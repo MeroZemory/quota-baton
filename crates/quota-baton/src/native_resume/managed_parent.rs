@@ -1,4 +1,4 @@
-//! Unregistered ordinary-traffic run owner. No automatic activation is wired.
+//! Unregistered run owner for ONE native ticket and ONE core reset episode.
 //!
 //! The caller keeps admission/catalog alive until this owner has returned or
 //! finished Drop. Own the authenticated endpoint and both jobs before entering
@@ -6,17 +6,19 @@
 //!
 //! Three owned std threads serialize dispatch, read native stdout, and publish UI
 //! input. The supervisor never calls Publisher (which may wait on ingress).
-//! Actor/pump futures are driven locally, never spawned. Every process_next,
-//! including its complete physical write/LF/flush, has a five-second watchdog.
+//! Actor/pump futures are driven locally, never spawned. Bounded core IPC and
+//! physical dispatch have distinct watchdog phases. Consume and its complete
+//! physical write/LF/flush share ONE original five-second candidate deadline.
 //! Cleanup first stops BOTH jobs without ingress locking, then synchronously
 //! drops actor/pump futures and their channels, wakes workers and joins them.
 //! Job drain itself uses RemoteRun's fail-closed lifetime, not a bounded promise.
 //!
-//! Observe/Inspect/ticket handoff is deliberately absent. No final read is begun,
-//! the dispatch callback always denies, and Due cannot authorize any write. The
-//! command parent is retained on the dispatcher thread for a later typed handoff.
-//! A future Consume bridge belongs ONLY inside its native committed callback,
-//! on that std thread, never a Tokio worker or while holding ingress across await.
+//! Core loss/refusal/expiry disables auto but preserves ordinary traffic. Only
+//! the dedicated dispatcher thread bridges core IPC with Handle::block_on, with
+//! Consume ONLY inside its native committed callback, never holding ingress
+//! across await. A real Grant is retained through that callback's physical write.
+//! No controller replacement, owner reconnect, second Observe or write retry.
+//! There is no whole-run deadline: caller/root-future Drop cancels ownership.
 
 use std::{
     future::{Future, pending},
@@ -24,23 +26,25 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use tokio::{sync::Notify, time::Instant};
+use tokio::{runtime::Handle, sync::Notify, time::Instant};
 use tokio_tungstenite::WebSocketStream;
 
 use super::{
     control_actor,
-    core_control::CoreControl,
+    core_control::{Consumption, CoreControl, Grant, Inspection, Observation},
+    dispatcher,
     endpoint::EndpointIo,
     framing,
+    goal::{Delivery, StoppedGoalTicket},
     ingress::{Frame, Publisher, Source},
-    parent_dispatch::Parent,
+    parent_dispatch::{self, Parent},
     socket_pump,
 };
 
@@ -96,21 +100,35 @@ pub(crate) enum Error {
     Worker,
     Ingress,
     Dispatch,
+    WriteUncertain,
     NativeRead,
     NativeEof,
     Pump,
-    Core,
-    UnexpectedHint,
     Job,
     Watchdog,
-    Lifetime,
     Cleanup,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Operation {
+    #[default]
+    Idle,
+    AwaitCore(Instant),
+    Physical(Instant),
+}
+
+#[derive(Default)]
+struct AutoMailbox {
+    disabled: bool,
+    episode: Option<u64>,
+    due: Option<u64>,
 }
 
 #[derive(Default)]
 struct State {
     failure: Option<Error>,
-    event_deadline: Option<Instant>,
+    operation: Operation,
+    auto: AutoMailbox,
 }
 
 #[derive(Default)]
@@ -121,34 +139,150 @@ struct Shared {
     enabled: AtomicBool,
     dirty: Mutex<bool>,
     dispatch_wake: Condvar,
+    #[cfg(any(test, feature = "testkit"))]
+    test_ingress: std::sync::OnceLock<tokio::sync::mpsc::Sender<Source>>,
 }
 
 impl Shared {
+    fn state(&self) -> MutexGuard<'_, State> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poison) => {
+                let mut state = poison.into_inner();
+                // Never recover a poisoned mailbox as live authority.
+                state.auto.disabled = true;
+                state
+            }
+        }
+    }
+
     // No untrusted work or pipe/ingress calls run under these small state locks.
     fn fail(&self, error: Error) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state();
+        if error == Error::WriteUncertain {
+            state.failure = Some(error);
+        }
         state.failure.get_or_insert(error);
         drop(state);
         self.changed.notify_one();
     }
 
-    fn start_event(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .event_deadline = Some(Instant::now() + EVENT_BUDGET);
+    fn start_event(&self) -> Instant {
+        let deadline = Instant::now() + EVENT_BUDGET;
+        self.state().operation = Operation::Physical(deadline);
         self.changed.notify_one();
+        deadline
     }
 
     fn end_event(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        // A late completion cannot erase expiry before the supervisor sees it.
-        if state.event_deadline.is_some_and(|d| Instant::now() >= d) {
+        let mut state = self.state();
+        // A clean IPC timeout is auto denial, never a physical watchdog failure.
+        // Physical expiry cannot be erased by a late completion instead.
+        if matches!(state.operation, Operation::Physical(d) if Instant::now() >= d) {
             state.failure.get_or_insert(Error::Watchdog);
         }
-        state.event_deadline = None;
+        state.operation = Operation::Idle;
         drop(state);
         self.changed.notify_one();
+    }
+
+    fn await_core(&self, deadline: Instant) -> bool {
+        let mut state = self.state();
+        if state.auto.disabled || self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        state.operation = Operation::AwaitCore(deadline);
+        drop(state);
+        self.changed.notify_one();
+        true
+    }
+
+    fn enter_physical(&self, deadline: Instant) -> bool {
+        let mut state = self.state();
+        if state.auto.disabled || self.stopped.load(Ordering::Acquire) || Instant::now() >= deadline
+        {
+            state.auto.disabled = true;
+            return false;
+        }
+        // Keep the candidate's original bound, including time spent in Consume.
+        state.operation = Operation::Physical(deadline);
+        drop(state);
+        self.changed.notify_one();
+        true
+    }
+
+    fn disable_auto(&self) {
+        self.state().auto.disabled = true;
+        self.changed.notify_one();
+        self.wake_dispatch();
+    }
+
+    fn auto_disabled(&self) -> bool {
+        self.state().auto.disabled
+    }
+
+    fn bind_episode(&self, episode: u64) -> bool {
+        let mut state = self.state();
+        let auto = &mut state.auto;
+        if episode == 0
+            || auto.episode.is_some_and(|id| id != episode)
+            || auto.due.is_some_and(|id| id != episode)
+        {
+            auto.disabled = true;
+        }
+        if !auto.disabled {
+            auto.episode = Some(episode);
+        }
+        let bound = !auto.disabled;
+        drop(state);
+        self.changed.notify_one();
+        self.wake_dispatch();
+        bound
+    }
+
+    fn publish_due(&self, episode: u64) {
+        let mut state = self.state();
+        let auto = &mut state.auto;
+        if episode == 0
+            || auto.episode.is_some_and(|id| id != episode)
+            || auto.due.is_some_and(|id| id != episode)
+        {
+            auto.disabled = true;
+        }
+        if !auto.disabled {
+            // Observe::Due and a buffered DueHint can name the same episode.
+            auto.due = Some(episode);
+        }
+        drop(state);
+        self.changed.notify_one();
+        self.wake_dispatch();
+    }
+
+    fn take_due(&self, episode: u64) -> bool {
+        let mut state = self.state();
+        if state.auto.disabled || state.auto.due != Some(episode) {
+            return false;
+        }
+        state.auto.due.take();
+        true
+    }
+
+    fn supervision(&self) -> Result<(Option<Instant>, bool), Error> {
+        let mut state = self.state();
+        if let Some(error) = state.failure {
+            return Err(error);
+        }
+        let deadline = match state.operation {
+            Operation::Idle => None,
+            Operation::Physical(d) if Instant::now() >= d => return Err(Error::Watchdog),
+            Operation::AwaitCore(d) if Instant::now() >= d => {
+                state.auto.disabled = true;
+                state.operation = Operation::Idle;
+                None
+            }
+            Operation::Physical(d) | Operation::AwaitCore(d) => Some(d),
+        };
+        Ok((deadline, state.auto.disabled))
     }
 
     fn wake_dispatch(&self) {
@@ -208,17 +342,27 @@ pub(crate) struct ManagedParent<J: Jobs> {
     pump: Option<Pump>,
     due: Option<tokio::sync::mpsc::Receiver<control_actor::DueHint>>,
     workers: Vec<JoinHandle<()>>,
-    lifetime: Instant,
     cleaned: bool,
 }
 
 impl<J: Jobs> ManagedParent<J> {
+    /// Install one bounded, lossy publication observer. A received Source proves
+    /// successful ingress admission, never dispatch completion or authority.
+    #[cfg(any(test, feature = "testkit"))]
+    pub(crate) fn test_ingress(&mut self) -> tokio::sync::mpsc::Receiver<Source> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(super::ingress::QUEUE_FRAMES);
+        assert!(
+            self.shared.test_ingress.set(sender).is_ok(),
+            "test ingress observer already installed"
+        );
+        receiver
+    }
+
     pub(crate) fn new(
         jobs: J,
         namespace: String,
         control: CoreControl,
         socket: WebSocketStream<EndpointIo>,
-        lifetime: Instant,
     ) -> Result<Self, Error> {
         let mut owner = Self {
             jobs,
@@ -227,16 +371,18 @@ impl<J: Jobs> ManagedParent<J> {
             pump: None,
             due: None,
             workers: Vec::with_capacity(3),
-            lifetime,
             cleaned: false,
         };
+        let runtime = Handle::try_current().map_err(|_| Error::Setup)?;
         let (stdin, stdout) = owner.jobs.take_stdio().map_err(|_| Error::Setup)?;
         let (ui, socket_io) = socket_pump::channels();
         let (mut core, actor_io) = control_actor::channels();
         owner.due = core.take_due();
-        owner.actor = Some(Box::pin(control_actor::run(control, actor_io, lifetime)));
+        owner.actor = Some(Box::pin(control_actor::run_until_cancelled(
+            control, actor_io,
+        )));
         owner.pump = Some(Box::pin(socket_pump::run(socket, socket_io)));
-        let (mut parent, publisher) = Parent::new(
+        let (parent, publisher) = Parent::new(
             namespace,
             stdin,
             UiAdapter {
@@ -278,24 +424,7 @@ impl<J: Jobs> ManagedParent<J> {
         })?;
 
         owner.spawn("qb-native-dispatch", move |shared| {
-            // Deliberately no Observe/Inspect/Consume in this scaffold. Keeping
-            // the noncloneable command parent here establishes future ownership.
-            let _core = core;
-            while !shared.stopped.load(Ordering::Acquire) {
-                if !shared.enabled.load(Ordering::Acquire) {
-                    shared.wait_dispatch();
-                    continue;
-                }
-                shared.start_event();
-                let result = parent.process_next(|| false);
-                shared.end_event();
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => shared.wait_dispatch(),
-                    Err(_) => return Err(Error::Dispatch),
-                }
-            }
-            Ok(())
+            dispatch_loop(parent, core, runtime, &shared)
         })?;
         Ok(owner)
     }
@@ -335,18 +464,9 @@ impl<J: Jobs> ManagedParent<J> {
 
     async fn supervise(&mut self) -> Result<JobStatus, Error> {
         loop {
-            let deadline = {
-                let state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(error) = state.failure {
-                    return Err(error);
-                }
-                if state.event_deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(Error::Watchdog);
-                }
-                state.event_deadline
-            };
-            if Instant::now() >= self.lifetime {
-                return Err(Error::Lifetime);
+            let (deadline, auto_disabled) = self.shared.supervision()?;
+            if auto_disabled {
+                self.drop_actor();
             }
             let status = self.jobs.try_wait().map_err(|_| Error::Job)?;
             if status != JobStatus::Running {
@@ -355,13 +475,39 @@ impl<J: Jobs> ManagedParent<J> {
             tokio::select! {
                 () = self.shared.changed.notified() => {},
                 () = wait_deadline(deadline) => {},
-                _ = self.actor.as_mut().ok_or(Error::Core)? => return Err(Error::Core),
+                _ = async {
+                    match self.actor.as_mut() {
+                        Some(actor) => actor.await,
+                        None => pending().await,
+                    }
+                } => self.stop_auto(),
                 _ = self.pump.as_mut().ok_or(Error::Pump)? => return Err(Error::Pump),
-                _ = self.due.as_mut().ok_or(Error::Core)?.recv() => return Err(Error::UnexpectedHint),
-                () = tokio::time::sleep_until(self.lifetime) => return Err(Error::Lifetime),
+                hint = async {
+                    match self.due.as_mut() {
+                        Some(due) => due.recv().await,
+                        None => pending().await,
+                    }
+                } => match hint {
+                    Some(hint) => self.shared.publish_due(hint.episode()),
+                    None => self.stop_auto(),
+                },
                 () = tokio::time::sleep(CHILD_POLL) => {},
             }
         }
+    }
+
+    fn drop_actor(&mut self) {
+        let had_actor = self.actor.is_some() || self.due.is_some();
+        drop(self.actor.take());
+        drop(self.due.take());
+        if had_actor {
+            self.shared.wake_dispatch();
+        }
+    }
+
+    fn stop_auto(&mut self) {
+        self.shared.disable_auto();
+        self.drop_actor();
     }
 
     fn cleanup(&mut self) -> Result<(), Error> {
@@ -393,6 +539,199 @@ impl<J: Jobs> Drop for ManagedParent<J> {
     }
 }
 
+enum AutoPhase {
+    Learning,
+    Waiting {
+        ticket: StoppedGoalTicket,
+        episode: u64,
+    },
+    FinalRead {
+        episode: u64,
+    },
+    Terminal,
+}
+
+fn terminal_auto<N: Write, U: Write>(
+    parent: &mut Parent<N, U>,
+    core: &mut Option<control_actor::Parent>,
+    phase: &mut AutoPhase,
+    shared: &Shared,
+) {
+    *phase = AutoPhase::Terminal;
+    parent.cancel_resume();
+    // Called only outside process_next: never invalidate a held Grant before
+    // its immediate physical write has returned (or failed/been vetoed).
+    drop(core.take());
+    shared.disable_auto();
+}
+
+fn dispatch_error(error: parent_dispatch::Error) -> Error {
+    match error {
+        parent_dispatch::Error::Dispatch(dispatcher::Error::WriteUncertain) => {
+            Error::WriteUncertain
+        }
+        parent_dispatch::Error::Ingress(_) => Error::Ingress,
+        parent_dispatch::Error::Dispatch(_) => Error::Dispatch,
+    }
+}
+
+fn dispatch_loop<N: Write, U: Write>(
+    mut parent: Parent<N, U>,
+    core: control_actor::Parent,
+    runtime: Handle,
+    shared: &Shared,
+) -> Result<(), Error> {
+    let mut core = Some(core);
+    let mut phase = AutoPhase::Learning;
+    while !shared.stopped.load(Ordering::Acquire) {
+        if !shared.enabled.load(Ordering::Acquire) {
+            shared.wait_dispatch();
+            continue;
+        }
+        if shared.auto_disabled() && core.is_some() {
+            terminal_auto(&mut parent, &mut core, &mut phase, shared);
+        }
+
+        let deadline = shared.start_event();
+        let episode = match phase {
+            AutoPhase::FinalRead { episode } => Some(episode),
+            _ => None,
+        };
+        let mut grant: Option<Grant> = None;
+        let mut attempted = false;
+        let result = parent.process_next(|| {
+            attempted = true;
+            let (Some(episode), Some(core)) = (episode, core.as_ref()) else {
+                return false;
+            };
+            if !shared.await_core(deadline) {
+                return false;
+            }
+            // ONLY the dedicated std thread, ONLY inside committed callback,
+            // and NO ingress/mailbox mutex across this bounded exchange.
+            match runtime.block_on(core.consume(episode, deadline)) {
+                Ok(Consumption::Granted(receipt)) => {
+                    let valid = receipt.is_current(episode);
+                    grant = Some(receipt);
+                    valid && shared.enter_physical(deadline)
+                }
+                _ => false,
+            }
+        });
+        // Preserve physical uncertainty ahead of any secondary timeout/latch.
+        if result
+            == Err(parent_dispatch::Error::Dispatch(
+                dispatcher::Error::WriteUncertain,
+            ))
+        {
+            shared.fail(Error::WriteUncertain);
+        }
+        shared.end_event();
+        // This exact nonClone receipt lived through payload, LF and flush.
+        drop(grant);
+        let denied = result
+            == Err(parent_dispatch::Error::Dispatch(
+                dispatcher::Error::AuthorityDenied,
+            ));
+        if attempted
+            || denied
+            || (matches!(phase, AutoPhase::FinalRead { .. })
+                && parent.delivery() == Delivery::Cancelled)
+        {
+            terminal_auto(&mut parent, &mut core, &mut phase, shared);
+        }
+        let processed = match result {
+            Ok(processed) => processed,
+            Err(_) if denied => true,
+            Err(error) => return Err(dispatch_error(error)),
+        };
+        if shared.auto_disabled() && core.is_some() {
+            terminal_auto(&mut parent, &mut core, &mut phase, shared);
+        }
+
+        if matches!(phase, AutoPhase::Learning)
+            && let Some(ticket) = parent.stopped_ticket()
+        {
+            // Taking this ticket permanently leaves Learning, on EVERY result.
+            phase = AutoPhase::Terminal;
+            let deadline = Instant::now() + EVENT_BUDGET;
+            let observed = match core.as_ref() {
+                Some(core) if shared.await_core(deadline) => {
+                    runtime.block_on(core.observe(ticket.thread_id(), deadline))
+                }
+                _ => {
+                    terminal_auto(&mut parent, &mut core, &mut phase, shared);
+                    continue;
+                }
+            };
+            shared.end_event();
+            let immediate = matches!(observed, Ok(Observation::Due { .. }));
+            match observed {
+                Ok(Observation::Waiting { episode, .. }) | Ok(Observation::Due { episode })
+                    if shared.bind_episode(episode) =>
+                {
+                    if immediate {
+                        shared.publish_due(episode);
+                    }
+                    phase = AutoPhase::Waiting { ticket, episode };
+                }
+                _ => terminal_auto(&mut parent, &mut core, &mut phase, shared),
+            }
+            continue;
+        }
+
+        // Drain admitted ordinary events BEFORE Inspect. Checkpoint in
+        // begin_final_read also vetoes input admitted while Inspect awaited.
+        if !processed {
+            if let AutoPhase::Waiting { episode, .. } = phase
+                && shared.take_due(episode)
+            {
+                let AutoPhase::Waiting { ticket, episode } =
+                    std::mem::replace(&mut phase, AutoPhase::Terminal)
+                else {
+                    return Err(Error::Worker);
+                };
+                let deadline = Instant::now() + EVENT_BUDGET;
+                let inspected = match core.as_ref() {
+                    Some(core) if shared.await_core(deadline) => {
+                        runtime.block_on(core.inspect(episode, deadline))
+                    }
+                    _ => {
+                        terminal_auto(&mut parent, &mut core, &mut phase, shared);
+                        continue;
+                    }
+                };
+                shared.end_event();
+                if matches!(inspected, Ok(Inspection::Ready)) && shared.enter_physical(deadline) {
+                    let result = parent.begin_final_read(ticket);
+                    if result
+                        == Err(parent_dispatch::Error::Dispatch(
+                            dispatcher::Error::WriteUncertain,
+                        ))
+                    {
+                        shared.fail(Error::WriteUncertain);
+                    }
+                    shared.end_event();
+                    match result {
+                        Ok(()) => phase = AutoPhase::FinalRead { episode },
+                        Err(parent_dispatch::Error::Dispatch(
+                            dispatcher::Error::AuthorityDenied,
+                        )) => {
+                            terminal_auto(&mut parent, &mut core, &mut phase, shared);
+                        }
+                        Err(error) => return Err(dispatch_error(error)),
+                    }
+                } else {
+                    terminal_auto(&mut parent, &mut core, &mut phase, shared);
+                }
+                continue;
+            }
+            shared.wait_dispatch();
+        }
+    }
+    Ok(())
+}
+
 async fn wait_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -416,6 +755,12 @@ fn reader_loop(
             publisher
                 .publish(source, frame)
                 .map_err(|_| Error::Ingress)?;
+            #[cfg(any(test, feature = "testkit"))]
+            if let Some(observer) = shared.test_ingress.get() {
+                // Full/closed is observation loss only; never block, retry,
+                // alter ingress, or grant/deny automatic authority here.
+                let _ = observer.try_send(source);
+            }
             shared.wake_dispatch();
         }
         Ok(())

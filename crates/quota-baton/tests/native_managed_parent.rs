@@ -1,5 +1,5 @@
-//! Unregistered owner scaffold. Synthetic WS peers and owned synthetic I/O/jobs.
-//! No reset qualification or automatic activation is claimed by these tests.
+//! Managed-parent composition with synthetic WS peers and owned synthetic I/O/jobs.
+//! Exercises local ordering and write lifetime, not real core reset qualification.
 #![allow(dead_code)] // Path-included staged APIs are not product registration.
 #[path = "../src/native_resume/control_actor.rs"]
 mod control_actor;
@@ -119,6 +119,9 @@ struct FakeState {
     writing: bool,
     blocked_at_stop: bool,
     pipe_drops: usize,
+    fail_after: Option<usize>,
+    block_flush: bool,
+    flushes: usize,
 }
 
 struct Proof {
@@ -126,6 +129,7 @@ struct Proof {
     changed: Condvar,
     entered: Notify,
     written: Notify,
+    flushing: Notify,
 }
 
 impl Proof {
@@ -141,10 +145,14 @@ impl Proof {
                 writing: false,
                 blocked_at_stop: false,
                 pipe_drops: 0,
+                fail_after: None,
+                block_flush: false,
+                flushes: 0,
             }),
             changed: Condvar::new(),
             entered: Notify::new(),
             written: Notify::new(),
+            flushing: Notify::new(),
         })
     }
 
@@ -191,11 +199,31 @@ impl Write for FakeInput {
         if state.stopped {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        state.input.extend_from_slice(bytes);
+        let remaining = state
+            .fail_after
+            .unwrap_or(usize::MAX)
+            .saturating_sub(state.input.len());
+        if remaining == 0 {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let size = bytes.len().min(remaining);
+        state.input.extend_from_slice(&bytes[..size]);
         self.0.written.notify_one();
-        Ok(bytes.len())
+        Ok(size)
     }
     fn flush(&mut self) -> io::Result<()> {
+        let mut state = self.0.state.lock().unwrap();
+        if state.block_flush {
+            self.0.flushing.notify_one();
+        }
+        while state.block_flush && !state.stopped {
+            state = self.0.changed.wait(state).unwrap();
+        }
+        if state.stopped {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        state.flushes += 1;
+        self.0.written.notify_one();
         Ok(())
     }
 }
@@ -269,7 +297,6 @@ async fn managed_ordinary_bytes_then_drop_closes_local_futures_and_joins_workers
             PREFIX.into(),
             control,
             socket,
-            lifetime(),
         ));
         let mut run = Box::pin(owner.run());
         tokio::select! {
@@ -302,7 +329,6 @@ async fn managed_unpolled_owner_drop_stops_jobs_and_joins_waiting_readers() {
             PREFIX.into(),
             control,
             socket,
-            lifetime(),
         ));
         drop(owner);
         proof.cleaned(false);
@@ -322,7 +348,6 @@ async fn managed_cancel_blocked_write_stops_jobs_before_join_without_async_progr
             PREFIX.into(),
             control,
             socket,
-            lifetime(),
         ));
         let mut run = Box::pin(owner.run());
         tokio::select! {
@@ -350,7 +375,6 @@ async fn managed_watchdog_independently_stops_a_blocked_physical_write() {
             PREFIX.into(),
             control,
             socket,
-            lifetime(),
         ));
         let peer = async {
             require(ui.send(text(REQUEST)).await);
@@ -374,7 +398,6 @@ async fn managed_pump_loss_interrupts_blocked_write_and_cleans_both_directions()
             PREFIX.into(),
             control,
             socket,
-            lifetime(),
         ));
         let peer = async {
             require(ui.send(text(REQUEST)).await);
@@ -401,7 +424,6 @@ async fn managed_child_status_preserves_which_child_exited_before_cleanup() {
                 PREFIX.into(),
                 control,
                 socket,
-                lifetime(),
             ));
             assert_eq!(owner.run().await, Ok(status));
             proof.cleaned(false);
@@ -544,7 +566,6 @@ mod actual_remote {
                     PREFIX.into(),
                     control,
                     socket,
-                    lifetime(),
                 ));
                 let large = serde_json::json!({
                     "id": 1, "method": "account/read",
@@ -588,4 +609,390 @@ mod actual_remote {
         })
         .await;
     }
+}
+
+// Real local control client/actor and Dispatcher, with synthetic peers only.
+// These peers assert protocol/correlation and local ordering, not core quota authority.
+const THREAD: &str = "11111111-2222-4333-8444-555555555555";
+const EPISODE: u64 = 17;
+use qb_proto::native_reset::{Command, Event, Refusal, Reply, Request as CoreRequest, VERSION};
+use serde_json::{Value, json};
+
+impl Proof {
+    async fn wait_native_frame(&self, id: &Value) -> Value {
+        loop {
+            let changed = self.written.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let found = self
+                .state
+                .lock()
+                .unwrap()
+                .input
+                .split(|b| *b == b'\n')
+                .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+                .find(|frame| &frame["id"] == id);
+            if let Some(frame) = found {
+                return frame;
+            }
+            changed.await;
+        }
+    }
+    fn automatic_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .input
+            .split(|b| *b == b'\n')
+            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+            .filter(|frame| frame["params"]["origin"] == "automatic")
+            .count()
+    }
+    fn live(&self) {
+        let state = self.state.lock().unwrap();
+        assert!(!state.stopped);
+        assert_eq!(state.stops, 0);
+    }
+}
+fn native_goal(status: &str) -> Value {
+    json!({"threadId":THREAD,"objective":"synthetic objective","createdAt":1,"updatedAt":2,"status":status})
+}
+async fn ui_value(ui: &mut UiPeer) -> Value {
+    let message = require(require(ui.next().await.ok_or(())));
+    let Message::Text(text) = message else {
+        panic!("expected synthetic UI JSON");
+    };
+    require(serde_json::from_str(text.as_str()))
+}
+async fn core_request(core: &mut WebSocketStream<TcpStream>) -> CoreRequest {
+    let message = require(require(core.next().await.ok_or(())));
+    let Message::Text(text) = message else {
+        panic!("expected bounded control request");
+    };
+    let request: CoreRequest = require(serde_json::from_str(text.as_str()));
+    assert_eq!(request.version, VERSION);
+    assert_ne!(request.request_id, 0);
+    request
+}
+async fn core_reply(core: &mut WebSocketStream<TcpStream>, id: Option<u64>, event: Event) {
+    let reply = Reply {
+        version: VERSION,
+        request_id: id,
+        event,
+    };
+    assert!(reply.valid_shape());
+    require(
+        core.send(Message::Text(require(serde_json::to_string(&reply)).into()))
+            .await,
+    );
+}
+async fn stopped_dialogue(ui: &mut UiPeer, proof: &Proof) {
+    for (request, response) in [
+        (
+            json!({"id":21,"method":"thread/start","params":{}}),
+            json!({"id":21,"result":{"thread":{"id":THREAD}}}),
+        ),
+        (
+            json!({"id":22,"method":"thread/goal/set","params":{
+            "threadId":THREAD,"objective":"synthetic objective","origin":"user","status":"active"}}),
+            json!({"id":22,"result":{"goal":native_goal("active")}}),
+        ),
+    ] {
+        require(ui.send(text(request.to_string().as_bytes())).await);
+        assert_eq!(proof.wait_native_frame(&request["id"]).await, request);
+        proof.native(response.to_string().as_bytes());
+        assert_eq!(ui_value(ui).await, response);
+    }
+    let notification = json!({"method":"thread/goal/updated","params":{"threadId":THREAD,"goal":native_goal("usageLimited")}});
+    proof.native(notification.to_string().as_bytes());
+    assert_eq!(ui_value(ui).await, notification);
+    let request = json!({"id":23,"method":"thread/goal/get","params":{"threadId":THREAD}});
+    require(ui.send(text(request.to_string().as_bytes())).await);
+    assert_eq!(proof.wait_native_frame(&request["id"]).await, request);
+    let response = json!({"id":23,"result":{"goal":native_goal("usageLimited")}});
+    proof.native(response.to_string().as_bytes());
+    assert_eq!(ui_value(ui).await, response);
+}
+async fn waiting(core: &mut WebSocketStream<TcpStream>) {
+    let request = core_request(core).await;
+    assert!(matches!(&request.command, Command::Observe { thread_id } if thread_id == THREAD));
+    core_reply(
+        core,
+        Some(request.request_id),
+        Event::Waiting {
+            episode: EPISODE,
+            reset_unix_ms: 2_000_000_000_000,
+        },
+    )
+    .await;
+}
+async fn ready(core: &mut WebSocketStream<TcpStream>, proof: &Proof) {
+    core_reply(core, None, Event::Due { episode: EPISODE }).await;
+    let request = core_request(core).await;
+    assert!(matches!(
+        request.command,
+        Command::Inspect { episode: EPISODE }
+    ));
+    // Repeated same-episode hints must coalesce rather than schedule another turn.
+    core_reply(core, None, Event::Due { episode: EPISODE }).await;
+    core_reply(
+        core,
+        Some(request.request_id),
+        Event::Ready { episode: EPISODE },
+    )
+    .await;
+    let final_get = proof.wait_native_frame(&json!(format!("{PREFIX}1"))).await;
+    assert_eq!(final_get["method"], "thread/goal/get");
+    assert_eq!(final_get["params"]["threadId"], THREAD);
+}
+fn final_native_reply(proof: &Proof) {
+    proof.native(
+        json!({"id":format!("{PREFIX}1"),"result":{"goal":native_goal("usageLimited")}})
+            .to_string()
+            .as_bytes(),
+    );
+}
+async fn ordinary_still_live(ui: &mut UiPeer, proof: &Proof, id: u64) {
+    proof.live();
+    let request = json!({"id":id,"method":"account/read","params":{"synthetic":true}});
+    require(ui.send(text(request.to_string().as_bytes())).await);
+    assert_eq!(proof.wait_native_frame(&request["id"]).await, request);
+    let response = json!({"id":id,"result":{"synthetic":true}});
+    proof.native(response.to_string().as_bytes());
+    assert_eq!(ui_value(ui).await, response);
+    proof.live();
+}
+
+#[tokio::test]
+async fn managed_episode_observe_inspect_final_reply_then_consume_once_live_through_flush() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("run exited during episode"); }
+            () = async {
+                stopped_dialogue(&mut ui, &proof).await;
+                waiting(&mut core).await;
+                ready(&mut core, &proof).await;
+                assert_eq!(proof.automatic_count(), 0);
+                // The next command cannot be Consume until the final native reply.
+                assert!(timeout(Duration::from_millis(30), core.next()).await.is_err());
+                proof.state.lock().unwrap().block_flush = true;
+                final_native_reply(&proof);
+                let consume = core_request(&mut core).await;
+                assert!(matches!(consume.command, Command::Consume { episode: EPISODE }));
+                core_reply(&mut core, Some(consume.request_id), Event::Granted { episode: EPISODE }).await;
+                proof.flushing.notified().await;
+                assert_eq!(proof.automatic_count(), 1);
+                // A physical flush is positively blocked: control must remain live.
+                assert!(timeout(Duration::from_millis(30), core.next()).await.is_err(), "managed_core_live_through_activation_flush");
+                {
+                    let mut state = proof.state.lock().unwrap();
+                    state.block_flush = false;
+                    proof.changed.notify_all();
+                }
+                let command = proof.wait_native_frame(&json!(format!("{PREFIX}2"))).await;
+                assert_eq!(command["params"], json!({"threadId":THREAD,"status":"active","origin":"automatic"}));
+                ordinary_still_live(&mut ui, &proof, 30).await;
+                final_native_reply(&proof);
+                ordinary_still_live(&mut ui, &proof, 31).await;
+                assert_eq!(proof.automatic_count(), 1);
+            } => {}
+        }
+        drop(run);
+        proof.cleaned(false);
+    }).await;
+}
+
+#[tokio::test]
+async fn managed_episode_refused_core_loss_wrong_hint_and_inspect_refusal_preserve_tui() {
+    bounded(async {
+        for mode in 0..4 {
+            let (socket, mut ui, control, mut core) = peers().await;
+            let proof = Proof::new(false);
+            let owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+            let mut run = Box::pin(owner.run());
+            tokio::select! {
+                result = &mut run => { let _ = result; panic!("core authority loss killed ordinary run mode={mode}"); }
+                () = async {
+                    stopped_dialogue(&mut ui, &proof).await;
+                    if mode == 0 {
+                        let request = core_request(&mut core).await;
+                        assert!(matches!(&request.command, Command::Observe { thread_id } if thread_id == THREAD));
+                        core_reply(&mut core, Some(request.request_id), Event::Refused { reason: Refusal::Unavailable }).await;
+                    } else {
+                        waiting(&mut core).await;
+                        match mode {
+                            1 => require(core.send(Message::Close(None)).await),
+                            2 => core_reply(&mut core, None, Event::Due { episode: EPISODE + 1 }).await,
+                            _ => {
+                                core_reply(&mut core, None, Event::Due { episode: EPISODE }).await;
+                                let request = core_request(&mut core).await;
+                                assert!(matches!(request.command, Command::Inspect { episode: EPISODE }));
+                                core_reply(&mut core, Some(request.request_id), Event::Refused { reason: Refusal::Cancelled }).await;
+                            }
+                        }
+                    }
+                    closed(&mut core).await;
+                    ordinary_still_live(&mut ui, &proof, 40).await;
+                    ordinary_still_live(&mut ui, &proof, 41).await;
+                    assert_eq!(proof.automatic_count(), 0);
+                } => {}
+            }
+            drop(run);
+            proof.cleaned(false);
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn managed_episode_ui_during_inspect_is_forwarded_and_no_consume_occurs() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let mut owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+        let mut admitted = owner.test_ingress();
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("inspect veto killed ordinary run"); }
+            () = async {
+                stopped_dialogue(&mut ui, &proof).await;
+                waiting(&mut core).await;
+                core_reply(&mut core, None, Event::Due { episode: EPISODE }).await;
+                let request = core_request(&mut core).await;
+                assert!(matches!(request.command, Command::Inspect { episode: EPISODE }));
+                while admitted.try_recv().is_ok() {}
+                require(ui.send(text(br#"{"id":50,"method":"account/read","params":{}}"#)).await);
+                assert_eq!(admitted.recv().await, Some(ingress::Source::Ui));
+                // Publication, not WebSocket send completion, establishes the veto.
+                core_reply(&mut core, Some(request.request_id), Event::Ready { episode: EPISODE }).await;
+                closed(&mut core).await;
+                proof.wait_native_frame(&json!(50)).await;
+                proof.native(br#"{"id":50,"result":{}}"#);
+                assert_eq!(ui_value(&mut ui).await["id"], 50);
+                assert_eq!(proof.automatic_count(), 0);
+                ordinary_still_live(&mut ui, &proof, 51).await;
+            } => {}
+        }
+        drop(run);
+        proof.cleaned(false);
+    }).await;
+}
+
+#[tokio::test]
+async fn managed_episode_consumed_partial_write_is_uncertain_and_never_retried() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let peer = async {
+            stopped_dialogue(&mut ui, &proof).await;
+            waiting(&mut core).await;
+            ready(&mut core, &proof).await;
+            let before = proof.state.lock().unwrap().input.len();
+            proof.state.lock().unwrap().fail_after = Some(before + 5);
+            final_native_reply(&proof);
+            let consume = core_request(&mut core).await;
+            assert!(matches!(
+                consume.command,
+                Command::Consume { episode: EPISODE }
+            ));
+            core_reply(
+                &mut core,
+                Some(consume.request_id),
+                Event::Granted { episode: EPISODE },
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(result, Err(Error::WriteUncertain));
+        proof.cleaned(false);
+        {
+            let state = proof.state.lock().unwrap();
+            assert_eq!(
+                Some(state.input.len()),
+                state.fail_after,
+                "exactly one partial write, no retry"
+            );
+        }
+        assert_eq!(
+            proof.automatic_count(),
+            0,
+            "partial frame is not a complete activation receipt"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_episode_ui_published_during_consume_vetoes_grant_and_preserves_tui() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let mut owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+        let mut admitted = owner.test_ingress();
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("consume veto killed ordinary run"); }
+            () = async {
+                stopped_dialogue(&mut ui, &proof).await;
+                waiting(&mut core).await;
+                ready(&mut core, &proof).await;
+                final_native_reply(&proof);
+                let consume = core_request(&mut core).await;
+                assert!(matches!(consume.command, Command::Consume { episode: EPISODE }));
+                while admitted.try_recv().is_ok() {}
+                require(ui.send(text(br#"{"id":60,"method":"account/read","params":{}}"#)).await);
+                assert_eq!(admitted.recv().await, Some(ingress::Source::Ui));
+                core_reply(&mut core, Some(consume.request_id), Event::Granted { episode: EPISODE }).await;
+                closed(&mut core).await;
+                proof.wait_native_frame(&json!(60)).await;
+                proof.native(br#"{"id":60,"result":{}}"#);
+                assert_eq!(ui_value(&mut ui).await["id"], 60);
+                ordinary_still_live(&mut ui, &proof, 61).await;
+                assert_eq!(proof.automatic_count(), 0);
+            } => {}
+        }
+        drop(run);
+        proof.cleaned(false);
+    }).await;
+}
+
+#[tokio::test]
+async fn managed_episode_consume_timeout_disables_auto_without_whole_run_expiry() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("AwaitCore timeout killed ordinary run"); }
+            () = async {
+                stopped_dialogue(&mut ui, &proof).await;
+                waiting(&mut core).await;
+                ready(&mut core, &proof).await;
+                final_native_reply(&proof);
+                let consume = core_request(&mut core).await;
+                assert!(matches!(consume.command, Command::Consume { episode: EPISODE }));
+                // Deliberately withhold the reply beyond the one original
+                // five-second event budget. No physical write has begun.
+                let end = require(timeout(Duration::from_secs(7), core.next()).await);
+                assert!(matches!(end, None | Some(Err(_)) | Some(Ok(Message::Close(_)))));
+                ordinary_still_live(&mut ui, &proof, 70).await;
+                // A stale final response cannot rearm a second episode.
+                final_native_reply(&proof);
+                ordinary_still_live(&mut ui, &proof, 71).await;
+                assert_eq!(proof.automatic_count(), 0);
+            } => {}
+        }
+        drop(run);
+        proof.cleaned(false);
+    }).await;
 }
