@@ -1157,6 +1157,7 @@ async fn upgrade_inner(
     // The handshake defers the marker to the first response.create ledger row.
     completion.record.after_move = false;
     let context = pump::Context {
+        launch_pin: launch_pin.clone(),
         runtime: Some(state.accounts.clone()),
         relay: Some(state.clone()),
         drain_signal: Some(Box::pin({

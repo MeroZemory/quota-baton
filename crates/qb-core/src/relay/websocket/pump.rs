@@ -24,7 +24,11 @@ use tokio_tungstenite::tungstenite::{
     },
 };
 
-use super::{ClientSocket, UpstreamSocket};
+use super::{
+    ClientSocket, UpstreamSocket,
+    ws_attempt::{Candidate, Leg, Sent},
+    ws_write::ForwardWrite,
+};
 use crate::{
     accounts::Provider::Codex,
     guard::{InflightBudget, Reservation},
@@ -57,6 +61,7 @@ pub(super) struct Context {
     pub close_after_response: bool,
     pub capture_ticket: Option<PathBuf>,
     pub connection: String,
+    pub launch_pin: Option<Arc<crate::launch_tokens::LaunchPin>>,
 }
 
 impl Context {
@@ -152,6 +157,7 @@ pub(in crate::relay) struct CurrentCompletion {
     first_message: bool,
     model: Option<String>,
     response_id: Option<String>,
+    physical_key: Option<String>,
     last_create: Option<(Message, Reservation)>,
     rate: Arc<RateBudget>,
 }
@@ -202,6 +208,7 @@ impl CurrentCompletion {
             first_message: true,
             model: None,
             response_id: None,
+            physical_key: session.key.clone(),
             last_create: None,
             rate,
         })
@@ -906,6 +913,7 @@ struct PendingRateResend {
     reservation: Reservation,
     rate: Arc<RateBudget>,
     model: Option<String>,
+    key: Option<String>,
 }
 
 // The create's caller/deadline owner is separate from metadata operations.
@@ -1458,6 +1466,272 @@ fn admit_create(
     })
 }
 
+// One owner per successful physical upgrade. Candidate only holds Leg, so the
+// last pump/write owner dropping also revokes candidates on task abort.
+struct PhysicalLeg {
+    witness: Leg,
+    sent: Mutex<Option<PhysicalSent>>,
+}
+struct PhysicalSent {
+    request: Option<u64>,
+    sent: Sent,
+    response_id: Option<String>,
+    snapshot: DispatchSnapshot,
+}
+// Captured for this write, never reconstructed from latest context after C9.
+pub(super) struct DispatchSnapshot {
+    pub(super) account: String,
+    pub(super) key: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) pin: Option<Arc<crate::launch_tokens::LaunchPin>>,
+    pub(super) owner: Option<crate::launch_tokens::LaunchOwnerScope>,
+}
+pub(super) struct QuotaCandidateSnapshot {
+    pub(super) candidate: Candidate,
+    pub(super) dispatch: DispatchSnapshot,
+    pub(super) request: Option<u64>,
+}
+impl DispatchSnapshot {
+    fn new(context: &Context, key: Option<String>, model: Option<String>) -> Self {
+        Self {
+            account: context.account.clone(),
+            key,
+            model,
+            pin: context.launch_pin.clone(),
+            owner: context
+                .launch_pin
+                .as_ref()
+                .and_then(|pin| pin.deferred_owner_scope()),
+        }
+    }
+    fn copy(&self) -> Self {
+        Self {
+            account: self.account.clone(),
+            key: self.key.clone(),
+            model: self.model.clone(),
+            pin: self.pin.clone(),
+            owner: self.owner.clone(),
+        }
+    }
+}
+impl PhysicalLeg {
+    fn new(account: &str) -> Arc<Self> {
+        Arc::new(Self {
+            witness: Leg::new(account),
+            sent: Mutex::new(None),
+        })
+    }
+    // created may BIND an ID to an already physically sent write, never retire
+    // it. A frame seen before whole-write finish is conservatively unwitnessed:
+    // no later ledger lookup repairs the missing physical ID binding. This
+    // explicit-ID attempt remains ineligible unless another created is observed
+    // after finish; ID-less quota still requires the helper's flushed witness.
+    fn observe_created(&self, event: &Value, current: &BTreeMap<u64, CurrentCompletion>) {
+        if event["type"] != "response.created" {
+            return;
+        }
+        let Ok(Some(id)) = physical_response_id(event) else {
+            return;
+        };
+        let mut slot = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(physical) = slot.as_mut() {
+            if physical.request.is_none_or(|request| {
+                current
+                    .get(&request)
+                    .is_some_and(|active| active.response_id.as_deref() == Some(id))
+            }) {
+                match physical.response_id.as_deref() {
+                    None => physical.response_id = Some(id.to_owned()),
+                    Some(previous) if previous != id => self.witness.ambiguous(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    // This uses ONLY an explicit response ID already bound to this physical
+    // completion AND its actual physical Sent. No first-sent terminal fallback.
+    fn terminal(&self, event: &Value, current: &BTreeMap<u64, CurrentCompletion>) {
+        if !matches!(
+            event["type"].as_str(),
+            Some("error" | "response.failed" | "response.done" | "response.completed")
+        ) {
+            return;
+        }
+        let Ok(Some(id)) = physical_response_id(event) else {
+            return;
+        };
+        let mut slot = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|physical| {
+            physical.response_id.as_deref() == Some(id)
+                && physical.request.is_none_or(|request| {
+                    current
+                        .get(&request)
+                        .is_some_and(|active| active.response_id.as_deref() == Some(id))
+                })
+        }) {
+            self.witness
+                .retire(&slot.take().expect("matched physical send").sent);
+        }
+    }
+    fn quota_candidate(
+        &self,
+        event: &Value,
+        current: &BTreeMap<u64, CurrentCompletion>,
+    ) -> Option<QuotaCandidateSnapshot> {
+        let wrapped = matches!(event["type"].as_str(), Some("error" | "response.failed"))
+            || (matches!(
+                event["type"].as_str(),
+                Some("response.done" | "response.completed")
+            ) && event["response"]["status"] == "failed");
+        let quota = [&event["error"], &event["response"]["error"]]
+            .iter()
+            .any(|error| {
+                error["code"] == "usage_limit_reached" || error["type"] == "usage_limit_reached"
+            });
+        if !wrapped || !quota {
+            return None;
+        }
+        let slot = self.sent.lock().ok()?;
+        let physical = slot.as_ref()?;
+        // Unknown explicit IDs cannot claim an unrelated actual send. ID-less
+        // quota errors still require the helper's single untainted sent witness.
+        if let Some(id) = physical_response_id(event).ok()? {
+            if physical.response_id.as_deref() != Some(id)
+                || !physical.request.is_none_or(|request| {
+                    current
+                        .get(&request)
+                        .is_some_and(|active| active.response_id.as_deref() == Some(id))
+                })
+            {
+                return None;
+            }
+        }
+        Some(QuotaCandidateSnapshot {
+            candidate: self.witness.quota_candidate()?,
+            dispatch: physical.snapshot.copy(),
+            request: physical.request,
+        })
+    }
+}
+impl Drop for PhysicalLeg {
+    fn drop(&mut self) {
+        self.witness.close();
+    }
+}
+
+fn physical_response_id(event: &Value) -> Result<Option<&str>, ()> {
+    fn read(value: Option<&Value>) -> Result<Option<&str>, ()> {
+        value
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                    .ok_or(())
+            })
+            .transpose()
+    }
+    let top = read(event.get("response_id"))?;
+    let nested = read(
+        event
+            .get("response")
+            .and_then(|response| response.get("id")),
+    )?;
+    if matches!((top, nested), (Some(a), Some(b)) if a != b) {
+        return Err(());
+    }
+    Ok(top.or(nested))
+}
+
+// Taint opaque application data at its actual start_send, never on receipt or
+// while queued at poll_ready. Controls use the original write path directly.
+struct OpaqueSink<S> {
+    inner: S,
+    witness: Leg,
+}
+impl<S: Sink<Message> + Unpin> Sink<Message> for OpaqueSink<S> {
+    type Error = S::Error;
+    fn poll_ready(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_ready(cx)
+    }
+    fn start_send(mut self: std::pin::Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+        self.witness.ambiguous();
+        std::pin::Pin::new(&mut self.inner).start_send(message)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.witness.close();
+        std::pin::Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
+
+fn write_physical<S>(
+    sink: S,
+    message: Message,
+    reservation: Reservation,
+    delivered: Delivered,
+    physical: Arc<PhysicalLeg>,
+    dispatch: Option<DispatchSnapshot>,
+) -> Write<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+    S::Error: Send,
+{
+    Box::pin(async move {
+        if let Some(snapshot) = dispatch {
+            let request = delivered.request;
+            // Must match write()'s ORIGINAL message predicate and chunk size.
+            let count = if message.len() > PARSE_LIMIT
+                && matches!(&message, Message::Text(_) | Message::Binary(_))
+            {
+                message.len().div_ceil(64 * 1024)
+            } else {
+                1
+            };
+            let sink = ForwardWrite::new(
+                sink,
+                physical.witness.clone(),
+                snapshot.key.clone(),
+                snapshot.model.clone(),
+                std::num::NonZeroUsize::new(count).expect("at least one fragment"),
+            );
+            let (sink, success, delivered) = write(sink, message, reservation, delivered).await;
+            let (sink, sent) = sink.finish(success);
+            if let Some(sent) = sent {
+                *physical.sent.lock().unwrap_or_else(|e| e.into_inner()) = Some(PhysicalSent {
+                    request,
+                    sent,
+                    response_id: None,
+                    snapshot,
+                });
+            }
+            (sink, success, delivered)
+        } else if matches!(
+            &message,
+            Message::Text(_) | Message::Binary(_) | Message::Frame(_)
+        ) {
+            let sink = OpaqueSink {
+                inner: sink,
+                witness: physical.witness.clone(),
+            };
+            let (sink, success, delivered) = write(sink, message, reservation, delivered).await;
+            (sink.inner, success, delivered)
+        } else {
+            write(sink, message, reservation, delivered).await
+        }
+    })
+}
+
 type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
 
 fn write_initial<S>(
@@ -1466,6 +1740,8 @@ fn write_initial<S>(
     reservation: Reservation,
     delivered: Delivered,
     create: Arc<CreateLifetime>,
+    physical: Arc<PhysicalLeg>,
+    dispatch: DispatchSnapshot,
 ) -> Write<S>
 where
     S: Sink<Message> + Send + Unpin + 'static,
@@ -1473,17 +1749,27 @@ where
 {
     Box::pin(async move {
         #[cfg(test)]
-        let (sink, success, delivered) = write(
+        let (sink, success, delivered) = write_physical(
             tests::TimerWriteSink::new(sink, &create),
             message,
             reservation,
             delivered,
+            physical,
+            Some(dispatch),
         )
         .await;
         #[cfg(test)]
         let result = (sink.into_inner(), success, delivered);
         #[cfg(not(test))]
-        let result = write(sink, message, reservation, delivered).await;
+        let result = write_physical(
+            sink,
+            message,
+            reservation,
+            delivered,
+            physical,
+            Some(dispatch),
+        )
+        .await;
         // Keep the paired caller alive through the first poll and physical
         // write backpressure. Admission is not a delivery/flush receipt.
         drop(create);
@@ -1550,6 +1836,7 @@ fn guarded_upstream_write<S>(
     delivered: Delivered,
     model: Option<String>,
     managed: bool,
+    physical: Arc<PhysicalLeg>,
 ) -> Write<S>
 where
     S: Sink<Message> + Send + Unpin + 'static,
@@ -1680,7 +1967,12 @@ where
             rate.initial_dispatch();
             rate.record_forced_send(context.runtime.as_ref(), &context.account);
         }
-        write(sink, message, reservation, delivered).await
+        let typed_create =
+            super::super::wire_metadata::Metadata::parse(&message.clone().into_data())
+                .is_some_and(|meta| meta.create());
+        let dispatch = typed_create
+            .then(|| DispatchSnapshot::new(&context, context.session.key.clone(), model));
+        write_physical(sink, message, reservation, delivered, physical, dispatch).await
     })
 }
 
@@ -1710,12 +2002,18 @@ type RateRedial = BoxFuture<
         (
             Write<SplitSink<UpstreamSocket, Message>>,
             SplitStream<UpstreamSocket>,
+            Arc<PhysicalLeg>,
         ),
         &'static str,
     >,
 >;
 
-fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial {
+fn redial_rate(
+    context: Arc<Context>,
+    pending: PendingRateResend,
+    old: Arc<PhysicalLeg>,
+) -> RateRedial {
+    old.witness.close();
     Box::pin(async move {
         if !pending.rate.can_retry() {
             return Err("rate_wait_timeout");
@@ -1747,6 +2045,8 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         // duration connect deadline.
         let socket = super::redial_same_account(&context, pending.model.as_deref()).await?;
         let (sink, read) = socket.split();
+        let physical = PhysicalLeg::new(&context.account);
+        let write_physical_leg = physical.clone();
         let bytes = pending.message.len();
         let reservation = pending.reservation;
         // Count a retry only when its write is actually polled, after a dial.
@@ -1814,7 +2114,7 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
             rate.note_usage_send(&context);
             rate.sent();
             rate.record_forced_send(context.runtime.as_ref(), &context.account);
-            write(
+            write_physical(
                 sink,
                 pending.message,
                 reservation,
@@ -1824,10 +2124,12 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
                     terminal: None,
                     completed: false,
                 },
+                write_physical_leg,
+                Some(DispatchSnapshot::new(&context, pending.key, pending.model)),
             )
             .await
         }) as Write<SplitSink<UpstreamSocket, Message>>;
-        Ok((write, read))
+        Ok((write, read, physical))
     })
 }
 
@@ -1843,6 +2145,7 @@ async fn run_with_read_timeout(
 ) {
     let (client_sink, mut client_read) = client.split();
     let (upstream_sink, mut upstream_read) = upstream.split();
+    let mut physical = PhysicalLeg::new(&context.account);
     let mut client_sink = Some(client_sink);
     let mut upstream_sink = Some(upstream_sink);
     let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
@@ -1924,6 +2227,9 @@ async fn run_with_read_timeout(
             .relay
             .as_ref()
             .is_some_and(|relay| relay.is_draining());
+        if draining {
+            physical.witness.close();
+        }
         // Keep an admitted payload here until the write arm is polled, so
         // drain can cancel it without losing the upstream sink or older turns.
         if draining && pending_launch_create.take().is_some() {
@@ -1953,6 +2259,7 @@ async fn run_with_read_timeout(
             end_deadline = Instant::now() + CLOSE_TIMEOUT;
         }
         if ending.is_some() {
+            physical.witness.close();
             launch_preparation = None;
             pending_launch_create = None;
             pending_inspection = None;
@@ -2179,7 +2486,7 @@ async fn run_with_read_timeout(
             result = async { rate_redial.as_mut().unwrap().await }, if rate_redial.is_some() && ending.is_none() => {
                 rate_redial = None;
                 match result {
-                    Ok((write, read)) => { upstream_read = read; to_upstream = Some(write); }
+                    Ok((write, read, next)) => { physical = next; upstream_read = read; to_upstream = Some(write); }
                     Err(reason) => {
                         if managed_socket && let Some(error) = launch_failure(reason) { pending_launch_error = Some(launch_error(error)); }
                         for active in current.values_mut() { active.completion.record.outcome = reason.into(); }
@@ -2273,6 +2580,7 @@ async fn run_with_read_timeout(
                     if !managed && context.has_managed_binding() {
                         return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some(PROMOTED_BEFORE_WRITE), completed: false });
                     }
+                    let mut dispatch_key = current.get(&pending.request).and_then(|active| active.physical_key.clone());
                     if managed && let Some(relay) = &context.relay {
                         // A live provisional pin can redirect to its adopted C8 key.
                         let dispatch_info = context.session.key.as_deref()
@@ -2282,6 +2590,7 @@ async fn run_with_read_timeout(
                             && relay.bindings.permits_dispatch(Some(&info.canonical_key), &context.account)) {
                             return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
                         }
+                        dispatch_key = dispatch_info.map(|info| info.canonical_key);
                     }
                     if !pending.rate.can_send() {
                         return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
@@ -2290,6 +2599,7 @@ async fn run_with_read_timeout(
                         return (sink, false, Delivered { bytes:0, request:Some(pending.request), terminal:Some("request_timeout"), completed:false });
                     }
                     if let Some(active) = current.get_mut(&pending.request) {
+                        active.physical_key = dispatch_key.clone();
                         active.completion.accounting_attempt(&context.account);
                         if let Some(binding) = &active.completion.binding {
                             binding.dispatched();
@@ -2298,9 +2608,11 @@ async fn run_with_read_timeout(
                     pending.rate.note_usage_send(&context);
                     pending.rate.initial_dispatch();
                     pending.rate.record_forced_send(context.runtime.as_ref(), &context.account);
+                    let dispatch = DispatchSnapshot::new(&context, dispatch_key,
+                        current.get(&pending.request).and_then(|active| active.model.clone()));
                     to_upstream = Some(write_initial(sink, pending.message, pending.reservation, Delivered {
                         bytes, request: Some(pending.request), terminal: None, completed: false,
-                    }, pending.create));
+                    }, pending.create, physical.clone(), dispatch));
                 }
                 to_upstream.as_mut().unwrap().await
             }, if to_upstream.is_some() || (initial_ready && ending.is_none()) => {
@@ -2332,7 +2644,7 @@ async fn run_with_read_timeout(
                     && let Some(pending) = pending_rate_redial.take()
                     && !has_previous_response_id(&pending.message)
                 {
-                    rate_redial = Some(redial_rate(context.clone(), pending));
+                    rate_redial = Some(redial_rate(context.clone(), pending, physical.clone()));
                 } else if !success && ending.is_none() {
                     for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                     ending = Some((None, "upstream_write_error"));
@@ -2384,6 +2696,7 @@ async fn run_with_read_timeout(
                             }
                         }
                     }
+                    physical.witness.close();
                     to_upstream = None;
                     launch_preparation = None;
                     pending_launch_create = None;
@@ -2459,12 +2772,13 @@ async fn run_with_read_timeout(
                         }
                         if let Some(active) = request.and_then(|id| current.get_mut(&id)) { active.completion.input_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
                         if let Message::Close(frame) = &message {
+                            physical.witness.close();
                             ending = Some((frame.clone(), "client_close"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
                         let fallback_model = if let Message::Text(text) = &message { super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()) } else { None };
                         to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
-                            Delivered { bytes, request, terminal: None, completed: false }, fallback_model, managed_socket));
+                            Delivered { bytes, request, terminal: None, completed: false }, fallback_model, managed_socket, physical.clone()));
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
                 }
@@ -2479,7 +2793,19 @@ async fn run_with_read_timeout(
                             to_upstream = Some(flush(upstream_sink.take().unwrap()));
                         }
                         let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
+                        // poll_reset.rs integration point: move this exact snapshot
+                        // and original budgeted error into its pending future slot,
+                        // BEFORE response_completion/apply_error/reconnect_available.
+                        // This source-only slice deliberately does not start C9.
+                        let _quota_candidate = event.as_ref().and_then(|event| physical.quota_candidate(event, &current));
+                        // Keep a captured candidate live for the sibling's pending
+                        // operation. In this standalone draft it is dropped unused;
+                        // no registration or wait is authorized by this hook alone.
+                        if _quota_candidate.is_none() {
+                            if let Some(event) = event.as_ref() { physical.terminal(event, &current); }
+                        }
                         let request = response_completion(&mut current, event.as_ref());
+                        if let Some(event) = event.as_ref() { physical.observe_created(event, &current); }
                         if request.is_none() && connection_errors < 16
                             && let Some(error) = event.as_ref().filter(|event| {
                                 matches!(event["type"].as_str(), Some("error" | "response.failed"))
@@ -2592,6 +2918,7 @@ async fn run_with_read_timeout(
                                             reservation: reservation.clone(),
                                             rate: rate.clone(),
                                             model: current[&request.expect("active rate request")].model.clone(),
+                                            key: current[&request.expect("active rate request")].physical_key.clone(),
                                         });
                                         let runtime = context.runtime.clone();
                                         let relay = context.relay.clone();
@@ -2600,6 +2927,8 @@ async fn run_with_read_timeout(
                                         let account = context.account.clone();
                                         let bytes = message.len();
                                         let retry_context = context.clone();
+                                        let retry_physical = physical.clone();
+                                        let retry_key = current[&request.expect("active rate request")].physical_key.clone();
                                         to_upstream = Some(Box::pin(async move {
                                             if !rate.admit(runtime.as_ref(), &account).await {
                                                 if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
@@ -2621,11 +2950,13 @@ async fn run_with_read_timeout(
                                             rate.note_usage_send(&retry_context);
                                             rate.sent();
                                             rate.record_forced_send(runtime.as_ref(), &account);
-                                            write(
+                                            write_physical(
                                                 sink,
                                                 message,
                                                 reservation,
                                                 Delivered { bytes, request, terminal: None, completed: false },
+                                                retry_physical,
+                                                Some(DispatchSnapshot::new(&retry_context, retry_key, retry_model)),
                                             )
                                             .await
                                         }));
@@ -2653,7 +2984,7 @@ async fn run_with_read_timeout(
                         {
                             to_upstream = None;
                             if !has_previous_response_id(&pending.message) && pending.rate.can_retry() {
-                                rate_redial = Some(redial_rate(context.clone(), pending));
+                                rate_redial = Some(redial_rate(context.clone(), pending, physical.clone()));
                                 continue;
                             }
                             ending = Some((frame.clone(), "upstream_close"));
@@ -2684,7 +3015,7 @@ async fn run_with_read_timeout(
                         {
                             to_upstream = None;
                             if pending.rate.can_retry() {
-                                rate_redial = Some(redial_rate(context.clone(), pending));
+                                rate_redial = Some(redial_rate(context.clone(), pending, physical.clone()));
                                 continue;
                             }
                         }
@@ -2726,6 +3057,7 @@ async fn run_with_read_timeout(
             _ = tokio::time::sleep_until(end_deadline), if ending.is_some() => { break; }
         }
     }
+    physical.witness.close();
     // End waits and release retained slots before the close handshake and the
     // completion snapshot. Direct cancellation still uses the Drop fallback.
     drop(to_upstream);
