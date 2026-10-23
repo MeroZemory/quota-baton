@@ -6,7 +6,7 @@ mod core_control;
 
 use std::{future::Future, time::Duration};
 
-use control_actor::{Error, channels, run};
+use control_actor::{Error, channels, run, run_until_cancelled};
 use core_control::{Consumption, CoreControl, Inspection, Observation};
 use futures_util::{SinkExt, StreamExt};
 use qb_proto::native_reset::{Command, Event, Refusal, Reply, Request, VERSION};
@@ -138,8 +138,10 @@ async fn actual_waiting_due_explicit_inspect_consume_and_close_exact_once() {
         };
         assert_eq!(grant.request_id(), 3);
         assert!(grant.test_deadline() > Instant::now());
-        assert!(grant.authorizes(EPISODE));
+        assert!(grant.is_current(EPISODE));
         require(parent.close(deadline()).await);
+        assert!(!grant.is_current(EPISODE));
+        assert!(!grant.authorizes(EPISODE));
     };
     let peer = async {
         observed(&mut server, false).await;
@@ -159,7 +161,7 @@ async fn actual_waiting_due_explicit_inspect_consume_and_close_exact_once() {
         closed(&mut server).await;
     };
     let (result, (), ()) =
-        bounded(async { tokio::join!(run(control, io, deadline()), parent_work, peer) }).await;
+        bounded(async { tokio::join!(run_until_cancelled(control, io), parent_work, peer) }).await;
     require(result);
 }
 
@@ -499,4 +501,43 @@ async fn explicit_client_cancel_baseline_closes_instead_of_granting() {
         bounded(async { tokio::join!(control.cancel(EPISODE, deadline()), peer) }).await;
     require(result);
     assert!(control.is_closed());
+}
+
+#[tokio::test]
+async fn cancellation_only_initial_idle_parent_drop_closes_without_observe() {
+    let (control, mut server) = pair().await;
+    let (parent, io) = channels();
+    let mut actor = Box::pin(run_until_cancelled(control, io));
+    assert!(futures_util::poll!(actor.as_mut()).is_pending());
+    drop(parent);
+    let (result, ()) = bounded(async { tokio::join!(actor, closed(&mut server)) }).await;
+    assert_eq!(result, Err(Error::Cancelled));
+}
+
+#[tokio::test]
+async fn cancellation_only_due_idle_parent_or_actor_drop_closes_without_consume() {
+    for drop_parent in [true, false] {
+        let (control, mut server) = pair().await;
+        let (parent, io) = channels();
+        let mut actor = Box::pin(run_until_cancelled(control, io));
+        let observed = bounded(async {
+            tokio::select! {
+                result = &mut actor => { let _ = result; panic!("actor ended before cancellation"); }
+                (result, ()) = async {
+                    tokio::join!(parent.observe("thread-a", deadline()), observed(&mut server, false))
+                } => result,
+            }
+        }).await;
+        require(observed);
+        assert!(futures_util::poll!(actor.as_mut()).is_pending());
+        if drop_parent {
+            drop(parent);
+            let (result, ()) = bounded(async { tokio::join!(actor, closed(&mut server)) }).await;
+            assert_eq!(result, Err(Error::Cancelled));
+        } else {
+            drop(actor);
+            closed(&mut server).await;
+            assert!(parent.consume(EPISODE, deadline()).await.is_err());
+        }
+    }
 }

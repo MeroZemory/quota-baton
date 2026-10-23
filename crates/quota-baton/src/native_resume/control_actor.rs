@@ -6,7 +6,8 @@
 //! this actor alive until the write ends; then Close. No reconnect or retries.
 //!
 //! Command deadlines are absolute, including queue time, and capped at five
-//! seconds. Only the idle Due wait uses the longer parent episode deadline.
+//! seconds. Initial-command and Due idle waits may have no deadline; after Due,
+//! waiting for each explicit Inspect/Consume command is capped at five seconds.
 //! next_due is polled continuously after Waiting: ONLY an actor command, actor
 //! shutdown, hint receiver loss or that lifetime deadline can interrupt it.
 //! Ordinary UI/native ingress must NOT be sent as actor commands. Early Inspect
@@ -299,12 +300,24 @@ async fn exchange<T>(
     }
 }
 
-async fn command(io: &mut ActorIo, deadline: Instant) -> Result<Command, Interrupted> {
+async fn idle_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn bounded_deadline(deadline: Instant, lifetime: Option<Instant>) -> Instant {
+    let deadline = deadline.min(Instant::now() + COMMAND_LIMIT);
+    lifetime.map_or(deadline, |lifetime| deadline.min(lifetime))
+}
+
+async fn command(io: &mut ActorIo, deadline: Option<Instant>) -> Result<Command, Interrupted> {
     tokio::select! {
         biased;
         _ = io.shutdown.cancelled() => Err(Interrupted::Error(Error::Cancelled)),
         _ = io.hints.closed() => Err(Interrupted::Error(Error::HintLost)),
-        _ = sleep_until(deadline) => Err(Interrupted::Error(Error::Timeout)),
+        _ = idle_deadline(deadline) => Err(Interrupted::Error(Error::Timeout)),
         command = io.commands.recv() => command.ok_or(Interrupted::Command(None)),
     }
 }
@@ -335,10 +348,20 @@ fn emit_due(io: &ActorIo, episode: u64) -> Result<(), Error> {
 }
 
 /// Parent supplies the episode lifetime; elapsed lifetime is always terminal.
-pub(crate) async fn run(
+pub(crate) async fn run(control: CoreControl, io: ActorIo, lifetime: Instant) -> Result<(), Error> {
+    run_inner(control, io, Some(lifetime)).await
+}
+
+/// Cancellation-only initial-command/Due idle waits; all exchanges and post-Due
+/// phases remain bounded. Outer parent must retain/abort/join this future.
+pub(crate) async fn run_until_cancelled(control: CoreControl, io: ActorIo) -> Result<(), Error> {
+    run_inner(control, io, None).await
+}
+
+async fn run_inner(
     control: CoreControl,
     mut io: ActorIo,
-    lifetime: Instant,
+    lifetime: Option<Instant>,
 ) -> Result<(), Error> {
     let mut owned = OwnedControl(control);
     let result = episode(&mut owned.0, &mut io, lifetime).await;
@@ -357,7 +380,7 @@ pub(crate) async fn run(
 async fn episode(
     control: &mut CoreControl,
     io: &mut ActorIo,
-    lifetime: Instant,
+    lifetime: Option<Instant>,
 ) -> Result<(), Error> {
     let first = match command(io, lifetime).await {
         Ok(command) => command,
@@ -371,21 +394,16 @@ async fn episode(
     else {
         return Err(terminate(control, Interrupted::Command(Some(first))));
     };
-    let observed = match exchange(
-        control.observe(&thread, deadline.min(lifetime)),
-        &mut reply,
-        io,
-        deadline.min(lifetime),
-    )
-    .await
-    {
-        Ok(observed) => observed,
-        Err(error) => {
-            let error = terminate(control, error);
-            let _ = reply.send(Err(error));
-            return Err(error);
-        }
-    };
+    let deadline = bounded_deadline(deadline, lifetime);
+    let observed =
+        match exchange(control.observe(&thread, deadline), &mut reply, io, deadline).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                let error = terminate(control, error);
+                let _ = reply.send(Err(error));
+                return Err(error);
+            }
+        };
     let (episode, waiting) = match &observed {
         Observation::Waiting { episode, .. } => (*episode, true),
         Observation::Due { episode } => (*episode, false),
@@ -402,7 +420,12 @@ async fn episode(
             _ = io.shutdown.cancelled() => Err(Interrupted::Error(Error::Cancelled)),
             _ = io.hints.closed() => Err(Interrupted::Error(Error::HintLost)),
             next = io.commands.recv() => Err(Interrupted::Command(next)),
-            result = control.next_due(lifetime) => result.map_err(|error| Interrupted::Error(Error::Core(error))),
+            result = async {
+                match lifetime {
+                    Some(lifetime) => control.next_due(lifetime).await,
+                    None => control.next_due_until_cancelled().await,
+                }
+            } => result.map_err(|error| Interrupted::Error(Error::Core(error))),
         };
         match due {
             Ok(due) if due == episode => {}
@@ -412,7 +435,8 @@ async fn episode(
     }
     emit_due(io, episode)?;
 
-    let inspect = match command(io, lifetime).await {
+    let inspect_deadline = bounded_deadline(Instant::now() + COMMAND_LIMIT, lifetime);
+    let inspect = match command(io, Some(inspect_deadline)).await {
         Ok(command) => command,
         Err(error) => return Err(terminate(control, error)),
     };
@@ -428,21 +452,16 @@ async fn episode(
         reply.send(Err(Error::Phase)).ok();
         return Err(Error::Phase);
     }
-    let inspected = match exchange(
-        control.inspect(episode, deadline.min(lifetime)),
-        &mut reply,
-        io,
-        deadline.min(lifetime),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            let error = terminate(control, error);
-            let _ = reply.send(Err(error));
-            return Err(error);
-        }
-    };
+    let deadline = bounded_deadline(deadline, lifetime);
+    let inspected =
+        match exchange(control.inspect(episode, deadline), &mut reply, io, deadline).await {
+            Ok(result) => result,
+            Err(error) => {
+                let error = terminate(control, error);
+                let _ = reply.send(Err(error));
+                return Err(error);
+            }
+        };
     let ready = matches!(inspected, Inspection::Ready);
     if !ready {
         control.close();
@@ -452,7 +471,8 @@ async fn episode(
         return Err(Error::Refused);
     }
 
-    let consume = match command(io, lifetime).await {
+    let consume_deadline = bounded_deadline(Instant::now() + COMMAND_LIMIT, lifetime);
+    let consume = match command(io, Some(consume_deadline)).await {
         Ok(command) => command,
         Err(error) => return Err(terminate(control, error)),
     };
@@ -468,7 +488,7 @@ async fn episode(
         reply.send(Err(Error::Phase)).ok();
         return Err(Error::Phase);
     }
-    let deadline = deadline.min(lifetime);
+    let deadline = bounded_deadline(deadline, lifetime);
     let consumed =
         match exchange(control.consume(episode, deadline), &mut reply, io, deadline).await {
             Ok(result) => result,
@@ -488,7 +508,7 @@ async fn episode(
     }
     // Grant stays bound to live control while the parent executes its callback.
     // No second command except Close is valid, even if the grant receiver is lost.
-    let last = match command(io, deadline).await {
+    let last = match command(io, Some(deadline)).await {
         Ok(command) => Interrupted::Command(Some(command)),
         Err(error) => error,
     };
