@@ -78,6 +78,15 @@ impl Serialize for ThreadId {
     }
 }
 
+/// Bounded, non-content native state used only for observation.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeGoalState {
+    Active,
+    Paused,
+    UsageLimited,
+}
+
 /// Fixed non-content records only. Neither Event nor ThreadId is Clone or Debug.
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -96,6 +105,10 @@ pub(crate) enum Event {
     NativeTurnCompleted {
         thread_id: ThreadId,
         successful: bool,
+    },
+    NativeGoalUpdated {
+        thread_id: ThreadId,
+        state: NativeGoalState,
     },
     Observed {
         episode: u64,
@@ -136,6 +149,19 @@ pub(crate) fn classify_native_notification(frame: &[u8]) -> Option<Event> {
     }
     let params = notification.get("params")?.as_object()?;
     match notification.get("method")?.as_str()? {
+        "thread/goal/updated" => {
+            let id = params.get("threadId")?.as_str()?;
+            let state = match params.get("goal")?.as_object()?.get("status")?.as_str()? {
+                "active" => NativeGoalState::Active,
+                "paused" => NativeGoalState::Paused,
+                "usageLimited" => NativeGoalState::UsageLimited,
+                _ => return None,
+            };
+            Some(Event::NativeGoalUpdated {
+                thread_id: ThreadId::parse(id).ok()?,
+                state,
+            })
+        }
         "thread/started" => {
             let id = params.get("thread")?.as_object()?.get("id")?.as_str()?;
             Some(Event::NativeThreadStarted {
