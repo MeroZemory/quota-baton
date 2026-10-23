@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R13 N5c 긴급 정책 실행
-목표: 확인된 긴급 토글·대기 표시 통합; 실제 5시간 한도 대기·전환 결함 수정과 HWND 검증
+목표: N5c 긴급 정책·실제 클릭 검증 완료; 다음 N10 자동 외부 사용 감지·WS spill 보호
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 14:09 KST (HTTP74 통과; WS140통과/1timeout 뒤 동일 조건 집중1 통과, 잔여 검사·실제 HWND 진행)
+갱신: 2026-10-23 14:23 KST (N5c 집중 관문·실제 한/영 HWND4·읽기 전용 실행 점검 통과; C+E 전체는 미출시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -94,7 +94,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N5a R13 E HTTP wait and reset-resume for non-urgent sessions at 5h limits | S1 | none (bound is a setting; N5m only tunes its default) | `impl/r13-wait` | hold then serve on the same account after reset; bound exceeded falls back; cancellation releases |
 | N5b R13 E WS/SSE cancellation and keepalive during a hold | S1 | none | `impl/r13-ws-hold` | cancelled held WS/SSE releases its slot and binding; no orphaned upstream |
 | N5c R13 E urgent policy (`on_5h_limit`, `--urgent`, CLI and dashboard toggle; 7d always moves) | S1 | none | `impl/r13-urgent` | policy tests, CLI tests, real-path capture |
-| N10 direct-use reserve and bounded WS capacity spill | S1; research in W | none for implementation; user chooses real reserved accounts | `impl/n10` after N5c | reserved accounts reject running-session moves; new placements use them only as a last resort; own-account slot wait precedes spill; four-session reset-target replay admits at most one spill before fresh post-spill usage; source-line research on native access-program gating |
+| N10 automatic outside-use detection and bounded WS capacity spill | S1; research in W | D30; no user settings | `impl/n10` after N5c | rising usage without qb traffic marks outside use; own traffic never marks; clean window clears; marked accounts reject running-session moves and are last-resort new placements; own-slot wait then D20-charged spill, at most one per reset target before fresh evidence; source-only access-program research |
 | N5d R13 E native-client resume after reset (Codex `/goal resume` only for a live goal; Claude continue) | S1 | none | `impl/r13-native-resume` | synthetic native test, exactly-once resume |
 | N5i R13 C+E integration and defaults | S1 | N5a-d merged, N5m table | `impl/r13-ce` | full gate; then S2 install |
 | N3 R9.5 move progress, interruption safety, readable preview | S1 | none | `impl/r9.5`, brief R9.5-move-progress.md | golden ko/en output, Ctrl+C tests per step, finish/rollback after a kill |
@@ -201,6 +201,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 06:58 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.5 설치 수용; recorder e01 단일 epoch 수집10/23 06:58~10/24 06:58, 다음 설치는 수집 뒤 |
 | 2026-10-23 09:31 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5a HTTP 집중 관문 통과; C+E 전체 통합·설치 전이므로 출시 수 유지 |
 | 2026-10-23 11:33 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5b 집중 관문 통과; N5c-d·N5i 및 C+E 설치 전이므로 출시 수 유지 |
+| 2026-10-23 14:24 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5c 집중 관문·실제 한/영 클릭4HWND 완료; N10·N5d·통합·설치 전이므로 출시 수 유지 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -394,14 +395,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 13:33 | N5c 정책 publication 경합 보완 단위 | outer4·실제 HTTP1/2모드·WS2/3코호트·strict core testkit all-target lint·fmt·diff 통과 | 실제 첫 결과/기존 대기 중 원래 wake·마감·drain 유지 | 코드f2c964f; n5c-publication-observer-repair 입력 fingerprint. 단위 진단 이벤트 범위 수정 뒤 기존 HTTP 순서 보존; 최종 gate/실제 HWND 전 |
 | 2026-10-23 13:56 | N5c 정책 경합 대조·Strict fixture 정리 | publication2 intended101/정확 복원0, HTTP3·fmt 통과 | 기존 즉시 정책 취소/Strict60/추가 전송 없음 검증 뒤에만 명시적 hold0 정리 | n5c-g2-controls-publication-final-01; 최초 final m4b72통과/2timeout 기록, 8초 client와 원래20초 cache hold 충돌. 제품 변경 없음; 최종 영향/실제 HWND 전 |
 | 2026-10-23 14:09 | N5c HTTP 전체·WS timeout 진단 | HTTP74 통과; WS140통과/1timeout, 실패 테스트 동일2초 제한 집중 재실행1통과 | 시간 제한·전송/계정/리셋 assertions 유지; panic에 expected stage만 추가 | n5c-final-repair 및 n5c-final-ws-repair/1.log; 첫 WS 실패 원인은 미확정. 나머지 영향·실제 HWND 관문 전 |
+| 2026-10-23 14:24 | N5c 집중 영향·실제 창 관문 | core957·HTTP74·tray12·CLI23 통과; WS140/1timeout 뒤 동일 exact1 통과; strict lint·실제 ko/en4HWND·launch check0 | 권한·원래 리셋/캐시 대기·기한 유지·취소 정리 | 코드744190e와 docs-only dev merge 입력; 비반복 토글 실제 down/up·임시 진단 정확 복원. WS 원실패/UIA enqueue 원인 미확정은 보고서 보존; 전체 C+E/replay 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
-| 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
+| 남은 차이 | 지금 | 넘어야 할 값 | 다음 동작 |
 |---|---|---|---|
-| 기록기 N6t/N6r | 최소 기록기 설치·수집 중, 초기 cut/전체 owner/실제 replay 미수용 | 완전성 증명·24시간 차등 재생 | 10/24 06:58 이후 e01 단일 epoch export 검증; takeover listener/writer 순서 점검 |
-| 대기·재개 N5c-d | N5a·N5b 관문, N5c 저장·실행·경합 단위 완료; 대시보드 토글·실제 이동·native 재개 미완료 | 긴급 정책과 reset 후 exactly-once 재개, C+E 전체 관문 | N5c 실제 정책/wake·N5d native 재개 뒤 N5i 통합; 기본 hold는 실측 근거로 결정 |
-| 통합 예측 N7 | 검증 가능한 24시간 입력 부족 | 명시한 오차 범위의 backtest | body-free 입력·훈련/후속 관측 검증, 풀 예측 표시는 보류 |
+| 외부 직접 사용·WS spill 보호 | N10 미구현; D30 확정·소스 조사 완료 | 외부 사용 자동 보호·fresh 관측 전 대상별 최대1spill | N10 구현과 실제4세션 회귀 |
+| R13 C+E 실행 | N5a-c 집중 관문 완료·native 재개 미완료 | 리셋 뒤 자동 재개 정확히1회·통합 설치 | N10 뒤 N5d·N5i |
+| 제공자 통합 예측 | 현재 잔여량·개별 예측 제공, pooled 미출시 | 실제24시간 backtest 후 보수적 pooled runway | 독립 N7 backtest lane·UI 통합 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
