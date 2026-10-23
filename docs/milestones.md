@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 확인된 긴급 토글·대기 표시 통합; 실제 5시간 한도 대기·전환 결함 수정과 HWND 검증
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 12:56 KST (UI d7c6243; G1 965e489·1445c41·초기 poll f9fe3e4 집중 통과; G2·실제 HWND 남음)
+갱신: 2026-10-23 13:07 KST (G2 245879f 집중 통과; 정책 잠금 보완·실제 HWND 남음)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -387,6 +387,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 12:35 | N5c 확인된 긴급 UI·대기 표시 구현 단위 | core5·tray12·실제HTTP4, tray testkit strict lint·fmt·diff exit0 | 응답 지연·중복 억제·창 재개 상태·실제 대기 DTO | 코드d7c6243; n5c-ui-mailbox-repair/n5c-ui-lint-repair/n5c-ui-integration-repair 입력 기록. 실제 HWND와 G1/G2 수정은 미완료; N5c 관문 아님 |
 | 2026-10-23 12:46 | N5c 먼 5시간 한도 실제 응답 보존 수정 | HTTP5가족/20모드 사례·기존 HTTP/body5·strict core lint·fmt·diff 통과 | 일반 세션 실제429 유지, 긴급·주간·크레딧 대비 유지 | 코드965e489; 빈 필터 제외 후 lib 필터 수정. 조건 제거 exit101·정확 복원 exit0; G2·초기 poll·HWND·전체 N5c 전 |
 | 2026-10-23 12:56 | N5c 초기 full-poll 5시간 Wait·응답 경계 단위 | 초기 HTTP3가족/9사례·기존 Move1·G1물리2·경계2, strict core lint·fmt·diff 통과 | 한도 확인 뒤 zero target send·qb 작성429·정확 리셋, 원본 응답 fallback 보존 | 코드f9fe3e4·1445c41; 초기 기준 exact200/429 실패 뒤 수정 통과; G2·HWND·N5d·전체 N5c 전 |
+| 2026-10-23 13:07 | N5c 긴급 변경 뒤 원래 캐시 대기 보존 | core9·실제 HTTP1(2모드)·WS8, strict core testkit all-target lint·fmt·diff 통과 | 원래 리셋/마감 유지·조기 target send 없음·native retention | 코드245879f; n5c-cache-remainder-compile-repair 입력 fingerprint. 초기 테스트 import 컴파일 오류 수정; 정책 publication 경합·정확 제거 대조·실제 HWND·전체 N5c는 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
