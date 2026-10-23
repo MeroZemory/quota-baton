@@ -123,6 +123,11 @@ struct Pending {
     quota_before_request: bool,
 }
 
+struct StoppedCandidate {
+    goal: Value,
+    generation: u64,
+}
+
 /// No callbacks, I/O, sleeps, retries or automatic rearming.
 pub(crate) struct Controller {
     namespace: String,
@@ -138,6 +143,9 @@ pub(crate) struct Controller {
     seen_turns: BTreeSet<String>,
     retired_namespaces: Vec<String>,
     quota_observed: bool,
+    stop_candidate: Option<StoppedCandidate>,
+    stop_read: Option<StoppedCandidate>,
+    stop_read_issued: bool,
     stopped: Option<Value>,
     sealed: bool,
     ticket_taken: bool,
@@ -170,6 +178,9 @@ impl Controller {
             seen_turns: BTreeSet::new(),
             retired_namespaces: Vec::new(),
             quota_observed: false,
+            stop_candidate: None,
+            stop_read: None,
+            stop_read_issued: false,
             stopped: None,
             sealed: false,
             ticket_taken: false,
@@ -190,6 +201,8 @@ impl Controller {
         self.progress = None;
         self.ticket_taken = true;
         self.stopped = None;
+        self.stop_candidate = None;
+        self.stop_read = None;
         self.active = None;
         self.quota_observed = false;
         if matches!(self.delivery, Delivery::NotSent | Delivery::Checking) {
@@ -202,6 +215,8 @@ impl Controller {
         self.progress = None;
         self.connected = false;
         self.stopped = None;
+        self.stop_candidate = None;
+        self.stop_read = None;
         self.active = None;
         self.dispatched_goal = None;
         self.quota_observed = false;
@@ -221,6 +236,8 @@ impl Controller {
             .checked_add(1)
             .ok_or(Error::GenerationExhausted)?;
         self.stopped = None;
+        self.stop_candidate = None;
+        self.stop_read = None;
         if self.sealed && matches!(self.delivery, Delivery::NotSent | Delivery::Checking) {
             self.delivery = Delivery::Cancelled;
         }
@@ -230,6 +247,8 @@ impl Controller {
     fn forget_goal(&mut self) {
         self.active = None;
         self.quota_observed = false;
+        self.stop_candidate = None;
+        self.stop_read = None;
     }
 
     /// Malformed/colliding/over-bound input poisons the session, even if a caller
@@ -329,10 +348,10 @@ impl Controller {
                 .find(|ns| id.starts_with(ns.as_str()))
                 .map(|ns| (id, ns))
         }) {
-            // Only the two RPCs actually owned by a retired controller can have
+            // Only the three RPCs owned by a retired controller can have
             // late replies. Unknown suffixes and native requests are collisions.
             if value.get("method").is_some()
-                || !matches!(id.strip_prefix(retired.as_str()), Some("1" | "2"))
+                || !matches!(id.strip_prefix(retired.as_str()), Some("1" | "2" | "3"))
             {
                 return Err(Error::NamespaceCollision);
             }
@@ -345,6 +364,35 @@ impl Controller {
             // Suppress ALL private responses, including late/duplicate/unknown IDs.
             if value.get("method").is_some() {
                 return Err(Error::NamespaceCollision);
+            }
+            if id == format!("{}3", self.namespace) {
+                if let Some(read) = self.stop_read.take() {
+                    let goal = &value["result"]["goal"];
+                    if value.get("error").is_some()
+                        || read.goal != *goal
+                        || read.generation != self.generation
+                        || !self.sealed
+                        || self.ticket_taken
+                        || self.automatic_vetoed
+                        || self.delivery != Delivery::NotSent
+                        || !self.quota_observed
+                        || !self.pending.is_empty()
+                        || goal["threadId"].as_str() != self.current.as_deref()
+                        || !self.active.as_ref().is_some_and(|active| {
+                            active["status"] == "active" && same_identity(active, goal)
+                        })
+                    {
+                        self.cancel_resume();
+                    } else {
+                        // Ownership evidence only. The parent must still obtain
+                        // core authority and perform the unchanged final read.
+                        self.stopped = Some(read.goal);
+                    }
+                } else if !self.stop_read_issued {
+                    // A receipt before issuance cannot be replayed as correlation.
+                    self.cancel_resume();
+                }
+                return Ok(Action::Suppress);
             }
             if id == format!("{}1", self.namespace) && self.delivery == Delivery::Checking {
                 let goal = &value["result"]["goal"];
@@ -437,10 +485,24 @@ impl Controller {
                     } else if self.active.as_ref().is_some_and(|a| same_identity(a, goal))
                         && goal["status"] == "usageLimited"
                     {
-                        if self.stopped.as_ref().is_some_and(|s| s != goal) {
+                        if self.stopped.as_ref().is_some_and(|s| s != goal)
+                            || self
+                                .stop_read
+                                .as_ref()
+                                .is_some_and(|read| read.goal != *goal)
+                        {
                             self.revoke()?;
                         }
                         self.quota_observed = true;
+                        if !self.sealed
+                            && value.get("id").is_none()
+                            && value.get("jsonrpc").is_none_or(|v| v == "2.0")
+                        {
+                            self.stop_candidate = Some(StoppedCandidate {
+                                goal: goal.clone(),
+                                generation: self.generation,
+                            });
+                        }
                     } else if goal["status"] == "active"
                         && !self.quota_observed
                         && !self.sealed
@@ -679,6 +741,7 @@ impl Controller {
                 && self.pending.is_empty()
             {
                 self.stopped = Some(goal.clone());
+                self.stop_candidate = None;
                 self.sealed = true;
             }
         } else if goal["status"] == "active"
@@ -692,6 +755,43 @@ impl Controller {
             self.forget_goal();
         }
         Ok(())
+    }
+
+    /// One non-mutating ownership preflight, explicitly driven by the parent.
+    /// Seals at issuance: every later UI frame vetoes automatic work. This is
+    /// neither core authority nor the final native read; there is no retry.
+    pub(crate) fn begin_stop_read(&mut self) -> Result<Option<Action>, Error> {
+        self.require_connected()?;
+        if self.stop_read_issued
+            || self.sealed
+            || self.ticket_taken
+            || self.automatic_vetoed
+            || self.delivery != Delivery::NotSent
+            || !self.quota_observed
+            || !self.pending.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(candidate) = self.stop_candidate.as_ref() else {
+            return Ok(None);
+        };
+        if candidate.generation != self.generation
+            || candidate.goal["status"] != "usageLimited"
+            || candidate.goal["threadId"].as_str() != self.current.as_deref()
+            || !self.active.as_ref().is_some_and(|active| {
+                active["status"] == "active" && same_identity(active, &candidate.goal)
+            })
+        {
+            return Ok(None);
+        }
+        self.stop_read = self.stop_candidate.take();
+        self.stop_read_issued = true;
+        self.sealed = true;
+        Ok(Some(self.inject(
+            3,
+            "thread/goal/get",
+            json!({ "threadId": self.current }),
+        )))
     }
 
     pub(crate) fn stopped_ticket(&mut self) -> Option<StoppedGoalTicket> {
