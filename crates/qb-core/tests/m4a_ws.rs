@@ -197,6 +197,10 @@ impl Harness {
                 .unwrap()
                 .with_token_endpoint(Provider::Codex, token_fake.url.clone()),
         );
+        #[cfg(feature = "testkit")]
+        let admin_routes = qb_core::admin::runtime_routes(state.clone(), 0);
+        #[cfg(not(feature = "testkit"))]
+        let admin_routes = axum::Router::new();
         let servers = http::spawn_with_routes(
             &config,
             LocalSecrets {
@@ -204,7 +208,7 @@ impl Harness {
                 admin_token: "synthetic-admin-key".into(),
             },
             relay::router(state.clone()),
-            axum::Router::new(),
+            admin_routes,
         )
         .await
         .unwrap();
