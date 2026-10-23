@@ -1504,6 +1504,7 @@ impl PolicyStore {
     /// Keep the native permission and exact wait plan coherent through inspect.
     /// This supplies policy data only, never quota or dispatch authority. inspect
     /// must not edit policy or reacquire publication (even for plan/permission).
+    #[cfg(test)]
     pub(crate) fn with_wait_plan<T>(
         &self,
         key: &str,
@@ -1555,6 +1556,23 @@ impl PolicyStore {
             return None;
         }
         inspect(&plan)
+    }
+
+    #[cfg(all(test, feature = "testkit"))]
+    pub(crate) fn hold_wait_publication_for_test(
+        &self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        released: &AtomicBool,
+    ) {
+        let publication = self.publication.write().unwrap();
+        entered.try_send(()).unwrap();
+        // A blocking-read mutant releases safely, then fails the held assertion.
+        let _ = release.recv_timeout(std::time::Duration::from_secs(5));
+        // Publish the safety-release flag BEFORE unlocking so a blocking-read
+        // mutant cannot beat this flag after acquiring the released guard.
+        released.store(true, Ordering::Release);
+        drop(publication);
     }
 
     /// Nonblocking native policy view, not wait or dispatch authority. None means
