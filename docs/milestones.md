@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R13 N5i HTTP·WS/SSE 대기 통합
-목표: N5d 통과한 판단·HTTP 검증 보존; N5i 기본 경계와 WS·첫 클릭 재확인
+목표: N5i 집중 관문 통과; N11 오래된 fixture6개 마무리·설치 인계
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 21:58 KST (N5d 시간 제한 종료; 전체 native 수용은 N5d-native 후속)
+갱신: 2026-10-23 22:02 KST (N5i 집중324·WS 재확인1·실제 첫 클릭1 통과; N5d-native 후속)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -105,6 +105,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N5c R13 E urgent policy (`on_5h_limit`, `--urgent`, CLI and dashboard toggle; 7d always moves) | S1 | none | `impl/r13-urgent` | policy tests, CLI tests, real-path capture |
 | N10 automatic outside-use detection and bounded WS capacity spill | S1; research in W | D30; no user settings | `impl/n10` after N5c | rising usage without qb traffic marks outside use; own traffic never marks; clean window clears; marked accounts reject running-session moves and are last-resort new placements; own-slot wait then D20-charged spill, at most one per reset target before fresh evidence; source-only access-program research |
 | N5d R13 E native-client resume after reset (Codex `/goal resume` only for a live goal; Claude continue) | S1 | none | `impl/r13-native-resume` | time-box close: passing unit/HTTP decision checks, running goal only and exactly once; full native acceptance deferred to N5d-native |
+| N5d-native full native reset continuation | S1 follow-up | supervisor resumes native acceptance scope | existing staged entry; no new harness in the current time-box | actual product-entry smoke and running-goal-only exactly-once evidence before ordinary activation; paused goals never resume |
 | N5i R13 C+E integration and defaults | S1 | N5a-c plus bounded N5d decision checks and N5m table | `impl/r13-native-resume` | focused gate, former WS timeout target once and first-click UIA once; native fallback remains disabled in ordinary builds; then S2 install |
 | N3 R9.5 move progress, interruption safety, readable preview | S1 | none | `impl/r9.5`, brief R9.5-move-progress.md | golden ko/en output, Ctrl+C tests per step, finish/rollback after a kill |
 | N4 R12.11 canary version timeout | S1 | none | `impl/r12.11` (proposal kept) | slow-version, timeout-to-cache and unparseable regressions |
@@ -214,6 +215,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 16:48 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N10 집중45·실제 한영4창·두 workspace strict lint·전체 행렬 검증 완료. 기존6실패 재현; 추가 합성 버전 timeout은 변경 없는 복구54 직렬 재실행 통과. 미설치 |
 | 2026-10-23 16:52 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N10 설치 수용·takeover 연결 거절0/1,278; 출시 분모 밖 보호 보완 |
 | 2026-10-23 17:20 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R12.11 집중 관문 완료·self-merge 인계; C+E 전체·통합 예측 미출시 |
+| 2026-10-23 22:02 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5i 주 경로 집중 관문 통과·설치 인계 전; 전체 native 자동 재개는 N5d-native 후속 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -417,14 +419,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 20:43 | N5d 단일 core 권한·native 재개 통합 | managed37·actor18/client21·parent12/dispatcher10 통과; 기본/testkit CLI strict·fmt0 | premature core-close 정확 red101→바이트복원0; 권한 상실 시 ordinary 보존 | a46e25a·04721aa·288dd5c; episode-unit/unit-inputs.json. 제품 등록·실제 native/core 실행·반복 episode·WS producer·Claude 재개는 미수용 |
 | 2026-10-23 21:34 | N5d 제품 런처·정상 종료/직접 쓰기 오류 경계 | managed46·observer8·launch-client25·기본/testkit CLI strict·fmt 통과 | 종료·직접 쓰기·원인 보존 제거3건101→정확복원0 | eb2601b·b2a6c38·0bddc36; production-entry-unit-inputs.json. 두 초기 대조는 감도 미입증으로 보존; 실제 core/native TUI·반복 episode·WS producer·Claude 재개 수용은 별도 |
 | 2026-10-23 21:43 | N5d 실제 실행 관측 연결 | managed51·observer8·기본/testkit strict lint·fmt·시험 제품 build 통과 | Capture finish와 실제 entry/control/write/ACK/cleanup 인과 관측 | c7b3e7c; observation-registration-inputs.json. 첫 native 하네스는 코어 시작 전용 fixture 키 형식 오류로 실패·완전 정리; 실제 native 재개 수용 전 |
+| 2026-10-23 22:02 | N5i 주 경로 통합·기본 경계 | 집중 테스트 실행324통과, 기본/testkit strict core·CLI·fmt0, 실제 HWND 첫 클릭1통과 | 이전 WS timeout target1회·기존 제한 유지·원래 reset/취소 보존 | 572892a·da9a538; n5i-focused 및 n5i-main-path 입력별 지문. 전체 native 수용·실제24시간 replay·설치 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
-| 남은 차이 | 지금 | 넘어야 할 값 | 다음 동작 |
+| 빈칸 | 현재 값 | 필요한 값 | 다음 행동 |
 |---|---|---|---|
-| R13 C+E native 재개 | N5a-c 관문·실제 TUI3사례·물리/초기 HTTP 대기 권한 검증 | 실행 소유자에 정확히1회 재개·통합 설치 | 코어 초기화 권한·owned transport·Claude 지속 재개 수용 후 N5i |
-| 실제24시간 라우팅 재생 | 기록기 설치·다중 epoch 입력 규칙 확정 | 각 epoch 초기 상태와 손실을 반영한 재생 | N6t owner와 N6r 실제 export 검증 |
-| 제공자 통합 예측 | 표시·잔여량 차트 설치; backtest 준비 | 실제24시간 backtest와 pooled 검증 | N7 검증 후 UI 통합 |
+| C+E 설치 | N5i 주 경로 focused gate 통과, native fallback 비활성 | 설계 세션 설치·실제 주 경로 수용 | N5i 인계; N11 오래된 fixture6개 정리 |
+| 제공자 통합 예측 | 잔여량·속도 차트 제공, pooled runway 미출시 | 24시간 backtest 후 통합 예측 | N7 backtest와 UI |
+| Native fallback·구조 검증 | 판단/HTTP 통과, 전체 native 미수용·replay export 대기 | N5d-native 실제 수용 및 epoch별24시간 재생 | 별도 후속; 주 경로 설치를 막지 않음 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
