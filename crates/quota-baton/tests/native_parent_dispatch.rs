@@ -68,7 +68,13 @@ fn ordinary(parent: &mut Parent<Sink, Sink>, publisher: &Publisher, source: Sour
         Ok(true)
     );
 }
-fn stopped() -> (Parent<Sink, Sink>, Publisher, Sink, Sink) {
+fn stopped_candidate() -> (
+    Parent<Sink, Sink>,
+    Publisher,
+    Sink,
+    Sink,
+    goal::StoppedGoalTicket,
+) {
     let n = Sink::default();
     let u = Sink::default();
     let (mut parent, publisher) = Parent::new(PREFIX.into(), n.clone(), u.clone()).unwrap();
@@ -118,6 +124,10 @@ fn stopped() -> (Parent<Sink, Sink>, Publisher, Sink, Sink) {
     );
     let ticket = parent.stopped_ticket().unwrap();
     assert_eq!(ticket.thread_id(), THREAD);
+    (parent, publisher, n, u, ticket)
+}
+fn stopped() -> (Parent<Sink, Sink>, Publisher, Sink, Sink) {
+    let (mut parent, publisher, n, u, ticket) = stopped_candidate();
     parent.begin_final_read(ticket).unwrap();
     (parent, publisher, n, u)
 }
@@ -321,4 +331,88 @@ fn imported_ordinary_dispatch_and_framing_remain_non_authorizing() {
         framing::read_frame(&mut input).unwrap(),
         Some(b"{}".to_vec())
     );
+}
+
+#[test]
+fn parent_stale_final_read_ticket_denies_auto_but_keeps_ordinary_transport() {
+    for user_edit in [false, true] {
+        let (mut parent, publisher, n, u, ticket) = stopped_candidate();
+        if user_edit {
+            ordinary(
+                &mut parent,
+                &publisher,
+                Source::Ui,
+                json!({
+                    "id":4,"method":"thread/goal/set","params":{
+                        "threadId":THREAD,"objective":"new synthetic objective",
+                        "origin":"user","status":"active"
+                    }
+                }),
+            );
+        } else {
+            parent.cancel_resume();
+        }
+        let before_native = n.0.lock().unwrap().bytes.len();
+        assert_eq!(
+            parent.begin_final_read(ticket),
+            Err(Error::Dispatch(dispatcher::Error::AuthorityDenied)),
+            "a stale native ticket must cancel only automatic continuation"
+        );
+        assert_eq!(n.0.lock().unwrap().bytes.len(), before_native);
+        assert!(parent.stopped_ticket().is_none(), "a veto must never rearm");
+        let before_ui = u.0.lock().unwrap().bytes.len();
+        ordinary(
+            &mut parent,
+            &publisher,
+            Source::Native,
+            json!({"method":"server/notice","params":{"synthetic":true}}),
+        );
+        assert!(u.0.lock().unwrap().bytes.len() > before_ui);
+        ordinary(
+            &mut parent,
+            &publisher,
+            Source::Ui,
+            json!({"id":5,"method":"account/read","params":{}}),
+        );
+        assert!(n.0.lock().unwrap().bytes.len() > before_native);
+        assert!(automatic(&n).is_empty());
+    }
+}
+
+#[test]
+fn parent_invalid_native_protocol_still_revokes_ingress() {
+    let (mut parent, publisher, _, _) = stopped();
+    publish(&publisher, Source::Native, json!({"id":[],"result":{}}));
+    assert_eq!(
+        parent.process_next(|| panic!("invalid protocol cannot authorize")),
+        Err(Error::Dispatch(dispatcher::Error::Protocol))
+    );
+    assert_eq!(
+        publisher.publish(Source::Ui, Frame::new(b"{}".to_vec()).unwrap()),
+        Err(ingress::Error::Revoked)
+    );
+}
+
+#[test]
+fn parent_input_queued_during_inspect_denies_final_read_without_losing_input() {
+    let (mut parent, publisher, n, _, ticket) = stopped_candidate();
+    let before_native = n.0.lock().unwrap().bytes.len();
+    publish(
+        &publisher,
+        Source::Ui,
+        json!({"id":4,"method":"account/read","params":{}}),
+    );
+    assert_eq!(
+        parent.begin_final_read(ticket),
+        Err(Error::Dispatch(dispatcher::Error::AuthorityDenied)),
+        "known input must veto the final read without losing ordinary traffic"
+    );
+    assert_eq!(n.0.lock().unwrap().bytes.len(), before_native);
+    assert_eq!(
+        parent.process_next(|| panic!("queued user input cannot authorize")),
+        Ok(true)
+    );
+    assert!(n.0.lock().unwrap().bytes.len() > before_native);
+    assert!(parent.stopped_ticket().is_none());
+    assert!(automatic(&n).is_empty());
 }

@@ -89,6 +89,16 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
     /// this call. A native ownership ticket alone never permits automatic work.
     pub(crate) fn begin_final_read(&mut self, ticket: StoppedGoalTicket) -> Result<(), Error> {
         let action = self.controller.begin_final_read(ticket);
+        if matches!(
+            action,
+            Err(super::goal::Error::TicketInvalid | super::goal::Error::AttemptConsumed)
+        ) {
+            // A real user edit or authority cancellation may invalidate the
+            // ticket while Inspect is pending. This is a clean auto veto, not
+            // malformed native protocol or loss of the ordinary TUI transport.
+            self.controller.cancel_resume();
+            return Err(Error::AuthorityDenied);
+        }
         self.apply(action, || false)
     }
 
