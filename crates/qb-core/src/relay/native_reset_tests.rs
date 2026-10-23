@@ -630,7 +630,7 @@ async fn physically_registered_wrong_thread_never_receives_waiting_or_grant() {
 }
 
 #[tokio::test]
-async fn actual_consumed_grant_keeps_owner_live_for_ping_and_refuses_duplicate() {
+async fn actual_consumed_grant_and_advance_keep_owner_live_for_distinct_episodes() {
     // Expiry can notify the watcher again. Only same-episode Due hints may
     // precede the correlated reply; the entire exchange has one bounded wait.
     async fn phase_reply(socket: &mut Socket, request_id: u64, episode: u64) -> Reply {
@@ -732,7 +732,135 @@ async fn actual_consumed_grant_keeps_owner_live_for_ping_and_refuses_duplicate()
         }
     ));
     assert!(scope.live());
-    close_owner(&mut socket, &scope).await;
+
+    // Native may issue its next request before the parent processes successful
+    // turn progress. Keep exactly this new physical registration pending.
+    let (next, next_scope) = fixture.register_after(3).await;
+    assert!(next.as_u64() > id.as_u64() && next_scope.same_owner(&scope));
+    send_command(
+        &mut socket,
+        5,
+        Command::Inspect {
+            episode: next.as_u64(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        phase_reply(&mut socket, 5, id.as_u64()).await.event,
+        Event::Refused {
+            reason: Refusal::Unavailable
+        }
+    ));
+    send_command(
+        &mut socket,
+        6,
+        Command::Advance {
+            episode: id.as_u64(),
+        },
+    )
+    .await;
+    let advanced = reply(&mut socket, 6).await;
+    assert!(matches!(advanced.event, Event::Advanced { episode } if episode == id.as_u64()));
+    assert!(!advanced.grants(6, id.as_u64()) && !advanced.grants(6, next.as_u64()));
+    for (request_id, command) in [
+        (
+            7,
+            Command::Advance {
+                episode: id.as_u64(),
+            },
+        ),
+        (
+            8,
+            Command::Consume {
+                episode: id.as_u64(),
+            },
+        ),
+        (
+            9,
+            Command::Cancel {
+                episode: id.as_u64(),
+            },
+        ),
+    ] {
+        send_command(&mut socket, request_id, command).await;
+        assert!(matches!(
+            reply(&mut socket, request_id).await.event,
+            Event::Refused { .. }
+        ));
+    }
+    send_command(
+        &mut socket,
+        10,
+        Command::Observe {
+            thread_id: THREAD.into(),
+        },
+    )
+    .await;
+    assert!(matches!(reply(&mut socket, 10).await.event,
+        Event::Waiting { episode, .. } if episode == next.as_u64()));
+    // A fresh Due proves grant_issued/due state and the watcher were rearmed;
+    // the consumed ID cannot label the second episode's hint.
+    let due_wire = match bounded(socket.next()).await {
+        Some(Ok(Message::Text(wire))) => wire,
+        _ => panic!("missing second episode Due barrier"),
+    };
+    let due: Reply = require(serde_json::from_str(&due_wire));
+    assert!(due.valid_shape() && due.request_id.is_none());
+    assert!(matches!(due.event, Event::Due { episode } if episode == next.as_u64()));
+    send_command(
+        &mut socket,
+        11,
+        Command::Inspect {
+            episode: next.as_u64(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(phase_reply(&mut socket, 11, next.as_u64()).await.event,
+        Event::Ready { episode } if episode == next.as_u64())
+    );
+    send_command(
+        &mut socket,
+        12,
+        Command::Consume {
+            episode: next.as_u64(),
+        },
+    )
+    .await;
+    assert!(
+        phase_reply(&mut socket, 12, next.as_u64())
+            .await
+            .grants(12, next.as_u64())
+    );
+    ping(&mut socket).await;
+    send_command(
+        &mut socket,
+        13,
+        Command::Advance {
+            episode: next.as_u64(),
+        },
+    )
+    .await;
+    assert!(matches!(reply(&mut socket, 13).await.event,
+        Event::Advanced { episode } if episode == next.as_u64()));
+    // An empty advanced slot must park normally, still bound to this thread.
+    ping(&mut socket).await;
+    let notified = scope.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    send_command(
+        &mut socket,
+        14,
+        Command::Observe {
+            thread_id: OTHER_THREAD.into(),
+        },
+    )
+    .await;
+    if scope.live() {
+        bounded(notified).await;
+    }
+    assert!(!scope.live());
+    terminal(&mut socket).await;
     fixture.finish().await;
 }
 

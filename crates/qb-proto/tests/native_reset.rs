@@ -7,6 +7,7 @@ fn requests_round_trip_without_accepting_goal_text_or_caller_authority() {
         json!({"type":"observe", "thread_id":"synthetic-thread"}),
         json!({"type":"consume", "episode":7}),
         json!({"type":"inspect", "episode":7}),
+        json!({"type":"advance", "episode":7}),
         json!({"type":"cancel", "episode":7}),
     ] {
         let wire = json!({"version":VERSION,"request_id":1,"command":command});
@@ -17,6 +18,7 @@ fn requests_round_trip_without_accepting_goal_text_or_caller_authority() {
     for wire in [
         json!({"version":VERSION,"request_id":1,"command":{"type":"observe", "thread_id":"a", "objective":"synthetic"}}),
         json!({"version":VERSION,"request_id":1,"command":{"type":"consume", "episode":7,"reset_unix_ms":123}}),
+        json!({"version":VERSION,"request_id":1,"command":{"type":"advance", "episode":7,"next_episode":8}}),
         json!({"version":VERSION,"request_id":1,"command":{"type":"resume","episode":7}}),
         json!({"version":VERSION,"request_id":1,"command":{"type":"cancel","episode":7},"authorized":true}),
     ] {
@@ -45,6 +47,11 @@ fn invalid_request_envelopes_are_never_shape_valid() {
         Request {
             version: VERSION,
             request_id: 1,
+            command: Command::Advance { episode: 0 },
+        },
+        Request {
+            version: VERSION,
+            request_id: 1,
             command: Command::Observe {
                 thread_id: "a".repeat(257),
             },
@@ -67,6 +74,7 @@ fn hints_and_other_request_or_episode_grants_never_admit_activation() {
         json!({"type":"waiting", "episode":7,"reset_unix_ms":123}),
         json!({"type":"due", "episode":7}),
         json!({"type":"ready", "episode":7}),
+        json!({"type":"advanced", "episode":7}),
         json!({"type":"cancelled", "episode":7}),
         json!({"type":"refused", "reason":"not_due"}),
     ] {
@@ -85,6 +93,23 @@ fn hints_and_other_request_or_episode_grants_never_admit_activation() {
     assert!(!reply.grants(2, 7));
     assert!(!reply.grants(1, 8));
     assert!(!reply.grants(0, 7));
+}
+
+#[test]
+fn advanced_is_only_a_correlated_prior_episode_receipt() {
+    for request_id in [None, Some(0), Some(1)] {
+        for episode in [0, 7] {
+            let reply = Reply {
+                version: VERSION,
+                request_id,
+                event: Event::Advanced { episode },
+            };
+            assert_eq!(reply.valid_shape(), request_id == Some(1) && episode == 7);
+            assert!(!reply.grants(1, 7));
+            assert!(!reply.grants(1, 8));
+        }
+    }
+    assert!(serde_json::from_value::<Reply>(json!({"version":VERSION,"request_id":1,"event":{"type":"advanced","episode":7,"next_episode":8}})).is_err());
 }
 
 #[test]

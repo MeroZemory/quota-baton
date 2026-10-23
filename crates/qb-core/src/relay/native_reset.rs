@@ -111,6 +111,7 @@ async fn control(
 ) {
     let scope = owner.scope();
     let mut thread: Option<String> = None;
+    let mut observed = false;
     let mut last_request = 0;
     let mut due_announced = false;
     let mut grant_issued = false;
@@ -154,7 +155,7 @@ async fn control(
                     let mono_now = Instant::now();
                     let wall_now = chrono::Utc::now();
                     if mono_now >= at && wall_now >= reset_at {
-                        if thread.is_some() && !due_announced {
+                        if observed && !due_announced {
                             if send(
                                 &mut socket,
                                 None,
@@ -232,6 +233,7 @@ async fn control(
                     break;
                 }
                 thread = Some(thread_id);
+                observed = true;
                 match state
                     .accounts
                     .deferred_reset_status(&scope, thread.as_deref().unwrap_or_default())
@@ -256,6 +258,54 @@ async fn control(
                 } else {
                     Event::Refused {
                         reason: Refusal::Cancelled,
+                    }
+                }
+            }
+            Command::Advance { episode } => {
+                if !grant_issued
+                    || !thread
+                        .as_deref()
+                        .is_some_and(|thread| scope.matches_thread(thread))
+                {
+                    Event::Refused {
+                        reason: Refusal::Unavailable,
+                    }
+                } else {
+                    let operation = IssueOperation::new(Instant::now() + CONTROL_TIMEOUT);
+                    let _caller = operation.caller_guard();
+                    let work_operation = operation.clone();
+                    let work_scope = scope.clone();
+                    let accounts = state.accounts.clone();
+                    let bindings = state.bindings.clone();
+                    let mut task = tokio::task::spawn_blocking(move || {
+                        accounts.advance_deferred_reset(
+                            &bindings,
+                            &work_scope,
+                            DeferredResetId::from_u64(episode),
+                            &work_operation,
+                        )
+                    });
+                    let result = tokio::select! {
+                        biased;
+                        _ = state.wait_for_drain_start() => break,
+                        _ = tokio::time::sleep_until(operation.deadline()) => break,
+                        _ = socket.next() => break,
+                        result = &mut task => result,
+                    };
+                    if !operation.can_reply() || !scope.live() {
+                        break;
+                    }
+                    if matches!(result, Ok(Ok(true))) {
+                        grant_issued = false;
+                        due_announced = false;
+                        observed = false;
+                        // Keep thread and last_request: this is the same owner,
+                        // and the next Observe may only repeat its identity.
+                        Event::Advanced { episode }
+                    } else {
+                        Event::Refused {
+                            reason: Refusal::Unavailable,
+                        }
                     }
                 }
             }

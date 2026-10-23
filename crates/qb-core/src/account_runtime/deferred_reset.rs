@@ -139,12 +139,14 @@ struct State {
     records: BTreeMap<u64, Arc<Record>>,
 }
 pub(super) struct DeferredResets {
+    identity: Arc<()>,
     state: Mutex<State>,
     changed: Notify,
 }
 impl DeferredResets {
     pub(super) fn new() -> Self {
         Self {
+            identity: Arc::new(()),
             state: Mutex::new(State {
                 next: 0,
                 closed: false,
@@ -212,13 +214,23 @@ impl DeferredResets {
             recovery: AtomicU8::new(0),
             expiry_generation: AtomicU64::new(0),
         });
-        if !intent.caller_current() || !record.live() || !owner.claim(intent.key()) {
+        let _owner_live = owner.live_guard()?;
+        if !intent.caller_current()
+            || !record.live()
+            || !owner.claim(
+                intent.key(),
+                id.0,
+                record.qualification.started_at,
+                &self.identity,
+            )
+        {
             drop(state);
             drop(removed);
             return None;
         }
         state.next = id.0;
         state.records.insert(id.0, record);
+        drop(_owner_live);
         drop(state);
         drop(removed);
         self.changed.notify_waiters();
@@ -230,7 +242,8 @@ impl DeferredResets {
             return None;
         }
         let record = state.records.get(&id.0)?;
-        (record.owner.same_owner(owner) && record.live()).then(|| record.clone())
+        (record.owner.same_owner(owner) && owner.episode_id().ok()? == Some(id.0) && record.live())
+            .then(|| record.clone())
     }
     pub(super) fn requalify_account(
         &self,
@@ -452,16 +465,17 @@ impl AccountRuntime {
         if state.closed {
             return DeferredResetStatus::Cancelled;
         }
-        let Some(record) = state
-            .records
-            .values()
-            .find(|record| record.owner.same_owner(scope))
-        else {
-            return if scope.root().is_some() {
-                DeferredResetStatus::Cancelled
-            } else {
-                DeferredResetStatus::Empty
-            };
+        if scope.root().is_some() && !scope.matches_thread(native_thread_uuid) {
+            return DeferredResetStatus::Cancelled;
+        }
+        let Ok(id) = scope.episode_id() else {
+            return DeferredResetStatus::Cancelled;
+        };
+        let Some(id) = id else {
+            return DeferredResetStatus::Empty;
+        };
+        let Some(record) = state.records.get(&id).filter(|r| r.owner.same_owner(scope)) else {
+            return DeferredResetStatus::Cancelled;
         };
         if !scope.matches_thread(native_thread_uuid) || !record.live() {
             return DeferredResetStatus::Cancelled;
@@ -494,10 +508,12 @@ impl AccountRuntime {
             .lock()
             .ok()
             .and_then(|state| {
-                state
-                    .records
-                    .values()
-                    .find(|r| r.owner.same_owner(scope))
+                scope
+                    .episode_id()
+                    .ok()
+                    .flatten()
+                    .and_then(|id| state.records.get(&id))
+                    .filter(|r| r.owner.same_owner(scope))
                     .cloned()
             });
         let Some(record) = record else {
@@ -547,6 +563,118 @@ impl AccountRuntime {
         drop(state);
         self.wait_owner.deferred.changed.notify_waiters();
         true
+    }
+    /// Retire only this owner's exact consumed receipt, once. This opens one
+    /// future registration with fresh native qualification on the same root/pin.
+    /// A new registration racing the parent's turn-progress processing may be
+    /// pending already; revalidate it under all native gates before publishing.
+    /// This supplies neither a reset nor a resume permit.
+    pub(crate) fn advance_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        scope: &LaunchOwnerScope,
+        id: DeferredResetId,
+        operation: &IssueOperation,
+    ) -> Result<bool, ()> {
+        let record = {
+            let state = self.wait_owner.deferred.state.lock().map_err(|_| ())?;
+            if state.closed || state.next == u64::MAX || !operation.can_reply() {
+                return Ok(false);
+            }
+            let Ok(pending) = scope.pending_episode(id.0, &self.wait_owner.deferred.identity)
+            else {
+                return Ok(false);
+            };
+            if let Some(pending) = pending {
+                let Some(record) = state.records.get(&pending) else {
+                    return Ok(false);
+                };
+                record.clone()
+            } else {
+                let Some(owner_live) = scope.live_guard() else {
+                    return Ok(false);
+                };
+                if !operation.can_reply() {
+                    return Ok(false);
+                }
+                let advanced =
+                    scope.advance_episode(id.0, &self.wait_owner.deferred.identity, None);
+                drop(owner_live);
+                drop(state);
+                if advanced {
+                    self.wait_owner.deferred.changed.notify_waiters();
+                }
+                return Ok(advanced);
+            }
+        };
+        // Never acquire Store while holding the deferred leaf gate: registration
+        // and final consumption use Store -> bindings/policy -> deferred -> owner.
+        let _transaction = self.store.transaction().map_err(|_| ())?;
+        let released = self.released_quota.lock().map_err(|_| ())?;
+        let probes = self.probes.lock().map_err(|_| ())?;
+        let volatile = self.volatile.lock().map_err(|_| ())?;
+        if !operation.can_reply()
+            || self.store.writes_stopped()
+            || !record.owner.same_owner(scope)
+            || !record.live()
+            || record.phase.load(Ordering::Acquire) != WAITING
+            || probes.contains(&record.account)
+            || volatile.contains_key(&record.account)
+            || released
+                .get(&record.account)
+                .is_some_and(|release| release.pending)
+        {
+            return Ok(false);
+        }
+        let account = self
+            .store
+            .read_account_unlocked(&record.account)
+            .map_err(|_| ())?;
+        if !record.same_hold(&account) || !self.deferred_credentials_current(&account) {
+            return Ok(false);
+        }
+        let request = HttpWaitRequest {
+            provider: Provider::Codex,
+            key: Some(&record.root),
+            model: Some(&record.model),
+            expected_source: Some(&record.account),
+            operation,
+        };
+        let result = bindings.with_deferred_launch(
+            request,
+            scope,
+            Some((record.binding.clone(), record.policy.clone())),
+            |intent, _, _| {
+                if intent.policy_key() != record.policy_key
+                    || !same_plan(&record.plan, intent.plan())
+                    || !record.live()
+                    || record.phase.load(Ordering::Acquire) != WAITING
+                    || !intent.caller_current()
+                {
+                    return None;
+                }
+                let state = self.wait_owner.deferred.state.lock().ok()?;
+                if state.closed
+                    || !state
+                        .records
+                        .get(&record.id.0)
+                        .is_some_and(|r| Arc::ptr_eq(r, &record))
+                {
+                    return None;
+                }
+                let _owner_live = scope.live_guard()?;
+                if !intent.caller_current() {
+                    return None;
+                }
+                scope
+                    .advance_episode(id.0, &self.wait_owner.deferred.identity, Some(record.id.0))
+                    .then_some(())
+            },
+        );
+        if result.is_some() {
+            self.wait_owner.deferred.changed.notify_waiters();
+        }
+        Ok(result.is_some())
     }
     /// Readiness hint before native final-get. May persist exact native expiry;
     /// never consumes the episode or grants automatic activation authority.
@@ -735,6 +863,9 @@ impl AccountRuntime {
                         .phase
                         .compare_exchange(READY, CONSUMED, Ordering::AcqRel, Ordering::Acquire)
                         .ok()?;
+                    if !scope.consumed_episode(id.0) {
+                        return None;
+                    }
                 } else if record.phase.load(Ordering::Acquire) != READY {
                     return None;
                 }
@@ -756,6 +887,8 @@ pub(crate) fn same_plan(a: &Plan, b: &Plan) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod advance_tests;
+
     use super::*;
     use crate::{
         account_runtime::HealthSignal,
