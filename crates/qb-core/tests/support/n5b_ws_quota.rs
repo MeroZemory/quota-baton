@@ -62,6 +62,7 @@ async fn policy(h: &Harness, mode: Mode, wait: u64) {
                 Some(Settings {
                     mode,
                     reset_wait_secs: wait,
+                    on_5h_limit: qb_core::routing::On5hLimit::Wait,
                 }),
                 None,
                 false,

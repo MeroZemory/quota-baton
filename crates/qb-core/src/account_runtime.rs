@@ -2,7 +2,7 @@ mod wait_admission;
 mod wait_owner;
 mod wait_proof;
 
-pub(crate) use wait_owner::PendingHttp429;
+pub(crate) use wait_owner::{PendingHttp429, WaitPolicySnapshot};
 pub(crate) use wait_proof::ReportOrigin;
 
 use std::{

@@ -3766,6 +3766,7 @@ async fn r11_http_issue(h: &Harness) -> qb_core::relay::LaunchReply {
                 account_pref: None,
                 resume_id: None,
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )
@@ -3975,6 +3976,7 @@ async fn r11_http_warm_distinct(h: &Harness, models: &[&[&str]]) -> Vec<String> 
                     account_pref: Some(id.clone()),
                     resume_id: None,
                     move_for_model: false,
+                    urgent: false,
                 },
                 h.servers.data_addr.port(),
             )
@@ -4014,6 +4016,7 @@ async fn r11_http_entry_forced_move_filters_model_and_prefers_whole_advertised_c
                 account_pref: Some(ids[0].clone()),
                 resume_id: None,
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )
@@ -4093,6 +4096,7 @@ async fn r11_http_entry_forced_move_never_uses_a_healthy_incompatible_account() 
                 account_pref: Some(ids[0].clone()),
                 resume_id: None,
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )
@@ -4227,6 +4231,7 @@ async fn r11_http_entry_recovered_original_wins_after_destination_catalog_wait()
                 account_pref: Some(ids[0].clone()),
                 resume_id: None,
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )
@@ -4314,6 +4319,7 @@ async fn r11_http_entry_concurrent_launches_adopt_one_real_c8_binding() {
                 account_pref: Some(other.clone()),
                 resume_id: None,
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )
@@ -4405,6 +4411,7 @@ async fn r11_models_issue_raw(h: &Harness, raw: &Value) -> qb_core::relay::Launc
                 account_pref: None,
                 resume_id: None,
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )
@@ -4745,6 +4752,7 @@ async fn r11_http_entry_destination_pause_before_admission_never_publishes_move(
                 account_pref: Some(ids[0].clone()),
                 resume_id: None,
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )
@@ -5059,6 +5067,7 @@ async fn r11_http_entry_simultaneous_resume_issuance_preserves_persisted_authori
                 account_pref: Some(other.clone()),
                 resume_id: Some("r11-persisted-resume".into()),
                 move_for_model: false,
+                urgent: false,
             },
             h.servers.data_addr.port(),
         )

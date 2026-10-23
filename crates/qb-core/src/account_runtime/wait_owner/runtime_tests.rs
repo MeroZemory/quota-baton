@@ -212,6 +212,7 @@ impl Fixture {
                 Some(Settings {
                     mode: Mode::Strict,
                     reset_wait_secs: seconds,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 false,
@@ -445,6 +446,7 @@ async fn n5a_runtime_wait_uses_native_policy_and_preserves_same_receipt_on_unrel
             Some(Settings {
                 mode: Mode::Strict,
                 reset_wait_secs: 30,
+                on_5h_limit: crate::routing::On5hLimit::Wait,
             }),
             None,
             false,

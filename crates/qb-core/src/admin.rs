@@ -301,19 +301,27 @@ async fn issue_launch(
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RoutingUpdate {
+    ClaudeUrgentLaunch {
+        session_id: String,
+    },
+    Urgent {
+        id: String,
+        on_5h_limit: crate::routing::On5hLimit,
+    },
     Project {
         id: Option<String>,
         name: String,
-        settings: crate::routing::Settings,
+        settings: crate::routing::SettingsEdit,
     },
     Session {
         id: String,
-        settings: Option<crate::routing::Settings>,
+        settings: Option<crate::routing::SettingsEdit>,
         project: Option<String>,
         #[serde(default)]
         inherit: bool,
     },
 }
+
 async fn routing_view(State(state): State<RuntimeAdmin>) -> Response {
     let relay = state.relay.clone();
     match tokio::task::spawn_blocking(move || relay.routing_view()).await {
@@ -340,8 +348,10 @@ async fn routing_update(
     let table = state.relay.bindings.clone();
     let result=tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         match request {
-            RoutingUpdate::Project{id,name,settings}=>Ok(serde_json::json!({"id":table.policies.put_project(id.as_deref(),crate::routing::Project{name,settings})?})),
-            RoutingUpdate::Session{id,settings,project,inherit}=>{table.set_routing_session(&id,settings,project.as_deref(),inherit)?;Ok(serde_json::json!({"updated":true}))},
+            RoutingUpdate::ClaudeUrgentLaunch{session_id}=>{table.register_claude_urgent(&session_id)?;Ok(serde_json::json!({"updated":true}))},
+            RoutingUpdate::Urgent{id,on_5h_limit}=>{table.set_routing_session_urgent(&id,on_5h_limit)?;Ok(serde_json::json!({"updated":true}))},
+            RoutingUpdate::Project{id,name,settings}=>Ok(serde_json::json!({"id":table.policies.put_project_patch(id.as_deref(),name,settings)?})),
+            RoutingUpdate::Session{id,settings,project,inherit}=>{table.set_routing_session_patch(&id,settings,project.as_deref(),inherit)?;Ok(serde_json::json!({"updated":true}))},
         }
     }).await;
     match result {
@@ -945,5 +955,77 @@ mod tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod n5c_routing_dto_tests {
+    use super::RoutingUpdate;
+
+    #[test]
+    fn n5c_claude_launch_intent_accepts_only_exact_registration_shape() {
+        let request = serde_json::json!({"kind":"claude_urgent_launch",
+            "session_id":"12345678-1234-4234-8234-123456789abc"});
+        assert!(matches!(
+            serde_json::from_value::<RoutingUpdate>(request.clone()).unwrap(),
+            RoutingUpdate::ClaudeUrgentLaunch { .. }
+        ));
+        let mut extra = request;
+        extra["settings"] = serde_json::json!({"mode":"rebalance"});
+        assert!(serde_json::from_value::<RoutingUpdate>(extra).is_err());
+    }
+
+    #[test]
+    fn n5c_legacy_admin_edits_preserve_omitted_urgency() {
+        let project = serde_json::json!({"kind":"project","name":"synthetic",
+            "settings":{"mode":"strict","reset_wait_secs":17}});
+        let session = serde_json::json!({"kind":"session","id":"synthetic",
+            "settings":{"mode":"strict","reset_wait_secs":17}});
+        for value in [project, session] {
+            match serde_json::from_value::<RoutingUpdate>(value.clone()).unwrap() {
+                RoutingUpdate::Project { settings, .. }
+                | RoutingUpdate::Session {
+                    settings: Some(settings),
+                    ..
+                } => {
+                    assert!(settings.on_5h_limit.is_none());
+                    assert_eq!(settings.mode, crate::routing::Mode::Strict);
+                    assert_eq!(settings.reset_wait_secs, 17);
+                }
+                _ => panic!("expected settings edit"),
+            }
+            let mut invalid = value;
+            invalid["settings"]["on_5h_limit"] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<RoutingUpdate>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn n5c_admin_urgency_only_request_cannot_smuggle_complete_policy() {
+        for (wire, expected) in [
+            ("wait", crate::routing::On5hLimit::Wait),
+            ("move", crate::routing::On5hLimit::Move),
+        ] {
+            let value = serde_json::json!({"kind":"urgent","id":"synthetic","on_5h_limit":wire});
+            assert!(
+                matches!(serde_json::from_value::<RoutingUpdate>(value.clone()).unwrap(),
+                RoutingUpdate::Urgent { on_5h_limit, .. } if on_5h_limit == expected)
+            );
+            let mut invalid = value;
+            invalid["settings"] = serde_json::json!({"mode":"rebalance","reset_wait_secs":60});
+            assert!(serde_json::from_value::<RoutingUpdate>(invalid).is_err());
+        }
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("on"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<RoutingUpdate>(serde_json::json!({
+                    "kind":"urgent","id":"synthetic","on_5h_limit":value
+                }))
+                .is_err()
+            );
+        }
     }
 }

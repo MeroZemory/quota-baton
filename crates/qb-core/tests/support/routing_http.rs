@@ -1057,6 +1057,7 @@ async fn global_strict_is_rejected_and_explicit_strict_corrupt_restore_preserves
                         Some(qb_core::routing::Settings {
                             mode: qb_core::routing::Mode::Strict,
                             reset_wait_secs: 0,
+                            on_5h_limit: qb_core::routing::On5hLimit::Wait,
                         }),
                         None,
                         None,

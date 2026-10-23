@@ -132,6 +132,7 @@ async fn wait_quota(
     // Infer the crate-visible receipt returned through the runtime API; the
     // private wait_owner module need not be exposed to this relay child.
     let mut receipt = None;
+    let mut policy_snapshot: Option<crate::account_runtime::WaitPolicySnapshot> = None;
     // Once set, this envelope is immutable even after replacement proof tickets.
     let mut envelope: Option<(Instant, DateTime<Utc>)> = None;
 
@@ -151,10 +152,24 @@ async fn wait_quota(
         if let Some(ended) = ended_envelope(source, envelope, Instant::now(), Utc::now()) {
             return Some(ended);
         }
+        // Reject-only policy view: no Store/runtime/binding gates or new proof.
+        // Global revision alone is not a change to this admitted wait.
+        if policy_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.unchanged(&relay.bindings.policies))
+        {
+            return stopped(source, envelope.is_some());
+        }
         let accounts = relay.accounts.clone();
         let bindings = relay.bindings.clone();
         let work_inputs = inputs.clone();
         let previous = receipt.take();
+        #[cfg(feature = "testkit")]
+        let result_hold = if previous.is_none() && matches!(transport, WaitTransport::Http) {
+            relay.take_http_quota_wait_result_hold(key, source)
+        } else {
+            None
+        };
         let task = tokio::task::spawn_blocking(move || {
             if !caller_live(
                 &work_inputs.operation,
@@ -163,15 +178,32 @@ async fn wait_quota(
             ) {
                 return Ok(None);
             }
-            match previous {
+            let inspected = match previous {
                 None => accounts.current_http_quota_wait(&bindings, work_inputs.request()),
                 Some(old) => {
                     accounts.renew_current_http_quota_wait(&bindings, work_inputs.request(), old)
                 }
+            };
+            // The actual native API has returned: ALL native guards are gone.
+            // This owner-local test gate delays delivery, never creates proof.
+            #[cfg(feature = "testkit")]
+            if let (Some(hold), Ok(Some(current))) = (result_hold, &inspected) {
+                hold.wait(super::HttpQuotaWaitResultBounds {
+                    source: current.account().to_owned(),
+                    reset_at: current.reset_at(),
+                    wake: current.wake(),
+                    deadline: current.deadline(),
+                });
             }
+            inspected
         });
+        #[cfg(feature = "testkit")]
+        if matches!(transport, WaitTransport::Http) {
+            relay.observe_http_quota_wait_inspection("inspection_started", source);
+        }
         tokio::pin!(task);
-        let inspected = tokio::select! {
+        let inspected = loop {
+            tokio::select! {
             biased;
             _ = relay.wait_for_drain_start() => return stopped(source, envelope.is_some()),
             _ = tokio::time::sleep_until(deadline) => return stopped(source, envelope.is_some()),
@@ -186,7 +218,42 @@ async fn wait_quota(
                 }
                 return ended_envelope(source, envelope, Instant::now(), Utc::now());
             },
-            result = &mut task => result,
+            _ = &mut policy => {
+                // Rearm BEFORE observing publication: notify_waiters stores no
+                // permit for a waiter that was not yet registered.
+                policy.set(relay.bindings.policies.changed.notified());
+                policy.as_mut().enable();
+                if !caller_live(operation, deadline, relay.is_draining()) {
+                    return stopped(source, envelope.is_some());
+                }
+                if let Some(ended) = ended_envelope(source, envelope, Instant::now(), Utc::now()) {
+                    return Some(ended);
+                }
+                if policy_snapshot.as_ref().is_some_and(|snapshot| {
+                    !snapshot.unchanged(&relay.bindings.policies)
+                }) {
+                    #[cfg(feature = "testkit")]
+                    if matches!(transport, WaitTransport::Http) {
+                        relay.observe_http_quota_wait_inspection("policy_revoked", source);
+                    }
+                    return stopped(source, envelope.is_some());
+                }
+                #[cfg(feature = "testkit")]
+                if matches!(transport, WaitTransport::Http) {
+                    relay.observe_http_quota_wait_inspection(
+                        if policy_snapshot.is_some() {
+                            "policy_unchanged"
+                        } else {
+                            "policy_before_snapshot"
+                        },
+                        source,
+                    );
+                }
+                // Unrelated/same-value publication, or no admitted receipt yet:
+                // keep THIS task. Never spawn another blocked inspection.
+            },
+            result = &mut task => break result,
+            }
         };
         // Dropping a JoinHandle cannot stop running blocking work. It only
         // performs inspection, never dispatch, writes, or operation admission.
@@ -201,6 +268,10 @@ async fn wait_quota(
         let current = match inspected {
             Ok(Ok(Some(current))) => current,
             _ => {
+                #[cfg(feature = "testkit")]
+                if envelope.is_none() && matches!(transport, WaitTransport::Http) {
+                    relay.observe_http_quota_wait_inspection("initial_refused", source);
+                }
                 return envelope.map(|_| WaitHint {
                     source: inputs.source.clone(),
                     end: WaitEnd::Revoked,
@@ -218,6 +289,21 @@ async fn wait_quota(
                 source: inputs.source.clone(),
                 end: WaitEnd::Revoked,
             });
+        }
+        if first {
+            policy_snapshot = Some(current.policy_snapshot());
+        }
+        // Publication may have been consumed before the first snapshot was
+        // available. Recheck the receipt's policy before retaining or sleeping.
+        if policy_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.unchanged(&relay.bindings.policies))
+        {
+            #[cfg(feature = "testkit")]
+            if matches!(transport, WaitTransport::Http) {
+                relay.observe_http_quota_wait_inspection("result_policy_revoked", source);
+            }
+            return stopped(source, envelope.is_some());
         }
         receipt = Some(current);
         #[cfg(feature = "testkit")]

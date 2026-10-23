@@ -175,6 +175,7 @@ pub(super) async fn strict(h: &Harness) {
             Some(qb_core::routing::Settings {
                 mode: qb_core::routing::Mode::Strict,
                 reset_wait_secs: 0,
+                on_5h_limit: qb_core::routing::On5hLimit::Wait,
             }),
             None,
             false,
@@ -587,6 +588,7 @@ async fn upgrade_skips_reset_beyond_remaining_budget_without_overriding_strict()
                 Some(qb_core::routing::Settings {
                     mode,
                     reset_wait_secs: 60,
+                    on_5h_limit: qb_core::routing::On5hLimit::Wait,
                 }),
                 None,
                 false,
@@ -639,6 +641,7 @@ async fn pending_quota_reconnect_skips_reset_outside_upgrade_budget_in_each_mode
                 Some(qb_core::routing::Settings {
                     mode,
                     reset_wait_secs: 60,
+                    on_5h_limit: qb_core::routing::On5hLimit::Wait,
                 }),
                 None,
                 false,

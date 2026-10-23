@@ -152,6 +152,7 @@ pub(crate) struct LaunchPlan {
     pub effective_model: Option<String>,
     pub account_pref: Option<String>,
     pub move_for_model: bool,
+    pub urgent: bool,
     pub resume_id: Option<String>,
     /// Help/version/completion: do not perform admission, account or core I/O.
     pub passthrough: bool,
@@ -270,6 +271,7 @@ fn inspect(args: &[OsString]) -> Result<Inspected> {
             effective_model: None,
             account_pref: None,
             move_for_model: false,
+            urgent: false,
             resume_id: None,
             passthrough: false,
             model_is_explicit: false,
@@ -305,6 +307,10 @@ fn inspect(args: &[OsString]) -> Result<Inspected> {
             result.plan.passthrough = true;
             return Ok(result);
         }
+        if prompt && arg == "--urgent" {
+            result.plan.native_args.push(args[start].clone());
+            continue;
+        }
         if !prompt && (arg == "--account" || arg.starts_with("--account=")) {
             if result.plan.account_pref.is_some() {
                 return Err(refusal(GRAMMAR));
@@ -323,6 +329,13 @@ fn inspect(args: &[OsString]) -> Result<Inspected> {
                 return Err(refusal(GRAMMAR));
             }
             result.plan.account_pref = Some(value.to_owned());
+            continue;
+        }
+        if !prompt && arg == "--urgent" {
+            if result.plan.urgent {
+                return Err(refusal(GRAMMAR));
+            }
+            result.plan.urgent = true;
             continue;
         }
         if !prompt && arg == "--move-for-model" {
@@ -502,6 +515,8 @@ struct LaunchRequest<'a> {
     account_pref: Option<&'a str>,
     resume_id: Option<&'a str>,
     move_for_model: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    urgent: bool,
 }
 
 #[derive(Deserialize)]
@@ -623,6 +638,7 @@ pub(crate) async fn issue_launch(
         account_pref: plan.account_pref.as_deref(),
         resume_id: plan.resume_id.as_deref(),
         move_for_model: plan.move_for_model,
+        urgent: plan.urgent,
     };
     let response = client
         .post(format!(
@@ -1572,6 +1588,7 @@ mod tests {
             account_pref: Some("alpha"),
             resume_id: Some(UUID),
             move_for_model: true,
+            urgent: false,
         };
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 5);
@@ -1580,5 +1597,842 @@ mod tests {
         assert_eq!(value["account_pref"], "alpha");
         assert_eq!(value["resume_id"], UUID);
         assert_eq!(value["move_for_model"], true);
+    }
+
+    #[test]
+    fn n5c_codex_urgent_interactive_exec_and_resume_strip_only_launcher_intent() {
+        for (input, expected) in [
+            (vec!["--urgent", "-m", "chosen"], vec!["-m", "chosen"]),
+            (
+                vec!["exec", "--urgent", "-m", "chosen", "synthetic prompt"],
+                vec!["exec", "-m", "chosen", "synthetic prompt"],
+            ),
+            (
+                vec!["e", "resume", UUID, "--urgent", "-m", "chosen"],
+                vec!["e", "resume", UUID, "-m", "chosen"],
+            ),
+            (
+                vec!["--urgent", "exec", "--", "--urgent"],
+                vec!["exec", "--", "--urgent"],
+            ),
+        ] {
+            let plan = planned(&input);
+            assert!(plan.urgent);
+            assert_eq!(plan.native_args, argv(&expected));
+            let args = overrides(&plan, reply_for(&plan), 10200).unwrap();
+            let prefix = if plan.model_is_explicit { 4 } else { 6 };
+            assert_eq!(&args[prefix..], plan.native_args.as_slice());
+        }
+        assert!(inspect(&argv(&["--urgent", "--urgent"])).is_err());
+        assert!(inspect(&argv(&["--urgent=true"])).is_err());
+    }
+
+    fn reply_for(plan: &LaunchPlan) -> LaunchReply {
+        LaunchReply {
+            model: plan.effective_model.clone(),
+            ..reply()
+        }
+    }
+
+    #[tokio::test]
+    async fn n5c_codex_urgent_uses_real_authenticated_issue_request() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        std::fs::write(home.path().join("admin.token"), &admin).unwrap();
+        std::fs::write(
+            home.path().join("client.key"),
+            URL_SAFE_NO_PAD.encode([2u8; 32]),
+        )
+        .unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        let app = Router::new().route(
+            "/admin/v1/launches",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let admin = admin.clone();
+                    let count = count.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], format!("Bearer {admin}"));
+                        assert_eq!(
+                            body,
+                            serde_json::json!({
+                                "model":"chosen", "model_is_explicit":true,
+                                "account_pref":null, "resume_id":null,
+                                "move_for_model":false, "urgent":true,
+                            })
+                        );
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "base_url":format!("http://127.0.0.1:10200/l/{TOKEN}/v1"),
+                            "catalog_url":format!("http://127.0.0.1:10200/l/{TOKEN}/v1/models"),
+                            "account":"synthetic", "model":"chosen",
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = qb_core::config::Config::default();
+        config.server.admin_port = listener.local_addr().unwrap().port();
+        config.server.data_port = 10200;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let plan = planned(&["--urgent", "exec", "-m", "chosen", "synthetic prompt"]);
+        let issued = issue_launch(&plan, home.path(), &config).await.unwrap();
+        let native = issued
+            .native_args(&home.path().join("synthetic-catalog.json"))
+            .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &native[4..],
+            argv(&["exec", "-m", "chosen", "synthetic prompt"])
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn n5c_codex_urgent_operands_prompts_and_plain_requests_are_unchanged() {
+        for input in [
+            vec!["--image", "--urgent"],
+            vec!["--image=--urgent", "synthetic prompt"],
+            vec!["--", "--urgent"],
+            vec!["exec", "synthetic prompt", "--urgent"],
+        ] {
+            let plan = planned(&input);
+            assert!(!plan.urgent);
+            assert_eq!(plan.native_args, argv(&input));
+        }
+        let home = Path::new("synthetic-nonexistent-help-home");
+        for input in [
+            vec!["--urgent", "--help"],
+            vec!["exec", "--urgent", "--help"],
+        ] {
+            let plan = parse(&argv(&input), home).unwrap();
+            assert!(plan.passthrough);
+            assert!(!plan.native_args.iter().any(|arg| arg == "--urgent"));
+        }
+        let request = LaunchRequest {
+            model: "synthetic",
+            model_is_explicit: true,
+            account_pref: None,
+            resume_id: None,
+            move_for_model: false,
+            urgent: false,
+        };
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("urgent")
+                .is_none()
+        );
+        let urgent = LaunchRequest {
+            urgent: true,
+            ..request
+        };
+        assert_eq!(serde_json::to_value(urgent).unwrap()["urgent"], true);
+    }
+}
+
+pub(crate) async fn run_claude(
+    program: &Path,
+    settings: Option<&Path>,
+    args: &[OsString],
+) -> Result<i32> {
+    claude_urgent::run(program, settings, args).await
+}
+
+mod claude_urgent {
+    //! Bounded Claude launch planning and one-time authenticated urgency intent.
+    //! Options are recognized only before the first positional prompt or `--`.
+    //! Unknown grammar is passed through ordinarily, but refuses an urgent launch.
+
+    use std::{ffi::OsString, path::Path, time::Duration};
+
+    const REGISTER: &str =
+        "긴급 실행 정책을 저장하지 못했습니다. 코어를 실행한 뒤 다시 시도해 주세요.";
+
+    fn fresh_uuid() -> String {
+        let mut bytes: [u8; 16] = rand::random();
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )
+    }
+
+    /// Explicit launch intent is stored once, before starting the child. Ordinary
+    /// launches perform no admin I/O and never overwrite a later dashboard toggle.
+    pub(crate) async fn run(
+        program: &Path,
+        settings: Option<&Path>,
+        args: &[OsString],
+    ) -> anyhow::Result<i32> {
+        let plan = parse(args, fresh_uuid).map_err(crate::accounts_cli::AccountCliError)?;
+        if plan.urgent {
+            let failure = || crate::accounts_cli::AccountCliError(REGISTER);
+            let home = qb_core::home().map_err(|_| failure())?;
+            let config = qb_core::config::Config::load(&home).map_err(|_| failure())?;
+            register(&home, &config, &plan).await?;
+        }
+        Ok(crate::launcher_label::run(
+            crate::launcher_label::Client::Claude,
+            program,
+            settings,
+            &plan.native_args,
+        )?)
+    }
+
+    async fn register(
+        home: &Path,
+        config: &qb_core::config::Config,
+        plan: &Plan,
+    ) -> anyhow::Result<()> {
+        let failure = || crate::accounts_cli::AccountCliError(REGISTER);
+        let id = plan
+            .expected_root
+            .as_deref()
+            .and_then(|root| root.strip_prefix("claude:"))
+            .filter(|id| uuid(id).is_some())
+            .ok_or_else(failure)?;
+        anyhow::ensure!(plan.urgent && config.server.admin_port != 0, failure());
+        let secrets = qb_core::local_secrets::load_existing(home).map_err(|_| failure())?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|_| failure())?;
+        let mut response = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/v1/routing",
+                config.server.admin_port
+            ))
+            .bearer_auth(&secrets.admin_token)
+            .json(&serde_json::json!({"kind":"claude_urgent_launch","session_id":id}))
+            .send()
+            .await
+            .map_err(|_| failure())?;
+        // No upstream error body or credential value crosses this CLI boundary.
+        anyhow::ensure!(response.status().is_success(), failure());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| failure())? {
+            anyhow::ensure!(bytes.len().saturating_add(chunk.len()) <= 4096, failure());
+            bytes.extend_from_slice(&chunk);
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Reply {
+            updated: bool,
+        }
+        let reply: Reply = serde_json::from_slice(&bytes).map_err(|_| failure())?;
+        anyhow::ensure!(reply.updated, failure());
+        Ok(())
+    }
+
+    #[derive(PartialEq, Eq)]
+    pub(crate) struct Plan {
+        pub native_args: Vec<OsString>,
+        /// C8 policy root, never a display label or a managed Codex launch handle.
+        pub expected_root: Option<String>,
+        pub urgent: bool,
+    }
+
+    impl std::fmt::Debug for Plan {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ClaudeLaunchPlan([REDACTED])")
+        }
+    }
+
+    const GRAMMAR: &str = "긴급 실행에서 확인되지 않은 Claude 옵션입니다. 명시적인 세션 ID와 지원되는 옵션을 사용해 주세요.";
+    const SELECTOR: &str = "긴급 실행은 새 세션 또는 정확한 UUID 재개만 지원합니다. 세션 선택기·계속·분기·원격 재개는 사용할 수 없습니다.";
+    const UUID: &str = "긴급 실행의 세션 ID는 하이픈을 포함한 정확한 UUID여야 합니다.";
+    const DUPLICATE: &str = "긴급 실행 옵션이나 세션 선택 옵션을 중복 지정할 수 없습니다.";
+    const OPERAND: &str = "긴급 실행의 Claude 옵션에 필요한 값이 없습니다.";
+
+    fn uuid(value: &str) -> Option<String> {
+        (value.len() == 36
+            && value.bytes().enumerate().all(|(i, b)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    b == b'-'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            }))
+        // C8 hashes the native string, not a parsed UUID. Do not invent a casing
+        // conversion here; the eventual ingress must verify the emitted ID exactly.
+        .then(|| value.to_owned())
+    }
+
+    // Single-operand forms only. In particular -p is Claude's print switch, not
+    // Codex's profile option. These operands are used by the dedicated launcher or
+    // the existing Claude hold fixture. Variadic tool/directory options are not
+    // guessed from their spelling or from a fixture passing one empty value.
+    fn takes_value(name: &str) -> bool {
+        matches!(
+            name,
+            "--model"
+                | "--settings"
+                | "--setting-sources"
+                | "--max-turns"
+                | "--output-format"
+                | "--input-format"
+                | "--permission-mode"
+                | "--system-prompt"
+        )
+    }
+
+    fn switch(name: &str) -> bool {
+        matches!(
+            name,
+            "--print" | "-p" | "--no-session-persistence" | "--strict-mcp-config" | "--verbose"
+        )
+    }
+
+    /// The coordinator supplies UUID generation lazily. It is called exactly once
+    /// only for a valid fresh urgent launch without an explicit native session ID.
+    /// Ordinary launches return the original arguments and never call it.
+    ///
+    /// This supports a bounded option vocabulary, not Claude's complete grammar.
+    /// No selector or prompt is rewritten; fresh ID injection is the only addition.
+    pub(crate) fn parse(
+        args: &[OsString],
+        fresh_uuid: impl FnOnce() -> String,
+    ) -> Result<Plan, &'static str> {
+        let mut native_args = Vec::with_capacity(args.len());
+        let mut index = 0;
+        let mut urgent = false;
+        let mut informational = false;
+        let mut error = None;
+        let mut resume = None;
+        let mut session = None;
+        let mut resume_seen = false;
+        let mut session_seen = false;
+        while index < args.len() {
+            let start = index;
+            index += 1;
+            let Some(arg) = args[start].to_str() else {
+                // An opaque positional prompt ends our options region. An opaque
+                // option cannot be assigned a guessed arity on the urgent path.
+                if args[start].to_string_lossy().starts_with('-') {
+                    error.get_or_insert(GRAMMAR);
+                    native_args.push(args[start].clone());
+                    continue;
+                }
+                native_args.extend_from_slice(&args[start..]);
+                break;
+            };
+            if arg == "--" || !arg.starts_with('-') || arg == "-" {
+                native_args.extend_from_slice(&args[start..]);
+                break;
+            }
+            // Informational native options are recognized only in the option
+            // region, never as an opaque option operand or literal prompt.
+            if matches!(arg, "--help" | "-h" | "--version" | "-v") {
+                informational = true;
+                native_args.push(args[start].clone());
+                continue;
+            }
+            if arg == "--urgent" {
+                if urgent {
+                    error.get_or_insert(DUPLICATE);
+                }
+                urgent = true;
+                continue;
+            }
+            let (name, attached) = arg
+                .split_once('=')
+                .map_or((arg, None), |(name, value)| (name, Some(value)));
+            native_args.push(args[start].clone());
+            if name == "--resume" || name == "-r" || name == "--session-id" {
+                if name == "-r" && attached.is_some() {
+                    error.get_or_insert(GRAMMAR);
+                }
+                let is_resume = name != "--session-id";
+                let seen = if is_resume {
+                    &mut resume_seen
+                } else {
+                    &mut session_seen
+                };
+                if *seen {
+                    error.get_or_insert(DUPLICATE);
+                }
+                *seen = true;
+                // Resume's optional operand is absent when the next token is an
+                // option. Never swallow --urgent as a picker/name operand.
+                let value = if let Some(value) = attached {
+                    Some(value)
+                } else if let Some(value) = args.get(index).and_then(|value| value.to_str())
+                    && !value.starts_with('-')
+                {
+                    native_args.push(args[index].clone());
+                    index += 1;
+                    Some(value)
+                } else {
+                    None
+                };
+                match value.and_then(uuid) {
+                    Some(id) if is_resume => resume = Some(id),
+                    Some(id) => session = Some(id),
+                    None => {
+                        error.get_or_insert(if is_resume { SELECTOR } else { UUID });
+                    }
+                }
+            } else if matches!(
+                name,
+                "--continue" | "-c" | "--fork-session" | "--teleport" | "--from-pr"
+            ) {
+                error.get_or_insert(SELECTOR);
+                // A remote/PR selector may carry an ID. Recognizing that token
+                // only lets us reject following urgency; it cannot authorize a
+                // launch or change ordinary native arguments.
+                if matches!(name, "--teleport" | "--from-pr")
+                    && attached.is_none()
+                    && args
+                        .get(index)
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| !value.starts_with('-'))
+                {
+                    native_args.push(args[index].clone());
+                    index += 1;
+                }
+            } else if matches!(name, "--tools" | "--mcp-config") && attached.is_some() {
+                // Native variadic flags are unambiguous only in one-token form.
+            } else if takes_value(name) {
+                if attached.is_none() {
+                    if let Some(value) = args.get(index) {
+                        // Values are opaque, including a literal --urgent or --.
+                        native_args.push(value.clone());
+                        index += 1;
+                    } else {
+                        error.get_or_insert(OPERAND);
+                    }
+                }
+            } else if !switch(name) || attached.is_some() {
+                error.get_or_insert(GRAMMAR);
+            }
+        }
+        if !urgent {
+            return Ok(Plan {
+                native_args: args.to_vec(),
+                expected_root: None,
+                urgent: false,
+            });
+        }
+        if informational {
+            return Ok(Plan {
+                native_args,
+                expected_root: None,
+                urgent: false,
+            });
+        }
+        if args.len() > super::MAX_ARGS {
+            return Err(GRAMMAR);
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if resume_seen && session_seen {
+            return Err(SELECTOR);
+        }
+        let id = if let Some(id) = resume.or(session) {
+            id
+        } else {
+            let id = uuid(&fresh_uuid()).ok_or(UUID)?;
+            // Prepend before the preserved prompt/-- tail; never append an option
+            // where native parsing would treat it as user input.
+            native_args.splice(0..0, [OsString::from("--session-id"), OsString::from(&id)]);
+            id
+        };
+        Ok(Plan {
+            native_args,
+            expected_root: Some(format!("claude:{id}")),
+            urgent: true,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::Cell;
+
+        const ID: &str = "12345678-1234-4321-abcd-123456789abc";
+        const FRESH: &str = "87654321-4321-4321-abcd-cba987654321";
+
+        #[test]
+        fn n5c_claude_urgent_generated_id_is_v4_with_canonical_native_shape() {
+            let first = fresh_uuid();
+            let second = fresh_uuid();
+            assert_eq!(uuid(&first).as_deref(), Some(first.as_str()));
+            assert_eq!(first.as_bytes()[14], b'4');
+            assert!(matches!(first.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+            assert_ne!(first, second);
+        }
+
+        #[test]
+        fn n5c_claude_urgent_print_transport_options_preserve_exact_operands() {
+            let input = args(&[
+                "--urgent",
+                "--session-id",
+                ID,
+                "-p",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--tools=",
+                "--mcp-config={\"mcpServers\":{}}",
+                "--system-prompt",
+                "--urgent",
+                "synthetic prompt",
+            ]);
+            let plan = parse(&input, || panic!("explicit id must not allocate")).unwrap();
+            assert!(plan.urgent);
+            assert_eq!(plan.native_args, input[1..]);
+        }
+
+        #[tokio::test]
+        async fn n5c_claude_urgent_registration_checks_auth_and_bounded_success() {
+            use axum::{
+                Json, Router,
+                http::{HeaderMap, StatusCode},
+                routing::post,
+            };
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
+            std::fs::create_dir_all(&dir).unwrap();
+            let home = tempfile::tempdir_in(dir).unwrap();
+            let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
+            std::fs::write(home.path().join("admin.token"), &admin).unwrap();
+            std::fs::write(
+                home.path().join("client.key"),
+                URL_SAFE_NO_PAD.encode([2u8; 32]),
+            )
+            .unwrap();
+            let mode = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::new(AtomicUsize::new(0));
+            let handler_mode = mode.clone();
+            let handler_seen = seen.clone();
+            let app = Router::new().route(
+                "/admin/v1/routing",
+                post(
+                    move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                        let mode = handler_mode.clone();
+                        let seen = handler_seen.clone();
+                        let admin = admin.clone();
+                        async move {
+                            assert_eq!(headers["authorization"], format!("Bearer {admin}"));
+                            assert_eq!(
+                                body,
+                                serde_json::json!({"kind":"claude_urgent_launch","session_id":ID})
+                            );
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            match mode.load(Ordering::SeqCst) {
+                                0 => (StatusCode::OK, "{\"updated\":true}".to_owned()),
+                                1 => (StatusCode::OK, "{\"updated\":false}".to_owned()),
+                                2 => (StatusCode::OK, "private-value".repeat(4096)),
+                                _ => (StatusCode::TEMPORARY_REDIRECT, "private-value".to_owned()),
+                            }
+                        }
+                    },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert!(![10100, 10101].contains(&port));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut config = qb_core::config::Config::default();
+            config.server.admin_port = port;
+            let plan = planned(&["--urgent", "--session-id", ID]).unwrap();
+            for case in 0..4 {
+                mode.store(case, Ordering::SeqCst);
+                let result = register(home.path(), &config, &plan).await;
+                if case == 0 {
+                    assert!(result.is_ok());
+                } else {
+                    assert_eq!(result.unwrap_err().to_string(), REGISTER);
+                }
+            }
+            assert_eq!(seen.load(Ordering::SeqCst), 4);
+            server.abort();
+        }
+
+        fn args(values: &[&str]) -> Vec<OsString> {
+            values.iter().map(OsString::from).collect()
+        }
+
+        fn planned(values: &[&str]) -> Result<Plan, &'static str> {
+            parse(&args(values), || FRESH.into())
+        }
+
+        #[test]
+        fn n5c_claude_urgent_fresh_injects_before_prompt_without_changing_input() {
+            let plan = planned(&["--urgent", "-p", "hello", "--urgent"]).unwrap();
+            assert_eq!(
+                plan.native_args,
+                args(&["--session-id", FRESH, "-p", "hello", "--urgent"])
+            );
+            assert_eq!(plan.expected_root, Some(format!("claude:{FRESH}")));
+            assert!(plan.urgent);
+        }
+
+        #[test]
+        fn n5c_claude_urgent_ordinary_is_exact_and_never_allocates() {
+            for input in [
+                vec![],
+                vec!["--unknown", "value"],
+                vec!["--continue"],
+                vec!["--resume"],
+                vec!["--session-id", "invalid"],
+                vec!["--model", "--urgent", "hello"],
+                vec!["--", "--urgent"],
+                vec!["literal prompt", "--urgent"],
+                vec!["--urgent=true"],
+            ] {
+                let original = args(&input);
+                let plan = parse(&original, || panic!("ordinary launch allocated ID")).unwrap();
+                assert_eq!(plan.native_args, original);
+                assert_eq!(plan.expected_root, None);
+                assert!(!plan.urgent);
+            }
+        }
+
+        #[test]
+        fn n5c_claude_urgent_option_operands_are_opaque() {
+            for option in ["--model", "--settings", "--setting-sources", "--max-turns"] {
+                let plan = planned(&[option, "--urgent", "--urgent", "hello"]).unwrap();
+                assert_eq!(
+                    plan.native_args,
+                    args(&["--session-id", FRESH, option, "--urgent", "hello"])
+                );
+            }
+            let plan = planned(&["--urgent", "--model", "--", "hello"]).unwrap();
+            assert_eq!(
+                plan.native_args,
+                args(&["--session-id", FRESH, "--model", "--", "hello"])
+            );
+        }
+
+        #[test]
+        fn n5c_claude_urgent_tail_is_preserved_after_consumed_intent() {
+            let plan = planned(&["--urgent", "--", "--urgent", "--continue"]).unwrap();
+            assert_eq!(
+                plan.native_args,
+                args(&["--session-id", FRESH, "--", "--urgent", "--continue"])
+            );
+        }
+
+        #[test]
+        fn n5c_claude_urgent_attached_values_and_unknown_before_intent() {
+            let plan = planned(&["--model=--urgent", "--urgent", "hello"]).unwrap();
+            assert_eq!(
+                plan.native_args,
+                args(&["--session-id", FRESH, "--model=--urgent", "hello"])
+            );
+            assert!(!planned(&["--model=--urgent", "hello"]).unwrap().urgent);
+            for input in [
+                vec!["--unknown", "--urgent"],
+                vec!["--print=true", "--urgent"],
+            ] {
+                assert_eq!(
+                    parse(&args(&input), || panic!("invalid grammar allocated ID")),
+                    Err(GRAMMAR)
+                );
+            }
+        }
+
+        #[test]
+        fn n5c_claude_urgent_exact_resume_and_explicit_fresh_never_allocate() {
+            for input in [
+                vec!["--urgent".into(), "--resume".into(), ID.into()],
+                vec!["-r".into(), ID.into(), "--urgent".into()],
+                vec![format!("--resume={ID}"), "--urgent".into()],
+                vec!["--session-id".into(), ID.into(), "--urgent".into()],
+                vec![format!("--session-id={ID}"), "--urgent".into()],
+            ] {
+                let original: Vec<OsString> = input.iter().map(OsString::from).collect();
+                let plan = parse(&original, || panic!("explicit ID allocated another ID")).unwrap();
+                assert_eq!(plan.expected_root, Some(format!("claude:{ID}")));
+                assert_eq!(
+                    plan.native_args,
+                    original
+                        .into_iter()
+                        .filter(|v| v != "--urgent")
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        #[test]
+        fn n5c_claude_urgent_ambiguous_selectors_refused_without_allocation() {
+            for input in [
+                vec!["--urgent", "--resume"],
+                vec!["--resume", "--urgent"],
+                vec!["--urgent", "--resume", "named-session"],
+                vec!["--urgent", "-c"],
+                vec!["--urgent", "--continue"],
+                vec!["--urgent", "--fork-session"],
+                vec!["--urgent", "--teleport"],
+                vec!["--urgent", "--from-pr=12"],
+                vec!["--teleport", ID, "--urgent"],
+                vec!["--from-pr", "12", "--urgent"],
+                vec!["--urgent", "--resume", ID, "--session-id", ID],
+            ] {
+                assert!(parse(&args(&input), || panic!("refused launch allocated ID")).is_err());
+            }
+        }
+
+        #[test]
+        fn n5c_claude_urgent_unknown_grammar_refuses_only_urgent_path() {
+            for option in [
+                "--unknown",
+                "--allowedTools",
+                "--tools",
+                "--add-dir",
+                "-pr",
+                "--urgent=true",
+            ] {
+                assert!(planned(&["--urgent", option]).is_err());
+                assert!(!planned(&[option]).unwrap().urgent);
+            }
+        }
+
+        #[test]
+        fn n5c_claude_urgent_duplicate_and_missing_operands_refused() {
+            for input in [
+                vec!["--urgent", "--urgent"],
+                vec!["--urgent", "--session-id", ID, "--session-id", ID],
+                vec!["--urgent", "--resume", ID, "-r", ID],
+                vec!["--urgent", "--model"],
+                vec!["--urgent", "--session-id"],
+            ] {
+                assert!(planned(&input).is_err());
+            }
+        }
+
+        #[test]
+        fn n5c_claude_urgent_uuid_validation_and_canonical_root() {
+            for id in [
+                "",
+                "not-a-uuid",
+                "1234567812344321abcd123456789abc",
+                "12345678-1234-4321-abcd-123456789abz",
+            ] {
+                assert_eq!(planned(&["--urgent", "--resume", id]), Err(SELECTOR));
+                assert_eq!(planned(&["--urgent", "--session-id", id]), Err(UUID));
+            }
+            let upper = ID.to_ascii_uppercase();
+            let plan = planned(&["--urgent", "--resume", &upper]).unwrap();
+            assert_eq!(plan.expected_root, Some(format!("claude:{upper}")));
+            assert_eq!(plan.native_args, args(&["--resume", &upper]));
+            assert_eq!(parse(&args(&["--urgent"]), || "invalid".into()), Err(UUID));
+        }
+
+        #[test]
+        fn n5c_claude_urgent_fresh_id_supplier_called_exactly_once() {
+            let calls = Cell::new(0);
+            let plan = parse(&args(&["--urgent"]), || {
+                calls.set(calls.get() + 1);
+                FRESH.into()
+            })
+            .unwrap();
+            assert_eq!(calls.get(), 1);
+            assert!(plan.urgent);
+        }
+    }
+
+    #[cfg(test)]
+    mod informational_tests {
+        use super::*;
+
+        #[test]
+        fn n5c_claude_urgent_help_consumes_only_intent_without_allocating() {
+            for input in [
+                vec!["--urgent", "--help"],
+                vec!["--help", "--urgent"],
+                vec!["--urgent", "--version"],
+                vec!["--urgent", "--unknown", "-h"],
+            ] {
+                let args: Vec<_> = input.iter().map(OsString::from).collect();
+                let plan = parse(&args, || panic!("help must not allocate a native UUID")).unwrap();
+                let expected: Vec<_> = input
+                    .iter()
+                    .filter(|arg| **arg != "--urgent")
+                    .map(OsString::from)
+                    .collect();
+                assert_eq!(plan.native_args, expected);
+                assert!(!plan.urgent);
+                assert!(plan.expected_root.is_none());
+            }
+            // These help-looking values must not bypass actual urgent registration.
+            for input in [
+                vec!["--urgent", "--model", "--help"],
+                vec!["--urgent", "--", "--help"],
+                vec!["--urgent", "synthetic prompt", "--help"],
+            ] {
+                let args: Vec<_> = input.iter().map(OsString::from).collect();
+                assert!(
+                    parse(&args, || "87654321-4321-4321-abcd-cba987654321".into())
+                        .unwrap()
+                        .urgent
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn n5c_claude_urgent_plain_and_help_reach_native_validation_without_core() {
+            // A relative program fails existing runner validation before any spawn.
+            // A registration/setup error instead would reveal accidental core I/O.
+            for values in [
+                vec!["--help"],
+                vec!["--urgent", "--help"],
+                vec!["--unknown", "value"],
+            ] {
+                let args: Vec<_> = values.iter().map(OsString::from).collect();
+                let expected = crate::launcher_label::run(
+                    crate::launcher_label::Client::Claude,
+                    Path::new("synthetic-relative-native"),
+                    None,
+                    &args,
+                )
+                .unwrap_err();
+                let error = run(Path::new("synthetic-relative-native"), None, &args)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), expected.to_string());
+                assert!(error.downcast_ref::<std::io::Error>().is_some());
+            }
+        }
+
+        #[test]
+        fn n5c_claude_urgent_debug_does_not_retain_prompt_or_native_id() {
+            let args = [
+                OsString::from("--urgent"),
+                OsString::from("synthetic-private-prompt"),
+            ];
+            let plan = parse(&args, || "87654321-4321-4321-abcd-cba987654321".into()).unwrap();
+            assert_eq!(format!("{plan:?}"), "ClaudeLaunchPlan([REDACTED])");
+        }
     }
 }

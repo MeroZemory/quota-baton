@@ -32,6 +32,14 @@ pub enum Mode {
     #[default]
     Rebalance,
 }
+/// Stored 5h-limit intent; execution/holding policy is integrated separately.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum On5hLimit {
+    #[default]
+    Wait,
+    Move,
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ChurnLimits {
@@ -75,12 +83,47 @@ impl ChurnLimits {
 pub struct Settings {
     pub mode: Mode,
     pub reset_wait_secs: u64,
+    #[serde(default)]
+    pub on_5h_limit: On5hLimit,
 }
+/// Administrative edit; omission preserves urgency inside the writer gate.
+/// Persisted Settings always include on_5h_limit.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsEdit {
+    pub mode: Mode,
+    pub reset_wait_secs: u64,
+    #[serde(default, deserialize_with = "supplied_urgency")]
+    pub on_5h_limit: Option<On5hLimit>,
+}
+fn supplied_urgency<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<On5hLimit>, D::Error> {
+    On5hLimit::deserialize(d).map(Some)
+}
+impl From<Settings> for SettingsEdit {
+    fn from(settings: Settings) -> Self {
+        Self {
+            mode: settings.mode,
+            reset_wait_secs: settings.reset_wait_secs,
+            on_5h_limit: Some(settings.on_5h_limit),
+        }
+    }
+}
+impl SettingsEdit {
+    fn resolve(&self, urgency: On5hLimit) -> Settings {
+        Settings {
+            mode: self.mode,
+            reset_wait_secs: self.reset_wait_secs,
+            on_5h_limit: self.on_5h_limit.unwrap_or(urgency),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             mode: Mode::Rebalance,
             reset_wait_secs: 60,
+            on_5h_limit: On5hLimit::Wait,
         }
     }
 }
@@ -118,20 +161,39 @@ struct SessionPolicy {
     explicit: Option<Settings>,
     #[serde(deserialize_with = "required_optional")]
     anchor: Option<String>,
+    /// A launch-only override must not freeze global mode/reset before ingress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    urgency: Option<On5hLimit>,
     movements: Vec<Movement>,
 }
 impl SessionPolicy {
     fn durable(&self, defaults: &Settings) -> bool {
-        self.explicit.is_some()
+        self.urgency.is_some()
+            || self.explicit.is_some()
             || self.project.is_some()
             || (self.anchor.is_some() && self.settings(defaults).mode == Mode::Strict)
     }
-    fn settings<'a>(&'a self, defaults: &'a Settings) -> &'a Settings {
-        self.explicit.as_ref().unwrap_or(if self.project.is_some() {
-            &self.baseline
-        } else {
-            defaults
-        })
+    fn settings(&self, defaults: &Settings) -> Settings {
+        let mut settings = self
+            .explicit
+            .as_ref()
+            .unwrap_or(if self.project.is_some() {
+                &self.baseline
+            } else {
+                defaults
+            })
+            .clone();
+        if let Some(urgency) = self.urgency {
+            settings.on_5h_limit = urgency;
+        }
+        settings
+    }
+    fn unassociated_launch_intent(&self) -> bool {
+        self.urgency.is_some()
+            && self.project.is_none()
+            && self.explicit.is_none()
+            && self.anchor.is_none()
+            && self.movements.is_empty()
     }
 }
 fn required_optional<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -484,6 +546,99 @@ fn fence_path(path: &Path) -> PathBuf {
 fn policy_digest(state: &State) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(state)?)))
 }
+
+/// Verify the prior canonical representation, never erasing explicit Move.
+fn prior_settings_digest(state: &State) -> Result<Option<String>> {
+    #[derive(Serialize)]
+    struct PriorSettings {
+        mode: Mode,
+        reset_wait_secs: u64,
+    }
+    fn prior(settings: &Settings) -> Option<PriorSettings> {
+        (settings.on_5h_limit == On5hLimit::Wait).then_some(PriorSettings {
+            mode: settings.mode,
+            reset_wait_secs: settings.reset_wait_secs,
+        })
+    }
+    #[derive(Serialize)]
+    struct PriorProject<'a> {
+        name: &'a str,
+        settings: PriorSettings,
+    }
+    #[derive(Serialize)]
+    struct PriorSession<'a> {
+        project: &'a Option<String>,
+        baseline: PriorSettings,
+        explicit: Option<PriorSettings>,
+        anchor: &'a Option<String>,
+        movements: &'a Vec<Movement>,
+    }
+    #[derive(Serialize)]
+    struct PriorState<'a> {
+        schema: u32,
+        revision: u64,
+        projects: BTreeMap<&'a String, PriorProject<'a>>,
+        sessions: BTreeMap<&'a String, PriorSession<'a>>,
+        legacy_codex_roots: &'a BTreeSet<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        durable_overflow_until: Option<DateTime<Utc>>,
+    }
+    let mut projects = BTreeMap::new();
+    for (id, project) in &state.projects {
+        let Some(settings) = prior(&project.settings) else {
+            return Ok(None);
+        };
+        projects.insert(
+            id,
+            PriorProject {
+                name: &project.name,
+                settings,
+            },
+        );
+    }
+    let mut sessions = BTreeMap::new();
+    for (id, session) in &state.sessions {
+        // The old representation cannot authenticate a new independent override,
+        // including explicit Wait. Never erase it to satisfy a legacy fence.
+        if session.urgency.is_some() {
+            return Ok(None);
+        }
+        let Some(baseline) = prior(&session.baseline) else {
+            return Ok(None);
+        };
+        let explicit = match &session.explicit {
+            Some(settings) => {
+                let Some(settings) = prior(settings) else {
+                    return Ok(None);
+                };
+                Some(settings)
+            }
+            None => None,
+        };
+        sessions.insert(
+            id,
+            PriorSession {
+                project: &session.project,
+                baseline,
+                explicit,
+                anchor: &session.anchor,
+                movements: &session.movements,
+            },
+        );
+    }
+    let prior = PriorState {
+        schema: state.schema,
+        revision: state.revision,
+        projects,
+        sessions,
+        legacy_codex_roots: &state.legacy_codex_roots,
+        durable_overflow_until: state.durable_overflow_until,
+    };
+    Ok(Some(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&prior)?)
+    )))
+}
 fn strict_intent(state: &State, defaults: &Settings) -> State {
     let mut strict = State {
         projects: state
@@ -517,13 +672,14 @@ fn strict_intent(state: &State, defaults: &Settings) -> State {
                 id.clone(),
                 SessionPolicy {
                     project: None,
-                    baseline: session.settings(defaults).clone(),
-                    explicit: Some(session.settings(defaults).clone()),
+                    baseline: session.settings(defaults),
+                    explicit: Some(session.settings(defaults)),
                     anchor: if mode == Mode::Strict {
                         session.anchor.clone()
                     } else {
                         None
                     },
+                    urgency: None,
                     movements: Vec::new(),
                 },
             );
@@ -628,6 +784,7 @@ fn read_fence(path: &Path) -> Result<Option<PolicyFence>> {
                 validate_state(strict)?;
                 if strict.sessions.values().any(|s| {
                     s.explicit.is_none()
+                        || s.urgency.is_some()
                         || (s.explicit.as_ref().is_some_and(|v| v.mode != Mode::Strict)
                             && s.anchor.is_some())
                         || s.project.is_some()
@@ -723,6 +880,7 @@ fn legacy_strict_evidence(path: &Path, defaults: &Settings) -> State {
                         } else {
                             None
                         },
+                        urgency: None,
                         movements: Vec::new(),
                     },
                 );
@@ -793,15 +951,22 @@ fn recover_policy(
     {
         merge_intent(&mut strict, witness.clone());
     }
-    let adopt = matches!(&fence, Ok(None)) || matches!(&fence, Ok(Some(f)) if f.schema == 1);
+    let mut adopt = matches!(&fence, Ok(None)) || matches!(&fence, Ok(Some(f)) if f.schema == 1);
     let checked = (|| -> Result<Option<State>> {
         let state = loaded?;
         if let Some(fence) = fence? {
             let state = state
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("routing policy missing"))?;
-            if fence.revision != state.revision || fence.digest != policy_digest(state)? {
+            if fence.revision != state.revision {
                 bail!("routing policy generation mismatch");
+            }
+            if fence.digest != policy_digest(state)? {
+                if prior_settings_digest(state)?.as_deref() != Some(fence.digest.as_str()) {
+                    bail!("routing policy generation mismatch");
+                }
+                // Upgrade only after every remaining recovery check succeeds.
+                adopt = true;
             }
             if fence.pending {
                 bail!("routing policy transaction incomplete");
@@ -1308,6 +1473,7 @@ impl PolicyStore {
                     baseline: self.defaults.clone(),
                     explicit: None,
                     anchor: None,
+                    urgency: None,
                     movements: Vec::new(),
                 });
                 if entry.anchor.is_none() {
@@ -1349,7 +1515,7 @@ impl PolicyStore {
             return None;
         }
         let plan = self.plan_published(Some(key));
-        if plan.settings.reset_wait_secs == 0 {
+        if plan.settings.reset_wait_secs == 0 || plan.settings.on_5h_limit != On5hLimit::Wait {
             return None;
         }
         inspect(&plan)
@@ -1366,14 +1532,11 @@ impl PolicyStore {
             state.sessions.get(id)
         };
         Plan {
-            settings: session.map_or_else(
-                || self.defaults.clone(),
-                |s| s.settings(&self.defaults).clone(),
-            ),
+            settings: session.map_or_else(|| self.defaults.clone(), |s| s.settings(&self.defaults)),
             anchor: session.and_then(|s| s.anchor.clone()),
             project: session.and_then(|s| s.project.clone()),
             source: session.map_or("global", |s| {
-                if s.explicit.is_some() {
+                if s.explicit.is_some() || s.urgency.is_some() {
                     "session"
                 } else if s.project.is_some() {
                     "project"
@@ -1418,11 +1581,16 @@ impl PolicyStore {
         serde_json::json!({"revision":state.revision,"defaults":self.defaults,"projects":state.projects,"sessions":state.sessions.keys().map(|id| (id.clone(), self.resolve(&state,id))).collect::<BTreeMap<_,_>>()})
     }
     pub fn put_project(&self, id: Option<&str>, project: Project) -> Result<String> {
-        project.settings.validate()?;
-        if project.name.is_empty()
-            || project.name.chars().count() > 80
-            || project.name.chars().any(char::is_control)
-        {
+        self.put_project_patch(id, project.name, project.settings.into())
+    }
+    pub fn put_project_patch(
+        &self,
+        id: Option<&str>,
+        name: String,
+        settings: SettingsEdit,
+    ) -> Result<String> {
+        settings.resolve(On5hLimit::Wait).validate()?;
+        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
             bail!("invalid routing project name");
         }
         let id = id
@@ -1432,7 +1600,17 @@ impl PolicyStore {
             bail!("invalid routing project id");
         }
         self.update(|state| {
-            state.projects.insert(id.clone(), project);
+            let urgency = state
+                .projects
+                .get(&id)
+                .map_or(self.defaults.on_5h_limit, |p| p.settings.on_5h_limit);
+            state.projects.insert(
+                id.clone(),
+                Project {
+                    name,
+                    settings: settings.resolve(urgency),
+                },
+            );
             Ok(id)
         })
     }
@@ -1444,6 +1622,59 @@ impl PolicyStore {
         anchor: Option<&str>,
     ) -> Result<()> {
         self.edit_session(id, explicit, project, anchor, true)
+    }
+    /// Store urgency only, resolving the effective settings under the writer gate.
+    /// A supplied key must come from observed-root lookup or an authenticated
+    /// native launch with an exact session UUID. Never trust a display label.
+    pub fn set_session_urgent_for_key(
+        &self,
+        id: &str,
+        on_5h_limit: On5hLimit,
+        key: Option<&str>,
+    ) -> Result<()> {
+        if !valid_id(id, 64) {
+            bail!("invalid routing session id");
+        }
+        if key.is_some_and(|key| session_id(key) != id) {
+            bail!("routing handle does not match observed root");
+        }
+        self.update(|state| {
+            if !state.sessions.contains_key(id) {
+                let key = key.ok_or_else(|| anyhow::anyhow!("unknown routing session"))?;
+                let effective = state.policy_id(key);
+                let session =
+                    state
+                        .sessions
+                        .get(&effective)
+                        .cloned()
+                        .unwrap_or_else(|| SessionPolicy {
+                            project: None,
+                            baseline: self.defaults.clone(),
+                            explicit: None,
+                            anchor: None,
+                            urgency: None,
+                            movements: Vec::new(),
+                        });
+                state.sessions.insert(id.to_owned(), session);
+            }
+            let session = state.sessions.get_mut(id).unwrap();
+            if session.explicit.is_some()
+                || (session.urgency.is_none()
+                    && (session.project.is_some()
+                        || session.anchor.is_some()
+                        || !session.movements.is_empty()))
+            {
+                // Existing complete overrides/observed policies retain their
+                // established representation and every non-urgency setting.
+                let mut settings = session.settings(&self.defaults);
+                settings.on_5h_limit = on_5h_limit;
+                session.explicit = Some(settings);
+                session.urgency = None;
+            } else {
+                session.urgency = Some(on_5h_limit);
+            }
+            Ok(())
+        })
     }
     pub fn edit_session(
         &self,
@@ -1464,6 +1695,17 @@ impl PolicyStore {
         inherit: bool,
         key: Option<&str>,
     ) -> Result<()> {
+        self.edit_session_patch_for_key(id, explicit.map(Into::into), project, anchor, inherit, key)
+    }
+    pub fn edit_session_patch_for_key(
+        &self,
+        id: &str,
+        explicit: Option<SettingsEdit>,
+        project: Option<&str>,
+        anchor: Option<&str>,
+        inherit: bool,
+        key: Option<&str>,
+    ) -> Result<()> {
         if explicit.is_none() && project.is_none() && !inherit {
             bail!("routing edit requires policy, project or explicit inherit");
         }
@@ -1471,7 +1713,7 @@ impl PolicyStore {
             bail!("invalid routing session id");
         }
         if let Some(settings) = &explicit {
-            settings.validate()?;
+            settings.resolve(On5hLimit::Wait).validate()?;
         }
         self.update(|state| {
             if !state.sessions.contains_key(id) {
@@ -1495,6 +1737,15 @@ impl PolicyStore {
                     );
                 }
             }
+            let explicit = explicit.as_ref().map(|edit| {
+                let urgency = state
+                    .sessions
+                    .get(id)
+                    .map_or(self.defaults.on_5h_limit, |s| {
+                        s.settings(&self.defaults).on_5h_limit
+                    });
+                edit.resolve(urgency)
+            });
             let baseline = match project {
                 Some(p) => state
                     .projects
@@ -1515,6 +1766,7 @@ impl PolicyStore {
                     baseline: baseline.clone(),
                     explicit: None,
                     anchor: anchor.map(str::to_owned),
+                    urgency: None,
                     movements: Vec::new(),
                 });
             if let Some(project) = project {
@@ -1523,6 +1775,7 @@ impl PolicyStore {
             }
             if explicit.is_some() || inherit {
                 entry.explicit = explicit;
+                entry.urgency = None;
             }
             // Editing policy never silently chooses another account.
             if entry.anchor.is_none() {
@@ -1541,6 +1794,27 @@ impl PolicyStore {
         project: &str,
         anchor: Option<&str>,
     ) -> Result<()> {
+        self.associate_project_inner(key, project, anchor, None)
+    }
+    pub(crate) fn associate_managed_first_project(
+        &self,
+        evidence: crate::bindings::ManagedFirstProject<'_>,
+        project: &str,
+    ) -> Result<()> {
+        self.associate_project_inner(
+            evidence.key(),
+            project,
+            Some(evidence.account()),
+            Some(&evidence),
+        )
+    }
+    fn associate_project_inner(
+        &self,
+        key: &str,
+        project: &str,
+        anchor: Option<&str>,
+        managed: Option<&crate::bindings::ManagedFirstProject<'_>>,
+    ) -> Result<()> {
         if self.recovery_blocked.load(Ordering::Acquire)
             && self
                 .recovery_intent
@@ -1554,33 +1828,67 @@ impl PolicyStore {
         let id = self.snapshot().policy_id(key);
         {
             let state = self.snapshot();
-            if let Some(session) = state.sessions.get(&id) {
+            if managed.is_none()
+                && let Some(session) = state.sessions.get(&id)
+            {
                 if session.project.as_deref() == Some(project)
                     && (session.anchor.is_some() || anchor.is_none())
                 {
                     return Ok(());
                 }
-                if session.project.as_deref() != Some(project) {
+                if session.project.as_deref() != Some(project)
+                    && !(session.unassociated_launch_intent() && anchor.is_none())
+                {
                     bail!("routing project conflicts with existing session");
                 }
             }
         }
         self.update(|state| {
-            if let Some(session) = state.sessions.get_mut(&id) {
-                if session.project.as_deref() == Some(project) {
-                    if session.anchor.is_none() {
-                        session.anchor = anchor.map(str::to_owned);
-                    }
-                    return Ok(());
-                }
-                bail!("routing project conflicts with existing session");
-            }
+            // Resolve the owner-proved identity again under the writer gate.
+            let id = if managed.is_some() {
+                state.policy_id(key)
+            } else {
+                id
+            };
             let baseline = state
                 .projects
                 .get(project)
                 .ok_or_else(|| anyhow::anyhow!("unknown routing project"))?
                 .settings
                 .clone();
+            if let Some(session) = state.sessions.get_mut(&id) {
+                if managed.is_some()
+                    && session
+                        .anchor
+                        .as_deref()
+                        .is_some_and(|current| Some(current) != anchor)
+                {
+                    bail!("managed first-project account changed");
+                }
+                if session.project.as_deref() == Some(project) {
+                    if session.anchor.is_none() {
+                        session.anchor = anchor.map(str::to_owned);
+                    }
+                    return Ok(());
+                }
+                // Recheck under the writer gate: a concurrent explicit edit,
+                // anchor or different project must never be overwritten.
+                let fresh_managed = managed.is_some()
+                    && session.urgency.is_some()
+                    && session.project.is_none()
+                    && session.explicit.is_none()
+                    && session.movements.is_empty()
+                    && (session.anchor.is_none() || session.anchor.as_deref() == anchor);
+                if (session.unassociated_launch_intent() && anchor.is_none()) || fresh_managed {
+                    session.project = Some(project.to_owned());
+                    session.baseline = baseline;
+                    if fresh_managed {
+                        session.anchor = anchor.map(str::to_owned);
+                    }
+                    return Ok(());
+                }
+                bail!("routing project conflicts with existing session");
+            }
             state.sessions.insert(
                 id,
                 SessionPolicy {
@@ -1588,6 +1896,7 @@ impl PolicyStore {
                     baseline,
                     explicit: None,
                     anchor: anchor.map(str::to_owned),
+                    urgency: None,
                     movements: Vec::new(),
                 },
             );
@@ -1876,6 +2185,7 @@ impl PolicyStore {
                 baseline: self.defaults.clone(),
                 explicit: None,
                 anchor: previous.map(str::to_owned),
+                urgency: None,
                 movements: Vec::new(),
             });
             let from = entry.anchor.as_deref().or(previous).map(str::to_owned);
@@ -1974,7 +2284,903 @@ mod tests {
         Settings {
             mode,
             reset_wait_secs: 7,
+            on_5h_limit: On5hLimit::Wait,
         }
+    }
+
+    #[test]
+    fn r13_on_5h_limit_legacy_json_defaults_wait_and_explicit_move_roundtrips() {
+        let old: Settings =
+            serde_json::from_str(r#"{"mode":"strict","reset_wait_secs":7}"#).unwrap();
+        assert_eq!(old.on_5h_limit, On5hLimit::Wait);
+        assert_eq!(old.mode, Mode::Strict);
+        assert_eq!(Settings::default().on_5h_limit, On5hLimit::Wait);
+        let value = serde_json::json!({"mode":"recover","reset_wait_secs":7,"on_5h_limit":"move"});
+        let explicit: Settings = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(explicit.on_5h_limit, On5hLimit::Move);
+        assert_eq!(serde_json::to_value(&explicit).unwrap(), value);
+        for invalid in [
+            serde_json::json!({"mode":"strict","on_5h_limit":"wait"}),
+            serde_json::json!({"reset_wait_secs":7,"on_5h_limit":"wait"}),
+            serde_json::json!({"mode":"strict","reset_wait_secs":7,"on_5h_limit":"urgent"}),
+        ] {
+            assert!(serde_json::from_value::<Settings>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn r13_settings_edit_distinguishes_omission_from_invalid_urgency() {
+        let legacy = serde_json::json!({"mode":"strict","reset_wait_secs":23});
+        let omitted: SettingsEdit = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(omitted.on_5h_limit, None);
+        assert_eq!(
+            omitted.resolve(On5hLimit::Move).on_5h_limit,
+            On5hLimit::Move
+        );
+        for (value, expected) in [("wait", On5hLimit::Wait), ("move", On5hLimit::Move)] {
+            let mut edit = legacy.clone();
+            edit["on_5h_limit"] = value.into();
+            let edit: SettingsEdit = serde_json::from_value(edit).unwrap();
+            assert_eq!(edit.on_5h_limit, Some(expected));
+            assert_eq!(edit.resolve(On5hLimit::Move).on_5h_limit, expected);
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!("urgent"),
+            serde_json::json!([]),
+        ] {
+            let mut edit = legacy.clone();
+            edit["on_5h_limit"] = invalid;
+            assert!(serde_json::from_value::<SettingsEdit>(edit).is_err());
+        }
+        let mut unknown = legacy.clone();
+        unknown["urgent"] = true.into();
+        assert!(serde_json::from_value::<SettingsEdit>(unknown).is_err());
+        for missing in ["mode", "reset_wait_secs"] {
+            let mut edit = legacy.clone();
+            edit.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<SettingsEdit>(edit).is_err());
+        }
+    }
+
+    #[test]
+    fn r13_on_5h_limit_persists_root_and_frozen_project_inheritance() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let move_settings = Settings {
+            on_5h_limit: On5hLimit::Move,
+            ..settings(Mode::Recover)
+        };
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "r13-policy".into(),
+                    settings: move_settings.clone(),
+                },
+            )
+            .unwrap();
+        store.associate("claude:r13-project", &project).unwrap();
+        store
+            .set_session(
+                &session_id("claude:r13-root"),
+                Some(move_settings.clone()),
+                None,
+                None,
+            )
+            .unwrap();
+        // D20 baselines are frozen: later project edits affect only new roots.
+        store
+            .put_project(
+                Some(&project),
+                Project {
+                    name: "r13-policy".into(),
+                    settings: settings(Mode::Recover),
+                },
+            )
+            .unwrap();
+        store.associate("claude:r13-new-project", &project).unwrap();
+        drop(store);
+        let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        for key in [
+            "claude:r13-root",
+            "claude:r13-root:agent:child",
+            "claude:r13-project",
+            "claude:r13-project:agent:child",
+        ] {
+            assert_eq!(restarted.plan(Some(key)).settings, move_settings);
+        }
+        assert_eq!(
+            restarted
+                .plan(Some("claude:r13-new-project"))
+                .settings
+                .on_5h_limit,
+            On5hLimit::Wait
+        );
+        assert_eq!(
+            restarted
+                .plan(Some("claude:r13-unassigned"))
+                .settings
+                .on_5h_limit,
+            On5hLimit::Wait
+        );
+    }
+
+    #[test]
+    fn r13_on_5h_limit_is_independent_of_strict_mode_and_wait_bounds() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        for policy in [On5hLimit::Wait, On5hLimit::Move] {
+            let home = tempfile::tempdir_in(&root).unwrap();
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            let strict = Settings {
+                on_5h_limit: policy,
+                ..settings(Mode::Strict)
+            };
+            store
+                .set_session(
+                    &session_id("claude:r13-strict"),
+                    Some(strict.clone()),
+                    None,
+                    Some("cx-a"),
+                )
+                .unwrap();
+            drop(store);
+            let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            assert_eq!(
+                restarted
+                    .plan(Some("claude:r13-strict:agent:child"))
+                    .settings,
+                strict
+            );
+            assert!(restarted.permits_dispatch(Some("claude:r13-strict"), "cx-a"));
+            assert!(!restarted.permits_dispatch(Some("claude:r13-strict"), "cx-b"));
+            assert!(
+                Settings {
+                    reset_wait_secs: 120,
+                    ..strict.clone()
+                }
+                .validate()
+                .is_ok()
+            );
+            assert!(
+                Settings {
+                    reset_wait_secs: 121,
+                    ..strict
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn r13_urgent_toggle_preserves_strict_project_baseline_and_anchor() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "strict-urgency".into(),
+                    settings: settings(Mode::Strict),
+                },
+            )
+            .unwrap();
+        let key = "claude:r13-toggle";
+        let id = session_id(key);
+        store
+            .associate_with_anchor(key, &project, Some("cx-a"))
+            .unwrap();
+        let before = store.snapshot().sessions[&id].clone();
+        for policy in [On5hLimit::Move, On5hLimit::Wait] {
+            store
+                .set_session_urgent_for_key(&id, policy, Some(key))
+                .unwrap();
+            let snapshot = store.snapshot();
+            let after = &snapshot.sessions[&id];
+            assert_eq!(after.baseline, before.baseline);
+            assert_eq!(after.project, before.project);
+            assert_eq!(after.anchor, before.anchor);
+            assert_eq!(
+                serde_json::to_value(&after.movements).unwrap(),
+                serde_json::to_value(&before.movements).unwrap()
+            );
+            let effective = after.explicit.as_ref().unwrap();
+            assert_eq!(effective.mode, Mode::Strict);
+            assert_eq!(effective.reset_wait_secs, before.baseline.reset_wait_secs);
+            assert_eq!(effective.on_5h_limit, policy);
+            assert!(store.permits_dispatch(Some(key), "cx-a"));
+            assert!(!store.permits_dispatch(Some(key), "cx-b"));
+        }
+        assert_eq!(
+            store.snapshot().projects[&project].settings.on_5h_limit,
+            On5hLimit::Wait
+        );
+    }
+
+    #[test]
+    fn r13_urgent_rejects_unobserved_id_and_accepts_matching_observed_root() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let key = "codex:r13-observed";
+        let id = session_id(key);
+        assert!(
+            store
+                .set_session_urgent_for_key("invalid", On5hLimit::Move, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .set_session_urgent_for_key(&id, On5hLimit::Move, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .set_session_urgent_for_key(&id, On5hLimit::Move, Some("codex:wrong"))
+                .is_err()
+        );
+        assert!(store.snapshot().sessions.is_empty());
+        store
+            .set_session_urgent_for_key(&id, On5hLimit::Move, Some(key))
+            .unwrap();
+        let before = store.plan(Some(key));
+        assert_eq!(before.settings.mode, Mode::Rebalance);
+        assert_eq!(before.settings.reset_wait_secs, 60);
+        assert_eq!(before.settings.on_5h_limit, On5hLimit::Move);
+        store
+            .set_session_urgent_for_key(&id, On5hLimit::Wait, None)
+            .unwrap();
+        drop(store);
+        let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert_eq!(
+            restarted.plan(Some(key)).settings.on_5h_limit,
+            On5hLimit::Wait
+        );
+    }
+
+    #[test]
+    fn r13_urgency_only_uses_current_defaults_then_frozen_project_after_restart() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let key = "claude:12345678-1234-4321-abcd-123456789abc";
+        let id = session_id(key);
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .set_session_urgent_for_key(&id, On5hLimit::Move, Some(key))
+            .unwrap();
+        let saved = serde_json::to_value(&store.snapshot().sessions[&id]).unwrap();
+        assert!(saved["explicit"].is_null());
+        assert_eq!(saved["urgency"], "move");
+        drop(store);
+        let defaults = Settings {
+            mode: Mode::Recover,
+            reset_wait_secs: 37,
+            on_5h_limit: On5hLimit::Wait,
+        };
+        let store = PolicyStore::new(home.path(), defaults).unwrap();
+        let before = store.plan(Some(key));
+        assert_eq!(before.settings.mode, Mode::Recover);
+        assert_eq!(before.settings.reset_wait_secs, 37);
+        assert_eq!(before.settings.on_5h_limit, On5hLimit::Move);
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "strict baseline".into(),
+                    settings: Settings {
+                        mode: Mode::Strict,
+                        reset_wait_secs: 23,
+                        on_5h_limit: On5hLimit::Wait,
+                    },
+                },
+            )
+            .unwrap();
+        store.associate(key, &project).unwrap();
+        store
+            .set_session_urgent_for_key(&id, On5hLimit::Wait, None)
+            .unwrap();
+        drop(store);
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let after = store.plan(Some(key));
+        assert_eq!(after.project.as_deref(), Some(project.as_str()));
+        assert_eq!(after.settings.mode, Mode::Strict);
+        assert_eq!(after.settings.reset_wait_secs, 23);
+        assert_eq!(after.settings.on_5h_limit, On5hLimit::Wait);
+        assert!(store.snapshot().sessions[&id].explicit.is_none());
+    }
+
+    #[test]
+    fn r13_urgency_only_first_association_rechecks_concurrent_explicit_edit() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
+        let key = "claude:12345678-1234-4321-abcd-123456789abc";
+        let id = session_id(key);
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "first strict".into(),
+                    settings: settings(Mode::Strict),
+                },
+            )
+            .unwrap();
+        store
+            .set_session_urgent_for_key(&id, On5hLimit::Move, Some(key))
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        let writer_id = id.clone();
+        let edit = std::thread::spawn(move || {
+            writer.update(|state| {
+                let session = state.sessions.get_mut(&writer_id).unwrap();
+                session.explicit = Some(Settings {
+                    mode: Mode::Recover,
+                    reset_wait_secs: 31,
+                    on_5h_limit: On5hLimit::Move,
+                });
+                session.urgency = None;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let associating = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let association = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(associating.associate(key, &project).is_err())
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(30))
+            .is_err();
+        release_tx.send(()).unwrap();
+        edit.join().unwrap().unwrap();
+        association.join().unwrap();
+        assert!(blocked);
+        assert!(done_rx.recv().unwrap());
+        let plan = store.plan(Some(key));
+        assert_eq!(plan.settings.mode, Mode::Recover);
+        assert_eq!(plan.settings.reset_wait_secs, 31);
+        assert_eq!(plan.settings.on_5h_limit, On5hLimit::Move);
+        assert!(plan.project.is_none());
+    }
+
+    #[test]
+    fn r13_urgency_only_does_not_authorize_anchored_or_different_project_reassociation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let key = "claude:12345678-1234-4321-abcd-123456789abc";
+        let id = session_id(key);
+        let first = store
+            .put_project(
+                None,
+                Project {
+                    name: "one".into(),
+                    settings: settings(Mode::Strict),
+                },
+            )
+            .unwrap();
+        let other = store
+            .put_project(
+                None,
+                Project {
+                    name: "two".into(),
+                    settings: settings(Mode::Recover),
+                },
+            )
+            .unwrap();
+        store
+            .set_session_urgent_for_key(&id, On5hLimit::Move, Some(key))
+            .unwrap();
+        let before = policy_digest(&store.snapshot()).unwrap();
+        assert!(
+            store
+                .associate_with_anchor(key, &first, Some("cl-a"))
+                .is_err()
+        );
+        assert_eq!(policy_digest(&store.snapshot()).unwrap(), before);
+        store.associate(key, &first).unwrap();
+        let before = policy_digest(&store.snapshot()).unwrap();
+        assert!(store.associate(key, &other).is_err());
+        assert_eq!(policy_digest(&store.snapshot()).unwrap(), before);
+    }
+
+    #[test]
+    fn r13_urgent_legacy_child_copies_intent_without_editing_parent() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let parent = session_id("codex:r13-legacy");
+        let key = "codex:r13-legacy:agent:child";
+        let child = session_id(key);
+        store
+            .set_session(&parent, Some(settings(Mode::Strict)), None, Some("cx-a"))
+            .unwrap();
+        store
+            .update(|state| {
+                state.legacy_codex_roots.insert(parent.clone());
+                Ok(())
+            })
+            .unwrap();
+        let before = serde_json::to_value(&store.snapshot().sessions[&parent]).unwrap();
+        store
+            .set_session_urgent_for_key(&child, On5hLimit::Move, Some(key))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&store.snapshot().sessions[&parent]).unwrap(),
+            before
+        );
+        assert_eq!(store.plan(Some(key)).settings.on_5h_limit, On5hLimit::Move);
+        assert_eq!(store.plan(Some(key)).settings.mode, Mode::Strict);
+        assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
+    }
+
+    #[test]
+    fn r13_urgent_atomic_update_preserves_concurrent_mode_edit() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
+        let key = "claude:r13-atomic-urgent";
+        let id = session_id(key);
+        store
+            .set_session(&id, Some(settings(Mode::Recover)), None, Some("cx-a"))
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        let writer_id = id.clone();
+        let mode_edit = std::thread::spawn(move || {
+            writer.update(|state| {
+                let settings = state
+                    .sessions
+                    .get_mut(&writer_id)
+                    .unwrap()
+                    .explicit
+                    .as_mut()
+                    .unwrap();
+                settings.mode = Mode::Strict;
+                settings.reset_wait_secs = 19;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let urgent_store = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let urgent_edit = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = urgent_store.set_session_urgent_for_key(&id, On5hLimit::Move, Some(key));
+            done_tx.send(()).unwrap();
+            result
+        });
+        started_rx.recv().unwrap();
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err();
+        release_tx.send(()).unwrap();
+        mode_edit.join().unwrap().unwrap();
+        urgent_edit.join().unwrap().unwrap();
+        assert!(blocked);
+        let settings = store.plan(Some(key)).settings;
+        assert_eq!(settings.mode, Mode::Strict);
+        assert_eq!(settings.reset_wait_secs, 19);
+        assert_eq!(settings.on_5h_limit, On5hLimit::Move);
+        assert!(!store.permits_dispatch(Some(key), "cx-b"));
+    }
+
+    // Independent old-format fixture: digest the historical serializer's exact
+    // field order, not the migration helper or a sorted serde_json::Value map.
+    fn r13_prior_pair(mode: Mode) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let path = home.path().join("routing-policies.json");
+        let id = session_id("claude:r13-prior-pair");
+        let project = "a".repeat(32);
+        let mode = serde_json::to_string(&mode).unwrap();
+        let settings = format!(r#"{{"mode":{mode},"reset_wait_secs":17}}"#);
+        let raw = format!(
+            r#"{{"schema":2,"revision":7,"projects":{{"{project}":{{"name":"old-project","settings":{settings}}}}},"sessions":{{"{id}":{{"project":"{project}","baseline":{settings},"explicit":{settings},"anchor":"cx-a","movements":[]}}}},"legacy_codex_roots":[]}}"#
+        );
+        let state: State = serde_json::from_str(&raw).unwrap();
+        let mut witness =
+            serde_json::to_value(strict_intent(&state, &Settings::default())).unwrap();
+        fn old_settings(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("on_5h_limit");
+                    for child in map.values_mut() {
+                        old_settings(child);
+                    }
+                }
+                serde_json::Value::Array(array) => {
+                    for child in array {
+                        old_settings(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        old_settings(&mut witness);
+        let fence = serde_json::json!({"schema":2,"revision":7,
+            "digest":format!("{:x}", Sha256::digest(raw.as_bytes())),
+            "strict":witness,"pending":false});
+        crate::bindings::atomic_write(&path, raw.as_bytes()).unwrap();
+        crate::bindings::atomic_write(&fence_path(&path), &serde_json::to_vec(&fence).unwrap())
+            .unwrap();
+        (home, path, id)
+    }
+
+    #[test]
+    fn r13_prior_settings_fence_upgrades_strict_and_nonstrict_pairs() {
+        for mode in [Mode::Strict, Mode::Recover] {
+            let (_home, path, id) = r13_prior_pair(mode);
+            let original = fs::read(&path).unwrap();
+            let before = read_fence(&path).unwrap().unwrap();
+            let recovery = recover_policy(&path, &Settings::default(), None, None, None);
+            assert!(!recovery.degraded);
+            assert!(!recovery.blocked);
+            assert!(recovery.seen);
+            assert_eq!(
+                recovery.state.sessions[&id]
+                    .settings(&Settings::default())
+                    .mode,
+                mode
+            );
+            assert_eq!(
+                recovery.state.sessions[&id]
+                    .settings(&Settings::default())
+                    .on_5h_limit,
+                On5hLimit::Wait
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let after = read_fence(&path).unwrap().unwrap();
+            assert_eq!(after.revision, before.revision);
+            assert!(!after.pending);
+            assert_ne!(after.digest, before.digest);
+            assert_eq!(after.digest, policy_digest(&recovery.state).unwrap());
+            assert_eq!(
+                policy_digest(&after.strict.unwrap()).unwrap(),
+                policy_digest(&before.strict.unwrap()).unwrap()
+            );
+            let reopened = recover_policy(&path, &Settings::default(), None, None, None);
+            assert!(!reopened.degraded);
+        }
+    }
+
+    #[test]
+    fn r13_urgency_only_cannot_be_erased_by_prior_settings_fence_fallback() {
+        for urgency in [On5hLimit::Move, On5hLimit::Wait] {
+            let (_home, path, id) = r13_prior_pair(Mode::Strict);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["sessions"][&id]["urgency"] = serde_json::to_value(urgency).unwrap();
+            let state: State = serde_json::from_value(value.clone()).unwrap();
+            assert!(prior_settings_digest(&state).unwrap().is_none());
+            crate::bindings::atomic_write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+            let recovery = recover_policy(&path, &Settings::default(), None, None, None);
+            assert!(recovery.degraded);
+            assert!(recovery.blocked);
+            assert_eq!(recovery.state.sessions[&id].anchor.as_deref(), Some("cx-a"));
+        }
+    }
+
+    #[test]
+    fn r13_urgency_only_current_fence_detects_tamper_and_retains_strict_witness() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let key = "claude:12345678-1234-4321-abcd-123456789abc";
+        let id = session_id(key);
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "strict".into(),
+                    settings: settings(Mode::Strict),
+                },
+            )
+            .unwrap();
+        store
+            .set_session_urgent_for_key(&id, On5hLimit::Move, Some(key))
+            .unwrap();
+        store.associate(key, &project).unwrap();
+        store
+            .dispatch(Some(key), "cl-a", None, "placement", Utc::now())
+            .unwrap();
+        let path = store.path.clone();
+        let fence = read_fence(&path).unwrap().unwrap();
+        assert_eq!(
+            fence.digest,
+            policy_digest(&durable_state(&store.snapshot(), &store.defaults)).unwrap()
+        );
+        let witness = fence.strict.unwrap();
+        assert_eq!(
+            witness.sessions[&id].settings(&store.defaults).on_5h_limit,
+            On5hLimit::Move
+        );
+        assert_eq!(witness.sessions[&id].anchor.as_deref(), Some("cl-a"));
+        drop(store);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["sessions"][&id]["urgency"] = "wait".into();
+        crate::bindings::atomic_write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        let recovered = recover_policy(&path, &Settings::default(), None, None, None);
+        assert!(recovered.degraded);
+        assert!(recovered.blocked);
+        assert_eq!(
+            recovered.state.sessions[&id].anchor.as_deref(),
+            Some("cl-a")
+        );
+    }
+
+    #[test]
+    fn r13_prior_settings_fence_rejects_tampering_and_explicit_move() {
+        for mode in [Mode::Strict, Mode::Recover] {
+            for field in ["reset_wait_secs", "anchor", "on_5h_limit"] {
+                let (_home, path, id) = r13_prior_pair(mode);
+                let mut state: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                match field {
+                    "anchor" => state["sessions"][&id]["anchor"] = "cx-b".into(),
+                    "reset_wait_secs" => state["sessions"][&id]["explicit"][field] = 18.into(),
+                    _ => state["sessions"][&id]["explicit"][field] = "move".into(),
+                }
+                crate::bindings::atomic_write(&path, &serde_json::to_vec(&state).unwrap()).unwrap();
+                let recovery = recover_policy(&path, &Settings::default(), None, None, None);
+                assert!(recovery.degraded, "{mode:?} {field}");
+                assert_eq!(recovery.blocked, mode == Mode::Strict);
+            }
+        }
+    }
+
+    #[test]
+    fn r13_prior_settings_fence_preserves_pending_revision_and_witness_guards() {
+        for guard in ["pending", "revision", "witness"] {
+            let (_home, path, id) = r13_prior_pair(Mode::Strict);
+            let mut fence: serde_json::Value =
+                serde_json::from_slice(&fs::read(fence_path(&path)).unwrap()).unwrap();
+            match guard {
+                "pending" => fence["pending"] = true.into(),
+                "revision" => fence["revision"] = 8.into(),
+                _ => fence["strict"]["sessions"][&id]["anchor"] = "cx-b".into(),
+            }
+            let original = serde_json::to_vec(&fence).unwrap();
+            crate::bindings::atomic_write(&fence_path(&path), &original).unwrap();
+            let recovery = recover_policy(&path, &Settings::default(), None, None, None);
+            assert!(recovery.degraded, "{guard}");
+            assert!(recovery.blocked);
+            assert_eq!(fs::read(fence_path(&path)).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn r13_prior_settings_fence_preserves_live_generation_guard() {
+        for newer_revision in [false, true] {
+            let (_home, path, _id) = r13_prior_pair(Mode::Strict);
+            let original = fs::read(fence_path(&path)).unwrap();
+            let generation = (if newer_revision { 8 } else { 7 }, "0".repeat(64));
+            let recovery =
+                recover_policy(&path, &Settings::default(), None, None, Some(&generation));
+            assert!(recovery.degraded);
+            assert!(recovery.blocked);
+            assert_eq!(fs::read(fence_path(&path)).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn r13_omitted_urgency_preserves_project_and_explicit_session_edits() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "urgent".into(),
+                    settings: Settings {
+                        on_5h_limit: On5hLimit::Move,
+                        ..settings(Mode::Strict)
+                    },
+                },
+            )
+            .unwrap();
+        let omitted = SettingsEdit {
+            mode: Mode::Strict,
+            reset_wait_secs: 19,
+            on_5h_limit: None,
+        };
+        store
+            .put_project_patch(Some(&project), "renamed".into(), omitted.clone())
+            .unwrap();
+        assert_eq!(
+            store.snapshot().projects[&project].settings.on_5h_limit,
+            On5hLimit::Move
+        );
+        let key = "claude:r13-omitted-urgent";
+        let id = session_id(key);
+        store
+            .associate_with_anchor(key, &project, Some("cx-a"))
+            .unwrap();
+        let before = store.snapshot().sessions[&id].clone();
+        store
+            .edit_session_patch_for_key(
+                &id,
+                Some(omitted.clone()),
+                None,
+                Some("cx-b"),
+                false,
+                Some(key),
+            )
+            .unwrap();
+        let snapshot = store.snapshot();
+        let after = &snapshot.sessions[&id];
+        assert_eq!(after.baseline, before.baseline);
+        assert_eq!(after.project, before.project);
+        assert_eq!(after.anchor, before.anchor);
+        assert_eq!(after.movements, before.movements);
+        assert_eq!(
+            after.explicit.as_ref().unwrap().on_5h_limit,
+            On5hLimit::Move
+        );
+        assert_eq!(after.explicit.as_ref().unwrap().mode, Mode::Strict);
+        assert!(!store.permits_dispatch(Some(key), "cx-b"));
+        for urgency in [On5hLimit::Wait, On5hLimit::Move] {
+            let explicit = SettingsEdit {
+                on_5h_limit: Some(urgency),
+                ..omitted.clone()
+            };
+            store
+                .edit_session_patch_for_key(&id, Some(explicit), None, None, false, Some(key))
+                .unwrap();
+            assert_eq!(store.plan(Some(key)).settings.on_5h_limit, urgency);
+        }
+    }
+
+    #[test]
+    fn r13_legacy_edit_after_each_urgent_toggle_preserves_latest_policy_and_anchor() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let key = "claude:r13-legacy-after-toggle";
+        let id = session_id(key);
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "strict-legacy-edit".into(),
+                    settings: settings(Mode::Strict),
+                },
+            )
+            .unwrap();
+        store
+            .associate_with_anchor(key, &project, Some("cx-a"))
+            .unwrap();
+        let before = store.snapshot().sessions[&id].clone();
+        for urgency in [On5hLimit::Move, On5hLimit::Wait] {
+            store
+                .set_session_urgent_for_key(&id, urgency, Some(key))
+                .unwrap();
+            let edit: SettingsEdit =
+                serde_json::from_str(r#"{"mode":"strict","reset_wait_secs":23}"#).unwrap();
+            store
+                .edit_session_patch_for_key(&id, Some(edit), None, None, false, Some(key))
+                .unwrap();
+            let plan = store.plan(Some(key));
+            assert_eq!(plan.settings.mode, Mode::Strict);
+            assert_eq!(plan.settings.reset_wait_secs, 23);
+            assert_eq!(plan.settings.on_5h_limit, urgency);
+            assert_eq!(plan.anchor.as_deref(), Some("cx-a"));
+            let snapshot = store.snapshot();
+            let after = &snapshot.sessions[&id];
+            assert_eq!(after.baseline, before.baseline);
+            assert_eq!(after.project, before.project);
+            assert_eq!(after.anchor, before.anchor);
+            assert_eq!(after.movements, before.movements);
+            assert!(store.permits_dispatch(Some(key), "cx-a"));
+            assert!(!store.permits_dispatch(Some(key), "cx-b"));
+        }
+        drop(store);
+        let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert_eq!(
+            restarted.plan(Some(key)).settings.on_5h_limit,
+            On5hLimit::Wait
+        );
+        assert_eq!(restarted.plan(Some(key)).settings.reset_wait_secs, 23);
+        assert!(!restarted.permits_dispatch(Some(key), "cx-b"));
+    }
+
+    #[test]
+    fn r13_omitted_urgency_resolves_after_concurrent_toggle_under_writer_gate() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
+        let key = "claude:r13-omitted-atomic";
+        let id = session_id(key);
+        store
+            .set_session(&id, Some(settings(Mode::Strict)), None, Some("cx-a"))
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        let writer_id = id.clone();
+        let toggle = std::thread::spawn(move || {
+            writer.update(|state| {
+                state
+                    .sessions
+                    .get_mut(&writer_id)
+                    .unwrap()
+                    .explicit
+                    .as_mut()
+                    .unwrap()
+                    .on_5h_limit = On5hLimit::Move;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let editor = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let edit = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = editor.edit_session_patch_for_key(
+                &id,
+                Some(SettingsEdit {
+                    mode: Mode::Strict,
+                    reset_wait_secs: 19,
+                    on_5h_limit: None,
+                }),
+                None,
+                None,
+                false,
+                Some(key),
+            );
+            done_tx.send(()).unwrap();
+            result
+        });
+        started_rx.recv().unwrap();
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err();
+        release_tx.send(()).unwrap();
+        toggle.join().unwrap().unwrap();
+        edit.join().unwrap().unwrap();
+        assert!(blocked);
+        let result = store.plan(Some(key));
+        assert_eq!(result.settings.on_5h_limit, On5hLimit::Move);
+        assert_eq!(result.settings.mode, Mode::Strict);
+        assert_eq!(result.settings.reset_wait_secs, 19);
+        assert_eq!(result.anchor.as_deref(), Some("cx-a"));
     }
     fn r11_consent(
         store: &PolicyStore,
@@ -2058,6 +3264,7 @@ mod tests {
                 Some(Settings {
                     mode: Mode::Recover,
                     reset_wait_secs: 0,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 None,
@@ -2508,6 +3715,7 @@ mod tests {
                             baseline: settings(Mode::Rebalance),
                             explicit: Some(settings(Mode::Rebalance)),
                             anchor: Some("cx-b".into()),
+                            urgency: None,
                             movements: vec![Movement {
                                 id: None,
                                 from: "cx-a".into(),
@@ -2942,6 +4150,7 @@ mod tests {
                             baseline: Settings::default(),
                             explicit: None,
                             anchor: Some("cx-a".into()),
+                            urgency: None,
                             movements: Vec::new(),
                         },
                     );
@@ -3225,7 +4434,8 @@ mod tests {
         assert!(
             Settings {
                 mode: Mode::Strict,
-                reset_wait_secs: 121
+                reset_wait_secs: 121,
+                on_5h_limit: On5hLimit::Wait,
             }
             .validate()
             .is_err()
@@ -3716,6 +4926,7 @@ mod tests {
                 baseline: Settings::default(),
                 explicit: None,
                 anchor: Some("cx-b".into()),
+                urgency: None,
                 movements: Vec::new(),
             },
         );
@@ -3745,6 +4956,7 @@ mod tests {
                 baseline: Settings::default(),
                 explicit: None,
                 anchor: Some("cx-a".into()),
+                urgency: None,
                 movements: Vec::new(),
             },
         );
@@ -3829,6 +5041,7 @@ mod tests {
                     baseline: Settings::default(),
                     explicit: explicit.then(Settings::default),
                     anchor: Some("cx-b".into()),
+                    urgency: None,
                     movements: vec![Movement {
                         id: Some(format!("{n:032x}")),
                         from: "cx-a".into(),
@@ -4667,6 +5880,7 @@ mod tests {
                             baseline: Settings::default(),
                             explicit: None,
                             anchor: Some("cx-original".into()),
+                            urgency: None,
                             movements: Vec::new(),
                         },
                     )]),
@@ -4797,6 +6011,7 @@ mod issue_operation_writer_tests {
                 Settings {
                     mode: Mode::Strict,
                     reset_wait_secs: 7,
+                    on_5h_limit: On5hLimit::Wait,
                 },
             )
             .unwrap(),
@@ -4853,6 +6068,7 @@ mod issue_operation_writer_tests {
             Settings {
                 mode: Mode::Strict,
                 reset_wait_secs: 7,
+                on_5h_limit: On5hLimit::Wait,
             },
         )
         .unwrap();

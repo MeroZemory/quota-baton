@@ -76,6 +76,66 @@ pub struct WsQuotaWaitEvent {
     pub deadline: tokio::time::Instant,
 }
 
+/// Read-only bounds of a genuine native result, never proof or send authority.
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+pub struct HttpQuotaWaitResultBounds {
+    pub source: String,
+    pub reset_at: chrono::DateTime<chrono::Utc>,
+    pub wake: tokio::time::Instant,
+    pub deadline: tokio::time::Instant,
+}
+
+/// One owner-local, first-inspection delivery barrier. Drop releases the worker.
+#[cfg(feature = "testkit")]
+pub struct HttpQuotaWaitResultGate {
+    entered: tokio::sync::oneshot::Receiver<HttpQuotaWaitResultBounds>,
+    release: Option<std::sync::mpsc::SyncSender<()>>,
+}
+
+#[cfg(feature = "testkit")]
+impl HttpQuotaWaitResultGate {
+    pub async fn entered(
+        &mut self,
+    ) -> Result<HttpQuotaWaitResultBounds, tokio::sync::oneshot::error::RecvError> {
+        (&mut self.entered).await
+    }
+
+    pub fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.try_send(());
+        }
+    }
+}
+
+#[cfg(feature = "testkit")]
+impl Drop for HttpQuotaWaitResultGate {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.try_send(());
+        }
+    }
+}
+
+#[cfg(feature = "testkit")]
+struct HttpQuotaWaitResultHold {
+    key: String,
+    source: String,
+    entered: tokio::sync::oneshot::Sender<HttpQuotaWaitResultBounds>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(feature = "testkit")]
+impl HttpQuotaWaitResultHold {
+    fn wait(self, bounds: HttpQuotaWaitResultBounds) {
+        if self.entered.send(bounds).is_ok() {
+            self.release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("bounded native-result delivery gate abandoned");
+        }
+    }
+}
+
 pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
     pub quota: Arc<crate::quota::UsagePoller>,
@@ -109,6 +169,10 @@ pub struct RelayState {
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     #[cfg(feature = "testkit")]
     http_quota_wait_events: tokio::sync::broadcast::Sender<HttpQuotaWaitEvent>,
+    #[cfg(feature = "testkit")]
+    http_quota_wait_inspections: tokio::sync::broadcast::Sender<HttpQuotaWaitEvent>,
+    #[cfg(feature = "testkit")]
+    http_quota_wait_result_hold: Mutex<Option<HttpQuotaWaitResultHold>>,
     #[cfg(feature = "testkit")]
     ws_quota_wait_events: tokio::sync::broadcast::Sender<WsQuotaWaitEvent>,
     draining: AtomicBool,
@@ -421,6 +485,62 @@ impl RelayState {
         self.http_quota_wait_events.subscribe()
     }
 
+    /// Arm exactly one matching first-result delivery gate on this relay.
+    #[cfg(feature = "testkit")]
+    pub fn hold_next_http_quota_wait_result(
+        &self,
+        key: &str,
+        source: &str,
+    ) -> HttpQuotaWaitResultGate {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut slot = self.http_quota_wait_result_hold.lock().unwrap();
+        assert!(slot.is_none(), "one delivery gate per relay");
+        *slot = Some(HttpQuotaWaitResultHold {
+            key: key.to_owned(),
+            source: source.to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        HttpQuotaWaitResultGate {
+            entered: entered_rx,
+            release: Some(release_tx),
+        }
+    }
+
+    #[cfg(feature = "testkit")]
+    fn take_http_quota_wait_result_hold(
+        &self,
+        key: &str,
+        source: &str,
+    ) -> Option<HttpQuotaWaitResultHold> {
+        let mut slot = self.http_quota_wait_result_hold.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|hold| hold.key == key && hold.source == source)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// Observation only; separate channel preserves existing wait-event order.
+    #[cfg(feature = "testkit")]
+    pub fn subscribe_http_quota_wait_inspections(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<HttpQuotaWaitEvent> {
+        self.http_quota_wait_inspections.subscribe()
+    }
+
+    #[cfg(feature = "testkit")]
+    fn observe_http_quota_wait_inspection(&self, stage: &'static str, source: &str) {
+        let _ = self.http_quota_wait_inspections.send(HttpQuotaWaitEvent {
+            stage,
+            source: source.to_owned(),
+        });
+    }
+
     #[cfg(feature = "testkit")]
     fn observe_http_quota_wait(&self, stage: &'static str, source: &str) {
         let _ = self.http_quota_wait_events.send(HttpQuotaWaitEvent {
@@ -616,6 +736,10 @@ impl RelayState {
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testkit")]
             http_quota_wait_events: tokio::sync::broadcast::channel(32).0,
+            #[cfg(feature = "testkit")]
+            http_quota_wait_inspections: tokio::sync::broadcast::channel(32).0,
+            #[cfg(feature = "testkit")]
+            http_quota_wait_result_hold: Mutex::new(None),
             #[cfg(feature = "testkit")]
             ws_quota_wait_events: tokio::sync::broadcast::channel(32).0,
             draining: AtomicBool::new(false),

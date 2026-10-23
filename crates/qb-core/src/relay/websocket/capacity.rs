@@ -279,6 +279,7 @@ mod tests {
                         Some(crate::routing::Settings {
                             mode: crate::routing::Mode::Strict,
                             reset_wait_secs: 0,
+                            on_5h_limit: crate::routing::On5hLimit::Wait,
                         }),
                         None,
                         Some(&a_id),
