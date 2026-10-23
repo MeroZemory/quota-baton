@@ -996,3 +996,83 @@ async fn managed_episode_consume_timeout_disables_auto_without_whole_run_expiry(
         proof.cleaned(false);
     }).await;
 }
+
+#[tokio::test]
+async fn managed_episode_delayed_consume_blocked_write_keeps_original_candidate_deadline() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let peer = async {
+            stopped_dialogue(&mut ui, &proof).await;
+            waiting(&mut core).await;
+            ready(&mut core, &proof).await;
+            final_native_reply(&proof);
+            let consume = core_request(&mut core).await;
+            let consume_at = Instant::now();
+            assert!(matches!(
+                consume.command,
+                Command::Consume { episode: EPISODE }
+            ));
+            let before = {
+                let mut state = proof.state.lock().unwrap();
+                state.block = true;
+                state.input.len()
+            };
+            // Spend part of this candidate's existing budget in the real
+            // Consume exchange. Physical admission must not refill five seconds.
+            tokio::time::sleep_until(consume_at + Duration::from_secs(2)).await;
+            core_reply(
+                &mut core,
+                Some(consume.request_id),
+                Event::Granted { episode: EPISODE },
+            )
+            .await;
+            loop {
+                let entered = proof.entered.notified();
+                tokio::pin!(entered);
+                entered.as_mut().enable();
+                {
+                    let state = proof.state.lock().unwrap();
+                    if state.writing && state.block {
+                        assert!(!state.stopped, "activation_write_started_before_watchdog");
+                        assert_eq!(state.input.len(), before, "activation_payload_is_blocked");
+                        break;
+                    }
+                }
+                // Earlier ordinary writes may have left a Notify permit; the
+                // checked writer state, rather than that permit, is the barrier.
+                entered.await;
+            }
+            consume_at
+        };
+        let run = async {
+            let result = owner.run().await;
+            (result, Instant::now())
+        };
+        let ((result, stopped_at), consume_at) = tokio::join!(run, peer);
+        let elapsed = stopped_at.duration_since(consume_at);
+        assert_eq!(result, Err(Error::Watchdog));
+        assert!(
+            elapsed >= Duration::from_millis(4500),
+            "original_candidate_deadline_not_early: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(6500),
+            "original_candidate_deadline_not_refilled_after_consume: {elapsed:?}"
+        );
+        proof.cleaned(true);
+        assert_eq!(
+            proof.automatic_count(),
+            0,
+            "blocked activation delivered no frame"
+        );
+        closed(&mut core).await;
+    })
+    .await;
+}
