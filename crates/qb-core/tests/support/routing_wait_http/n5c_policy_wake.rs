@@ -331,3 +331,6 @@ async fn n5c_http_move_before_first_admission_refuses_without_wait_hint() {
 
 #[path = "n5c_initial_policy_race.rs"]
 mod n5c_initial_policy_race;
+
+#[path = "n5c_urgency_behavior.rs"]
+mod n5c_urgency_behavior;
