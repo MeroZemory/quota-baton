@@ -1356,7 +1356,7 @@ mod tests {
         runtime.tick();
         assert_eq!(
             runtime.detail(&id).unwrap().session.label.unwrap().text,
-            "folder"
+            "fixture-private-folder"
         );
         drop(request);
     }
