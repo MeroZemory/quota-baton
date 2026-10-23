@@ -33,6 +33,11 @@ pub(crate) async fn try_run(
     client_key: &str,
     account_short: Option<&str>,
 ) -> Result<Option<i32>, LaunchError> {
+    // N5d-native remains a separate acceptance follow-up. Keep the established
+    // launcher in ordinary builds until the owned native path passes its smoke.
+    if !cfg!(all(feature = "testkit", debug_assertions)) {
+        return Ok(None);
+    }
     let remote = plan::from_issued_args(args);
     if matches!(remote, plan::Plan::ExistingPath) {
         return Ok(None);
