@@ -147,7 +147,23 @@ pub(crate) async fn try_run(
             .map_err(|_| LaunchError)?;
         #[cfg(all(feature = "testkit", debug_assertions))]
         observation::emit(observation::Event::ParentEntered);
-        let status = owner.run().await.map_err(|_| LaunchError)?;
+        let status = owner.run().await.map_err(|error| {
+            use managed_parent::Error;
+            diagnostic(match error {
+                Error::Setup => "owner-setup",
+                Error::Worker => "owner-worker",
+                Error::Ingress => "owner-ingress",
+                Error::Dispatch => "owner-dispatch",
+                Error::WriteUncertain => "owner-write-uncertain",
+                Error::NativeRead => "owner-native-read",
+                Error::NativeEof => "owner-native-eof",
+                Error::Pump => "owner-pump",
+                Error::Job => "owner-job",
+                Error::Watchdog => "owner-watchdog",
+                Error::Cleanup => "owner-cleanup",
+            });
+            LaunchError
+        })?;
         use managed_parent::JobStatus;
         Ok(Some(match status {
             JobStatus::TuiExited(code) | JobStatus::BothExited { tui: code, .. } => code,
