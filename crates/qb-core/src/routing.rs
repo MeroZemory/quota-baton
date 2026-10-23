@@ -1523,6 +1523,28 @@ impl PolicyStore {
         inspect: impl FnOnce(&Plan) -> Option<T>,
     ) -> Option<T> {
         let _publication = self.publication.read().ok()?;
+        self.quota_wait_condition_published(key, account, fallback, inspect)
+    }
+
+    /// Reject-only initial response handoff: never block the async caller on
+    /// publication. Current full native inspection already assembled the facts.
+    pub(crate) fn try_with_quota_wait_condition<T>(
+        &self,
+        key: &str,
+        account: &str,
+        inspect: impl FnOnce(&Plan) -> Option<T>,
+    ) -> Option<T> {
+        let _publication = self.publication.try_read().ok()?;
+        self.quota_wait_condition_published(key, account, true, inspect)
+    }
+
+    fn quota_wait_condition_published<T>(
+        &self,
+        key: &str,
+        account: &str,
+        fallback: bool,
+        inspect: impl FnOnce(&Plan) -> Option<T>,
+    ) -> Option<T> {
         if !self.permits_dispatch_published(Some(key), account) {
             return None;
         }

@@ -186,6 +186,17 @@ async fn n5a_http_full_poll_reset_beyond_hold_declines_initial_wait_and_normally
     let session = "synthetic-proof-entry-beyond-bound";
     const HOLD: u64 = 5;
     let (h, source, alternate, usage) = entry_fixture(session, HOLD).await;
+    // Preserve the original native over-bound-selection control explicitly as
+    // urgent Move. Nonurgent Wait now has its own qb-authored fallback tests.
+    h.admin(
+        reqwest::Method::POST,
+        "/admin/v1/routing",
+        Some(json!({
+            "kind":"urgent", "id":qb_core::routing::session_id(&format!("codex:{session}")),
+            "on_5h_limit":"move"
+        })),
+    )
+    .await;
     let reset = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 20, 0).unwrap();
     full_poll_before_request(&h, &usage, &source, reset).await;
     assert!((reset - Utc::now()).to_std().unwrap() > Duration::from_secs(HOLD) + PHASE);

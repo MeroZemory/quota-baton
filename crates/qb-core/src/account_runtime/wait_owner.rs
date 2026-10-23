@@ -194,6 +194,43 @@ impl QuotaWaitTicket {
     }
 }
 
+/// Read-only initial-response classification; never a WAIT receipt or send
+/// authority. Constructed only under the existing native inspection gates.
+pub(super) struct InitialFiveHourLimit {
+    ticket: QuotaWaitTicket,
+    deadline: tokio::time::Instant,
+    policy: WaitPolicySnapshot,
+}
+
+impl InitialFiveHourLimit {
+    pub(super) fn reset_at(&self) -> DateTime<Utc> {
+        self.ticket.reset_at
+    }
+
+    // Reject-only handoff check after the blocking response assembly. No Store,
+    // mutation, renewal, new ticket or interval is obtained here.
+    pub(super) fn reply_current(
+        &self,
+        owner: &WaitOwner,
+        policies: &crate::routing::PolicyStore,
+    ) -> bool {
+        policies
+            .try_with_quota_wait_condition(&self.policy.key, &self.policy.account, |plan| {
+                if !same_wait_plan(&self.policy.plan, plan)
+                    || tokio::time::Instant::now() >= self.deadline
+                {
+                    return None;
+                }
+                let proof = owner.proofs.admit(&self.ticket.native).ok()?;
+                (proof.reset_at == self.ticket.reset_at
+                    && proof.applies_to(self.ticket.request_model.as_deref())
+                    && proof.valid_at(Utc::now()))
+                .then_some(())
+            })
+            .is_some()
+    }
+}
+
 /// One gate-scoped WAIT receipt. Never permission to dispatch or retain a
 /// binding/credential lease. Identity, reset and monotonic bounds cannot change.
 pub(crate) struct AdmittedQuotaWait {
@@ -379,6 +416,58 @@ impl WaitOwner {
         // Recheck the exact physical report after classification/clock work.
         self.proofs.admit(&observed.native).ok()?;
         Some(())
+    }
+
+    /// A full current proof can classify a qb-authored initial response without
+    /// claiming that the usage poll was a physical provider rejection.
+    pub(super) fn initial_far_wait_unlocked(
+        &self,
+        intent: &crate::bindings::WaitIntent<'_>,
+        account: &Account,
+    ) -> Option<InitialFiveHourLimit> {
+        if account.id != intent.account()
+            || account.provider != intent.provider()
+            || !intent.existing_placement()
+            || intent.plan().settings.mode == crate::routing::Mode::Strict
+            || intent.plan().settings.on_5h_limit != crate::routing::On5hLimit::Wait
+        {
+            return None;
+        }
+        let wall = Utc::now();
+        let mono = tokio::time::Instant::now();
+        let ticket = self.acquire_current_unlocked(account, intent.model(), wall)?;
+        let remaining = ticket.reset_at.signed_duration_since(wall).to_std().ok()?;
+        if remaining.is_zero()
+            || !(remaining > std::time::Duration::from_secs(intent.plan().settings.reset_wait_secs)
+                || mono.checked_add(remaining)? >= intent.deadline())
+        {
+            return None;
+        }
+        let limit = InitialFiveHourLimit {
+            ticket,
+            deadline: intent.deadline(),
+            policy: WaitPolicySnapshot {
+                key: intent.policy_key().to_owned(),
+                account: intent.account().to_owned(),
+                plan: intent.plan().clone(),
+            },
+        };
+        (intent.caller_current()
+            && self.ticket_current_unlocked(&limit.ticket, account, intent.model(), Utc::now()))
+        .then_some(limit)
+    }
+
+    pub(super) fn initial_far_wait_is_current_unlocked(
+        &self,
+        limit: &InitialFiveHourLimit,
+        intent: &crate::bindings::WaitIntent<'_>,
+        account: &Account,
+    ) -> bool {
+        // Same callback/publication; never acquire a replacement proof.
+        intent.caller_current()
+            && intent.deadline() == limit.deadline
+            && same_wait_plan(&limit.policy.plan, intent.plan())
+            && self.ticket_current_unlocked(&limit.ticket, account, intent.model(), Utc::now())
     }
 
     /// Current metadata/credentials and runtime eligibility were checked by the

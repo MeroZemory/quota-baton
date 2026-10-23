@@ -2223,6 +2223,20 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             .ok()
             .flatten()
     };
+    // HTTP initial full-proof fallback is distinct from a physical provider
+    // rejection and from G2's admitted cache remainder. No upstream was sent.
+    #[cfg(all(feature = "phase0", debug_assertions))]
+    let allow_initial_fallback = parts.extensions.get::<ForcedAccount>().is_none();
+    #[cfg(not(all(feature = "phase0", debug_assertions)))]
+    let allow_initial_fallback = true;
+    if allow_initial_fallback
+        && let Some(response) = state
+            .initial_http_far_wait(provider, &session, request_model.as_deref(), data_deadline)
+            .await
+    {
+        completion.outcome(response.status().as_u16(), "quota_wait_fallback");
+        return response;
+    }
     #[cfg(all(feature = "phase0", debug_assertions))]
     let selection = if managed_http.is_some() {
         state
