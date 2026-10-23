@@ -92,7 +92,9 @@ fn ready(c: &mut Controller) -> StoppedGoalTicket {
         "notification alone is insufficient"
     );
     read_goal(c, snapshot("usageLimited"));
-    c.stopped_ticket().expect("correlated stopped snapshot")
+    let ticket = c.stopped_ticket().expect("correlated stopped snapshot");
+    assert_eq!(ticket.thread_id(), "thread-a");
+    ticket
 }
 
 fn command(action: Action) -> Value {

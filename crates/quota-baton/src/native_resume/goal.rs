@@ -83,8 +83,17 @@ pub(crate) enum Delivery {
 /// Opaque, non-cloneable native ownership evidence. NOT a core authority permit.
 /// Deliberately lacks Debug/serialization to avoid exposing the private namespace.
 pub(crate) struct StoppedGoalTicket {
+    thread_id: String,
     namespace: String,
     generation: u64,
+}
+
+impl StoppedGoalTicket {
+    /// Correlated native thread identity for the parent's exact C8-root check.
+    /// This is not core authority and cannot identify a launch by itself.
+    pub(crate) fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
 }
 
 struct Pending {
@@ -413,6 +422,7 @@ impl Controller {
         }
         self.ticket_taken = true;
         Some(StoppedGoalTicket {
+            thread_id: self.current.as_ref()?.clone(),
             namespace: self.namespace.clone(),
             generation: self.generation,
         })
@@ -426,6 +436,7 @@ impl Controller {
             return Err(Error::AttemptConsumed);
         }
         if ticket.namespace != self.namespace
+            || self.current.as_deref() != Some(ticket.thread_id.as_str())
             || ticket.generation != self.generation
             || !self.eligible()
         {
