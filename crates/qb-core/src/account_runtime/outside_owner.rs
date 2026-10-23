@@ -629,7 +629,7 @@ mod tests {
     async fn cap_failure_blocks_native_move(on_send: bool) {
         use crate::{
             accounts::{Identity, Provider, Tokens},
-            bindings::{Candidate, Decision},
+            bindings::{Candidate, Decision, DispatchAdmission, MoveObservations},
             config::RoutingConfig,
         };
 
@@ -642,15 +642,35 @@ mod tests {
             quota: None,
             inflight: 0,
         };
-        let choose = |key, candidate: &Candidate| {
-            table.choose(
+        let choose = |key: &str, candidate: &Candidate| {
+            // A filtered healthy source is not forced-move evidence. Preserve
+            // its snapshot and use a real pin owner for this explicit test move.
+            let mut sources = vec![source.clone()];
+            if candidate.account.id != source.account.id {
+                sources.push(candidate.clone());
+            }
+            let pins = crate::debug_pin::DebugPins::default();
+            pins.set(
+                Provider::Codex,
+                Some(key.to_owned()),
+                candidate.account.id.clone(),
+            );
+            let proof = pins.selection(Provider::Codex, Some(key)).unwrap();
+            table.choose_with_hold_at_admitted_proof(
                 Provider::Codex,
                 Some(key),
                 None,
                 None,
                 std::slice::from_ref(candidate),
-                None,
+                &sources,
+                MoveObservations::untracked(),
+                Some(&candidate.account.id),
                 0,
+                false,
+                false,
+                Utc::now(),
+                None,
+                |_| Some(DispatchAdmission::ordinary().with_pin(Some(proof))),
             )
         };
         for key in ["codex:cap-existing", "codex:cap-control"] {

@@ -203,6 +203,45 @@ mod failure_evidence_tests {
     }
 
     #[test]
+    fn n6t_body_model_does_not_replace_unknown_upgrade_request_context() {
+        let source = account();
+        let alive = Arc::new(AtomicBool::new(true));
+        let now = Instant::now();
+        let until = now + StdDuration::from_secs(30);
+        let mut decision = classify(
+            Provider::Codex,
+            StatusCode::BAD_REQUEST,
+            &HeaderMap::new(),
+            br#"{"error":{"message":"The model 'sample-model' is not supported when using Codex with a ChatGPT account"}}"#,
+            None,
+        );
+        assert_eq!(decision.kind, Kind::ModelPermission);
+        assert_eq!(decision.model.as_deref(), Some("sample-model"));
+        let proof = decision
+            .failed_attempt(&source, Some("codex:sample"), None, until, &alive)
+            .expect("a real rejected unknown-model upgrade retains its request context");
+        assert!(proof.applies_to(Some("codex:sample"), &source, None, now));
+        decision.model = Some("other-model".into());
+        assert!(
+            decision
+                .failed_attempt(&source, Some("codex:sample"), None, until, &alive)
+                .is_some()
+        );
+        assert!(!proof.applies_to(Some("codex:sample"), &source, Some("sample-model"), now));
+        assert!(
+            decision
+                .failed_attempt(
+                    &source,
+                    Some("codex:sample"),
+                    Some("sample-model"),
+                    until,
+                    &alive
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn n6t_kind_label_cannot_promote_relay_rate_or_overload_into_failure_evidence() {
         let source = account();
         let alive = Arc::new(AtomicBool::new(true));
@@ -508,7 +547,9 @@ pub(super) fn classify(
 ) -> Decision {
     let mut decision = classify_inner(provider, status, headers, body, model);
     decision.classified = decision.kind;
-    decision.classified_model = decision.model.clone();
+    // Evidence belongs to the attempted request, while decision.model may
+    // instead identify a model named by an upstream permission error.
+    decision.classified_model = model.map(str::to_owned);
     decision
 }
 

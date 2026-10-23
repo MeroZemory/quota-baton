@@ -79,7 +79,29 @@ impl Harness {
         routing: RoutingConfig,
         configure: impl FnOnce(&mut Config),
     ) -> Self {
-        let serial = SERIAL.lock().await;
+        Self::new_configured_serial(
+            provider,
+            n,
+            budget,
+            memory,
+            dead,
+            routing,
+            configure,
+            SERIAL.lock().await,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn new_configured_serial(
+        provider: Provider,
+        n: usize,
+        budget: u64,
+        memory: u64,
+        dead: bool,
+        routing: RoutingConfig,
+        configure: impl FnOnce(&mut Config),
+        serial: tokio::sync::MutexGuard<'static, ()>,
+    ) -> Self {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a-http");
         fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
@@ -5674,9 +5696,11 @@ mod n5d_zero_retention_producer {
 
     #[tokio::test]
     async fn n5d_zero_retention_physical_429_publishes_exact_scoped_waiting_episode() {
+        // Queueing for unrelated serial cases is not fixture startup latency.
+        let serial = SERIAL.lock().await;
         let h = timeout(
             BOUND,
-            Harness::new_configured(
+            Harness::new_configured_serial(
                 Provider::Codex,
                 1,
                 64,
@@ -5690,6 +5714,7 @@ mod n5d_zero_retention_producer {
                     config.routing.request_timeout_secs = 10;
                     config.routing.move_guard.trip_seconds = 5;
                 },
+                serial,
             ),
         )
         .await
@@ -5956,9 +5981,11 @@ mod n5d_initial_poll_producer {
             .await
             .unwrap()
             .unwrap();
+        // Queueing for unrelated serial cases is not fixture startup latency.
+        let serial = SERIAL.lock().await;
         let h = timeout(
             BOUND,
-            Harness::new_configured(
+            Harness::new_configured_serial(
                 Provider::Codex,
                 1,
                 64,
@@ -5974,6 +6001,7 @@ mod n5d_initial_poll_producer {
                     config.routing.move_guard.trip_seconds = 5;
                     config.routing.validate().unwrap();
                 },
+                serial,
             ),
         )
         .await
