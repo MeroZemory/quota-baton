@@ -26,11 +26,10 @@ fn console_free_startup_failure_reaches_file_log_without_fixture_contents() {
     let input = fixture.path().join("invalid.json");
     fs::write(&input, b"SYNTHETIC-SECRET-MUST-NOT-BE-LOGGED").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_quota-baton-tray"))
-        .args(["--render-png"])
-        .arg(fixture.path().join("unused.png"))
-        .arg("--fixture")
+        .args(["--no-supervise", "--fixture"])
         .arg(input)
         .env("QB_HOME", fixture.path())
+        .env("LOCALAPPDATA", fixture.path())
         .env("QB_LOG", "info")
         .creation_flags(CREATE_NO_WINDOW.0)
         .output()
@@ -78,7 +77,7 @@ fn console_free_unknown_flag_reaches_safe_startup_log() {
 
 #[test]
 fn console_free_missing_value_reaches_safe_startup_log() {
-    assert_argument_failure_is_logged(&["--render-png"]);
+    assert_argument_failure_is_logged(&["--theme"]);
 }
 
 #[test]

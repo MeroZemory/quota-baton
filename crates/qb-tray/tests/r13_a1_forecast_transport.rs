@@ -18,8 +18,11 @@ async fn r13_a1_http_forecast_survives_poll_dto_flyout_and_both_dashboard_tabs()
     use std::io::{Read, Write};
     let (clock, _) = fixture::fixture();
     let forecast = fixture::forecast(clock.utc(), false);
-    let expected = qb_core::usage_forecast_display::lines(&forecast, false);
-    assert!(!expected.is_empty());
+    let summary = qb_core::usage_forecast_display::summary(&forecast, false);
+    let expected = vec![summary.text.clone()];
+    let detail = qb_core::usage_forecast_display::lines(&forecast, false).join("\n");
+    assert!(!summary.text.is_empty());
+    assert!(!detail.is_empty());
     let payload = json!({"version":"synthetic-admin", "accounts":[
         {"id":"cx-a1","provider":"codex","label":"합성 Codex","user_state":"active",
          "health":{"kind":"ready"},"source":{"kind":"oauth"},
@@ -82,10 +85,14 @@ async fn r13_a1_http_forecast_survives_poll_dto_flyout_and_both_dashboard_tabs()
         v2::project(&serde_json::to_string(&read.snapshot).unwrap(), now).unwrap();
     for row in dashboard_accounts.sections.iter().flat_map(|s| &s.rows) {
         assert_eq!(row.forecast_lines, expected, "dashboard poll lost forecast");
+        assert_eq!(row.forecast_tooltip, detail, "dashboard poll lost detail");
+        assert_eq!(row.forecast_warning, summary.warning);
         assert_eq!(row.raw.usage_forecast.as_ref(), Some(&forecast));
     }
     for row in accounts.sections.iter().flat_map(|s| &s.rows) {
         assert_eq!(row.forecast_lines, expected, "flyout model lost forecast");
+        assert_eq!(row.forecast_tooltip, detail, "flyout model lost detail");
+        assert_eq!(row.forecast_warning, summary.warning);
         assert_eq!(row.raw.usage_forecast.as_ref(), Some(&forecast));
     }
     let mut data = m::DashboardSnapshot::new(dashboard_accounts);
@@ -98,19 +105,18 @@ async fn r13_a1_http_forecast_survives_poll_dto_flyout_and_both_dashboard_tabs()
         state.tab = tab;
         let view = m::project(&data, &mut state, &clock);
         for id in ["cx-a1", "cl-a1"] {
-            assert_eq!(
-                view.groups
-                    .iter()
-                    .find(|g| g.id == id)
-                    .unwrap()
-                    .forecast_lines,
-                expected
-            );
+            let group = view.groups.iter().find(|g| g.id == id).unwrap();
+            assert_eq!(group.forecast_lines, expected);
+            assert_eq!(group.forecast_tooltip, detail);
+            assert_eq!(group.forecast_warning, summary.warning);
             let tile = view.usage.iter().find(|t| t.id == id).unwrap();
             assert_eq!(tile.forecast_lines, expected);
+            assert_eq!(tile.forecast_tooltip, detail);
+            assert_eq!(tile.forecast_warning, summary.warning);
             assert!(!tile.projections.is_empty());
         }
         let scene = Scene::build(&view, &state, [1600., 1800.], &Metrics::default());
+        assert!(scene.tooltips.iter().any(|tip| tip.text == detail));
         for line in &expected {
             assert!(
                 scene
@@ -140,6 +146,8 @@ fn r13_a1_missing_and_null_forecast_keep_legacy_admin_payload_compatible() {
         .unwrap();
         let row = &projected.sections[1].rows[0];
         assert!(row.raw.usage_forecast.is_none());
-        assert!(row.forecast_lines.is_empty());
+        assert_eq!(row.forecast_lines, ["측정 중"]);
+        assert_eq!(row.forecast_tooltip, "측정 중");
+        assert!(!row.forecast_warning);
     }
 }

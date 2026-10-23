@@ -35,23 +35,27 @@ fn r13_forecast_shared_card_text_cold_steady_weekly_changing_and_credits() {
             .flat_map(|s| &s.rows)
             .find(|a| a.raw.id == tile.id)
             .unwrap();
-        let expected = qb_core::usage_forecast_display::lines(
-            account.raw.usage_forecast.as_ref().unwrap(),
+        let forecast = account.raw.usage_forecast.as_ref().unwrap();
+        let summary = qb_core::usage_forecast_display::summary(forecast, false);
+        let expected = vec![summary.text];
+        let detail = qb_core::usage_forecast_display::lines(
+            forecast,
             account.raw.credits_in_use == Some(true),
-        );
+        )
+        .join("\n");
         assert_eq!(account.forecast_lines, expected);
+        assert_eq!(account.forecast_tooltip, detail);
+        assert_eq!(account.forecast_warning, summary.warning);
+        assert_eq!(tile.forecast_tooltip, detail);
+        assert_eq!(tile.forecast_warning, summary.warning);
         assert_eq!(tile.forecast_lines, expected);
-        assert_eq!(
-            view.groups
-                .iter()
-                .find(|g| g.id == tile.id)
-                .unwrap()
-                .forecast_lines,
-            expected
-        );
+        let group = view.groups.iter().find(|g| g.id == tile.id).unwrap();
+        assert_eq!(group.forecast_lines, expected);
+        assert_eq!(group.forecast_tooltip, detail);
+        assert_eq!(group.forecast_warning, summary.warning);
     }
     let steady = view.usage.iter().find(|t| t.id == "steady").unwrap();
-    let text = steady.forecast_lines.join("\n");
+    let text = &steady.forecast_tooltip;
     for fragment in [
         "최근 속도",
         "12.0%/시간",
@@ -66,7 +70,7 @@ fn r13_forecast_shared_card_text_cold_steady_weekly_changing_and_credits() {
         assert!(text.contains(fragment), "missing {fragment}: {text}");
     }
     let cold = view.usage.iter().find(|t| t.id == "cold").unwrap();
-    assert_eq!(cold.forecast_lines, ["소진 예측: 측정 중"]);
+    assert_eq!(cold.forecast_lines, ["측정 중"]);
     assert!(cold.projections.is_empty());
 }
 
@@ -377,22 +381,109 @@ fn r13_forecast_absent_payload_keeps_incumbent_geometry_and_unconfirmed_has_no_p
     let mut state = DashboardState::default();
     state.tab = Tab::Usage;
     let view = m::project(&m::DashboardSnapshot::new(legacy), &mut state, &clock);
-    assert!(view.usage[0].forecast_lines.is_empty());
+    assert_eq!(view.usage[0].forecast_lines, ["측정 중"]);
+    assert_eq!(view.usage[0].forecast_tooltip, "측정 중");
+    assert!(!view.usage[0].forecast_warning);
     assert!(view.usage[0].projections.is_empty());
-    let scene = Scene::build(&view, &state, [1024., 640.], &Metrics::default());
-    assert_eq!(
-        scene
+
+    fn check_fit(scene: &Scene) -> (qb_tray::Rect, qb_tray::Rect, f32) {
+        let tiles: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|draw| match draw {
+                Draw::Stroke {
+                    rect,
+                    color: Color::GroupBorder,
+                    radius: 6.,
+                    ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tiles.len(), 1, "the legacy fixture has one account tile");
+        let tile = tiles[0];
+        let texts: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|draw| match draw {
+                Draw::Text { rect, measure, .. } if measure.text == "측정 중" && measure.wrap => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "one Measuring paragraph must be painted");
+        let text = texts[0];
+        assert!(width(text) > 0. && height(text) > 0.);
+        assert!(text.left >= tile.left && text.right <= tile.right);
+        assert!(text.top >= tile.top && text.bottom <= tile.bottom);
+        let nodes: Vec<_> = scene
+            .accessibility
+            .iter()
+            .filter(|node| node.key == "chart:legacy:forecast:0")
+            .collect();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].role, Role::Text);
+        assert_eq!(nodes[0].name, "측정 중");
+        assert_eq!(nodes[0].parent.as_deref(), Some("chart:legacy"));
+        assert_eq!(
+            nodes[0].rect, text,
+            "summary must be visible without clipping"
+        );
+        assert!(
+            scene
+                .tooltips
+                .iter()
+                .any(|tip| tip.rect == text && tip.text == "측정 중")
+        );
+        let region = scene
             .content
             .iter()
             .find(|r| r.region == ScrollRegion::Usage)
-            .unwrap()
-            .content_height,
-        300.
-    );
-    assert!(
-        !scene
-            .accessibility
-            .iter()
-            .any(|n| n.key.contains(":forecast:"))
-    );
+            .unwrap();
+        assert_eq!(region.offset, region.max_offset);
+        // The region includes the provider panels before this last account row,
+        // and the native row's 12-DIP trailing gutter. No fixed total height.
+        assert!(tile.top > region.viewport.top - region.offset);
+        assert!(
+            (region.viewport.top - region.offset + region.content_height - tile.bottom - 12.).abs()
+                < 0.01
+        );
+        (tile, text, region.content_height)
+    }
+
+    let size = [1024., 640.];
+    let probe = Scene::build(&view, &state, size, &Metrics::default());
+    state.usage_offset = probe
+        .content
+        .iter()
+        .find(|r| r.region == ScrollRegion::Usage)
+        .unwrap()
+        .max_offset;
+    let visible = Scene::build(&view, &state, size, &Metrics::default());
+    let (before_tile, before_text, before_content) = check_fit(&visible);
+
+    // Supply a taller text measurement to prove that allocation, scrolling and
+    // accessible bounds consume the same metric rather than merely painting it.
+    let mut metrics = Metrics::default();
+    for measure in &probe.measurements {
+        if measure.wrap && measure.text == "측정 중" {
+            metrics.heights.insert(measure.key(), 64.);
+        }
+    }
+    assert!(!metrics.heights.is_empty());
+    let probe = Scene::build(&view, &state, size, &metrics);
+    state.usage_offset = probe
+        .content
+        .iter()
+        .find(|r| r.region == ScrollRegion::Usage)
+        .unwrap()
+        .max_offset;
+    let measured = Scene::build(&view, &state, size, &metrics);
+    let (after_tile, after_text, after_content) = check_fit(&measured);
+    assert_eq!(height(after_text), 64.);
+    let extra = height(after_text) - height(before_text);
+    assert!(extra > 0.);
+    assert!((height(after_tile) - height(before_tile) - extra).abs() < 0.01);
+    assert!((after_content - before_content - extra).abs() < 0.01);
 }
