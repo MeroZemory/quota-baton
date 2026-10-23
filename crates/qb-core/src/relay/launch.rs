@@ -1774,7 +1774,7 @@ impl RelayState {
         .await?
         .into_iter()
         .collect();
-        let (refreshed, _, observed) = self
+        let (refreshed, _, observed, _) = self
             .candidates_with_evidence(
                 Provider::Codex,
                 resume_key.as_deref(),

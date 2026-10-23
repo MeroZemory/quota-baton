@@ -18,6 +18,7 @@ pub use health::HealthSignal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+pub(crate) use store::StoreUnavailableEvidence;
 pub use store::{AccountObserver, AccountStore, StoreError};
 pub(crate) use store::{BeforeAccountMutation, MetadataCause, MetadataMutation, ReportMutation};
 use zeroize::{Zeroize, ZeroizeOnDrop};
