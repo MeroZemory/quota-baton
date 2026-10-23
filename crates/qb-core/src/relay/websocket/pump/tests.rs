@@ -227,6 +227,7 @@ async fn pair_with_pump_timer_probe(
                         client,
                         upstream,
                         Context {
+                            launch_pin: None,
                             runtime: None,
                             session: Session {
                                 key: relay.as_ref().map(|_| "codex:overlap".into()),
@@ -1038,6 +1039,7 @@ async fn c6_row_13a_only_response_events_commit_the_current_request() {
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
     let context = Context {
+        launch_pin: None,
         runtime: None,
         relay: None,
         drain_signal: None,
@@ -1280,6 +1282,7 @@ async fn r1_create_unsent_completion_keeps_guard_but_ledgers_zero_attempts() {
     .await;
     let relay = pair.relay.as_ref().unwrap();
     let context = Context {
+        launch_pin: None,
         runtime: Some(relay.accounts.clone()),
         relay: Some(relay.clone()),
         drain_signal: None,
@@ -1347,6 +1350,7 @@ async fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders()
             let home = tempfile::tempdir_in(root).unwrap();
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let context = Context {
+                launch_pin: None,
                 runtime: None,
                 relay: None,
                 drain_signal: None,
@@ -1419,6 +1423,7 @@ async fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders()
 
 fn n5b_inspection_context(pair: &Pair) -> Context {
     Context {
+        launch_pin: None,
         runtime: None,
         relay: pair.relay.clone(),
         drain_signal: None,
@@ -1610,6 +1615,14 @@ async fn n5b_initial_write_keeps_caller_through_backpressure_then_drop() {
             completed: false,
         },
         create,
+        PhysicalLeg::new("sample-source"),
+        DispatchSnapshot {
+            account: "sample-source".into(),
+            key: None,
+            model: None,
+            pin: None,
+            owner: None,
+        },
     );
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
