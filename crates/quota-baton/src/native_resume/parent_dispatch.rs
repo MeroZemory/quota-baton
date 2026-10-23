@@ -52,6 +52,22 @@ impl<N: Write, U: Write> Parent<N, U> {
         self.dispatcher.stopped_ticket()
     }
 
+    /// Do not jump ahead of already admitted input. Later input still revokes
+    /// the sealed read candidate before its response can supply a ticket.
+    pub(crate) fn begin_stop_read(&mut self) -> Result<bool, Error> {
+        match self.ingress.checkpoint() {
+            Ok(_) => {}
+            Err(ingress::Error::Pending) => return Ok(false),
+            Err(error) => return Err(Error::Ingress(error)),
+        }
+        let mut unwind = UnwindClose(Some(self.close.clone()));
+        let result = self.dispatcher.begin_stop_read().map_err(Error::Dispatch);
+        if result.is_ok() {
+            unwind.0 = None;
+        }
+        result
+    }
+
     /// Pending progress is Ok(None); an automatic veto is AuthorityDenied. The
     /// proof is single-use and never substitutes for the caller's core Advance.
     pub(crate) fn take_next_episode_proof(&mut self) -> Result<Option<NextEpisodeProof>, Error> {

@@ -517,12 +517,31 @@ impl Shared {
     }
 
     fn wait_dispatch(&self) {
+        self.wait_dispatch_until(None);
+    }
+
+    fn wait_dispatch_until(&self, deadline: Option<Instant>) {
         let mut dirty = self.dirty.lock().unwrap_or_else(|p| p.into_inner());
         while !*dirty && !self.stopped.load(Ordering::Acquire) {
-            dirty = self
-                .dispatch_wake
-                .wait(dirty)
-                .unwrap_or_else(|p| p.into_inner());
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, timed) = self
+                    .dispatch_wake
+                    .wait_timeout(dirty, remaining)
+                    .unwrap_or_else(|p| p.into_inner());
+                dirty = next;
+                if timed.timed_out() {
+                    break;
+                }
+            } else {
+                dirty = self
+                    .dispatch_wake
+                    .wait(dirty)
+                    .unwrap_or_else(|p| p.into_inner());
+            }
         }
         *dirty = false;
     }
@@ -1020,6 +1039,9 @@ impl<J: Jobs> Drop for ManagedParent<J> {
 
 enum AutoPhase {
     Learning,
+    StopRead {
+        deadline: Instant,
+    },
     Waiting {
         ticket: StoppedGoalTicket,
         episode: u64,
@@ -1073,6 +1095,9 @@ fn dispatch_loop<N: Write, U: Write>(
             continue;
         }
         if shared.auto_disabled() && core.is_some() {
+            terminal_auto(&mut parent, &mut core, &mut phase, shared);
+        }
+        if matches!(phase, AutoPhase::StopRead { deadline } if Instant::now() >= deadline) {
             terminal_auto(&mut parent, &mut core, &mut phase, shared);
         }
 
@@ -1207,7 +1232,7 @@ fn dispatch_loop<N: Write, U: Write>(
             }
         }
 
-        if matches!(phase, AutoPhase::Learning)
+        if matches!(phase, AutoPhase::Learning | AutoPhase::StopRead { .. })
             && let Some(ticket) = parent.stopped_ticket()
         {
             #[cfg(all(feature = "testkit", debug_assertions))]
@@ -1250,6 +1275,24 @@ fn dispatch_loop<N: Write, U: Write>(
                 _ => terminal_auto(&mut parent, &mut core, &mut phase, shared),
             }
             continue;
+        }
+
+        if matches!(phase, AutoPhase::Learning) {
+            let deadline = Instant::now() + EVENT_BUDGET;
+            if shared.enter_physical(deadline) {
+                let result = parent.begin_stop_read();
+                shared.end_event();
+                match result {
+                    Ok(true) => phase = AutoPhase::StopRead { deadline },
+                    Ok(false) => {}
+                    Err(error) => return Err(dispatch_error(error)),
+                }
+            } else {
+                terminal_auto(&mut parent, &mut core, &mut phase, shared);
+            }
+        }
+        if matches!(phase, AutoPhase::StopRead { .. }) && parent.delivery() == Delivery::Cancelled {
+            terminal_auto(&mut parent, &mut core, &mut phase, shared);
         }
 
         // Drain admitted ordinary events BEFORE Inspect. Checkpoint in
@@ -1303,7 +1346,11 @@ fn dispatch_loop<N: Write, U: Write>(
                 }
                 continue;
             }
-            shared.wait_dispatch();
+            let deadline = match phase {
+                AutoPhase::StopRead { deadline } => Some(deadline),
+                _ => None,
+            };
+            shared.wait_dispatch_until(deadline);
         }
     }
     shared.retain_eof_dispatch();

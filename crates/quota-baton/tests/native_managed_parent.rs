@@ -718,7 +718,7 @@ async fn core_reply(core: &mut WebSocketStream<TcpStream>, id: Option<u64>, even
             .await,
     );
 }
-async fn stopped_dialogue(ui: &mut UiPeer, proof: &Proof) {
+async fn running_dialogue(ui: &mut UiPeer, proof: &Proof) {
     for (request, response) in [
         (
             json!({"id":21,"method":"thread/start","params":{}}),
@@ -735,15 +735,21 @@ async fn stopped_dialogue(ui: &mut UiPeer, proof: &Proof) {
         proof.native(response.to_string().as_bytes());
         assert_eq!(ui_value(ui).await, response);
     }
+}
+async fn stopped_dialogue(ui: &mut UiPeer, proof: &Proof) {
+    running_dialogue(ui, proof).await;
     let notification = json!({"method":"thread/goal/updated","params":{"threadId":THREAD,"goal":native_goal("usageLimited")}});
     proof.native(notification.to_string().as_bytes());
     assert_eq!(ui_value(ui).await, notification);
-    let request = json!({"id":23,"method":"thread/goal/get","params":{"threadId":THREAD}});
-    require(ui.send(text(request.to_string().as_bytes())).await);
-    assert_eq!(proof.wait_native_frame(&request["id"]).await, request);
-    let response = json!({"id":23,"result":{"goal":native_goal("usageLimited")}});
-    proof.native(response.to_string().as_bytes());
-    assert_eq!(ui_value(ui).await, response);
+    let request = proof.wait_native_frame(&json!(format!("{PREFIX}3"))).await;
+    assert_eq!(request["method"], "thread/goal/get");
+    assert_eq!(request["params"], json!({"threadId":THREAD}));
+    assert_eq!(proof.automatic_count(), 0);
+    proof.native(
+        json!({"id":request["id"],"result":{"goal":native_goal("usageLimited")}})
+            .to_string()
+            .as_bytes(),
+    );
 }
 async fn waiting(core: &mut WebSocketStream<TcpStream>) {
     let request = core_request(core).await;
@@ -1901,5 +1907,32 @@ async fn managed_ack_and_completed_native_progress_open_only_a_future_core_slot(
         }
         drop(run);
         proof.cleaned(false);
+    }).await;
+}
+
+#[tokio::test]
+async fn managed_missing_stop_read_reply_times_out_without_retry_and_keeps_ui() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("ordinary session exited on read timeout"); }
+            () = async {
+                running_dialogue(&mut ui,&proof).await;
+                let notice=json!({"method":"thread/goal/updated","params":{"threadId":THREAD,"goal":native_goal("usageLimited")}});
+                proof.native(notice.to_string().as_bytes());
+                assert_eq!(ui_value(&mut ui).await,notice);
+                proof.wait_native_frame(&json!(format!("{PREFIX}3"))).await;
+                assert!(matches!(require(timeout(Duration::from_secs(7),core.next()).await),None|Some(Err(_))|Some(Ok(Message::Close(_)))));
+                assert_eq!(proof.automatic_count(),0);
+                ordinary_still_live(&mut ui,&proof,91).await;
+                proof.native(json!({"id":format!("{PREFIX}3"),"result":{"goal":native_goal("usageLimited")}}).to_string().as_bytes());
+                ordinary_still_live(&mut ui,&proof,92).await;
+                assert_eq!(proof.automatic_count(),0);
+            } => {}
+        }
+        drop(run);proof.cleaned(false);
     }).await;
 }

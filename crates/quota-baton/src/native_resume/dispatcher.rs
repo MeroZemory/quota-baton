@@ -89,6 +89,18 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
         self.controller.stopped_ticket()
     }
 
+    /// Read-only native ownership check; this supplies no core permission.
+    pub(crate) fn begin_stop_read(&mut self) -> Result<bool, Error> {
+        match self
+            .controller
+            .begin_stop_read()
+            .map_err(|_| Error::Protocol)?
+        {
+            Some(action) => self.apply(Ok(action), || false).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
     pub(crate) fn take_next_episode_proof(&mut self) -> Result<Option<NextEpisodeProof>, Error> {
         self.controller
             .take_next_episode_proof()
