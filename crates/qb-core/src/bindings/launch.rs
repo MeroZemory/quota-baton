@@ -419,6 +419,78 @@ fn room(weight: usize) -> std::result::Result<(), LaunchError> {
 }
 
 impl BindingTable {
+    /// Read-only native cache-hold condition. This cannot admit an operation,
+    /// acquire quota proof or authorize dispatch. None means contention/poison;
+    /// Some(false) means a definite native refusal. All acquisitions are try-only.
+    /// Inspect must be pure: never await, mutate or reacquire these owner locks.
+    pub(crate) fn try_native_cache_view(
+        &self,
+        request: HttpWaitRequest<'_>,
+        inspect: impl FnOnce(&crate::routing::Plan) -> bool,
+    ) -> Option<bool> {
+        let _mutation = self.mutations.try_lock().ok()?;
+        let data = self.data.try_lock().ok()?;
+        if self.writes_stopped.load(Ordering::Acquire) || !request.operation.can_reply() {
+            return Some(false);
+        }
+        let (Some(key), Some(expected)) = (request.key, request.expected_source) else {
+            return Some(false);
+        };
+        let Some(canonical) = canonical(&data, key) else {
+            return Some(false);
+        };
+        let managed = data.launches.get(canonical);
+        let provider = if canonical.starts_with("claude:") {
+            Provider::Claude
+        } else if canonical.starts_with("codex:")
+            || (managed.is_some() && canonical.starts_with("launch:"))
+        {
+            Provider::Codex
+        } else {
+            return Some(false);
+        };
+        if provider != request.provider
+            || data
+                .groups
+                .get(canonical)
+                .is_none_or(|group| group.account != expected)
+            || managed.is_some_and(|metadata| {
+                request.model.is_none() || metadata.current_model.as_deref() != request.model
+            })
+        {
+            return Some(false);
+        }
+        let Some(policy_key) = policy_key(&data, Some(canonical)) else {
+            return Some(false);
+        };
+        // Data stays locked through policy publication and inspect: a native
+        // read-like prune cannot intervene between identity and retention.
+        self.policies
+            .try_native_cache_plan(policy_key, expected, |plan| {
+                self.retained_binding(&data, canonical, Utc::now())
+                    .is_some_and(|binding| binding.account == expected)
+                    && inspect(plan)
+                    && !self.writes_stopped.load(Ordering::Acquire)
+                    && request.operation.can_reply()
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_native_cache_data_for_test(
+        &self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        released: &AtomicBool,
+    ) {
+        let data = self.data.lock().unwrap();
+        entered.try_send(()).unwrap();
+        // Bounded safety release makes the blocking-read mutant fail an exact
+        // assertion instead of leaking a thread or hanging the test process.
+        let _ = release.recv_timeout(Duration::from_secs(5));
+        drop(data);
+        released.store(true, Ordering::Release);
+    }
+
     /// Relay admission/hold checks must use these wrappers after adoption so
     /// they consult the same durable policy identity as selection and commit.
     pub fn routing_plan(&self, key: Option<&str>) -> crate::routing::Plan {
@@ -1163,9 +1235,100 @@ mod r11_active_adoption_tests {
     use super::*;
     use crate::issue_operation::IssueOperation;
     use crate::routing::{Mode, Project, Settings, session_id};
+    use chrono::Duration as Delta;
+    use serde_json::json;
 
     const SOURCE: &str = "launch:active-adoption";
     const REAL: &str = "codex:active-adoption";
+
+    fn n5c_cache_request<'a>(operation: &'a IssueOperation, key: &'a str) -> HttpWaitRequest<'a> {
+        HttpWaitRequest {
+            provider: Provider::Codex,
+            key: Some(key),
+            model: Some("m1"),
+            expected_source: Some("a"),
+            operation,
+        }
+    }
+
+    #[test]
+    fn n5c_native_cache_view_rejects_expired_and_capacity_unpruned_rows() {
+        let (_home, table, _cs, _es) = fixture(Mode::Recover);
+        let operation = IssueOperation::new(tokio::time::Instant::now() + Duration::from_secs(60));
+        let key = "codex:synthetic-cache-oldest";
+        let now = Utc::now();
+        // Native decoder without import/prune deliberately models a row still
+        // physically present when a native read-like pruning pass is pending.
+        *table.data.lock().unwrap() = super::super::decode(json!({
+            "schema": 1,
+            "bindings": [{"key": key, "account": "a", "last_used": now - Delta::days(8)}],
+        }))
+        .unwrap();
+        assert!(table.models_launch_snapshot(Some(key), None).is_ok());
+        assert_eq!(
+            table.try_native_cache_view(n5c_cache_request(&operation, key), |_| true),
+            Some(false),
+            "native cache view must apply native retention to an expired unpruned row",
+        );
+        let mut rows = vec![json!({
+            "key": key, "account": "a", "last_used": now - Delta::minutes(1),
+        })];
+        rows.extend((0..CAPACITY).map(|i| {
+            json!({
+                "key": format!("codex:synthetic-cache-newer-{i:05}"),
+                "account": "a", "last_used": now,
+            })
+        }));
+        *table.data.lock().unwrap() = super::super::decode(json!({
+            "schema": 1, "bindings": rows,
+        }))
+        .unwrap();
+        assert_eq!(table.data.lock().unwrap().bindings.len(), CAPACITY + 1);
+        assert!(table.models_launch_snapshot(Some(key), None).is_ok());
+        assert_eq!(
+            table.try_native_cache_view(n5c_cache_request(&operation, key), |_| true),
+            Some(false),
+            "native cache view must apply native retention to a capacity-evictable row",
+        );
+    }
+
+    #[test]
+    fn n5c_native_cache_view_holds_identity_model_retention_through_policy_and_prune() {
+        let (_home, table, cs, es) = fixture(Mode::Recover);
+        place(&table, &cs, &es);
+        table
+            .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
+        let operation = IssueOperation::new(tokio::time::Instant::now() + Duration::from_secs(60));
+        for key in [SOURCE, REAL] {
+            assert_eq!(
+                table.try_native_cache_view(n5c_cache_request(&operation, key), |plan| {
+                    assert!(table.mutations.try_lock().is_err());
+                    assert!(
+                        table.data.try_lock().is_err(),
+                        "pruning must not split the coherent native view"
+                    );
+                    assert_eq!(plan.settings.mode, Mode::Recover);
+                    true
+                }),
+                Some(true)
+            );
+        }
+        let mut mismatch = n5c_cache_request(&operation, REAL);
+        mismatch.model = Some("m2");
+        assert_eq!(table.try_native_cache_view(mismatch, |_| true), Some(false));
+        // Public native read-like path really prunes; no direct test deletion or
+        // policy notification is needed for the next cache view to reject.
+        assert!(
+            table
+                .launch_info(REAL, Utc::now() + Delta::days(8))
+                .is_err()
+        );
+        assert_eq!(
+            table.try_native_cache_view(n5c_cache_request(&operation, REAL), |_| true),
+            Some(false),
+        );
+    }
 
     fn n5a_authority_ready(
         future: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,

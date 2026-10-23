@@ -431,6 +431,101 @@ async fn n5c_http_permitted_serving_credits_continue_on_a_for_either_urgency_and
     }
 }
 
+// Acceptance requirement, not a characterization that endorses current behavior.
+// Current source unconditionally spends the native hold on Revoked; see handoff.
+#[tokio::test]
+async fn n5c_http_midwait_move_preserves_original_cache_hold_then_real_429_normally_moves_b() {
+    for mode in ["recover", "rebalance"] {
+        let session = format!("synthetic-n5c-midwait-cache-{mode}");
+        let (h, a, b, usage) = behavior_fixture(&session, mode, "wait").await;
+        let reset = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 12, 0).unwrap();
+        full_poll_before_request(&h, &usage, &a, reset).await;
+        let earliest = Instant::now() + (reset - Utc::now()).to_std().unwrap();
+        let mut events = h.state.subscribe_http_quota_wait();
+        let mut phases = h.state.subscribe_http_quota_wait_inspections();
+        h.fake.state.push(far_limit()); // MUST be delivered to A after original reset
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, FINAL));
+        let (sent, release) = h.fake.state.pause_next_response();
+        let start = Instant::now();
+        let interrupt = async {
+            event(
+                &mut events,
+                "admitted",
+                &a,
+                PHASE,
+                "genuine Wait must first admit",
+            )
+            .await;
+            event(
+                &mut phases,
+                "inspection_started",
+                &a,
+                PHASE,
+                "first real inspection",
+            )
+            .await;
+            let held = HeldStore::start(&h, &a);
+            event(
+                &mut phases,
+                "inspection_started",
+                &a,
+                PHASE,
+                "blocked native renewal",
+            )
+            .await;
+            urgency(&h, &session, "move").await;
+            event(
+                &mut phases,
+                "policy_revoked",
+                &a,
+                PHASE,
+                "urgency must leave optional proof wait before native Store release",
+            )
+            .await;
+            held.assert_held();
+            assert!(Utc::now() < reset);
+            assert_eq!(h.fake.state.requests().len(), 1);
+            held.finish();
+            timeout(Duration::from_secs(16), sent)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                h.fake.state.requests()[1].received_at >= earliest,
+                "urgent cancellation must retain original native cache hold"
+            );
+            assert_source(&h, 1, &a); // detects wrongly sending A's 429 script to B
+            release.send(()).unwrap();
+        };
+        let ((status, account, body), ()) = timeout(Duration::from_secs(25), async {
+            tokio::join!(target(&h, &session), interrupt)
+        })
+        .await
+        .expect("same original operation must complete without a renewed deadline");
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert_eq!(
+            (status, account.as_str(), body.as_slice()),
+            (200, b.as_str(), FINAL.as_bytes())
+        );
+        assert_eq!(h.fake.state.requests().len(), 3);
+        assert_source(&h, 2, &b);
+        assert_one_move(&h, &a, &b);
+        assert_no_more_events(&mut events); // Revoked never becomes Reset/admitted
+        let remaining = phases.try_recv();
+        assert!(
+            matches!(
+                remaining,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "unexpected remaining native inspection event: {remaining:?}"
+        );
+        clean(&h, &a, &b).await;
+        assert_eq!(usage.state.requests().len(), 1);
+    }
+}
+
 // D26 fallback acceptance: preserve the actual provider 429; never manufacture
 // one from a usage poll. Current N5a over-bound behavior instead selects B.
 async fn far_five_hour(urgent: &str) {

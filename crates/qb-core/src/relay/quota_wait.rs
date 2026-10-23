@@ -13,6 +13,7 @@ use tokio::time::Instant;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WaitEnd {
     Reset,
+    NativeCacheReset,
     Revoked,
     WallResetPending,
 }
@@ -20,6 +21,23 @@ pub(super) enum WaitEnd {
 pub(super) struct WaitHint {
     pub(super) source: String,
     pub(super) end: WaitEnd,
+    native_cache: Option<NativeCacheInterval>,
+}
+
+impl WaitHint {
+    pub(super) fn reset_reached(&self) -> bool {
+        matches!(self.end, WaitEnd::Reset | WaitEnd::NativeCacheReset)
+    }
+}
+
+// Immutable data from an already admitted wait, not a second hold/proof lease.
+// Cloning for blocking reads preserves the same operation, wake and deadline.
+#[derive(Clone)]
+struct NativeCacheInterval {
+    inputs: Inputs,
+    plan: crate::routing::Plan,
+    wake: Instant,
+    reset: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -108,6 +126,43 @@ async fn wait_quota(
     _caller: &CallerGuard,
     transport: WaitTransport,
 ) -> Option<WaitHint> {
+    // One display-only lifetime survives both the optional engine and a native
+    // cache remainder; policy cancellation does not hide a still-pending hold.
+    let mut quota_wait_visibility = None;
+    let mut hint = wait_optional_quota(
+        relay,
+        provider,
+        key,
+        model,
+        source,
+        operation,
+        _caller,
+        transport,
+        &mut quota_wait_visibility,
+    )
+    .await?;
+    // The optional engine has returned and dropped its receipt/JoinHandle before
+    // a native remainder starts. A running blocking task remains inspection-only.
+    let result = match hint.native_cache.take() {
+        Some(interval) => Some(wait_native_cache(relay, interval).await),
+        None => Some(hint),
+    };
+    drop(quota_wait_visibility);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_optional_quota(
+    relay: &RelayState,
+    provider: Provider,
+    key: &str,
+    model: Option<&str>,
+    source: &str,
+    operation: &IssueOperation,
+    _caller: &CallerGuard,
+    transport: WaitTransport,
+    quota_wait_visibility: &mut Option<crate::dashboard::runtime::QuotaWaitGuard>,
+) -> Option<WaitHint> {
     // Bound copies before any detached blocking work. These are lookup inputs,
     // not independently trusted account/binding identities.
     if key.is_empty()
@@ -135,8 +190,7 @@ async fn wait_quota(
     let mut policy_snapshot: Option<crate::account_runtime::WaitPolicySnapshot> = None;
     // Once set, this envelope is immutable even after replacement proof tickets.
     let mut envelope: Option<(Instant, DateTime<Utc>)> = None;
-    // One display-only lifetime for this admitted envelope, never per renewal.
-    let mut _quota_wait_visibility = None;
+    let mut native_cache = None;
 
     loop {
         // Arm BOTH authority notifications before EVERY native inspection. An
@@ -160,7 +214,7 @@ async fn wait_quota(
             .as_ref()
             .is_some_and(|snapshot| !snapshot.unchanged(&relay.bindings.policies))
         {
-            return stopped(source, envelope.is_some());
+            return policy_stopped(source, envelope.is_some(), native_cache.take());
         }
         let accounts = relay.accounts.clone();
         let bindings = relay.bindings.clone();
@@ -238,7 +292,7 @@ async fn wait_quota(
                     if matches!(transport, WaitTransport::Http) {
                         relay.observe_http_quota_wait_inspection("policy_revoked", source);
                     }
-                    return stopped(source, envelope.is_some());
+                    return policy_stopped(source, envelope.is_some(), native_cache.take());
                 }
                 #[cfg(feature = "testkit")]
                 if matches!(transport, WaitTransport::Http) {
@@ -277,6 +331,7 @@ async fn wait_quota(
                 return envelope.map(|_| WaitHint {
                     source: inputs.source.clone(),
                     end: WaitEnd::Revoked,
+                    native_cache: None,
                 });
             }
         };
@@ -290,6 +345,7 @@ async fn wait_quota(
             return Some(WaitHint {
                 source: inputs.source.clone(),
                 end: WaitEnd::Revoked,
+                native_cache: None,
             });
         }
         if first {
@@ -305,10 +361,21 @@ async fn wait_quota(
             if matches!(transport, WaitTransport::Http) {
                 relay.observe_http_quota_wait_inspection("result_policy_revoked", source);
             }
-            return stopped(source, envelope.is_some());
+            return policy_stopped(source, envelope.is_some(), native_cache.take());
         }
         if first {
-            _quota_wait_visibility =
+            // Capture policy from the actual receipt, not a later plan lookup.
+            native_cache = Some(NativeCacheInterval {
+                inputs: inputs.clone(),
+                plan: policy_snapshot
+                    .as_ref()
+                    .expect("first wait policy")
+                    .plan()
+                    .clone(),
+                wake: fixed.0,
+                reset: fixed.1,
+            });
+            *quota_wait_visibility =
                 relay
                     .dashboard()
                     .quota_wait(key, source, current.reset_at(), deadline);
@@ -336,7 +403,7 @@ async fn wait_quota(
                     match event {
                         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Some(WaitHint { source: inputs.source.clone(), end: WaitEnd::Revoked });
+                            return Some(WaitHint { source: inputs.source.clone(), end: WaitEnd::Revoked, native_cache: None });
                         }
                     }
                 }
@@ -352,6 +419,258 @@ async fn wait_quota(
     }
 }
 
+// This classification only preserves the unused part of an admitted interval.
+// It cannot turn an inspection/proof failure into native hold permission.
+fn urgency_only_move(original: &crate::routing::Plan, current: &crate::routing::Plan) -> bool {
+    use crate::routing::On5hLimit;
+    original.settings.on_5h_limit == On5hLimit::Wait
+        && current.settings.on_5h_limit == On5hLimit::Move
+        && same_native_cache_plan(original, current)
+}
+
+fn same_native_cache_plan(original: &crate::routing::Plan, current: &crate::routing::Plan) -> bool {
+    // Once handed off, another urgency-only toggle still uses this SAME native
+    // interval. It cannot readmit optional waiting or renew its original bounds.
+    original.settings.reset_wait_secs != 0
+        && original.settings.reset_wait_secs == current.settings.reset_wait_secs
+        && original.settings.mode == current.settings.mode
+        && original.anchor == current.anchor
+        && original.project == current.project
+    // Creating an urgency overlay legitimately changes source to "session".
+    // Revision/source labels do not grant different native settings/authority.
+}
+
+fn policy_stopped(
+    source: &str,
+    admitted: bool,
+    interval: Option<NativeCacheInterval>,
+) -> Option<WaitHint> {
+    let mut hint = stopped(source, admitted)?;
+    // A candidate only. Exact urgency classification and native retention are
+    // checked together by the nonblocking owner view, not on this async branch.
+    hint.native_cache = interval;
+    Some(hint)
+}
+
+fn native_cache_view_current(
+    bindings: &crate::bindings::BindingTable,
+    interval: &NativeCacheInterval,
+    handed_off: bool,
+) -> Option<bool> {
+    bindings.try_native_cache_view(interval.inputs.request(), |current| {
+        if handed_off {
+            same_native_cache_plan(&interval.plan, current)
+        } else {
+            urgency_only_move(&interval.plan, current)
+        }
+    })
+}
+
+fn native_cache_account_current(
+    account: &crate::accounts::Account,
+    interval: &NativeCacheInterval,
+    now: DateTime<Utc>,
+) -> bool {
+    use crate::accounts::{Health, HealthReason, UserState};
+    account.id == interval.inputs.source
+        && account.provider == interval.inputs.provider
+        && account.user_state == UserState::Active
+        && !account.drain
+        && !account.auth_probe_pending
+        && account.auth_failures == 0
+        && account.payment_until.is_none_or(|until| until <= now)
+        && account
+            .token_meta
+            .expires_at
+            .is_none_or(|until| until > now)
+        && matches!(&account.health, Health::Cooling {
+            reason: HealthReason::Quota, until, scope,
+        } if *until == interval.reset && *until > now
+            && (scope == "account"
+                || scope.strip_prefix("model:").is_some_and(|blocked| {
+                    !blocked.is_empty() && interval.inputs.model.as_deref() == Some(blocked)
+                })))
+        && account.quota_cooling.as_ref().is_some_and(|quota| {
+            quota.window == "5h" && quota.reset_at == interval.reset && quota.started_at <= now
+        })
+}
+
+fn native_cache_ended(
+    interval: &NativeCacheInterval,
+    mono: Instant,
+    wall: DateTime<Utc>,
+) -> Option<WaitHint> {
+    let mut hint = ended_envelope(
+        &interval.inputs.source,
+        Some((interval.wake, interval.reset)),
+        mono,
+        wall,
+    )?;
+    if hint.end == WaitEnd::Reset {
+        hint.end = WaitEnd::NativeCacheReset;
+    }
+    Some(hint)
+}
+
+// Ordinary native metadata checks only: never acquire/renew a proof, reserve a
+// binding, admit the operation, refresh credentials, or change any deadline.
+async fn wait_native_cache(relay: &RelayState, interval: NativeCacheInterval) -> WaitHint {
+    use std::time::Duration;
+    // Native read-like pruning does not notify policy waiters. At most four
+    // quiet reject-only checks per second; original wake/deadline/drain and
+    // account/policy notifications remain independent. This cadence grants no
+    // permission and never starts another interval or quiet Store read.
+    const RECHECK: Duration = Duration::from_millis(250);
+    let inputs = &interval.inputs;
+    let deadline = inputs.operation.deadline();
+    let revoked = || stopped(&inputs.source, true).expect("admitted interval");
+    let mut events = relay.accounts.subscribe();
+    let mut handed_off = false;
+    loop {
+        let proof = relay.accounts.http_quota_wait_changed();
+        let policy = relay.bindings.policies.changed.notified();
+        tokio::pin!(proof, policy);
+        proof.as_mut().enable();
+        policy.as_mut().enable();
+        if !caller_live(&inputs.operation, deadline, relay.is_draining()) {
+            return revoked();
+        }
+        if let Some(ended) = native_cache_ended(&interval, Instant::now(), Utc::now()) {
+            return ended;
+        }
+        match native_cache_view_current(&relay.bindings, &interval, handed_off) {
+            Some(false) => return revoked(),
+            Some(true) => handed_off = true,
+            None => {
+                // Busy is not a refusal or permission. No new interval/job is
+                // created; caller/drain/original timers remain pollable.
+                tokio::select! {
+                    biased;
+                    _ = relay.wait_for_drain_start() => return revoked(),
+                    _ = tokio::time::sleep_until(deadline) => return revoked(),
+                    _ = tokio::time::sleep_until(interval.wake) => {},
+                    _ = &mut policy => {},
+                    _ = &mut proof => {},
+                    event = events.recv() => {
+                        if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            return revoked();
+                        }
+                    },
+                    _ = tokio::time::sleep(RECHECK) => {},
+                }
+                continue;
+            }
+        }
+        let accounts = relay.accounts.clone();
+        let bindings = relay.bindings.clone();
+        let read = interval.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let Ok(_transaction) = accounts.store.transaction() else {
+                return Some(false);
+            };
+            if accounts.store.writes_stopped()
+                || accounts.blocked_in_memory(&read.inputs.source)
+                || accounts.probing(&read.inputs.source)
+            {
+                return Some(false);
+            }
+            let Ok(account) = accounts.store.read_account_unlocked(&read.inputs.source) else {
+                return Some(false);
+            };
+            let credentials = accounts
+                .store
+                .tokens_unlocked(&account)
+                .is_ok_and(|tokens| !tokens.access_token.is_empty());
+            if !credentials
+                || !caller_live(
+                    &read.inputs.operation,
+                    read.inputs.operation.deadline(),
+                    false,
+                )
+                || !native_cache_account_current(&account, &read, Utc::now())
+            {
+                return Some(false);
+            }
+            native_cache_view_current(&bindings, &read, true)
+        });
+        tokio::pin!(task);
+        let mut dirty = false;
+        let current = loop {
+            if !caller_live(&inputs.operation, deadline, relay.is_draining()) {
+                return revoked();
+            }
+            if let Some(ended) = native_cache_ended(&interval, Instant::now(), Utc::now()) {
+                return ended;
+            }
+            if native_cache_view_current(&relay.bindings, &interval, true) == Some(false) {
+                return revoked();
+            }
+            tokio::select! {
+                biased;
+                _ = relay.wait_for_drain_start() => return revoked(),
+                _ = tokio::time::sleep_until(deadline) => return revoked(),
+                _ = tokio::time::sleep_until(interval.wake) => {},
+                _ = &mut policy => {
+                    policy.set(relay.bindings.policies.changed.notified());
+                    policy.as_mut().enable();
+                    dirty = true;
+                },
+                _ = &mut proof => {
+                    proof.set(relay.accounts.http_quota_wait_changed());
+                    proof.as_mut().enable();
+                    dirty = true;
+                },
+                event = events.recv() => match event {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => dirty = true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return revoked(),
+                },
+                result = &mut task => break result.unwrap_or(Some(false)),
+                _ = tokio::time::sleep(RECHECK) => {},
+            }
+        };
+        if !caller_live(&inputs.operation, deadline, relay.is_draining()) {
+            return revoked();
+        }
+        if let Some(ended) = native_cache_ended(&interval, Instant::now(), Utc::now()) {
+            return ended;
+        }
+        match current {
+            Some(false) => return revoked(),
+            None => continue,
+            Some(true) if dirty => continue,
+            Some(true) => {}
+        }
+        loop {
+            if !caller_live(&inputs.operation, deadline, relay.is_draining()) {
+                return revoked();
+            }
+            if let Some(ended) = native_cache_ended(&interval, Instant::now(), Utc::now()) {
+                return ended;
+            }
+            if native_cache_view_current(&relay.bindings, &interval, true) == Some(false) {
+                return revoked();
+            }
+            tokio::select! {
+                biased;
+                _ = relay.wait_for_drain_start() => return revoked(),
+                _ = tokio::time::sleep_until(deadline) => return revoked(),
+                _ = tokio::time::sleep_until(interval.wake) => {},
+                _ = &mut policy => break,
+                _ = &mut proof => break,
+                event = events.recv() => {
+                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        return revoked();
+                    }
+                    break;
+                },
+                _ = tokio::time::sleep(RECHECK) => {},
+            }
+            // A quiet periodic retention check does not reread credentials or
+            // create a blocking job. Notifications trigger ordinary recollection.
+        }
+    }
+}
+
 fn ended_envelope(
     source: &str,
     envelope: Option<(Instant, DateTime<Utc>)>,
@@ -364,6 +683,7 @@ fn ended_envelope(
     }
     Some(WaitHint {
         source: source.to_owned(),
+        native_cache: None,
         end: if reset_due(envelope, mono, wall) {
             WaitEnd::Reset
         } else {
@@ -376,6 +696,7 @@ fn stopped(source: &str, admitted: bool) -> Option<WaitHint> {
     admitted.then(|| WaitHint {
         source: source.to_owned(),
         end: WaitEnd::Revoked,
+        native_cache: None,
     })
 }
 
@@ -470,5 +791,329 @@ mod tests {
         drop(caller);
         assert!(!caller_live(&operation, deadline, false));
         assert!(operation.admit().is_err());
+    }
+
+    struct NativeDataHolder {
+        release: Option<std::sync::mpsc::SyncSender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl NativeDataHolder {
+        fn start(table: std::sync::Arc<crate::bindings::BindingTable>) -> Self {
+            let (entered, locked) = std::sync::mpsc::sync_channel(1);
+            let (release, resume) = std::sync::mpsc::sync_channel(1);
+            let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = released.clone();
+            let worker = std::thread::spawn(move || {
+                table.hold_native_cache_data_for_test(entered, resume, &flag);
+            });
+            let holder = Self {
+                release: Some(release),
+                worker: Some(worker),
+                released,
+            };
+            locked.recv_timeout(Duration::from_secs(5)).unwrap();
+            holder
+        }
+
+        fn assert_still_locked(&self) {
+            assert!(
+                !self.released.load(std::sync::atomic::Ordering::Acquire),
+                "native cache view must not block Tokio on Data"
+            );
+        }
+    }
+
+    impl Drop for NativeDataHolder {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.try_send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn native_relay() -> (tempfile::TempDir, RelayState, NativeCacheInterval) {
+        use std::sync::Arc;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-part-c/native-cache-unit-runs");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = Arc::new(crate::accounts::AccountStore::acquire(home.path()).unwrap());
+        let obs = Arc::new(crate::observability::Observability::new(home.path(), None).unwrap());
+        let mut config = crate::config::Config::default();
+        config.upstream.codex_base = "http://127.0.0.1:9".into();
+        config.upstream.anthropic_base = "http://127.0.0.1:9".into();
+        let relay = RelayState::new(
+            store,
+            &config,
+            obs,
+            Arc::new(crate::debug_pin::DebugPins::default()),
+        )
+        .unwrap();
+        let mut interval = native_interval();
+        relay
+            .bindings
+            .import(serde_json::json!({
+                "schema": 1,
+                "bindings": [{
+                    "key": interval.inputs.key,
+                    "account": interval.inputs.source,
+                    "last_used": Utc::now(),
+                }],
+            }))
+            .unwrap();
+        interval.plan = relay.bindings.routing_plan(Some(&interval.inputs.key));
+        relay
+            .bindings
+            .policies
+            .set_session_urgent_for_key(
+                &crate::routing::session_id(&interval.inputs.key),
+                crate::routing::On5hLimit::Move,
+                Some(&interval.inputs.key),
+            )
+            .unwrap();
+        assert_eq!(
+            native_cache_view_current(&relay.bindings, &interval, false),
+            Some(true)
+        );
+        (home, relay, interval)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n5c_native_cache_data_held_original_deadline_still_completes() {
+        // Deliberately test the private cache engine, not producer admission.
+        // The interval preserves the valid ordering wake(45s) < deadline(60s).
+        let (_home, relay, interval) = native_relay();
+        let caller = interval.inputs.operation.caller_guard();
+        let operation = interval.inputs.operation.clone();
+        let deadline = interval.inputs.operation.deadline();
+        let holder = NativeDataHolder::start(relay.bindings.clone());
+        let mut waiting = Box::pin(wait_native_cache(&relay, interval));
+        let first = futures_util::poll!(&mut waiting);
+        // This assertion catches a Data.lock mutant even if its safety holder
+        // has timed out before the first poll can return.
+        holder.assert_still_locked();
+        assert!(first.is_pending());
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+        let end = waiting.await;
+        assert_eq!(
+            end.end,
+            WaitEnd::Revoked,
+            "original operation deadline must win"
+        );
+        holder.assert_still_locked();
+        assert!(!caller_live(&operation, deadline, false));
+        drop(caller);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n5c_native_cache_data_held_original_wake_does_not_extend_wall_reset() {
+        let (_home, relay, mut interval) = native_relay();
+        let caller = interval.inputs.operation.caller_guard();
+        interval.reset = Utc::now() + chrono::Duration::days(1);
+        let wake = interval.wake;
+        let holder = NativeDataHolder::start(relay.bindings.clone());
+        let mut waiting = Box::pin(wait_native_cache(&relay, interval));
+        let first = futures_util::poll!(&mut waiting);
+        holder.assert_still_locked();
+        assert!(first.is_pending());
+        tokio::time::advance(wake.saturating_duration_since(Instant::now())).await;
+        let end = waiting.await;
+        assert_eq!(end.end, WaitEnd::WallResetPending);
+        assert!(!end.reset_reached());
+        holder.assert_still_locked();
+        drop(caller);
+    }
+
+    fn native_interval() -> NativeCacheInterval {
+        let wake = Instant::now() + Duration::from_secs(45);
+        NativeCacheInterval {
+            inputs: Inputs {
+                provider: Provider::Codex,
+                key: "codex:synthetic-cache-remainder".into(),
+                source: "synthetic-cache-source".into(),
+                model: Some("synthetic-cache-model".into()),
+                operation: IssueOperation::new(wake + Duration::from_secs(15)),
+            },
+            plan: crate::routing::Plan {
+                settings: crate::routing::Settings {
+                    mode: crate::routing::Mode::Recover,
+                    ..Default::default()
+                },
+                anchor: Some("synthetic-cache-source".into()),
+                project: Some("synthetic-cache-project".into()),
+                source: "project",
+                revision: 7,
+            },
+            wake,
+            reset: DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn n5c_native_cache_handoff_requires_only_effective_wait_to_move_change() {
+        use crate::routing::{Mode, On5hLimit};
+        let interval = native_interval();
+        let original = &interval.plan;
+        assert!(!urgency_only_move(original, original));
+        let mut urgent = original.clone();
+        urgent.settings.on_5h_limit = On5hLimit::Move;
+        urgent.revision += 1;
+        urgent.source = "session";
+        assert!(urgency_only_move(original, &urgent));
+        assert!(!urgency_only_move(&urgent, &urgent));
+        for budget in [0, 59, 61] {
+            let mut changed = urgent.clone();
+            changed.settings.reset_wait_secs = budget;
+            assert!(!urgency_only_move(original, &changed));
+        }
+        for mode in [Mode::Strict, Mode::Rebalance] {
+            let mut changed = urgent.clone();
+            changed.settings.mode = mode;
+            assert!(!urgency_only_move(original, &changed));
+        }
+        for value in [None, Some("synthetic-other".to_owned())] {
+            let mut changed = urgent.clone();
+            changed.anchor = value.clone();
+            assert!(!urgency_only_move(original, &changed));
+            changed = urgent.clone();
+            changed.project = value;
+            assert!(!urgency_only_move(original, &changed));
+        }
+        // A subsequent urgency toggle cannot replace the interval or start a
+        // second proof wait. The same native interval applies for either value.
+        assert!(same_native_cache_plan(original, &urgent));
+        assert!(same_native_cache_plan(original, original));
+    }
+
+    #[test]
+    fn n5c_native_cache_uses_original_mono_wall_and_operation_deadline() {
+        let interval = native_interval();
+        let deadline = interval.inputs.operation.deadline();
+        assert!(
+            native_cache_ended(
+                &interval,
+                interval.wake - Duration::from_nanos(1),
+                interval.reset,
+            )
+            .is_none()
+        );
+        let wall_pending = native_cache_ended(
+            &interval,
+            interval.wake,
+            interval.reset - chrono::Duration::nanoseconds(1),
+        )
+        .unwrap();
+        assert_eq!(wall_pending.end, WaitEnd::WallResetPending);
+        assert!(!wall_pending.reset_reached());
+        let ended = native_cache_ended(&interval, interval.wake, interval.reset).unwrap();
+        assert_eq!(ended.end, WaitEnd::NativeCacheReset);
+        assert!(ended.reset_reached());
+        assert!(ended.native_cache.is_none());
+        assert_eq!(interval.inputs.operation.deadline(), deadline);
+        assert_eq!(deadline, interval.wake + Duration::from_secs(15));
+        assert!(!caller_live(&interval.inputs.operation, deadline, true));
+        let caller = interval.inputs.operation.caller_guard();
+        drop(caller);
+        assert!(!caller_live(&interval.inputs.operation, deadline, false));
+    }
+
+    #[test]
+    fn n5c_native_cache_rejects_changed_native_source_model_reset_and_health() {
+        use crate::accounts::{Health, HealthReason, QuotaCooling, UserState};
+        let mut interval = native_interval();
+        let now = interval.reset - chrono::Duration::seconds(45);
+        let mut account = crate::accounts::health::tests::fixture();
+        account.id = interval.inputs.source.clone();
+        account.provider = interval.inputs.provider;
+        account.user_state = UserState::Active;
+        account.drain = false;
+        account.auth_probe_pending = false;
+        account.auth_failures = 0;
+        account.payment_until = None;
+        account.token_meta.expires_at = None;
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until: interval.reset,
+            scope: "model:synthetic-cache-model".into(),
+        };
+        account.quota_cooling = Some(QuotaCooling {
+            window: "5h".into(),
+            reset_at: interval.reset,
+            started_at: now,
+        });
+        assert!(native_cache_account_current(&account, &interval, now));
+        let change: &[fn(&mut crate::accounts::Account)] = &[
+            |a| a.id = "synthetic-other-source".into(),
+            |a| a.provider = Provider::Claude,
+            |a| a.user_state = UserState::Paused,
+            |a| a.drain = true,
+            |a| a.auth_probe_pending = true,
+            |a| a.auth_failures = 1,
+            |a| a.health = Health::Ready,
+            |a| a.quota_cooling = None,
+            |a| a.quota_cooling.as_mut().unwrap().window = "7d".into(),
+            |a| a.quota_cooling.as_mut().unwrap().reset_at += chrono::Duration::seconds(1),
+            |a| {
+                if let Health::Cooling { until, .. } = &mut a.health {
+                    *until += chrono::Duration::seconds(1);
+                }
+            },
+            |a| {
+                if let Health::Cooling { scope, .. } = &mut a.health {
+                    *scope = "model:synthetic-other-model".into();
+                }
+            },
+        ];
+        for (case, change) in change.iter().enumerate() {
+            let mut changed = account.clone();
+            change(&mut changed);
+            assert!(
+                !native_cache_account_current(&changed, &interval, now),
+                "case {case}"
+            );
+        }
+        for expires in [now - chrono::Duration::seconds(1), now] {
+            let mut changed = account.clone();
+            changed.token_meta.expires_at = Some(expires);
+            assert!(!native_cache_account_current(&changed, &interval, now));
+        }
+        let mut changed = account.clone();
+        changed.payment_until = Some(now + chrono::Duration::seconds(1));
+        assert!(!native_cache_account_current(&changed, &interval, now));
+        // Missing request model must not make an arbitrary unknown scope match
+        // by comparing two None values.
+        interval.inputs.model = None;
+        if let Health::Cooling { scope, .. } = &mut account.health {
+            *scope = "synthetic-unknown-scope".into();
+        }
+        assert!(!native_cache_account_current(&account, &interval, now));
+    }
+
+    #[test]
+    fn n5c_plain_proof_revocation_never_contains_native_cache_continuation() {
+        let interval = native_interval();
+        assert!(stopped(&interval.inputs.source, false).is_none());
+        let revoked = stopped(&interval.inputs.source, true).unwrap();
+        assert_eq!(revoked.end, WaitEnd::Revoked);
+        assert!(revoked.native_cache.is_none());
+        assert!(!revoked.reset_reached());
+        let proof_reset = ended_envelope(
+            &interval.inputs.source,
+            Some((interval.wake, interval.reset)),
+            interval.wake,
+            interval.reset,
+        )
+        .unwrap();
+        assert_eq!(proof_reset.end, WaitEnd::Reset);
+        assert!(proof_reset.native_cache.is_none());
     }
 }
