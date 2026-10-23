@@ -3,6 +3,7 @@
 //! The caller owns metadata collection, language selection, confirmation, and IO.
 
 use std::fmt::Write;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Language {
@@ -50,7 +51,7 @@ pub(crate) fn format_preview(language: Language, preview: &Preview<'_>) -> Strin
 /// Preview content only, ending in a blank line. Confirmation owns its prompt.
 pub(crate) fn format_body(language: Language, preview: &Preview<'_>) -> String {
     let id = short_id(preview.id);
-    let title = plain(preview.title);
+    let title = title(preview.title, preview.verbose.is_some());
     let size = size(preview.bytes);
     let source = readable_path(preview.source_home, preview.profile_home);
     let target = readable_path(preview.target_home, preview.profile_home);
@@ -58,10 +59,8 @@ pub(crate) fn format_body(language: Language, preview: &Preview<'_>) -> String {
     let mut out = String::new();
     match language {
         Language::Ko => {
-            let _ = writeln!(
-                out,
-                "대화 {id}를 qb로 가져옵니다  ({title} · 기록 {size})\n"
-            );
+            let _ = writeln!(out, "대화 {id}를 qb로 가져옵니다 · 기록 {size}");
+            let _ = writeln!(out, "  제목     {title}\n");
             let _ = writeln!(out, "  어디서   {source}    기본 Codex 홈");
             let _ = writeln!(out, "  어디로   {target}    codex-qb 홈");
             let _ = writeln!(out, "  목표     {goal}\n");
@@ -69,10 +68,8 @@ pub(crate) fn format_body(language: Language, preview: &Preview<'_>) -> String {
             out.push_str("  share   원본 홈에도 남겨 둡니다. 두 곳에서 동시에 열지 마세요.\n");
         }
         Language::En => {
-            let _ = writeln!(
-                out,
-                "Bring conversation {id} into qb  ({title} · history {size})\n"
-            );
+            let _ = writeln!(out, "Bring conversation {id} into qb · history {size}");
+            let _ = writeln!(out, "  Title    {title}\n");
             let _ = writeln!(out, "  From    {source}    default Codex home");
             let _ = writeln!(out, "  To      {target}    codex-qb home");
             let _ = writeln!(out, "  Goal    {goal}\n");
@@ -172,6 +169,30 @@ fn short_id(id: &str) -> String {
     plain(id).chars().take(8).collect()
 }
 
+/// Use terminal display columns, reserving one column for the truncation mark.
+/// Whitespace is normalized before controls are stripped so tabs never join words.
+fn title(value: &str, verbose: bool) -> String {
+    let line = value
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let normalized = plain(&line.split_whitespace().collect::<Vec<_>>().join(" "));
+    if verbose || normalized.width() <= 48 {
+        return normalized;
+    }
+    let mut result = String::new();
+    for ch in normalized.chars() {
+        let mut next = result.clone();
+        next.push(ch);
+        if next.width() > 47 {
+            break;
+        }
+        result.push(ch);
+    }
+    result.push('…');
+    result
+}
+
 // Strip incoming control characters as well as avoiding terminal escapes of our
 // own: even a title originating in metadata must not control terminal output.
 fn plain(value: &str) -> String {
@@ -221,7 +242,8 @@ mod tests {
         }
     }
 
-    const KO: &str = r#"대화 01234567를 qb로 가져옵니다  (sample-conversation · 기록 101 MB)
+    const KO: &str = r#"대화 01234567를 qb로 가져옵니다 · 기록 101 MB
+  제목     sample-conversation
 
   어디서   ~\.codex    기본 Codex 홈
   어디로   ~\.codex-acct\qb    codex-qb 홈
@@ -234,7 +256,8 @@ mod tests {
 
 move 또는 share를 입력하세요 (취소: Enter) > "#;
 
-    const EN: &str = r#"Bring conversation 01234567 into qb  (sample-conversation · history 101 MB)
+    const EN: &str = r#"Bring conversation 01234567 into qb · history 101 MB
+  Title    sample-conversation
 
   From    ~\.codex    default Codex home
   To      ~\.codex-acct\qb    codex-qb home
@@ -250,6 +273,53 @@ Enter move or share (cancel: Enter) > "#;
     #[test]
     fn golden_ko_plain_metadata() {
         assert_eq!(format_preview(Language::Ko, &preview()), KO);
+    }
+
+    #[test]
+    fn long_mixed_multiline_title_fits_48_display_columns() {
+        let prompt = format!(
+            "  {}\n{}",
+            "회의 abc ".repeat(400),
+            "second line".repeat(400)
+        );
+        assert!(prompt.chars().count() > 3000);
+        let displayed = title(&prompt, false);
+        assert!(displayed.ends_with('…'));
+        assert!(displayed.width() <= 48);
+        assert!(!displayed.contains("second line"));
+        assert!(title(&prompt, true).width() > 48);
+        assert!(!title(&prompt, true).contains('\n'));
+        for language in [Language::Ko, Language::En] {
+            let mut input = preview();
+            input.title = &prompt;
+            let output = format_body(language, &input);
+            assert_eq!(
+                output
+                    .lines()
+                    .nth(1)
+                    .unwrap()
+                    .trim()
+                    .split_once(' ')
+                    .unwrap()
+                    .1
+                    .trim(),
+                displayed
+            );
+        }
+    }
+
+    #[test]
+    fn title_collapses_whitespace_and_preserves_exact_width_boundary() {
+        assert_eq!(
+            title("\n \t\n title\t has   spaces\r\nignored", false),
+            "title has spaces"
+        );
+        assert_eq!(title(&"가".repeat(24), false), "가".repeat(24));
+        assert_eq!(title(&"a".repeat(48), false), "a".repeat(48));
+        assert_eq!(
+            title(&"가".repeat(25), false),
+            format!("{}…", "가".repeat(23))
+        );
     }
 
     #[test]

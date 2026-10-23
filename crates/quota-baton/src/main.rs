@@ -28,6 +28,7 @@ mod sessions_guard;
 mod sessions_map;
 mod sessions_plain_header;
 mod sessions_presentation;
+mod sessions_preview_title;
 mod sessions_progress;
 mod wire_readiness;
 
