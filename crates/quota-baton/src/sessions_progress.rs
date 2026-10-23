@@ -114,6 +114,26 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
 fn current() -> Option<Arc<Inner>> {
     CURRENT.with(|c| c.borrow().clone())
 }
+
+/// Header readers share cancellation and phase reporting, without owning the
+/// console handler or progress worker. Their scoped threads finish before us.
+#[derive(Clone)]
+pub(crate) struct ReaderContext(Option<Arc<Inner>>);
+pub(crate) fn reader_context() -> ReaderContext {
+    ReaderContext(current())
+}
+impl ReaderContext {
+    pub(crate) fn run<T>(&self, read: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Arc<Inner>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(CURRENT.with(|slot| slot.replace(self.0.clone())));
+        read()
+    }
+}
 fn write_line(inner: &Inner, line: &str) {
     let mut stderr = std::io::stderr().lock();
     let _ = write_progress(&mut stderr, inner.terminal, line);
@@ -160,6 +180,12 @@ pub(crate) struct Operation {
 }
 impl Operation {
     pub(crate) fn begin(id: &str, english: bool) -> Result<Self> {
+        Self::begin_task(id, english, true)
+    }
+    pub(crate) fn begin_existing(id: &str, english: bool) -> Result<Self> {
+        Self::begin_task(id, english, false)
+    }
+    fn begin_task(id: &str, english: bool, bringing: bool) -> Result<Self> {
         if current().is_some() {
             return Ok(Self {
                 inner: None,
@@ -171,7 +197,15 @@ impl Operation {
             .filter(|c| !c.is_control())
             .take(8)
             .collect::<String>();
-        let first = if english {
+        let first = if !bringing && english {
+            format!(
+                "Preparing conversation {short}. Large conversations can take 1-2 minutes. Keep this window open."
+            )
+        } else if !bringing {
+            format!(
+                "대화 {short} 작업을 준비합니다. 큰 대화는 1~2분 걸릴 수 있습니다. 창을 닫지 마세요."
+            )
+        } else if english {
             format!(
                 "Preparing to bring conversation {short} into quota-baton. Large conversations can take 1-2 minutes. Keep this window open."
             )
@@ -603,6 +637,24 @@ mod tests {
         let hook: Box<dyn Fn() + Send + Sync + 'static> = Box::new(test_request_cancel);
         check().unwrap();
         hook();
+        assert!(check().is_err());
+    }
+
+    #[test]
+    fn header_reader_inherits_cancellation_and_restores_thread_context() {
+        let cancellation = test_cancellation(true);
+        let context = reader_context();
+        cancellation.request_cancel();
+        std::thread::spawn(move || {
+            assert!(current().is_none());
+            context.run(|| {
+                assert!(english());
+                assert!(check().unwrap_err().is::<Interrupted>());
+            });
+            assert!(current().is_none());
+        })
+        .join()
+        .unwrap();
         assert!(check().is_err());
     }
 }

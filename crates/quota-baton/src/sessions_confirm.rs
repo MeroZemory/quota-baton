@@ -75,7 +75,9 @@ fn ask_with_io(
         "원본 홈에서 빼고 옮깁니다. 계속하려면 move를 입력하세요 (취소: Enter) > "
     };
     for attempt in 0..2 {
-        output.write_all(prompt.as_bytes()).and_then(|()| output.flush())
+        output
+            .write_all(prompt.as_bytes())
+            .and_then(|()| output.flush())
             .map_err(|_| anyhow!(OUTPUT_FAILED))?;
         let mut input = String::new();
         if read_line(&mut input).is_err() {
@@ -86,37 +88,68 @@ fn ask_with_io(
         if default == Mode::Resolve {
             let word = input.strip_suffix('\n').unwrap_or(&input);
             let word = word.strip_suffix('\r').unwrap_or(word);
-            return (word == "resolve").then_some(Mode::Resolve).ok_or_else(|| anyhow!(CANCELLED));
+            return (word == "resolve")
+                .then_some(Mode::Resolve)
+                .ok_or_else(|| anyhow!(CANCELLED));
         }
-        if let Some(mode) = parse_mode(&input, allow_share) { return Ok(mode); }
-        if input.is_empty() || matches!(input.as_str(), "\n" | "\r\n") || attempt == 1 { break; }
+        if let Some(mode) = parse_mode(&input, allow_share) {
+            return Ok(mode);
+        }
+        if input.is_empty() || matches!(input.as_str(), "\n" | "\r\n") || attempt == 1 {
+            break;
+        }
     }
     bail!(CANCELLED)
 }
 
 /// Returns true for finish. Rollback is never permitted after publication.
 pub(crate) fn recovery(yes: bool, can_rollback: bool) -> Result<bool> {
-    recovery_with_io(yes, can_rollback,
+    recovery_with_io(
+        yes,
+        can_rollback,
         (io::stdin().is_terminal(), io::stdout().is_terminal()),
-        crate::sessions_progress::read_line, &mut io::stdout().lock())
+        crate::sessions_progress::read_line,
+        &mut io::stdout().lock(),
+    )
 }
 
-fn recovery_with_io(yes: bool, can_rollback: bool, terminals: (bool,bool),
-    mut read: impl FnMut(&mut String)->io::Result<usize>, output: &mut impl Write) -> Result<bool> {
-    if yes { return Ok(true); }
+fn recovery_with_io(
+    yes: bool,
+    can_rollback: bool,
+    terminals: (bool, bool),
+    mut read: impl FnMut(&mut String) -> io::Result<usize>,
+    output: &mut impl Write,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
     let english = crate::sessions_progress::english();
     if !terminals.0 || !terminals.1 {
-        bail!("이전 이동 복구를 터미널에서 finish/rollback으로 선택하세요. 스크립트는 --yes를 사용하세요.");
+        bail!(
+            "이전 이동 복구를 터미널에서 finish/rollback으로 선택하세요. 스크립트는 --yes를 사용하세요."
+        );
     }
-    writeln!(output, "{}", if english {
-        "The previous move was interrupted. Finish or roll back? (finish/rollback)"
-    } else { "이전 이동이 중간에 멈췄습니다. 마저 끝낼까요? (finish/rollback)" })
-        .map_err(|_| anyhow!(OUTPUT_FAILED))?;
+    writeln!(
+        output,
+        "{}",
+        if english {
+            "The previous move was interrupted. Finish or roll back? (finish/rollback)"
+        } else {
+            "이전 이동이 중간에 멈췄습니다. 마저 끝낼까요? (finish/rollback)"
+        }
+    )
+    .map_err(|_| anyhow!(OUTPUT_FAILED))?;
     if !can_rollback {
-        writeln!(output, "{}", if english {
-            "Publication is committed; only finish is safe."
-        } else { "게시가 확정된 단계라 finish로만 복구할 수 있습니다." })
-            .map_err(|_| anyhow!(OUTPUT_FAILED))?;
+        writeln!(
+            output,
+            "{}",
+            if english {
+                "Publication is committed; only finish is safe."
+            } else {
+                "게시가 확정된 단계라 finish로만 복구할 수 있습니다."
+            }
+        )
+        .map_err(|_| anyhow!(OUTPUT_FAILED))?;
     }
     output.flush().map_err(|_| anyhow!(OUTPUT_FAILED))?;
     let mut line = String::new();
@@ -125,7 +158,11 @@ fn recovery_with_io(yes: bool, can_rollback: bool, terminals: (bool,bool),
         bail!(INPUT_FAILED);
     }
     crate::sessions_progress::check()?;
-    match line.strip_suffix("\r\n").or_else(||line.strip_suffix('\n')).unwrap_or(&line) {
+    match line
+        .strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(&line)
+    {
         "finish" => Ok(true),
         "rollback" if can_rollback => Ok(false),
         "rollback" => bail!("게시가 확정된 이동은 되돌릴 수 없습니다. finish로 먼저 복구하세요."),
@@ -148,7 +185,11 @@ fn parse_mode(input: &str, allow_share: bool) -> Option<Mode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, io::{Cursor, BufRead}, rc::Rc};
+    use std::{
+        cell::Cell,
+        io::{BufRead, Cursor},
+        rc::Rc,
+    };
 
     fn with_text(input: &str, allow_share: bool) -> (Result<Mode>, String) {
         let mut reader = Cursor::new(input.as_bytes());
@@ -276,7 +317,11 @@ mod tests {
         ] {
             let (result, output) = with_text(input, true);
             assert_eq!(result.unwrap_err().to_string(), CANCELLED);
-            let prompts = if matches!(input, "" | "\n" | "\r\n") { 1 } else { 2 };
+            let prompts = if matches!(input, "" | "\n" | "\r\n") {
+                1
+            } else {
+                2
+            };
             assert_eq!(output.matches("입력하세요").count(), prompts);
         }
     }
@@ -420,29 +465,78 @@ mod tests {
     }
     #[test]
     fn recovery_offers_exact_choices_but_never_rollback_after_commit() {
-        for (word, expected) in [("finish\n",true),("rollback\r\n",false)] {
-            let mut out=Vec::new();
-            let answer=recovery_with_io(false,true,(true,true),|line|{line.push_str(word);Ok(word.len())},&mut out).unwrap();
-            assert_eq!(answer,expected);
+        for (word, expected) in [("finish\n", true), ("rollback\r\n", false)] {
+            let mut out = Vec::new();
+            let answer = recovery_with_io(
+                false,
+                true,
+                (true, true),
+                |line| {
+                    line.push_str(word);
+                    Ok(word.len())
+                },
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(answer, expected);
             assert!(String::from_utf8(out).unwrap().contains("finish/rollback"));
         }
-        let error=recovery_with_io(false,false,(true,true),|line|{line.push_str("rollback\n");Ok(9)},&mut Vec::new()).unwrap_err();
+        let error = recovery_with_io(
+            false,
+            false,
+            (true, true),
+            |line| {
+                line.push_str("rollback\n");
+                Ok(9)
+            },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("finish로 먼저"));
         for input in ["", "\n", " Finish\n", "finish \n", "finish\n\n"] {
-            assert!(recovery_with_io(false,true,(true,true),|line|{line.push_str(input);Ok(input.len())},&mut Vec::new()).is_err());
+            assert!(
+                recovery_with_io(
+                    false,
+                    true,
+                    (true, true),
+                    |line| {
+                        line.push_str(input);
+                        Ok(input.len())
+                    },
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
         }
     }
     #[test]
     fn recovery_nonterminal_never_reads_and_script_yes_only_finishes() {
-        assert!(recovery_with_io(false,true,(false,false),|_|panic!("must not read"),&mut Vec::new()).is_err());
-        assert!(recovery_with_io(true,false,(false,false),|_|panic!("must not read"),&mut NoOutput).unwrap());
+        assert!(
+            recovery_with_io(
+                false,
+                true,
+                (false, false),
+                |_| panic!("must not read"),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        assert!(
+            recovery_with_io(
+                true,
+                false,
+                (false, false),
+                |_| panic!("must not read"),
+                &mut NoOutput
+            )
+            .unwrap()
+        );
     }
     #[test]
     fn unknown_input_then_exact_move_is_accepted_on_second_prompt() {
-        let (result,out)=with_text("typo\nmove\n",true);
-        assert_eq!(result.unwrap(),Mode::Move);
-        assert_eq!(out.matches("입력하세요").count(),2);
+        let (result, out) = with_text("typo\nmove\n", true);
+        assert_eq!(result.unwrap(), Mode::Move);
+        assert_eq!(out.matches("입력하세요").count(), 2);
         assert!(!out.contains('\r') && !out.contains('\u{1b}'));
     }
-
 }

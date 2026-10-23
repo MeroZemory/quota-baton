@@ -836,6 +836,9 @@ fn run_plan(store: &Store, mut m: Move) -> Result<()> {
             descendants(home, &m.id)?;
         }
     }
+    // Archiving a previous journal is already a write. Admit cancellation
+    // before it, then defer until the new journal has a durable boundary.
+    let _commit = crate::sessions_progress::commit()?;
     if let Some(previous) = load(store, &m.id)? {
         ensure!(
             !open(&previous),
@@ -860,7 +863,6 @@ fn run_plan(store: &Store, mut m: Move) -> Result<()> {
                 .filter(|p| p.exists()),
         );
     }
-    let _commit = crate::sessions_progress::commit()?;
     save(store, &m)?;
     step(store, &m, "prepared")?;
     execute(store, &mut m)
@@ -890,7 +892,12 @@ pub(super) fn import(
         &catalog.home,
     )?;
     if o.announce {
-        super::preview(id, &super::migration_files(catalog, id)?, &store.target, &m.database)?;
+        super::preview(
+            id,
+            &super::migration_files(catalog, id)?,
+            &store.target,
+            &m.database,
+        )?;
     }
     if o.apply {
         #[cfg(not(test))]
@@ -1048,7 +1055,9 @@ pub(super) fn recover_resolve(store: &Store, id: &str) -> Result<()> {
 }
 /// None means no open journal; false means the user rolled back and stops here.
 pub(super) fn offer_recovery(store: &Store, id: &str, yes: bool) -> Result<Option<bool>> {
-    let Some(m) = load(store, id)?.filter(open) else { return Ok(None); };
+    let Some(m) = load(store, id)?.filter(open) else {
+        return Ok(None);
+    };
     let finish = confirm::recovery(yes, m.phase < Phase::Decided)?;
     recover_impl(store, id, false, Some(finish))?;
     Ok(Some(finish))
@@ -1058,8 +1067,10 @@ fn recover_impl(store: &Store, id: &str, resolve_map: bool, choice: Option<bool>
     if !open(&m) {
         return Ok(());
     }
-    ensure!(choice != Some(false) || m.phase < Phase::Decided,
-        "게시가 확정된 이동은 되돌릴 수 없습니다. finish로 먼저 복구하세요.");
+    ensure!(
+        choice != Some(false) || m.phase < Phase::Decided,
+        "게시가 확정된 이동은 되돌릴 수 없습니다. finish로 먼저 복구하세요."
+    );
     let _admission = admission::exclusive(&m.homes, &m.id)?;
     let _store = store.lock()?;
     let names = m
@@ -1082,6 +1093,20 @@ fn recover_impl(store: &Store, id: &str, resolve_map: bool, choice: Option<bool>
                 return Ok(());
             }
             bail!("{CONFLICT}");
+        }
+        if choice == Some(true) && m.phase < Phase::Decided {
+            // Finishing an interrupted plan is a new forward admission. The
+            // destination may have changed since the original preview.
+            db::verify_destination_provider(&m.database)?;
+            let destination = discovery::catalog(&m.target)?;
+            destination.ensure_readable_for(&BTreeSet::from([m.id.clone()]))?;
+            ensure!(
+                !destination.threads.contains_key(&m.id)
+                    && !destination
+                        .all()
+                        .any(|item| { m.files.iter().any(|f| f.physical == item.physical) }),
+                "{CONFLICT}"
+            );
         }
         if resolve_map {
             ensure!(

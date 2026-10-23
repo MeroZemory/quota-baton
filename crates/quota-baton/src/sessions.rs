@@ -105,9 +105,8 @@ use std::{
 const DEFAULT_KEEP_SOURCE: bool = false;
 
 fn progress_english(home: &Path) -> bool {
-    qb_core::config::Config::load(home).is_ok_and(|config| {
-        config.ui.language == qb_core::config::UiLanguage::En
-    })
+    qb_core::config::Config::load(home)
+        .is_ok_and(|config| config.ui.language == qb_core::config::UiLanguage::En)
 }
 
 #[derive(Subcommand)]
@@ -882,8 +881,15 @@ fn update_index(target: &Path, entries: &[String], remove: bool) -> Result<()> {
     Ok(())
 }
 
-fn preview(id: &str, files: &[discovery::Rollout], target: &Path, database: &db::DbPlan) -> Result<()> {
-    use crate::sessions_presentation::{self as presentation, Language, Preview, FileLink, Verbose};
+fn preview(
+    id: &str,
+    files: &[discovery::Rollout],
+    target: &Path,
+    database: &db::DbPlan,
+) -> Result<()> {
+    use crate::sessions_presentation::{
+        self as presentation, FileLink, Language, Preview, Verbose,
+    };
     crate::sessions_progress::phase(crate::sessions_progress::Phase::Preview, None)?;
     let thread = database.threads.iter().find(|t| t.id == id);
     let text = |row: Option<&db::RowSnapshot>, key: &str| -> Option<String> {
@@ -892,25 +898,66 @@ fn preview(id: &str, files: &[discovery::Rollout], target: &Path, database: &db:
             _ => None,
         }
     };
-    let title = thread.and_then(|t| text(t.thread.as_ref(), "title"))
-        .or_else(|| thread.and_then(|t| t.latest_index_entry.as_ref())
-            .and_then(|entry| entry["thread_name"].as_str()).map(str::to_owned))
+    let title = thread
+        .and_then(|t| text(t.thread.as_ref(), "title"))
+        .or_else(|| {
+            thread
+                .and_then(|t| t.latest_index_entry.as_ref())
+                .and_then(|entry| entry["thread_name"].as_str())
+                .map(str::to_owned)
+        })
         .unwrap_or_default();
     let before = thread.and_then(|t| t.source_goal_status.as_deref());
     let after = thread.and_then(|t| text(t.goal.as_ref(), "status"));
-    let names = files.iter().map(|file| (file.path.to_string_lossy().into_owned(),
-        target.join("sessions").join(&file.relative).to_string_lossy().into_owned())).collect::<Vec<_>>();
-    let links = names.iter().map(|(source,target)| FileLink { source, target }).collect::<Vec<_>>();
-    let ancestors = files.iter().filter(|f| f.thread != id).map(|f| f.thread.as_str()).collect::<Vec<_>>();
-    let profile = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-        .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let names = files
+        .iter()
+        .map(|file| {
+            (
+                file.path.to_string_lossy().into_owned(),
+                target
+                    .join("sessions")
+                    .join(&file.relative)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let links = names
+        .iter()
+        .map(|(source, target)| FileLink { source, target })
+        .collect::<Vec<_>>();
+    let ancestors = files
+        .iter()
+        .filter(|f| f.thread != id)
+        .map(|f| f.thread.as_str())
+        .collect::<Vec<_>>();
+    let profile = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let source = database.source_home.to_string_lossy();
     let target = target.to_string_lossy();
-    let body = presentation::format_body(if crate::sessions_progress::english() { Language::En } else { Language::Ko },
-        &Preview { id, title: &title, bytes: files.iter().map(|f| f.bytes).sum(),
-            source_home: &source, target_home: &target, profile_home: &profile,
-            goal_before: before, goal_after: after.as_deref(),
-            verbose: crate::sessions_progress::verbose().then_some(Verbose { files: &links, ancestors: &ancestors }) });
+    let body = presentation::format_body(
+        if crate::sessions_progress::english() {
+            Language::En
+        } else {
+            Language::Ko
+        },
+        &Preview {
+            id,
+            title: &title,
+            bytes: files.iter().map(|f| f.bytes).sum(),
+            source_home: &source,
+            target_home: &target,
+            profile_home: &profile,
+            goal_before: before,
+            goal_after: after.as_deref(),
+            verbose: crate::sessions_progress::verbose().then_some(Verbose {
+                files: &links,
+                ancestors: &ancestors,
+            }),
+        },
+    );
     crate::print_stdout(format_args!("{body}"))?;
     Ok(())
 }
@@ -1048,6 +1095,7 @@ fn preview_imports(
         ) {
             Ok(_) => included.push(id.clone()),
             Err(error) if bulk => {
+                crate::sessions_progress::check()?;
                 let class = import_refusal_class(&error);
                 refused[class] += 1;
                 crate::print_stdout(format_args!(
@@ -1068,11 +1116,16 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
     );
     let id = match &command {
         SessionsCommand::Import { id, .. } => id.first().map(String::as_str).unwrap_or("all"),
-        SessionsCommand::Return { id, .. } | SessionsCommand::Recover { id, .. }
+        SessionsCommand::Return { id, .. }
+        | SessionsCommand::Recover { id, .. }
         | SessionsCommand::Unimport { id, .. } => id,
         SessionsCommand::Urgent { .. } => unreachable!(),
     };
-    let _progress = crate::sessions_progress::Operation::begin(id, progress_english(home))?;
+    let _progress = if matches!(&command, SessionsCommand::Import { .. }) {
+        crate::sessions_progress::Operation::begin(id, progress_english(home))?
+    } else {
+        crate::sessions_progress::Operation::begin_existing(id, progress_english(home))?
+    };
     run_with_store(Store::open(home)?, command)
 }
 
@@ -1121,11 +1174,13 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                 for requested in &id {
                     match staged::offer_recovery(&store, requested, yes)? {
                         Some(false) => return Ok(()),
-                        Some(true) => {},
+                        Some(true) => {}
                         None => remaining.push(requested.clone()),
                     }
                 }
-                if !id.is_empty() && remaining.is_empty() { return Ok(()); }
+                if !id.is_empty() && remaining.is_empty() {
+                    return Ok(());
+                }
                 id = remaining;
             }
             let catalog = discovery::catalog(&from)?;
@@ -1197,7 +1252,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                     ImportOptions {
                         apply,
                         skip_existing: all,
-                        announce: true,
+                        announce: !apply,
                         keep_source,
                         clean_stale,
                     },
@@ -1205,6 +1260,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                     Ok(true) => imported += 1,
                     Ok(false) => skipped += 1,
                     Err(error) if bulk => {
+                        crate::sessions_progress::check()?;
                         let class = import_refusal_class(&error);
                         match class {
                             0 => live += 1,
@@ -1382,8 +1438,10 @@ fn import_one_using(
             let bytes: u64 = copy.names.iter().map(|n| n.bytes).sum();
             crate::print_stdout(format_args!(
                 "다른 홈의 같은 기록: {} · {}개 · {} · {}",
-                crate::sessions_presentation::readable_path(&copy.home.to_string_lossy(),
-                    &std::env::var("USERPROFILE").unwrap_or_default()),
+                crate::sessions_presentation::readable_path(
+                    &copy.home.to_string_lossy(),
+                    &std::env::var("USERPROFILE").unwrap_or_default()
+                ),
                 copy.names.len(),
                 crate::sessions_presentation::size(bytes),
                 if clean_stale || !keep_source {
@@ -1509,6 +1567,7 @@ fn import_one_using(
         }
     }
     checkpoint(store, id, "linked")?;
+    crate::sessions_progress::phase(crate::sessions_progress::Phase::Records, None)?;
     db::apply(&database)?;
     checkpoint(store, id, "target_rows")?;
     update_index(&store.target, &record.index, false)?;
@@ -1568,6 +1627,9 @@ fn import_one_using(
     journal.imports.get_mut(id).unwrap().complete = true;
     store.save(&journal)?;
     checkpoint(store, id, "committed")?;
+    // Legacy sharing keeps its transaction as one safe step. Cancellation may
+    // stop here only after the durable journal reports the share complete.
+    crate::sessions_progress::boundary()?;
     if announce && keep_source {
         crate::print_stdout(format_args!(
             "주의: 두 홈의 대화 기록은 같은 파일입니다. 양쪽에서 동시에 실행하면 기록이 손상될 수 있습니다."
@@ -1981,14 +2043,21 @@ fn resume_in_target(store: &Store, id: &str, previous_owner: Option<&Path>) -> R
 
 /// Resolve only the requested journal before the ordinary admission veto.
 /// The returned scope must end before starting a native child.
-pub(crate) fn prepare_resume(home: &Path, id: Option<&str>, target: Option<&Path>)
-    -> Result<Option<crate::sessions_progress::Operation>> {
-    let Some(id) = id else { return Ok(None); };
+pub(crate) fn prepare_resume(
+    home: &Path,
+    id: Option<&str>,
+    target: Option<&Path>,
+) -> Result<Option<crate::sessions_progress::Operation>> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
     let progress = crate::sessions_progress::Operation::begin(id, progress_english(home))?;
     ensure!(discovery::valid_id(id), "대화 ID는 UUID여야 합니다");
     let store = Store::open_selected(home, target)?;
-    ensure!(staged::offer_recovery(&store, id, false)? != Some(false),
-        "이전 이동을 되돌렸습니다. 원본 홈에서 대화를 다시 열어 주세요.");
+    ensure!(
+        staged::offer_recovery(&store, id, false)? != Some(false),
+        "이전 이동을 되돌렸습니다. 원본 홈에서 대화를 다시 열어 주세요."
+    );
     Ok(Some(progress))
 }
 
@@ -2027,6 +2096,7 @@ pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -
             matches.push(catalog);
         }
     }
+    crate::sessions_progress::check()?;
     ensure!(
         !matches.is_empty(),
         "기존 홈에서 대화를 찾지 못했습니다. sessions import --from으로 원본을 지정하세요"
