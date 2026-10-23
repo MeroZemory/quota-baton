@@ -28,6 +28,7 @@ use super::{ClientSocket, UpstreamSocket};
 use crate::{
     accounts::Provider::Codex,
     guard::{InflightBudget, Reservation},
+    issue_operation::{CallerGuard, IssueOperation},
     observability::{Observability, safe_error_code, safe_identifier},
     relay::launch::DataLaunchError,
     relay::ledger::Completion,
@@ -889,12 +890,123 @@ struct PendingRateResend {
     model: Option<String>,
 }
 
+// The create's caller/deadline owner is separate from metadata operations.
+// Only slots and their polled futures retain this guard, never blocking work.
+struct CreateLifetime {
+    operation: IssueOperation,
+    caller: CallerGuard,
+    quota_attempted: std::sync::atomic::AtomicBool,
+    quota_revalidated: std::sync::atomic::AtomicBool,
+}
+
+impl CreateLifetime {
+    fn new(deadline: Instant) -> Arc<Self> {
+        let operation = IssueOperation::new(deadline);
+        let caller = operation.caller_guard();
+        Arc::new(Self {
+            operation,
+            caller,
+            quota_attempted: std::sync::atomic::AtomicBool::new(false),
+            quota_revalidated: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn live(&self, context: &Context) -> bool {
+        !context
+            .relay
+            .as_ref()
+            .is_some_and(|relay| relay.is_draining())
+            && self.operation.can_reply()
+            && self.operation.check().is_ok()
+    }
+
+    fn admit_first_write(&self) -> bool {
+        self.operation.can_reply()
+            && self.operation.check().is_ok()
+            && self.operation.admit().is_ok()
+    }
+}
+
+async fn native_initial_eligible(
+    context: &Context,
+    model: Option<&str>,
+    unknown_model: bool,
+) -> bool {
+    match &context.runtime {
+        Some(runtime) if unknown_model => runtime.eligible_unknown_model(&context.account).await,
+        Some(runtime) => runtime.eligible(&context.account, model).await,
+        None => true,
+    }
+}
+
+// Only this unsent-create adapter calls the shared wait. Rate resends and WS
+// error frames keep their existing row13/C6.3 paths and cannot enter here.
+async fn eligible_unsent_create(
+    context: &Context,
+    model: Option<&str>,
+    unknown_model: bool,
+    create: &CreateLifetime,
+) -> bool {
+    if !create.live(context) {
+        return false;
+    }
+    if native_initial_eligible(context, model, unknown_model).await {
+        return create.live(context);
+    }
+    if !create.live(context) {
+        return false;
+    }
+    let (Some(relay), Some(key)) = (&context.relay, context.session.key.as_deref()) else {
+        return false;
+    };
+    // One engine invocation for the entire create, across inspection/pacing.
+    // Renewals INSIDE that invocation preserve the admitted envelope.
+    if create.quota_attempted.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let hint = crate::relay::quota_wait::wait_ws_quota(
+        relay,
+        key,
+        model,
+        &context.account,
+        &create.operation,
+        &create.caller,
+    )
+    .await;
+    if !create.live(context) {
+        return false;
+    }
+    let Some(hint) = hint else {
+        return false;
+    };
+    if hint.source != context.account
+        || !matches!(
+            hint.end,
+            crate::relay::quota_wait::WaitEnd::Reset | crate::relay::quota_wait::WaitEnd::Revoked
+        )
+    {
+        return false;
+    }
+    // Reset or revoked authority is only a hint to recheck THIS pinned account.
+    // Never invoke the chooser, replace the socket, or mint dispatch authority.
+    let eligible =
+        native_initial_eligible(context, model, unknown_model).await && create.live(context);
+    if eligible {
+        create.quota_revalidated.store(true, Ordering::Release);
+    }
+    #[cfg(feature = "testkit")]
+    if eligible {
+        relay.observe_ws_quota_wait("reselect", &context.account, create.operation.deadline());
+    }
+    eligible
+}
+
 struct PendingInitial {
     request: u64,
     message: Message,
     reservation: Reservation,
     rate: Arc<RateBudget>,
-    deadline: Instant,
+    create: Arc<CreateLifetime>,
 }
 
 struct PendingInspection {
@@ -903,11 +1015,12 @@ struct PendingInspection {
     session: Session,
     model: Option<String>,
     managed: bool,
-    deadline: Instant,
+    create: Arc<CreateLifetime>,
 }
 
 #[derive(Debug)]
 enum InspectFailure {
+    Expired,
     Ineligible,
     ReservationUnavailable,
 }
@@ -916,6 +1029,7 @@ type InitialInspection = BoxFuture<'static, Result<CurrentCompletion, InspectFai
 #[derive(Debug, PartialEq, Eq)]
 enum InitialAdmission {
     Ready,
+    Expired,
     Rejected { expired: bool },
 }
 
@@ -927,11 +1041,15 @@ fn inspect_initial(context: Arc<Context>, pending: &PendingInspection) -> Initia
     };
     let model = pending.model.clone();
     let managed = pending.managed;
+    let create = pending.create.clone();
     #[cfg(feature = "testkit")]
     let message = pending.message.clone();
     #[cfg(feature = "testkit")]
-    let deadline = pending.deadline;
+    let deadline = create.operation.deadline();
     Box::pin(async move {
+        if !create.live(&context) {
+            return Err(InspectFailure::Expired);
+        }
         #[cfg(feature = "testkit")]
         if !wait_dispatch_until(
             &context,
@@ -943,10 +1061,12 @@ fn inspect_initial(context: Arc<Context>, pending: &PendingInspection) -> Initia
         {
             return Err(InspectFailure::Ineligible);
         }
-        if let Some(runtime) = &context.runtime
-            && !runtime.eligible(&context.account, model.as_deref()).await
-        {
-            return Err(InspectFailure::Ineligible);
+        if !eligible_unsent_create(&context, model.as_deref(), false, &create).await {
+            return Err(if create.live(&context) {
+                InspectFailure::Ineligible
+            } else {
+                InspectFailure::Expired
+            });
         }
         #[cfg(feature = "testkit")]
         if !wait_dispatch_until(
@@ -959,11 +1079,17 @@ fn inspect_initial(context: Arc<Context>, pending: &PendingInspection) -> Initia
         {
             return Err(InspectFailure::ReservationUnavailable);
         }
+        if !create.live(&context) {
+            return Err(InspectFailure::Expired);
+        }
         let active = if managed {
             CurrentCompletion::new_for_session(&context, &session).await
         } else {
             CurrentCompletion::new(&context).await
         };
+        if !create.live(&context) {
+            return Err(InspectFailure::Expired);
+        }
         active.ok_or(InspectFailure::ReservationUnavailable)
     })
 }
@@ -975,23 +1101,37 @@ fn admit_initial(
     managed: bool,
 ) -> BoxFuture<'static, InitialAdmission> {
     let rate = pending.rate.clone();
+    let create = pending.create.clone();
     #[cfg(feature = "testkit")]
     let message = pending.message.clone();
     Box::pin(async move {
+        if !create.live(&context) {
+            return InitialAdmission::Expired;
+        }
         let paced = rate.admit(context.runtime.as_ref(), &context.account).await;
+        if !create.live(&context) {
+            return InitialAdmission::Expired;
+        }
+        let unknown_model = !managed && model.is_none();
         let eligible = paced
-            && match &context.runtime {
-                Some(runtime) if !managed && model.is_none() => {
-                    runtime.eligible_unknown_model(&context.account).await
-                }
-                Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
-                None => true,
-            };
+            && !rate.initial_sent()
+            && !rate.is_committed()
+            && eligible_unsent_create(&context, model.as_deref(), unknown_model, &create).await;
         #[cfg(feature = "testkit")]
         let eligible = eligible
             && (managed
                 || wait_ordinary_dispatch(&context, &message, OrdinaryDispatchStage::AfterPacing)
                     .await);
+        // Recheck after the retained-frame gate too: a real poll may change
+        // eligibility during that suspension. The one-attempt flag prevents
+        // a new quota interval if this create already used the engine.
+        let eligible = eligible
+            && !rate.initial_sent()
+            && !rate.is_committed()
+            && eligible_unsent_create(&context, model.as_deref(), unknown_model, &create).await;
+        if !create.live(&context) {
+            return InitialAdmission::Expired;
+        }
         if eligible {
             return InitialAdmission::Ready;
         }
@@ -1001,6 +1141,9 @@ fn admit_initial(
             Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
             None => true,
         };
+        if !create.live(&context) {
+            return InitialAdmission::Expired;
+        }
         InitialAdmission::Rejected {
             expired: forced && eligible_now,
         }
@@ -1207,6 +1350,49 @@ pub(super) fn pause_create_dispatch(
     (observed, release)
 }
 
+// Only a successful unsent quota revalidation may bypass failed-refresh backoff.
+// This refresh supplies evidence to the unchanged native admission below; it
+// neither accepts a model nor changes the socket's source or create deadline.
+fn admit_create_after_quota(
+    context: Arc<Context>,
+    model: Option<String>,
+    create: Arc<CreateLifetime>,
+) -> CreateAdmission {
+    Box::pin(async move {
+        if !create.live(&context) {
+            return Err(DataLaunchError::Unavailable);
+        }
+        if create.quota_revalidated.load(Ordering::Acquire)
+            && let Some(relay) = &context.relay
+        {
+            let view = relay
+                .catalogs
+                .view(&context.account)
+                .map_err(|_| DataLaunchError::Unavailable)?;
+            if matches!(
+                view.observation,
+                crate::catalog::Observation::RefreshFailed { previous: None, .. }
+            ) {
+                tokio::select! {
+                    biased;
+                    _ = relay.wait_for_drain_start() => return Err(DataLaunchError::Unavailable),
+                    result = tokio::time::timeout_at(
+                        create.operation.deadline(),
+                        relay.launch_catalog(&context.account, true, true),
+                    ) => {
+                        result.map_err(|_| DataLaunchError::Unavailable)?
+                            .map_err(|_| DataLaunchError::Unavailable)?;
+                    }
+                }
+            }
+        }
+        if !create.live(&context) {
+            return Err(DataLaunchError::Unavailable);
+        }
+        admit_create(context, model, create.operation.deadline()).await
+    })
+}
+
 fn admit_create(
     context: Arc<Context>,
     model: Option<String>,
@@ -1253,6 +1439,37 @@ fn admit_create(
 }
 
 type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
+
+fn write_initial<S>(
+    sink: S,
+    message: Message,
+    reservation: Reservation,
+    delivered: Delivered,
+    create: Arc<CreateLifetime>,
+) -> Write<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+    S::Error: Send,
+{
+    Box::pin(async move {
+        #[cfg(test)]
+        let (sink, success, delivered) = write(
+            tests::TimerWriteSink::new(sink, &create),
+            message,
+            reservation,
+            delivered,
+        )
+        .await;
+        #[cfg(test)]
+        let result = (sink.into_inner(), success, delivered);
+        #[cfg(not(test))]
+        let result = write(sink, message, reservation, delivered).await;
+        // Keep the paired caller alive through the first poll and physical
+        // write backpressure. Admission is not a delivery/flush receipt.
+        drop(create);
+        result
+    })
+}
 
 fn write<S>(
     mut sink: S,
@@ -1607,7 +1824,7 @@ async fn run_with_read_timeout(
     let mut pending_rate_redial: Option<PendingRateResend> = None;
     let mut rate_redial: Option<RateRedial> = None;
     let mut deferred_client: Option<(Message, Reservation)> = None;
-    let mut pending_launch_create: Option<(Message, Reservation, Instant)> = None;
+    let mut pending_launch_create: Option<(Message, Reservation, Arc<CreateLifetime>)> = None;
     let mut launch_preparation: Option<LaunchPreparation> = None;
     let mut pending_launch_error: Option<Message> = None;
     let mut pending_initial: Option<PendingInitial> = None;
@@ -1749,7 +1966,23 @@ async fn run_with_read_timeout(
         // frame closes the connection instead of growing a queue.
         // split 잠금은 poll 사이에 해제되어
         // 큰 쓰기가 진행되는 동안 같은 소켓의 읽기와 자동 pong을 poll할 수 있다.
+        // The write arm can consume this slot and admit its first write while
+        // the same select is still polling. Keep identity without extending the
+        // caller's lifetime; the deadline applies only to that pending create.
+        let pending_create = pending_launch_create
+            .as_ref()
+            .map(|(_, _, create)| create)
+            .or_else(|| pending_inspection.as_ref().map(|pending| &pending.create))
+            .or_else(|| pending_initial.as_ref().map(|pending| &pending.create))
+            .map(|create| (Arc::downgrade(create), create.operation.deadline()));
+        let pending_create_deadline = pending_create.as_ref().map(|(_, deadline)| *deadline);
+        #[cfg(test)]
+        tests::observe_outer_create_snapshot(
+            pending_create.as_ref(),
+            initial_ready && pending_initial.is_some() && client_admitted,
+        );
         let pending_inspection_active = pending_inspection.is_some();
+        let pending_launch_active = pending_launch_create.is_some();
         let pending_client_admission = pending_launch_create.is_some()
             || pending_inspection_active
             || pending_initial.is_some()
@@ -1757,12 +1990,32 @@ async fn run_with_read_timeout(
             || pending_rate_redial.is_some()
             || rate_redial.is_some();
         tokio::select! {
+            _ = async {
+                match pending_create_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if pending_create_deadline.is_some() && ending.is_none() => {
+                // A Pending sink flush must not turn an admission deadline into
+                // a physical completion timeout after the write arm admitted it.
+                let still_pending = pending_launch_create.as_ref().map(|(_, _, create)| create)
+                    .or_else(|| pending_inspection.as_ref().map(|pending| &pending.create))
+                    .or_else(|| pending_initial.as_ref().map(|pending| &pending.create))
+                    .is_some_and(|current| pending_create.as_ref()
+                        .is_some_and(|(timed, _)| timed.ptr_eq(&Arc::downgrade(current))));
+                #[cfg(test)]
+                tests::observe_outer_create_timer(still_pending);
+                if still_pending {
+                    ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), "request_timeout"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                }
+            }
             _ = async { drain_signal.as_mut().unwrap().await }, if drain_signal.is_some() && !draining && ending.is_none() => {
                 draining = true;
             }
             result = async { launch_preparation.as_mut().unwrap().await }, if launch_preparation.is_some() && ending.is_none() => {
                 launch_preparation = None;
-                let (message, reservation, deadline) = pending_launch_create.take().expect("launch preparation owns payload");
+                let (message, reservation, create) = pending_launch_create.take().expect("launch preparation owns payload");
                 draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                 if draining { continue; }
                 let (session, accepted_model) = match result {
@@ -1776,7 +2029,7 @@ async fn run_with_read_timeout(
                         continue;
                     }
                 };
-                let pending = PendingInspection { message, reservation, session, model: Some(accepted_model), managed: true, deadline };
+                let pending = PendingInspection { message, reservation, session, model: Some(accepted_model), managed: true, create };
                 initial_inspection = Some(inspect_initial(context.clone(), &pending));
                 pending_inspection = Some(pending);
             }
@@ -1787,6 +2040,11 @@ async fn run_with_read_timeout(
                 if draining { continue; }
                 let mut active = match result {
                     Ok(active) => active,
+                    Err(InspectFailure::Expired) => {
+                        ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), "request_timeout"));
+                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        continue;
+                    }
                     Err(InspectFailure::Ineligible) => {
                         ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), "account_ineligible"));
                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -1813,7 +2071,7 @@ async fn run_with_read_timeout(
                 let request = next_request;
                 next_request += 1;
                 current.insert(request, active);
-                let initial = PendingInitial { request, message: pending.message, reservation: pending.reservation, rate, deadline: pending.deadline };
+                let initial = PendingInitial { request, message: pending.message, reservation: pending.reservation, rate, create: pending.create };
                 initial_admission = Some(admit_initial(context.clone(), &initial, model.clone(), pending.managed));
                 pending_initial = Some(initial);
             }
@@ -1825,6 +2083,12 @@ async fn run_with_read_timeout(
                     // Let the loop cancel only this queued turn; any earlier
                     // dispatched turns still drain before the native 1001.
                     pending_initial = Some(pending);
+                    continue;
+                }
+                if admission == InitialAdmission::Expired {
+                    if let Some(active) = current.get_mut(&pending.request) { active.completion.record.outcome = "request_timeout".into(); }
+                    ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), "request_timeout"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     continue;
                 }
                 if let InitialAdmission::Rejected { expired } = admission {
@@ -1851,7 +2115,7 @@ async fn run_with_read_timeout(
                             continue;
                         }
                     };
-                    create_admission = Some(admit_create(context.clone(), requested, pending.deadline));
+                    create_admission = Some(admit_create_after_quota(context.clone(), requested, pending.create.clone()));
                 } else {
                     initial_ready = true;
                 }
@@ -1920,7 +2184,7 @@ async fn run_with_read_timeout(
                             ending = Some((Some(CloseFrame { code: 1001.into(), reason: "".into() }), "takeover_drain"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        if current.is_empty() && !pending_inspection_active && ending.is_none() && let Some(runtime) = &context.runtime
+                        if current.is_empty() && !pending_launch_active && !pending_inspection_active && ending.is_none() && let Some(runtime) = &context.runtime
                             && !runtime.eligible(&context.account, model.as_deref()).await {
                             ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -1959,6 +2223,8 @@ async fn run_with_read_timeout(
                                 if !wait_ordinary_dispatch(&context, &message, OrdinaryDispatchStage::BeforeWrite).await {
                                     return Err("takeover_drain");
                                 }
+                                #[cfg(test)]
+                                tests::wait_outer_timer_write_gate().await;
                                 Ok(())
                             })
                         });
@@ -1994,6 +2260,9 @@ async fn run_with_read_timeout(
                     if !pending.rate.can_send() {
                         return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
                     }
+                    if !pending.create.admit_first_write() {
+                        return (sink, false, Delivered { bytes:0, request:Some(pending.request), terminal:Some("request_timeout"), completed:false });
+                    }
                     if let Some(active) = current.get_mut(&pending.request) {
                         active.completion.accounting_attempt(&context.account);
                         if let Some(binding) = &active.completion.binding {
@@ -2003,9 +2272,9 @@ async fn run_with_read_timeout(
                     pending.rate.note_usage_send(&context);
                     pending.rate.initial_dispatch();
                     pending.rate.record_forced_send(context.runtime.as_ref(), &context.account);
-                    to_upstream = Some(write(sink, pending.message, pending.reservation, Delivered {
+                    to_upstream = Some(write_initial(sink, pending.message, pending.reservation, Delivered {
                         bytes, request: Some(pending.request), terminal: None, completed: false,
-                    }));
+                    }, pending.create));
                 }
                 to_upstream.as_mut().unwrap().await
             }, if to_upstream.is_some() || (initial_ready && ending.is_none()) => {
@@ -2129,9 +2398,15 @@ async fn run_with_read_timeout(
                                     Err(error) => { pending_launch_error = Some(launch_error(error)); continue; }
                                 };
                                 let context = context.clone();
-                                let deadline = context.launch_deadline();
-                                launch_preparation = Some(Box::pin(async move { context.prepare_launch_create(requested.as_deref(), deadline).await }));
-                                pending_launch_create = Some((message, reservation, deadline));
+                                let create = CreateLifetime::new(context.launch_deadline());
+                                let preparation_create = create.clone();
+                                launch_preparation = Some(Box::pin(async move {
+                                    if !preparation_create.live(&context) { return Err(DataLaunchError::Unavailable); }
+                                    let prepared = context.prepare_launch_create(requested.as_deref(), preparation_create.operation.deadline()).await;
+                                    if !preparation_create.live(&context) { return Err(DataLaunchError::Unavailable); }
+                                    prepared
+                                }));
+                                pending_launch_create = Some((message, reservation, create));
                                 continue;
                             }
                         }
@@ -2141,7 +2416,7 @@ async fn run_with_read_timeout(
                             let pending = PendingInspection {
                                 model: super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()),
                                 session: Session { key: context.session.key.clone(), parent: context.session.parent.clone(), model: context.session.model.clone() },
-                                managed: false, deadline: context.launch_deadline(), message, reservation,
+                                managed: false, create: CreateLifetime::new(context.launch_deadline()), message, reservation,
                             };
                             initial_inspection = Some(inspect_initial(context.clone(), &pending));
                             pending_inspection = Some(pending);
@@ -2401,7 +2676,7 @@ async fn run_with_read_timeout(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
                 };
-                if relevant && current.is_empty() && !pending_inspection_active && !terminal_pending && let Some(runtime) = &context.runtime
+                if relevant && current.is_empty() && !pending_launch_active && !pending_inspection_active && !terminal_pending && let Some(runtime) = &context.runtime
                     && !runtime.eligible(&context.account, model.as_deref()).await {
                     ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;

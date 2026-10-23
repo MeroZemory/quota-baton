@@ -1,4 +1,7 @@
 use axum::http::{HeaderMap, StatusCode};
+#[cfg(feature = "testkit")]
+#[path = "support/n5b_ws_quota.rs"]
+mod n5b_ws_quota;
 #[path = "support/routing_ws.rs"]
 mod routing_ws;
 use chrono::{Duration as ChronoDuration, Utc};

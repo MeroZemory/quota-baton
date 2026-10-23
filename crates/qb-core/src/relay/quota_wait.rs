@@ -1,4 +1,4 @@
-//! Revocable proof-backed HTTP waiting, never send authority.
+//! Revocable proof-backed waiting, never send authority.
 use super::RelayState;
 use crate::{
     accounts::Provider,
@@ -56,6 +56,58 @@ pub(super) async fn wait_http_quota(
     operation: &IssueOperation,
     _caller: &CallerGuard,
 ) -> Option<WaitHint> {
+    wait_quota(
+        relay,
+        provider,
+        key,
+        model,
+        source,
+        operation,
+        _caller,
+        WaitTransport::Http,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum WaitTransport {
+    Http,
+    WsCreate,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn wait_ws_quota(
+    relay: &RelayState,
+    key: &str,
+    model: Option<&str>,
+    source: &str,
+    operation: &IssueOperation,
+    caller: &CallerGuard,
+) -> Option<WaitHint> {
+    wait_quota(
+        relay,
+        Provider::Codex,
+        key,
+        model,
+        source,
+        operation,
+        caller,
+        WaitTransport::WsCreate,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_quota(
+    relay: &RelayState,
+    provider: Provider,
+    key: &str,
+    model: Option<&str>,
+    source: &str,
+    operation: &IssueOperation,
+    _caller: &CallerGuard,
+    transport: WaitTransport,
+) -> Option<WaitHint> {
     // Bound copies before any detached blocking work. These are lookup inputs,
     // not independently trusted account/binding identities.
     if key.is_empty()
@@ -73,6 +125,8 @@ pub(super) async fn wait_http_quota(
         source: source.to_owned(),
         operation: operation.clone(),
     };
+    #[cfg(not(feature = "testkit"))]
+    let _ = transport;
     let deadline = operation.deadline();
     let mut account_events = relay.accounts.subscribe();
     // Infer the crate-visible receipt returned through the runtime API; the
@@ -168,7 +222,12 @@ pub(super) async fn wait_http_quota(
         receipt = Some(current);
         #[cfg(feature = "testkit")]
         if first {
-            relay.observe_http_quota_wait("admitted", source);
+            match transport {
+                WaitTransport::Http => relay.observe_http_quota_wait("admitted", source),
+                WaitTransport::WsCreate => {
+                    relay.observe_ws_quota_wait("admitted", source, deadline)
+                }
+            }
         }
         #[cfg(not(feature = "testkit"))]
         let _ = first;

@@ -1,6 +1,11 @@
 use super::*;
 use axum::{Router, extract::Request, http::StatusCode, response::Response, routing::get};
-use std::path::Path;
+use std::{
+    future::Future,
+    path::Path,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
@@ -101,6 +106,27 @@ async fn pair_with_rate_options(
     tracking: bool,
     rate: Option<(u64, u32)>,
 ) -> Pair {
+    pair_with_pump_timer_probe(
+        idle_close,
+        close_after_response,
+        limit,
+        read_timeout,
+        tracking,
+        rate,
+        None,
+    )
+    .await
+}
+
+async fn pair_with_pump_timer_probe(
+    idle_close: Duration,
+    close_after_response: bool,
+    limit: usize,
+    read_timeout: Duration,
+    tracking: bool,
+    rate: Option<(u64, u32)>,
+    timer_probe: Option<Arc<PumpTimerProbe>>,
+) -> Pair {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
@@ -171,6 +197,7 @@ async fn pair_with_rate_options(
     let handler_budget = budget.clone();
     let handler_memory_guard = memory_guard.clone();
     let handler_relay = relay.clone();
+    let handler_timer_probe = timer_probe;
     let (drain, drained) = tokio::sync::oneshot::channel();
     let drained = Arc::new(Mutex::new(Some(drained)));
     let router = Router::new().route(
@@ -181,6 +208,7 @@ async fn pair_with_rate_options(
             let budget = handler_budget.clone();
             let drained = drained.clone();
             let relay = handler_relay.clone();
+            let timer_probe = handler_timer_probe.clone();
             async move {
                 let upstream = upstream.lock().await.take().unwrap();
                 let drained = drained.lock().await.take().unwrap();
@@ -195,7 +223,7 @@ async fn pair_with_rate_options(
                         Some(config()),
                     )
                     .await;
-                    run_with_read_timeout(
+                    let pump = run_with_read_timeout(
                         client,
                         upstream,
                         Context {
@@ -224,8 +252,12 @@ async fn pair_with_rate_options(
                             connection: "fake-connection".into(),
                         },
                         read_timeout,
-                    )
-                    .await;
+                    );
+                    if let Some(probe) = timer_probe {
+                        PUMP_TIMER_PROBE.scope(probe, pump).await;
+                    } else {
+                        pump.await;
+                    }
                 });
                 Response::builder()
                     .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -1451,7 +1483,7 @@ async fn n5b_initial_admission_preserves_forced_expiry_classification() {
             message: Message::text("synthetic"),
             reservation: pair.budget.reserve_message(9),
             rate,
-            deadline: Instant::now(),
+            create: CreateLifetime::new(Instant::now() + Duration::from_secs(30)),
         };
         assert_eq!(
             admit_initial(context.clone(), &pending, None, false).await,
@@ -1467,7 +1499,7 @@ async fn n5b_initial_admission_preserves_forced_expiry_classification() {
         message: Message::text("synthetic"),
         reservation: pair.budget.reserve_message(9),
         rate: rate.clone(),
-        deadline: Instant::now(),
+        create: CreateLifetime::new(Instant::now() + Duration::from_secs(30)),
     };
     assert_eq!(
         admit_initial(context, &pending, Some("synthetic-model".into()), false).await,
@@ -1509,7 +1541,7 @@ async fn n5b_initial_admission_forced_but_ineligible_does_not_report_rate_expiry
         message: Message::text("synthetic"),
         reservation: pair.budget.reserve_message(9),
         rate,
-        deadline: Instant::now(),
+        create: CreateLifetime::new(Instant::now() + Duration::from_secs(30)),
     };
     assert_eq!(
         admit_initial(Arc::new(context), &pending, None, false).await,
@@ -1517,4 +1549,335 @@ async fn n5b_initial_admission_forced_but_ineligible_does_not_report_rate_expiry
     );
     drop(pending);
     assert_eq!(pair.budget.used(), 0);
+}
+
+#[test]
+fn n5b_create_guard_is_not_kept_alive_by_detached_operation() {
+    let create = CreateLifetime::new(Instant::now() + Duration::from_secs(30));
+    let detached_operation = create.operation.clone();
+    let pending_future_owner = create.clone();
+    drop(create);
+    assert!(detached_operation.can_reply());
+    assert!(detached_operation.check().is_ok());
+    drop(pending_future_owner);
+    assert!(!detached_operation.can_reply());
+    assert!(detached_operation.check().is_err());
+    assert!(detached_operation.admit().is_err());
+}
+
+#[test]
+fn n5b_create_expiry_is_not_rate_or_metadata_admission() {
+    let create = CreateLifetime::new(Instant::now() - Duration::from_millis(1));
+    let metadata = IssueOperation::new(Instant::now() + Duration::from_secs(30));
+    let _metadata_caller = metadata.caller_guard();
+    metadata.admit().unwrap();
+    let rate = RateBudget::with_limits(Duration::ZERO, 3);
+    assert!(
+        rate.can_send(),
+        "native rate expiry may still allow its one forced send"
+    );
+    assert!(
+        !create.admit_first_write(),
+        "neither metadata nor rate expiry grants expired create admission"
+    );
+    assert!(!rate.initial_sent());
+}
+
+#[tokio::test]
+async fn n5b_initial_write_keeps_caller_through_backpressure_then_drop() {
+    let (entered, arrived) = tokio::sync::oneshot::channel::<()>();
+    let (_release, blocked) = tokio::sync::oneshot::channel::<()>();
+    let sink = Box::pin(futures_util::sink::unfold(
+        (Some(entered), Some(blocked)),
+        |(entered, blocked), _: Message| async move {
+            let _ = entered.unwrap().send(());
+            let _ = blocked.unwrap().await;
+            Ok::<_, std::io::Error>((None, None))
+        },
+    ));
+    let budget = InflightBudget::new(32);
+    let create = CreateLifetime::new(Instant::now() + Duration::from_secs(30));
+    let operation = create.operation.clone();
+    assert!(create.admit_first_write());
+    let mut writer = write_initial(
+        sink,
+        Message::text("synthetic"),
+        budget.reserve_message(9),
+        Delivered {
+            bytes: 9,
+            request: Some(0),
+            terminal: None,
+            completed: false,
+        },
+        create,
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            arrived = arrived => arrived.unwrap(),
+            _ = &mut writer => panic!("initial write completed before native sink release"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        operation.can_reply(),
+        "physical Pending write must retain its original caller"
+    );
+    assert_eq!(budget.used(), 9);
+    drop(writer);
+    assert!(
+        !operation.can_reply(),
+        "cancelled physical write must drop its caller owner"
+    );
+    assert_eq!(budget.used(), 0);
+}
+
+// These one-shot controls are scoped to one actual pump task, not a global
+// writer override. They retain operation identity only, never its CallerGuard.
+tokio::task_local! {
+    static PUMP_TIMER_PROBE: Arc<PumpTimerProbe>;
+}
+
+type CreateTimerSnapshot = (std::sync::Weak<CreateLifetime>, Instant);
+type InitialFlushObservation = (std::sync::Weak<CreateLifetime>, IssueOperation);
+
+// A gate in the retained final-admission future lets the native read-budget
+// branch settle before this test releases a write. The snapshot comes from the
+// real outer select, after that branch is disabled by client_admitted == true.
+struct PumpTimerProbe {
+    before_write: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    snapshot: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<CreateTimerSnapshot>>>,
+    flush: std::sync::Mutex<Option<InitialFlushGate>>,
+    timer: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+}
+
+struct InitialFlushGate {
+    arrived: Option<tokio::sync::oneshot::Sender<InitialFlushObservation>>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+struct PumpTimerControl {
+    probe: Arc<PumpTimerProbe>,
+    at_snapshot: tokio::sync::oneshot::Receiver<CreateTimerSnapshot>,
+    start_write: tokio::sync::oneshot::Sender<()>,
+    at_flush: tokio::sync::oneshot::Receiver<InitialFlushObservation>,
+    at_timer: tokio::sync::oneshot::Receiver<bool>,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+impl PumpTimerControl {
+    fn new() -> Self {
+        let (start_write, before_write) = tokio::sync::oneshot::channel();
+        let (snapshot, at_snapshot) = tokio::sync::oneshot::channel();
+        let (arrived, at_flush) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let (timer, at_timer) = tokio::sync::oneshot::channel();
+        Self {
+            probe: Arc::new(PumpTimerProbe {
+                before_write: std::sync::Mutex::new(Some(before_write)),
+                snapshot: std::sync::Mutex::new(Some(snapshot)),
+                flush: std::sync::Mutex::new(Some(InitialFlushGate {
+                    arrived: Some(arrived),
+                    release: blocked,
+                })),
+                timer: std::sync::Mutex::new(Some(timer)),
+            }),
+            at_snapshot,
+            start_write,
+            at_flush,
+            at_timer,
+            release,
+        }
+    }
+}
+
+pub(super) fn observe_outer_create_snapshot(
+    pending: Option<&CreateTimerSnapshot>,
+    stable_read_admission: bool,
+) {
+    if !stable_read_admission {
+        return;
+    }
+    let Some((create, deadline)) = pending else {
+        return;
+    };
+    let _ = PUMP_TIMER_PROBE.try_with(|probe| {
+        if let Some(snapshot) = probe.snapshot.lock().unwrap().take() {
+            let _ = snapshot.send((create.clone(), *deadline));
+        }
+    });
+}
+
+pub(super) async fn wait_outer_timer_write_gate() {
+    let gate = PUMP_TIMER_PROBE
+        .try_with(|probe| probe.before_write.lock().unwrap().take())
+        .ok()
+        .flatten();
+    if let Some(gate) = gate {
+        let _ = gate.await;
+    }
+}
+
+pub(super) fn observe_outer_create_timer(still_pending: bool) {
+    let _ = PUMP_TIMER_PROBE.try_with(|probe| {
+        if let Some(timer) = probe.timer.lock().unwrap().take() {
+            let _ = timer.send(still_pending);
+        }
+    });
+}
+
+// The native writer still calls start_send on its real upstream sink. Only the
+// first poll_flush is held Pending, so the OUTER select must keep polling its
+// captured deadline while the admitted native write has not completed.
+pub(super) struct TimerWriteSink<S> {
+    inner: S,
+    gate: Option<InitialFlushGate>,
+    operation: Option<InitialFlushObservation>,
+}
+
+impl<S> TimerWriteSink<S> {
+    pub(super) fn new(inner: S, create: &Arc<CreateLifetime>) -> Self {
+        let gate = PUMP_TIMER_PROBE
+            .try_with(|probe| probe.flush.lock().unwrap().take())
+            .ok()
+            .flatten();
+        let operation = gate
+            .as_ref()
+            .map(|_| (Arc::downgrade(create), create.operation.clone()));
+        Self {
+            inner,
+            gate,
+            operation,
+        }
+    }
+
+    pub(super) fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: Sink<Message> + Unpin> Sink<Message> for TimerWriteSink<S> {
+    type Error = S::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        Pin::new(&mut self.get_mut().inner).start_send(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        if let Some(gate) = &mut this.gate {
+            if let Some(arrived) = gate.arrived.take() {
+                let _ = arrived.send(this.operation.take().expect("first flush owns operation"));
+            }
+            if Pin::new(&mut gate.release).poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.gate = None;
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
+#[tokio::test]
+async fn n5b_outer_timer_does_not_cancel_admitted_initial_flush() {
+    let control = PumpTimerControl::new();
+    let mut pair = pair_with_pump_timer_probe(
+        Duration::from_secs(60),
+        false,
+        PARSE_LIMIT,
+        UPSTREAM_READ_TIMEOUT,
+        false,
+        None,
+        Some(control.probe.clone()),
+    )
+    .await;
+    let create =
+        Message::text(r#"{"type":"response.create","model":"synthetic-model","input":[]}"#);
+    pair.client.send(create.clone()).await.unwrap();
+    // Reading the create resets client_admitted. Its already-ready budget
+    // branch can otherwise win after start_send, rebuilding the select without
+    // any pending create. Hold final admission until that native branch has run
+    // and the REAL outer select captured this exact pending create's deadline.
+    let (captured_create, captured_deadline) =
+        tokio::time::timeout(Duration::from_secs(5), control.at_snapshot)
+            .await
+            .expect("outer select must capture pending create after read admission settles")
+            .expect("pending create snapshot was dropped");
+    assert!(Instant::now() < captured_deadline);
+    control
+        .start_write
+        .send(())
+        .expect("final write admission remains held until the real snapshot");
+    let (written_create, operation) =
+        tokio::time::timeout(Duration::from_secs(5), control.at_flush)
+            .await
+            .expect("actual pump must reach admitted native sink flush")
+            .expect("native initial flush observation was dropped");
+    assert!(
+        captured_create.ptr_eq(&written_create),
+        "captured admission timer belongs to the admitted native write"
+    );
+    assert_eq!(captured_deadline, operation.deadline());
+    assert!(Instant::now() < operation.deadline());
+    assert!(pair.budget.used() >= create.len());
+
+    // Socket setup and the first native start_send have occurred. Advance
+    // only this current-thread runtime through the ORIGINAL create deadline.
+    tokio::time::pause();
+    let until_deadline = operation
+        .deadline()
+        .saturating_duration_since(Instant::now());
+    tokio::time::advance(until_deadline + Duration::from_millis(1)).await;
+    let still_pending = tokio::time::timeout(Duration::from_secs(1), control.at_timer)
+        .await
+        .expect("outer create timer must fire while admitted sink is Pending")
+        .expect("outer create timer observation was dropped");
+    let completion_allowed = operation.check().is_ok();
+    // Resume before any further real socket IO; paused-time auto-advance must
+    // not turn a normal socket round trip into an unrelated idle/read timeout.
+    tokio::time::resume();
+    assert!(!still_pending, "admitted create no longer awaits admission");
+    assert!(
+        completion_allowed,
+        "admitted operation permits completion after expiry"
+    );
+    assert!(pair.budget.used() >= create.len());
+    control
+        .release
+        .send(())
+        .expect("admitted native flush remains owned");
+    assert_eq!(next(&mut pair.peer).await, create);
+
+    let created = Message::text(
+        r#"{"type":"response.created","response":{"id":"synthetic-timer-response"}}"#,
+    );
+    pair.peer.send(created.clone()).await.unwrap();
+    assert_eq!(
+        next(&mut pair.client).await,
+        created,
+        "admitted create must survive the outer pending-deadline timer",
+    );
+    let completed = Message::text(
+        r#"{"type":"response.completed","response":{"id":"synthetic-timer-response"}}"#,
+    );
+    pair.peer.send(completed.clone()).await.unwrap();
+    assert_eq!(next(&mut pair.client).await, completed);
+    let rows = requests(&pair, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["outcome"], "ok");
+    assert!(
+        !records(&pair)
+            .iter()
+            .any(|row| row["event"] == "ws_close" && row["reason"] == "request_timeout")
+    );
+    pair.client.close(None).await.unwrap();
+    assert!(matches!(next(&mut pair.peer).await, Message::Close(_)));
 }

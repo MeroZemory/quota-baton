@@ -89,6 +89,10 @@ mod r11_actual {
 
     impl LaunchHarness {
         async fn new(count: usize) -> Self {
+            Self::new_configured(count, None, 5).await
+        }
+
+        async fn new_configured(count: usize, usage_base: Option<&str>, request_secs: u64) -> Self {
             let mut h =
                 Harness::new_with_options(count, false, false, Some((2, 3)), Some((5, 2))).await;
             // Reuse the synthetic homes, account import, WS recorder and serial
@@ -136,7 +140,11 @@ mod r11_actual {
             config.server.data_port = 0;
             config.server.admin_port = 0;
             config.upstream.codex_base = base;
-            config.routing.request_timeout_secs = 5;
+            config.routing.request_timeout_secs = request_secs;
+            if let Some(base) = usage_base {
+                config.upstream.codex_usage_base = base.to_owned();
+                config.routing.reset_hold_secs = 60;
+            }
             config.routing.move_guard.trip_seconds = 4;
             config.routing.ws_upgrade_hold_secs = 2;
             config.routing.rate_hold_secs = 2;
@@ -1525,6 +1533,499 @@ mod r11_actual {
                 other_session_release,
                 other_payload_release,
             ));
+        }
+    }
+    #[cfg(feature = "testkit")]
+    mod n5b_managed_preparation {
+        use super::*;
+        use qb_core::{
+            relay::WsQuotaWaitEvent,
+            routing::{Mode, Settings},
+        };
+        use qb_testkit::websocket::ConnectionEvent;
+        use std::sync::atomic::Ordering;
+        use tokio::{
+            sync::broadcast,
+            time::{Instant, sleep_until, timeout},
+        };
+
+        const KEY: &str = "codex:synthetic-managed-preparation";
+        const PHASE: Duration = Duration::from_secs(2);
+        const REQUEST: u64 = 12;
+        const RESET: i64 = 6;
+
+        async fn event(
+            events: &mut broadcast::Receiver<WsQuotaWaitEvent>,
+            stage: &str,
+            source: &str,
+        ) -> WsQuotaWaitEvent {
+            let event = timeout(PHASE, events.recv())
+                .await
+                .expect(
+                    "managed cold-catalog prepare must enter genuine quota admission/revalidation",
+                )
+                .expect("managed wait observer lost an event");
+            assert_eq!(event.stage, stage);
+            assert_eq!(event.source, source);
+            event
+        }
+
+        fn quiet(events: &mut broadcast::Receiver<WsQuotaWaitEvent>) {
+            assert!(
+                matches!(
+                    events.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ),
+                "one managed create must not admit another wait or revalidate twice"
+            );
+        }
+
+        async fn released(t: &LaunchHarness, source: &str) {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let events = t.h.fake.state.events();
+                    let closed = events.iter().all(|event| match event {
+                        ConnectionEvent::Opened(id) => events.iter().any(
+                            |event| matches!(event, ConnectionEvent::Closed(done) if done == id),
+                        ),
+                        _ => true,
+                    });
+                    if closed
+                        && t.h.state.ws_reserved_for_test(source) == 0
+                        && t.h.state.bindings.pending_count(source) == 0
+                        && t.h.state.accounts.inflight_count(source) == 0
+                        && t.h.state.inflight_requests.load(Ordering::Acquire) == 0
+                        && t.h.state.budget.used() == 0
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("managed fixture must release actual native owners without listener shutdown");
+            assert!(!t.h.servers.data_task.is_finished());
+        }
+
+        async fn run(unproved_model: bool) {
+            run_case(unproved_model, false).await;
+        }
+
+        async fn run_case(unproved_model: bool, recovered_unsupported: bool) {
+            let usage = timeout(PHASE, ScriptedUpstream::start())
+                .await
+                .unwrap()
+                .unwrap();
+            let t = LaunchHarness::new_configured(2, Some(&usage.url), REQUEST).await;
+            let launch = timeout(PHASE, t.issue(Some(&t.h.ids[0]))).await.unwrap();
+            let mut client = timeout(
+                PHASE,
+                t.connect(&launch, Some("synthetic-managed-preparation")),
+            )
+            .await
+            .unwrap();
+            let source = launch.account.clone();
+            assert_eq!(
+                t.h.fake.state.requests().len(),
+                1,
+                "actual managed 101 must precede the quota report"
+            );
+            assert!(matches!(
+                t.h.store.load(&source).unwrap().health,
+                Health::Ready
+            ));
+            assert_eq!(t.h.state.ws_reserved_for_test(&source), 1);
+            assert!(t.data().is_empty());
+            assert!(usage.state.requests().is_empty());
+            let info = t.h.state.bindings.launch_info(KEY, Utc::now()).unwrap();
+            assert!(info.managed);
+            assert_eq!(info.account, source);
+            assert_eq!(info.current_model.as_deref(), Some("synthetic-model"));
+            let table = t.h.state.bindings.clone();
+            timeout(
+                PHASE,
+                tokio::task::spawn_blocking(move || {
+                    table.set_routing_session(
+                        &qb_core::routing::session_id(KEY),
+                        Some(Settings {
+                            mode: Mode::Strict,
+                            reset_wait_secs: 60,
+                        }),
+                        None,
+                        false,
+                    )
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            // Cache loss is synthetic setup only, not a quota proof or a reset.
+            // Exactly one clear: a second clear after the failure would hide
+            // catalog retry/backoff behavior in the native preparation path.
+            assert!(t.h.state.clear_codex_catalog_for_test(&source).unwrap());
+            let catalog_before = t.catalogs.requests.lock().unwrap().len();
+            let (first_fetch, fail_first) = t.catalogs.pause();
+            let mut events = t.h.state.subscribe_ws_quota_wait();
+            let raw = if unproved_model {
+                "  {\"type\":\"response.create\",\"model\":\"alternate-model\",\"input\":[]} \n"
+            } else {
+                "  {\"type\":\"response.create\",\"model\":\"synthetic-model\",\"input\":[]} \n"
+            };
+            let sent = Instant::now();
+            timeout(PHASE, client.send(Message::text(raw)))
+                .await
+                .unwrap()
+                .unwrap();
+            timeout(PHASE, first_fetch)
+                .await
+                .expect("cold managed create must actually fetch its catalog before inspection")
+                .unwrap();
+            let preparing = Instant::now();
+            assert_eq!(
+                t.catalogs.requests.lock().unwrap().len(),
+                catalog_before + 1
+            );
+            assert!(t.data().is_empty());
+            // The same complete report reaches both cases. Only the native
+            // current model has the catalog-unavailable preparation fallback;
+            // a new model must never borrow this proof to bypass that fence.
+            let reset =
+                chrono::DateTime::from_timestamp(Utc::now().timestamp() + RESET, 0).unwrap();
+            usage.state.push(ScriptedResponse::json(StatusCode::OK, json!({"rate_limit": {
+                "primary_window": {"used_percent":100,"limit_window_seconds":18000,"reset_at":reset.timestamp()},
+                "secondary_window": {"used_percent":10,"limit_window_seconds":604800,"reset_at":(reset+ChronoDuration::hours(47)).timestamp()},
+                "active_limit":"5h"
+            }}).to_string()));
+            let account = timeout(PHASE, t.h.state.quota.poll(&source))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(account.health, Health::Cooling {reason:HealthReason::Quota, until, ref scope} if until == reset && scope == "account")
+            );
+            let cooling = account.quota_cooling.unwrap();
+            assert_eq!(cooling.window, "5h");
+            assert_eq!(cooling.reset_at, reset);
+            let polls = usage.state.requests();
+            assert_eq!(polls.len(), 1);
+            assert_eq!(polls[0].path_and_query, "/backend-api/wham/usage");
+            assert_eq!(polls[0].method, axum::http::Method::GET);
+            assert!(polls[0].body.is_empty());
+            assert!(
+                polls[0].headers.get("authorization")
+                    == t.h.fake.state.requests()[0].headers.get("authorization"),
+                "real poll must use the healthy managed socket's synthetic source"
+            );
+            assert_eq!(t.h.fake.state.requests().len(), 1);
+            assert!(t.data().is_empty());
+            // Returning 503 is the EXISTING gate-drop behavior. No direct
+            // health writes, forged proof, or substituted model on the poll.
+            drop(fail_first);
+            let sampled = Instant::now();
+            let reset_lower = sampled + (reset - Utc::now()).to_std().unwrap();
+            if unproved_model {
+                let received = timeout(PHASE, client.next())
+                    .await
+                    .expect("unproved managed model must fail before reset without admission")
+                    .unwrap()
+                    .unwrap();
+                let Message::Text(error) = received else {
+                    panic!("native unavailable model preparation explanation expected")
+                };
+                let error: Value = serde_json::from_str(&error).unwrap();
+                assert_eq!(error["error"]["code"], "launch_unavailable");
+                quiet(&mut events);
+                assert!(
+                    Utc::now() < reset,
+                    "new-model refusal must not borrow the current-model wait interval"
+                );
+                assert!(t.data().is_empty());
+                assert_eq!(
+                    t.catalogs.requests.lock().unwrap().len(),
+                    catalog_before + 1
+                );
+                assert_eq!(
+                    t.h.state
+                        .bindings
+                        .launch_info(KEY, Utc::now())
+                        .unwrap()
+                        .current_model
+                        .as_deref(),
+                    Some("synthetic-model")
+                );
+                assert_eq!(
+                    t.h.state.bindings.current(Some(KEY)).as_deref(),
+                    Some(source.as_str())
+                );
+                assert_eq!(t.h.fake.state.requests().len(), 1);
+                assert_close(
+                    timeout(PHASE, client.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    1000,
+                );
+                match timeout(PHASE, client.flush()).await.unwrap() {
+                    Ok(()) | Err(Error::ConnectionClosed | Error::AlreadyClosed) => {}
+                    Err(error) => panic!("native refusal close acknowledgement failed: {error}"),
+                }
+                drop(client);
+                released(&t, &source).await;
+                sleep_until(reset_lower + Duration::from_millis(300)).await;
+                assert!(t.data().is_empty());
+                assert_eq!(t.h.fake.state.requests().len(), 1);
+                assert_eq!(
+                    t.catalogs.requests.lock().unwrap().len(),
+                    catalog_before + 1
+                );
+                quiet(&mut events);
+                return;
+            }
+            // Native prepare can preserve the proved CURRENT model despite the
+            // cold-catalog failure while cooling; its first quota wait belongs
+            // in PendingInspection, not in an error-retry wrapper.
+            let admitted = event(&mut events, "admitted", &source).await;
+            assert!(reset - Utc::now() > ChronoDuration::seconds(3));
+            assert!(admitted.deadline >= sent + Duration::from_secs(REQUEST));
+            assert!(admitted.deadline <= preparing + Duration::from_secs(REQUEST));
+            assert!(t.data().is_empty());
+            assert_eq!(
+                t.catalogs.requests.lock().unwrap().len(),
+                catalog_before + 1
+            );
+            assert_eq!(
+                t.h.state
+                    .bindings
+                    .launch_info(KEY, Utc::now())
+                    .unwrap()
+                    .current_model
+                    .as_deref(),
+                Some("synthetic-model")
+            );
+            let (final_catalog, allow_final_catalog) = t.catalogs.pause();
+            tokio::select! {
+                biased;
+                _ = sleep_until(reset_lower) => {},
+                frame = client.next() => panic!("managed current-model wait produced a frame before reset: {frame:?}"),
+            }
+            assert!(t.data().is_empty());
+            let revalidated = event(&mut events, "reselect", &source).await;
+            assert_eq!(revalidated.deadline, admitted.deadline);
+            assert!(Utc::now() >= reset);
+            // The final native model gate must observe a recovered catalog.
+            // Never clear failed cache a second time to hide backoff behavior.
+            timeout(PHASE, final_catalog).await
+                .expect("managed current-model reset must revalidate the failed catalog at the final native model gate")
+                .unwrap();
+            assert!(t.data().is_empty());
+            assert_eq!(
+                t.catalogs.requests.lock().unwrap().len(),
+                catalog_before + 2
+            );
+            if recovered_unsupported {
+                // The actual second HTTP catalog succeeds, but no longer grants
+                // the requested CURRENT model. Do not alter the request/proof.
+                t.catalogs.set(&t.h, &source, &["alternate-model"]);
+                allow_final_catalog
+                    .send(())
+                    .expect("recovered unsupported catalog gate disappeared");
+                let received = timeout(PHASE, client.next())
+                    .await
+                    .expect("recovered catalog must promptly enforce native model refusal")
+                    .unwrap()
+                    .unwrap();
+                let Message::Text(error) = received else {
+                    panic!("native model_not_supported explanation expected after quota wait")
+                };
+                let error: Value = serde_json::from_str(&error).unwrap();
+                assert!(
+                    error["error"]["code"] == "model_not_supported",
+                    "recovered catalog must refuse unsupported current model at native final gate"
+                );
+                assert!(Instant::now() < admitted.deadline);
+                assert!(
+                    t.data().is_empty(),
+                    "unsupported model must never reach upstream"
+                );
+                assert_eq!(t.h.fake.state.requests().len(), 1, "no redial or chooser");
+                assert_eq!(
+                    t.catalogs.requests.lock().unwrap().len(),
+                    catalog_before + 3
+                );
+                assert_eq!(
+                    usage.state.requests().len(),
+                    1,
+                    "one genuine proof poll only"
+                );
+                assert_eq!(
+                    t.h.state.bindings.current(Some(KEY)).as_deref(),
+                    Some(source.as_str())
+                );
+                assert_eq!(
+                    t.h.state
+                        .bindings
+                        .launch_info(KEY, Utc::now())
+                        .unwrap()
+                        .current_model
+                        .as_deref(),
+                    Some("synthetic-model"),
+                    "rejected model must not publish a different accepted model"
+                );
+                let account = t.h.store.load(&source).unwrap();
+                let auth = format!(
+                    "Bearer {}",
+                    t.h.store.tokens(&account).unwrap().access_token
+                );
+                assert!(
+                    t.catalogs.requests.lock().unwrap()[catalog_before..]
+                        .iter()
+                        .all(|request| request == &auth)
+                );
+                quiet(&mut events);
+                // UnsupportedModel retains the socket natively. Close it via
+                // the real client, then require owner release before deadline.
+                timeout(
+                    PHASE,
+                    client.close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: 1000.into(),
+                        reason: "".into(),
+                    })),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_close(
+                    timeout(PHASE, client.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    1000,
+                );
+                match timeout(PHASE, client.flush()).await.unwrap() {
+                    Ok(()) | Err(Error::ConnectionClosed | Error::AlreadyClosed) => {}
+                    Err(_) => panic!("unsupported-model close acknowledgement failed"),
+                }
+                drop(client);
+                released(&t, &source).await;
+                assert!(
+                    Instant::now() < admitted.deadline,
+                    "native rejected-turn/socket owners must release within original deadline"
+                );
+                // No resumed task may leak a send/refresh after its old deadline.
+                sleep_until(admitted.deadline + Duration::from_millis(100)).await;
+                assert!(t.data().is_empty());
+                assert_eq!(t.h.fake.state.requests().len(), 1);
+                assert_eq!(
+                    t.catalogs.requests.lock().unwrap().len(),
+                    catalog_before + 3
+                );
+                assert_eq!(usage.state.requests().len(), 1);
+                quiet(&mut events);
+                return;
+            }
+            let done = Message::text(r#"{"type":"response.completed"}"#);
+            t.h.fake.state.push_reply([done.clone()]);
+            allow_final_catalog
+                .send(())
+                .expect("final native catalog gate disappeared");
+            assert_eq!(
+                timeout(PHASE, client.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                done
+            );
+            assert_eq!(t.data(), vec![Message::text(raw)]);
+            assert_eq!(
+                t.catalogs.requests.lock().unwrap().len(),
+                catalog_before + 2
+            );
+            // Upgrade also carries the current model. Select the completed
+            // native turn explicitly instead of matching its handshake row.
+            let row = timeout(Duration::from_secs(4), async {
+                loop {
+                    if let Some(row) = t.h.ledger().into_iter().find(|row| {
+                        row["transport"] == "ws"
+                            && row["model"] == "synthetic-model"
+                            && row["outcome"] == "ok"
+                    }) {
+                        break row;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(row["account"], source);
+            assert_eq!(row["attempts"], 1);
+            assert_eq!(row["rate_retries"], 0);
+            assert_eq!(
+                t.h.state.bindings.current(Some(KEY)).as_deref(),
+                Some(source.as_str())
+            );
+            assert_eq!(
+                t.h.fake.state.requests().len(),
+                1,
+                "no redial or account chooser"
+            );
+            let account = t.h.store.load(&source).unwrap();
+            let auth = format!(
+                "Bearer {}",
+                t.h.store.tokens(&account).unwrap().access_token
+            );
+            assert!(
+                t.catalogs.requests.lock().unwrap()[catalog_before..]
+                    .iter()
+                    .all(|request| request == &auth)
+            );
+            quiet(&mut events);
+            timeout(
+                PHASE,
+                client.close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1000.into(),
+                    reason: "".into(),
+                })),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_close(
+                timeout(PHASE, client.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                1000,
+            );
+            match timeout(PHASE, client.flush()).await.unwrap() {
+                Ok(()) | Err(Error::ConnectionClosed | Error::AlreadyClosed) => {}
+                Err(error) => panic!("current-model close acknowledgement failed: {error}"),
+            }
+            drop(client);
+            released(&t, &source).await;
+            sleep_until(reset_lower + Duration::from_millis(300)).await;
+            assert_eq!(t.data(), vec![Message::text(raw)]);
+            assert_eq!(t.h.fake.state.requests().len(), 1);
+            quiet(&mut events);
+        }
+
+        #[tokio::test]
+        async fn n5b_ws_managed_current_model_cold_catalog_wait_revalidates_after_reset() {
+            run(false).await;
+        }
+
+        #[tokio::test]
+        async fn n5b_ws_managed_unproved_model_cold_catalog_never_waits_or_sends() {
+            run(true).await;
+        }
+
+        #[tokio::test]
+        async fn n5b_ws_managed_recovered_catalog_refuses_current_model_after_quota_wait() {
+            run_case(false, true).await;
         }
     }
 }
