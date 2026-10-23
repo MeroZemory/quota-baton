@@ -5885,3 +5885,250 @@ mod n5d_zero_retention_producer {
         assert_eq!(h.fake.state.requests().len(), before + 1);
     }
 }
+
+mod n5d_initial_poll_producer {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use qb_proto::native_reset::{Command, Event, Reply, Request, VERSION};
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    use tokio_tungstenite::{
+        MaybeTlsStream, WebSocketStream, connect_async,
+        tungstenite::{Message, client::IntoClientRequest},
+    };
+
+    const BOUND: Duration = Duration::from_secs(5);
+    const THREAD: &str = "23456789-2345-4bcd-8efa-23456789abcd";
+    const UPLOAD: &str = r#"{ "model": "synthetic-model", "input": [] }"#;
+    type Owner = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    async fn exchange(owner: &mut Owner, request_id: u64, command: Command) -> Event {
+        let request = Request {
+            version: VERSION,
+            request_id,
+            command,
+        };
+        timeout(
+            BOUND,
+            owner.send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let message = timeout(BOUND, owner.next())
+            .await
+            .expect("initial full-poll producer must answer owner within bound")
+            .expect("owner closed before correlated response")
+            .expect("owner transport failed before correlated response");
+        let Message::Text(text) = message else {
+            panic!("expected correlated owner text response")
+        };
+        let reply: Reply = serde_json::from_str(&text).unwrap();
+        assert!(reply.valid_shape());
+        assert_eq!(reply.version, VERSION);
+        assert_eq!(reply.request_id, Some(request_id));
+        reply.event
+    }
+
+    async fn idle(h: &Harness, account: &str) {
+        timeout(BOUND, async {
+            while h
+                .state
+                .inflight_requests
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+                || h.state.accounts.inflight_count(account) != 0
+                || h.state.bindings.pending_count(account) != 0
+                || h.state.budget.used() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scoped initial producer must release native request counters");
+    }
+
+    #[tokio::test]
+    async fn n5d_initial_full_poll_far_429_publishes_waiting_without_data_attempt() {
+        let usage = timeout(BOUND, ScriptedUpstream::start())
+            .await
+            .unwrap()
+            .unwrap();
+        let h = timeout(
+            BOUND,
+            Harness::new_configured(
+                Provider::Codex,
+                1,
+                64,
+                1024,
+                false,
+                RoutingConfig::default(),
+                |config| {
+                    config.upstream.codex_usage_base = usage.url.clone();
+                    config.guard.retain_max_per_request_mib = 0;
+                    config.routing.mode = qb_core::routing::Mode::Recover;
+                    config.routing.reset_hold_secs = 1;
+                    config.routing.request_timeout_secs = 10;
+                    config.routing.move_guard.trip_seconds = 5;
+                    config.routing.validate().unwrap();
+                },
+            ),
+        )
+        .await
+        .expect("synthetic initial producer fixture must start within bound");
+        let launch = timeout(BOUND, r11_http_issue(&h))
+            .await
+            .expect("actual issued launch must complete");
+        let owner_url = format!(
+            "{}/qb/native-owner",
+            launch.base_url.replacen("http://", "ws://", 1)
+        );
+        let mut owner_request = owner_url.into_client_request().unwrap();
+        owner_request
+            .headers_mut()
+            .insert("authorization", "Bearer synthetic-client".parse().unwrap());
+        let (mut owner, upgrade) = timeout(BOUND, connect_async(owner_request))
+            .await
+            .expect("issued owner must open before exact C8 adoption")
+            .unwrap();
+        assert_eq!(upgrade.status().as_u16(), 101);
+
+        let client = reqwest::Client::builder().timeout(BOUND).build().unwrap();
+        h.fake.state.push(ok());
+        let warm = client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", THREAD)
+            .body(UPLOAD)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::OK);
+        warm.bytes().await.unwrap();
+        idle(&h, &launch.account).await;
+        let key = format!("codex:{THREAD}");
+        assert_eq!(
+            h.state.bindings.current(Some(&key)).as_deref(),
+            Some(launch.account.as_str())
+        );
+        assert_eq!(
+            h.state
+                .bindings
+                .policies
+                .plan(Some(&key))
+                .settings
+                .on_5h_limit,
+            qb_core::routing::On5hLimit::Wait
+        );
+        let before = h.fake.state.requests();
+        let warm_call = before
+            .iter()
+            .find(|call| call.path_and_query == "/responses")
+            .unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|call| call.path_and_query == "/responses")
+                .count(),
+            1
+        );
+        assert!(usage.state.requests().is_empty());
+
+        // Genuine account-scoped model=None poll, before the target HTTP request.
+        // No provider 429, saved Cooling, proof constructor or deferred injection.
+        let reset = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 3600, 0).unwrap();
+        usage.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            json!({"rate_limit": {
+                "primary_window":{"used_percent":100,"limit_window_seconds":18000,
+                    "reset_at":reset.timestamp()},
+                "secondary_window":{"used_percent":10,"limit_window_seconds":604800,
+                    "reset_at":(reset + ChronoDuration::hours(47)).timestamp()},
+                "active_limit":"5h"
+            }})
+            .to_string(),
+        ));
+        let account = timeout(BOUND, h.state.quota.poll(&launch.account))
+            .await
+            .expect("actual full poll must finish before initial fallback request")
+            .expect("actual full poll must be accepted");
+        assert!(matches!(account.health, Health::Cooling {
+            reason: HealthReason::Quota, until, ref scope,
+        } if until == reset && scope == "account"));
+        let cooling = account.quota_cooling.unwrap();
+        assert_eq!(cooling.window, "5h");
+        assert_eq!(cooling.reset_at, reset);
+        let polls = usage.state.requests();
+        assert_eq!(polls.len(), 1);
+        assert_eq!(polls[0].method, axum::http::Method::GET);
+        assert_eq!(polls[0].path_and_query, "/backend-api/wham/usage");
+        assert!(polls[0].body.is_empty());
+        assert_eq!(
+            polls[0].headers["authorization"],
+            warm_call.headers["authorization"]
+        );
+        assert_eq!(h.fake.state.requests().len(), before.len());
+
+        // A queued sentinel exposes any accidental physical send; the expected
+        // response is QB-authored initial fallback, not fabricated provider bytes.
+        h.fake.state.push(ok());
+        let response = client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", THREAD)
+            .body(UPLOAD)
+            .send()
+            .await
+            .expect("far full-poll fallback must return before reset");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(response.headers().get("x-codex-primary-reset-at").is_none());
+        let body = response.bytes().await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "quota_baton_wait");
+        assert_eq!(body["error"]["resets_at"], reset.timestamp());
+        assert_eq!(
+            h.fake.state.requests().len(),
+            before.len(),
+            "initial full-poll fallback must not make another data upstream call"
+        );
+        assert!(Utc::now() < reset);
+
+        let event = exchange(
+            &mut owner,
+            1,
+            Command::Observe {
+                thread_id: THREAD.into(),
+            },
+        )
+        .await;
+        let Event::Waiting {
+            episode,
+            reset_unix_ms,
+        } = event
+        else {
+            panic!("initial full-poll fallback must publish Waiting on the exact issued owner")
+        };
+        assert_ne!(episode, 0);
+        assert_eq!(reset_unix_ms, reset.timestamp_millis());
+        assert!(matches!(
+            exchange(&mut owner, 2, Command::Cancel { episode }).await,
+            Event::Cancelled { episode: actual } if actual == episode
+        ));
+        timeout(BOUND, async {
+            if let Some(message) = owner.next().await {
+                match message {
+                    Ok(Message::Close(_)) | Err(_) => {}
+                    _ => panic!("unexpected frame after initial episode cancellation"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled initial owner must close before teardown");
+        idle(&h, &launch.account).await;
+        assert_eq!(h.fake.state.requests().len(), before.len());
+        assert_eq!(usage.state.requests().len(), 1);
+    }
+}

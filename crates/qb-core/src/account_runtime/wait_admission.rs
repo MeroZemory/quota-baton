@@ -14,6 +14,32 @@ pub(crate) struct InitialQuotaFallback {
 }
 
 impl InitialQuotaFallback {
+    /// Optional deferred publication from this SAME initial fallback, not a new
+    /// inspection. Caller must wrap the returned exact pair in PendingPublication
+    /// inside its blocking job and keep only after the original response handoff.
+    /// Refusal does not change into_response or the ordinary fallback behavior.
+    pub(crate) fn register_deferred(
+        &self,
+        runtime: &AccountRuntime,
+        bindings: &BindingTable,
+        request: HttpWaitRequest<'_>,
+        pin: &crate::launch_tokens::LaunchPin,
+    ) -> Result<
+        Option<(
+            super::DeferredResetId,
+            crate::launch_tokens::LaunchOwnerScope,
+        )>,
+        (),
+    > {
+        let Some(owner) = self.owner.upgrade() else {
+            return Ok(None);
+        };
+        if !std::sync::Arc::ptr_eq(&owner, &runtime.wait_owner) {
+            return Ok(None);
+        }
+        runtime.register_initial_limit_deferred_reset(bindings, request, &self.limit, pin)
+    }
+
     pub(crate) fn into_response(
         self,
         policies: &crate::routing::PolicyStore,

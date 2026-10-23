@@ -74,6 +74,7 @@ impl RelayState {
         session: &session::Session,
         model: Option<&str>,
         deadline: tokio::time::Instant,
+        ingress: Option<&LaunchIngress>,
     ) -> Option<Response> {
         let key = session.key.as_deref()?;
         if key.is_empty()
@@ -91,8 +92,9 @@ impl RelayState {
         let bindings = self.bindings.clone();
         let work_key = key.to_owned();
         let model = model.map(str::to_owned);
+        let pin = ingress.and_then(|ingress| ingress.pin.clone());
         let task = tokio::task::spawn_blocking(move || {
-            accounts.current_http_initial_far_wait(
+            let fallback = accounts.current_http_initial_far_wait(
                 &bindings,
                 crate::bindings::HttpWaitRequest {
                     provider,
@@ -101,14 +103,38 @@ impl RelayState {
                     expected_source: None,
                     operation: &work_operation,
                 },
-            )
+            )?;
+            let publication = fallback.as_ref().and_then(|fallback| {
+                pin.as_deref().and_then(|pin| {
+                    accounts
+                        .register_initial_deferred_reset(
+                            &bindings,
+                            crate::bindings::HttpWaitRequest {
+                                provider,
+                                key: Some(&work_key),
+                                model: model.as_deref(),
+                                expected_source: None,
+                                operation: &work_operation,
+                            },
+                            fallback,
+                            pin,
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|(id, scope)| {
+                            native_reset::PendingPublication::new(accounts.clone(), scope, id)
+                        })
+                })
+            });
+            Ok::<_, ()>((fallback, publication))
         });
-        let fallback = tokio::select! {
+        let (fallback, publication) = tokio::select! {
             biased;
             _ = self.wait_for_drain_start() => return None,
             _ = tokio::time::sleep_until(deadline) => return None,
-            result = task => result.ok()?.ok()??,
+            result = task => result.ok()?.ok()?,
         };
+        let fallback = fallback?;
         if self.is_draining()
             || !operation.can_reply()
             || self.pins.get(provider, Some(key)).is_some()
@@ -120,6 +146,9 @@ impl RelayState {
         let response = fallback.into_response(&self.bindings.policies)?;
         if self.is_draining() || !operation.can_reply() {
             return None;
+        }
+        if let Some(publication) = publication {
+            publication.keep();
         }
         Some(response)
     }

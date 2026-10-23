@@ -203,6 +203,10 @@ pub(super) struct InitialFiveHourLimit {
 }
 
 impl InitialFiveHourLimit {
+    pub(super) fn account(&self) -> &str {
+        &self.policy.account
+    }
+
     pub(super) fn reset_at(&self) -> DateTime<Utc> {
         self.ticket.reset_at
     }
@@ -493,6 +497,45 @@ impl WaitOwner {
             && intent.deadline() == limit.deadline
             && same_wait_plan(&limit.policy.plan, intent.plan())
             && self.ticket_current_unlocked(&limit.ticket, account, intent.model(), Utc::now())
+    }
+
+    /// Project ONLY the exact original initial fallback ticket. Unlike a fresh
+    /// initial inspection, this never acquires a replacement current proof.
+    pub(super) fn qualify_deferred_initial_unlocked(
+        &self,
+        limit: &InitialFiveHourLimit,
+        intent: &crate::bindings::WaitIntent<'_>,
+        account: &Account,
+    ) -> Option<super::deferred_reset::PhysicalQualification> {
+        if intent.policy_key() != limit.policy.key
+            || intent.account() != limit.policy.account
+            || intent.provider() != account.provider
+            || !intent.existing_placement()
+            || intent.plan().settings.mode == crate::routing::Mode::Strict
+            || intent.plan().settings.on_5h_limit != crate::routing::On5hLimit::Wait
+            || !self.initial_far_wait_is_current_unlocked(limit, intent, account)
+        {
+            return None;
+        }
+        let proof = self.proofs.admit(&limit.ticket.native).ok()?;
+        let remaining = proof
+            .reset_at
+            .signed_duration_since(Utc::now())
+            .to_std()
+            .ok()?;
+        if remaining.is_zero()
+            || !(remaining > std::time::Duration::from_secs(intent.plan().settings.reset_wait_secs)
+                || tokio::time::Instant::now().checked_add(remaining)? >= intent.deadline())
+        {
+            return None;
+        }
+        Some(super::deferred_reset::PhysicalQualification {
+            reset_at: proof.reset_at,
+            started_at: proof.started_at,
+            scope: proof.scope.clone(),
+            allow_credits: proof.allow_credits,
+            quota_credit_releasable: proof.quota_credit_releasable,
+        })
     }
 
     /// Current metadata/credentials and runtime eligibility were checked by the

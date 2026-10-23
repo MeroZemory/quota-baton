@@ -357,6 +357,70 @@ impl AccountRuntime {
             }),
         )
     }
+    /// Initial producer facade: preserves the opaque fallback's exact original
+    /// proof and owner before fresh registration gates; never reacquires a proof.
+    pub(crate) fn register_initial_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        request: HttpWaitRequest<'_>,
+        fallback: &super::wait_admission::InitialQuotaFallback,
+        pin: &LaunchPin,
+    ) -> Result<Option<(DeferredResetId, LaunchOwnerScope)>, ()> {
+        fallback.register_deferred(self, bindings, request, pin)
+    }
+
+    /// Fresh native owner gates around the ORIGINAL fallback's opaque ticket.
+    /// The caller constructs RAII publication before releasing its task result.
+    pub(super) fn register_initial_limit_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        request: HttpWaitRequest<'_>,
+        limit: &super::wait_owner::InitialFiveHourLimit,
+        pin: &LaunchPin,
+    ) -> Result<Option<(DeferredResetId, LaunchOwnerScope)>, ()> {
+        let Some(scope) = pin.deferred_owner_scope() else {
+            return Ok(None);
+        };
+        if !scope.matches_pin(pin)
+            || request
+                .expected_source
+                .is_some_and(|source| source != limit.account())
+        {
+            return Ok(None);
+        }
+        let _transaction = self.store.transaction().map_err(|_| ())?;
+        let released = self.released_quota.lock().map_err(|_| ())?;
+        let probes = self.probes.lock().map_err(|_| ())?;
+        let volatile = self.volatile.lock().map_err(|_| ())?;
+        let source = limit.account();
+        if self.store.writes_stopped()
+            || probes.contains(source)
+            || volatile.contains_key(source)
+            || released.get(source).is_some_and(|release| release.pending)
+        {
+            return Ok(None);
+        }
+        let account = self.store.read_account_unlocked(source).map_err(|_| ())?;
+        if !self.deferred_credentials_current(&account) {
+            return Ok(None);
+        }
+        let request = HttpWaitRequest {
+            expected_source: Some(source),
+            ..request
+        };
+        Ok(
+            bindings.with_deferred_launch(request, &scope, None, |intent, binding, policy| {
+                let qualification = self
+                    .wait_owner
+                    .qualify_deferred_initial_unlocked(limit, intent, &account)?;
+                self.wait_owner
+                    .deferred
+                    .register(&scope, intent, qualification, &account, binding, policy)
+                    .map(|id| (id, scope.clone()))
+            }),
+        )
+    }
+
     fn deferred_credentials_current(&self, account: &Account) -> bool {
         let now = Utc::now();
         account.user_state == crate::accounts::UserState::Active
@@ -844,6 +908,39 @@ mod tests {
                 .expect("actual complete physical header/body adapter must qualify");
             (observed, reset)
         }
+        async fn poll(&self, reset: DateTime<Utc>, complete: bool) {
+            let at = Utc::now();
+            let mut raw = serde_json::json!({"observed_at":at,"windows":[
+                {"name":"5h","used_pct":100.0,"observed_at":at,"reset_at":reset},
+                {"name":"7d","used_pct":20.0,"observed_at":at,"reset_at":at+Duration::days(1)}
+            ]});
+            if !complete {
+                raw["windows"].as_array_mut().unwrap().pop();
+            }
+            let origin = self.runtime.capture_poll_origin(&self.id).await.unwrap();
+            self.runtime
+                .apply_quota_snapshot_reported_origin(
+                    &self.id,
+                    raw.clone(),
+                    &raw,
+                    None,
+                    Some(origin),
+                )
+                .await
+                .unwrap();
+        }
+        fn initial_operation() -> IssueOperation {
+            IssueOperation::new(Instant::now() + std::time::Duration::from_secs(20))
+        }
+        fn fallback(
+            &self,
+            operation: &IssueOperation,
+        ) -> super::super::wait_admission::InitialQuotaFallback {
+            self.runtime
+                .current_http_initial_far_wait(&self.table, self.request(operation))
+                .unwrap()
+                .expect("full current proof should produce initial fallback")
+        }
         fn register(&self, observed: &ObservedHttp429) -> (DeferredResetId, LaunchOwnerScope) {
             let operation = IssueOperation::new(Instant::now() + std::time::Duration::from_secs(1));
             let _caller = operation.caller_guard();
@@ -861,6 +958,145 @@ mod tests {
             IssueOperation::new(Instant::now() + std::time::Duration::from_secs(5))
         }
     }
+    #[tokio::test]
+    async fn n5d_initial_deferred_full_poll_original_fallback_registers_without_send() {
+        let f = Fixture::new();
+        let reset = Utc::now() + Duration::minutes(3);
+        f.poll(reset, true).await;
+        let operation = Fixture::initial_operation();
+        let _caller = operation.caller_guard();
+        let fallback = f.fallback(&operation);
+        let request = HttpWaitRequest {
+            expected_source: None,
+            ..f.request(&operation)
+        };
+        let (id, scope) = f
+            .runtime
+            .register_initial_deferred_reset(&f.table, request, &fallback, &f.pin)
+            .unwrap()
+            .expect("exact initial proof must register");
+        assert!(matches!(f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Waiting { id: actual, reset_at, .. }
+                if actual == id && reset_at == reset));
+        assert!(
+            fallback
+                .register_deferred(&f.runtime, &f.table, f.request(&operation), &f.pin)
+                .unwrap()
+                .is_none(),
+            "one owner episode only"
+        );
+        let response = fallback.into_response(&f.table.policies).unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(f.runtime.cancel_deferred_reset(&scope, id));
+    }
+
+    #[tokio::test]
+    async fn n5d_initial_deferred_replaced_full_or_partial_report_cannot_borrow_new_ticket() {
+        for complete in [true, false] {
+            let f = Fixture::new();
+            let reset = Utc::now() + Duration::minutes(3);
+            f.poll(reset, true).await;
+            let operation = Fixture::initial_operation();
+            let _caller = operation.caller_guard();
+            let stale = f.fallback(&operation);
+            f.poll(reset, complete).await;
+            assert!(
+                stale
+                    .register_deferred(&f.runtime, &f.table, f.request(&operation), &f.pin)
+                    .unwrap()
+                    .is_none(),
+                "old ticket cannot borrow replacement, complete={complete}"
+            );
+            assert!(stale.into_response(&f.table.policies).is_none());
+            assert_eq!(
+                f.runtime.deferred_reset_status(&f.lease.scope(), THREAD),
+                DeferredResetStatus::Empty
+            );
+            if complete {
+                let fresh = f.fallback(&operation);
+                let (id, scope) = fresh
+                    .register_deferred(&f.runtime, &f.table, f.request(&operation), &f.pin)
+                    .unwrap()
+                    .expect("genuinely fresh fallback remains usable");
+                assert!(f.runtime.cancel_deferred_reset(&scope, id));
+            } else {
+                assert!(
+                    f.runtime
+                        .current_http_initial_far_wait(&f.table, f.request(&operation))
+                        .unwrap()
+                        .is_none(),
+                    "missing long-window raw evidence cannot borrow cache"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn n5d_initial_deferred_refuses_changed_identity_deadline_model_owner_and_policy() {
+        let f = Fixture::new();
+        let reset = Utc::now() + Duration::minutes(3);
+        f.poll(reset, true).await;
+        let operation = Fixture::initial_operation();
+        let caller = operation.caller_guard();
+        let fallback = f.fallback(&operation);
+        let other = Fixture::new();
+        assert!(
+            fallback
+                .register_deferred(&other.runtime, &f.table, f.request(&operation), &f.pin)
+                .unwrap()
+                .is_none(),
+            "other runtime cannot interpret opaque limit"
+        );
+        let changed = Fixture::operation();
+        let _changed_caller = changed.caller_guard();
+        assert!(
+            fallback
+                .register_deferred(&f.runtime, &f.table, f.request(&changed), &f.pin)
+                .unwrap()
+                .is_none(),
+            "original deadline cannot be replaced"
+        );
+        for request in [
+            HttpWaitRequest {
+                expected_source: Some("synthetic-wrong-account"),
+                ..f.request(&operation)
+            },
+            HttpWaitRequest {
+                model: Some("synthetic-other"),
+                ..f.request(&operation)
+            },
+        ] {
+            assert!(
+                fallback
+                    .register_deferred(&f.runtime, &f.table, request, &f.pin)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        f.table
+            .set_routing_session_urgent(&session_id(ROOT), On5hLimit::Move)
+            .unwrap();
+        assert!(
+            fallback
+                .register_deferred(&f.runtime, &f.table, f.request(&operation), &f.pin)
+                .unwrap()
+                .is_none(),
+            "effective policy change refuses original limit"
+        );
+        drop(caller);
+        assert!(
+            fallback
+                .register_deferred(&f.runtime, &f.table, f.request(&operation), &f.pin)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            f.runtime.deferred_reset_status(&f.lease.scope(), THREAD),
+            DeferredResetStatus::Empty
+        );
+    }
+
     #[tokio::test]
     async fn n5d_physical_deferred_native_expiry_readiness_then_single_fresh_consume() {
         let f = Fixture::new();
