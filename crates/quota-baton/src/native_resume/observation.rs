@@ -245,6 +245,8 @@ impl Capture {
     }
 
     /// Live snapshot only; final flush/join may still fail. Use finish to accept.
+    #[cfg(test)]
+    #[allow(dead_code)] // Live-latch adapter used by the standalone capture tests.
     pub(crate) fn lost(&self) -> bool {
         STATS.lost()
     }
