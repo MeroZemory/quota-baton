@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13 N5c 긴급 정책 실행
-목표: N5c 긴급 정책·실제 클릭 검증 완료; 다음 N10 자동 외부 사용 감지·WS spill 보호
+현재 마일스톤: N10 자동 외부 사용 감지·WS spill 보호
+목표: N10 집중45검사·수정 제거 대조·실제 한영4창 통과; 전체 관문 검증
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 14:23 KST (N5c 집중 관문·실제 한/영 HWND4·읽기 전용 실행 점검 통과; C+E 전체는 미출시)
+갱신: 2026-10-23 15:50 KST (N10 구현 e43a37b; 실제4창 확인·전체 관문 실행 중, 미설치)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -45,6 +45,15 @@ totally ordered interval of at least 24 hours. Document gaps, dropped events,
 caps and warm-up. Include canonical session/alias state, routing policy, account
 health/quota evidence, capacity/admission events and the injected decision time.
 Persist only allowlisted metadata; never prompts, bodies or credentials.
+
+The 24-hour export may span several recorder epochs. Replay each epoch
+independently from its own reconciled initial state, with that epoch's loss
+manifest. Never carry pseudonyms, routing state or accounting authority across
+an epoch boundary by inference. Report each epoch's coverage and losses, then
+aggregate comparable counters over the covered interval. An epoch boundary does
+not itself invalidate the export or require restarting the capture clock;
+missing initial state or unexplained loss still remains insufficient evidence.
+Merged nodes may be installed while capture continues.
 
 Compare committed moves, returns within 30 minutes, and comparable estimated
 re-read tokens. The default margin is zero for each counter. Any intentional
@@ -89,7 +98,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N2 R16.3 provider charts and pace line | S1 | none | `impl/r16.3` from dev, brief section R16.3 | focused gate, real-path capture, regressions for differing resets and a paused account |
 | N6 R14.2 recorder, minimum delivery | S1 | none | `impl/r14.2` (keep db6baac), brief R14 plus D29 amendment 4 | schema, off switch, default off, 7-day bound, tests; then S2 install and enable; the 24 h capture starts at install |
 | N6t R14 typed rebind and static write check | S1 | none | `impl/r14-rebind` | compile-time choke point, static check failing on a planted write, existing tests |
-| N6r R14 differential replay gate | S1 | N6 installed plus 24 h captured export | `impl/r14-replay` | candidate vs installed replay report on the real export, margin 0 |
+| N6r R14 differential replay gate | S1 | N6 installed plus 24 h captured export; multiple reconciled epochs allowed | `impl/r14-replay` | each epoch replayed from its own initial state and loss manifest; candidate vs installed aggregate comparison, margin 0 |
 | N5m R13 C measurement: Codex cache survival by idle gap; client hold tolerance against a fake upstream | W | none | background `codex-qb exec` worker in `.sandbox/r13-measure/`; no cargo in S1 | measurement table in the R13 report |
 | N5a R13 E HTTP wait and reset-resume for non-urgent sessions at 5h limits | S1 | none (bound is a setting; N5m only tunes its default) | `impl/r13-wait` | hold then serve on the same account after reset; bound exceeded falls back; cancellation releases |
 | N5b R13 E WS/SSE cancellation and keepalive during a hold | S1 | none | `impl/r13-ws-hold` | cancelled held WS/SSE releases its slot and binding; no orphaned upstream |
@@ -401,7 +410,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 동작 |
 |---|---|---|---|
-| 외부 직접 사용·WS spill 보호 | N10 미구현; D30 확정·소스 조사 완료 | 외부 사용 자동 보호·fresh 관측 전 대상별 최대1spill | N10 구현과 실제4세션 회귀 |
+| 외부 직접 사용·WS spill 보호 | N10 구현·집중45검사·실제 한영4창 확인; 전체 관문 진행 중 | 외부 사용 자동 보호·fresh 관측 전 대상별 최대1spill | N10 구현과 실제4세션 회귀 |
 | R13 C+E 실행 | N5a-c 집중 관문 완료·native 재개 미완료 | 리셋 뒤 자동 재개 정확히1회·통합 설치 | N10 뒤 N5d·N5i |
 | 제공자 통합 예측 | 현재 잔여량·개별 예측 제공, pooled 미출시 | 실제24시간 backtest 후 보수적 pooled runway | 독립 N7 backtest lane·UI 통합 |
 <!-- gaps:end -->
