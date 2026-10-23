@@ -76,6 +76,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16 | 완료: 코드19b8d22, 영문 UI·snapshot·PNG·Claude 프로젝트명. 집중438통과·strict lint·실제 core/AdminClient/tray 3HWND·최종 CLI20 PNG 통과. 설치 수용 dev006449a·02:26 KST·takeover 거절0/1,811. brief `R16-readme-assets.md` |
 | R16.1 | 완료3737fe2·집중405·strict lint·D27 3HWND·KO PNG4개 동일: 영어 탭·표 제목·사용량 요약 폭 보완. 한국어 출력 보존, 1024×640·1320×900 scale2 실제 renderer 회귀·D27 경로 통과, self-merge 후 설계 세션 설치 |
 | R16.2 | 완료·설치 수용: dev ddf8d87, 04:34 KST; 실제 dashboard 확인·takeover 연결 거절0/1,959 |
+| N10 | 대기: 사용자 지시로 N5c 바로 뒤·N5d 앞. 계정별 reserve="direct"·CLI/tray/dashboard, 기존 세션 이동 금지·새 세션 최후 수단, own-slot 대기 후 WS spill의 D20 charge/약한 근거 cap·대상별 새 관측 전1개 제한, 초기화 직후 약한 근거·4세션 회귀. native 0.163 접근 프로그램 gate는 소스 연구만. 실제 예약 계정 선택·설치는 설계 세션/사용자 |
 | R9.5 | 대기(N3): 이동 진행·안전한 중단·재개·읽기 쉬운 확인. ready-node S1 순서에 따라 N5a-d 뒤 |
 | R16.3 | 완료·설치 수용(41cb129, 05:26 KST, takeover 거절0/1,889): 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |

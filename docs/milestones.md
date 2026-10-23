@@ -94,6 +94,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N5a R13 E HTTP wait and reset-resume for non-urgent sessions at 5h limits | S1 | none (bound is a setting; N5m only tunes its default) | `impl/r13-wait` | hold then serve on the same account after reset; bound exceeded falls back; cancellation releases |
 | N5b R13 E WS/SSE cancellation and keepalive during a hold | S1 | none | `impl/r13-ws-hold` | cancelled held WS/SSE releases its slot and binding; no orphaned upstream |
 | N5c R13 E urgent policy (`on_5h_limit`, `--urgent`, CLI and dashboard toggle; 7d always moves) | S1 | none | `impl/r13-urgent` | policy tests, CLI tests, real-path capture |
+| N10 direct-use reserve and bounded WS capacity spill | S1; research in W | none for implementation; user chooses real reserved accounts | `impl/n10` after N5c | reserved accounts reject running-session moves; new placements use them only as a last resort; own-account slot wait precedes spill; four-session reset-target replay admits at most one spill before fresh post-spill usage; source-line research on native access-program gating |
 | N5d R13 E native-client resume after reset (Codex `/goal resume` only for a live goal; Claude continue) | S1 | none | `impl/r13-native-resume` | synthetic native test, exactly-once resume |
 | N5i R13 C+E integration and defaults | S1 | N5a-d merged, N5m table | `impl/r13-ce` | full gate; then S2 install |
 | N3 R9.5 move progress, interruption safety, readable preview | S1 | none | `impl/r9.5`, brief R9.5-move-progress.md | golden ko/en output, Ctrl+C tests per step, finish/rollback after a kill |
@@ -103,7 +104,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N9 README final and v0.2.0 release | S2 and design | N1 and N2 installed | design session | public export scan clean, release assets built from the export |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (importance; change it only when importance changes): N1, N2, N6, N5a, N5b, N5c, N5d, N3, N4, N6t, N5i (when its inputs exist), N7 UI, N8, N6r (when its inputs exist).
+**Current S1 order** (importance; change it only when importance changes): N1, N2, N6, N5a, N5b, N5c, N10, N5d, N3, N4, N6t, N5i (when its inputs exist), N7 UI, N8, N6r (when its inputs exist).
 
 **Start now in W:** N5m and the N7 backtest.
 
