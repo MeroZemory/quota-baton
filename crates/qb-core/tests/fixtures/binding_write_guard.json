@@ -710,20 +710,20 @@
       "count": 1
     },
     {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::select_ordered",
+      "path": "crates/qb-core/src/bindings/selection.rs",
+      "function": "BindingTable::select_ranked",
       "expression": "assignment: b .Alone account =Alone anchor .Alone clone Parenthesis( )",
       "count": 1
     },
     {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::select_ordered",
+      "path": "crates/qb-core/src/bindings/selection.rs",
+      "function": "BindingTable::select_ranked",
       "expression": "compound-assignment: *Alone eligible &Joint =Alone candidate .Alone account .Alone id =Joint =Alone source |Joint |Alone Parenthesis( !Alone outside_unknown &Joint &Alone !Alone d .Alone outside_used .Alone contains Parenthesis( &Alone candidate .Alone account .Alone id ) )",
       "count": 1
     },
     {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::select_ordered",
+      "path": "crates/qb-core/src/bindings/selection.rs",
+      "function": "BindingTable::select_ranked",
       "expression": "opaque-macro: tracing :Joint :Alone debug !Alone Parenthesis( account =Alone %Alone b .Alone account ,Alone reason =Alone skip_reason ,Alone \"reset hold skipped\" )",
       "count": 1
     },

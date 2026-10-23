@@ -70,7 +70,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
 | R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 현재: N5a HTTP·N5b WS/SSE 집중 관문 완료(N5b library909·WS139·HTTP115, 기본/testkit strict lint·fmt; c79b69c); N5c 긴급 정책 실행 집중 관문 완료; N10 설치 완료; N5d 시간 제한 종료·판단/HTTP 검증 보존, 전체 native 수용은 N5d-native 후속; N5i 집중 관문 완료(테스트 실행324·WS target1·실제 첫 클릭1); 설치 수용(dev27499b8·22:11); 측정·백테스트는 독립 lane; R12.11 제안은 우선순위에 따라 보존; brief `R13-burn-icon-hold.md` |
-| R14 | 진행 중: R14.1 실행 보호·R14.2 최소 기록기 설치 수용. N6t 계정 봉인·승인 영수증·정적 검사와 health·WS 용량 증거 전달 단위 검증 완료; 나머지 owner 증거형 MoveReason·단일 이동 경로·최종 관문은 진행 중. 실제24시간 재생 N6r은 별도 미완료 |
+| R14 | 진행 중: R14.1 실행 보호·R14.2 최소 기록기 설치 수용. N6t 계정 봉인·승인 영수증·정적 검사와 health·WS 용량·C7 재분산 증거 전달 단위 검증 완료; 나머지 owner 증거형 MoveReason·단일 이동 경로·최종 관문은 진행 중. 실제24시간 재생 N6r은 별도 미완료 |
 | R14.1 | 설치 수용: dev249a14c (01:12 KST). guard21·R1419·HTTP12·WS123, strict lint 통과. takeover 연결 거절0/1,717·일반/이미지 exec·실제 dashboard 지표 확인 |
 | R12.11 | merged: df5bf72·집중58통과/1명시제외·strict CLI lint·real launch check·두 반례101→복원0. version15초·한 번 재시도·24시간 pass fallback, 잘못된 출력은 즉시 거절. 설치는 설계 세션 |
 | R16 | 완료: 코드19b8d22, 영문 UI·snapshot·PNG·Claude 프로젝트명. 집중438통과·strict lint·실제 core/AdminClient/tray 3HWND·최종 CLI20 PNG 통과. 설치 수용 dev006449a·02:26 KST·takeover 거절0/1,811. brief `R16-readme-assets.md` |
