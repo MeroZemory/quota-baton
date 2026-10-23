@@ -69,7 +69,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.1 | merged and INSTALLED (c6a304e, 10-21 23:14): image canary stage diagnostics and retry, user `-c` passthrough |
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
-| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 현재: N5a 대기 허가133·실제 HTTP 초기화 재개/취소·승인 hook 음성 대조 통과, 실제 poll/정책 무효화 및 최종 영향 회귀 진행; 측정·백테스트는 독립 lane; R12.11 제안은 우선순위에 따라 보존; brief `R13-burn-icon-hold.md` |
+| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 현재: N5a HTTP 관문 통과(library902·HTTP59·WS123, strict lint·fmt), N5b WS/SSE 취소·대기 연결 진행; 측정·백테스트는 독립 lane; R12.11 제안은 우선순위에 따라 보존; brief `R13-burn-icon-hold.md` |
 | R14 | 진행 중: 1차 실행 보호 관문 완료·설치 보류. R14.1 사건 단위 예산·240초 만료만 우선 전달하며 수집기는 설치 조건에서 분리. 2차 근거형 rebind·정적 검사·실제24시간 재생은 별도 미완료 |
 | R14.1 | 설치 수용: dev249a14c (01:12 KST). guard21·R1419·HTTP12·WS123, strict lint 통과. takeover 연결 거절0/1,717·일반/이미지 exec·실제 dashboard 지표 확인 |
 | R12.11 | 보류: 영문 UI 우선. version probe 15초·1회 재시도·24시간 pass cache fallback 제안 보존, 실행 관문 미수행 |
