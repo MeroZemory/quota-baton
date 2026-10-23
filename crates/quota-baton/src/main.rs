@@ -27,6 +27,8 @@ mod sessions_discovery;
 mod sessions_guard;
 mod sessions_map;
 mod sessions_plain_header;
+mod sessions_presentation;
+mod sessions_progress;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
