@@ -14,6 +14,7 @@ mod response;
 mod selection_guard;
 mod upload;
 mod websocket;
+pub(crate) use websocket::capacity::CapacityMoveEvidence;
 mod wire_metadata;
 
 use std::{
@@ -1326,7 +1327,7 @@ impl RelayState {
             let selection_operation = operation.clone();
             let choice = tokio::task::spawn_blocking(move || {
                 let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
-                    table.choose_with_hold_at_admitted_evidence(
+                    table.choose_with_hold_at_admitted_proof(
                         provider,
                         key.as_deref(),
                         parent.as_deref(),
@@ -1346,12 +1347,22 @@ impl RelayState {
                         |account| {
                             // BindingTable holds mutations through this
                             // admission and publication, including ordinary HTTP.
+                            let mut admission = None;
                             let allowed = selection_guard::admit(&selection_operation, || {
-                                eligible(account, table.existing_placement(key.as_deref(), account))
-                                    && admit.as_ref().is_none_or(|admit| admit(account))
+                                if !eligible(
+                                    account,
+                                    table.existing_placement(key.as_deref(), account),
+                                ) {
+                                    return false;
+                                }
+                                admission = admit.as_ref().map_or_else(
+                                    || Some(crate::bindings::DispatchAdmission::ordinary()),
+                                    |admit| admit(account),
+                                );
+                                admission.is_some()
                             });
                             denied_choice.store(!allowed, Ordering::Release);
-                            allowed
+                            if allowed { admission } else { None }
                         },
                     )
                 };

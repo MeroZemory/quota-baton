@@ -75,67 +75,67 @@
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "assignment: *Alone known =Alone Parenthesis( *Alone known ) .Alone max Parenthesis( request_bytes )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "assignment: account =Alone old .Alone account .Alone id .Alone clone Parenthesis( )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "assignment: d .Alone defer_count_changes =Alone false",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "assignment: d .Alone defer_count_changes =Alone true",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( group Parenthesis( key ) .Alone to_owned Parenthesis( ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( group Parenthesis( key ) .Alone to_owned Parenthesis( ) ) .Alone or_default Parenthesis( )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "method: d .Alone placements .Alone entry Parenthesis( c .Alone account .Alone id .Alone clone Parenthesis( ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "method: d .Alone placements .Alone entry Parenthesis( c .Alone account .Alone id .Alone clone Parenthesis( ) ) .Alone or_default Parenthesis( )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "method: self .Alone commit_move Parenthesis( permit ,Alone &Alone account ,Alone provider ,Alone &Alone guard_key ,Alone model ,Alone now )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "method: self .Alone publish_binding Parenthesis( &Alone mut d ,Alone provider ,Alone key ,Alone parent ,Alone candidates ,Alone pinned ,Alone request_bytes ,Alone hold_timed_out ,Alone now ,Alone &Alone account ,Alone reason ,Alone committed .Alone as_ref Parenthesis( ) ,Alone )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_evidence",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "mutable-escape: &Alone mut d",
       "count": 4
     },

@@ -23,7 +23,9 @@ use std::{
 
 const CAPACITY: usize = 20_000;
 const COUNT_CHANGE_CAPACITY: usize = CAPACITY * 2;
+mod admission;
 mod affinity;
+pub(crate) use admission::DispatchAdmission;
 mod capacity_spill;
 mod launch;
 pub(crate) use capacity_spill::CapacitySpillPermit;
@@ -2639,6 +2641,45 @@ impl BindingTable {
         coverage: Option<&BTreeSet<String>>,
         admit: impl FnOnce(&str) -> bool,
     ) -> Decision {
+        self.choose_with_hold_at_admitted_proof(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            move_evidence,
+            observations,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            now,
+            coverage,
+            |account| admit(account).then(DispatchAdmission::ordinary),
+        )
+    }
+
+    /// A capacity admission carries its owner's live reservation evidence.
+    /// Validate it against the actual source resolved under mutations, before
+    /// policy dispatch or any breaker charge/canonical account publication.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_with_hold_at_admitted_proof(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        move_evidence: &[Candidate],
+        observations: MoveObservations,
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        coverage: Option<&BTreeSet<String>>,
+        admit: impl FnOnce(&str) -> Option<DispatchAdmission>,
+    ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         for c in candidates {
@@ -2761,8 +2802,17 @@ impl BindingTable {
             }
         };
         let policy_key = launch::policy_key(&d, key).map(str::to_owned);
+        // Match the WS owner's saved-anchor/retained-source authority even
+        // when write-behind has not yet materialized a live binding row.
+        let admission_anchor = self.policies.plan(policy_key.as_deref()).anchor;
+        let admitted_from = self
+            .protected_source(&d, key, admission_anchor.as_deref(), now)
+            .or_else(|| guard_from.map(str::to_owned));
         drop(d);
-        if !admit(&account) {
+        let Some(admission) = admit(&account) else {
+            return Decision::None;
+        };
+        if !admission.valid_for(admitted_from.as_deref(), &account) {
             return Decision::None;
         }
         if self

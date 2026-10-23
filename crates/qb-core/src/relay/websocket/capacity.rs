@@ -1,14 +1,19 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-pub(in crate::relay) type Admission = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub(in crate::relay) type Admission =
+    Arc<dyn Fn(&str) -> Option<crate::bindings::DispatchAdmission> + Send + Sync>;
 
 /// One request's first-source grace, always inside its original upgrade limit.
 pub(super) struct OwnWait {
     source: String,
+    capacity: Weak<Capacity>,
     until: Instant,
     waited: bool,
 }
@@ -16,6 +21,36 @@ pub(super) struct OwnWait {
 /// A capacity-only hint. Binding admission must independently recheck the source.
 pub(super) struct SpillSource {
     source: String,
+    capacity: Weak<Capacity>,
+}
+
+/// A move justified by one live destination reservation and its capped source.
+/// Neither weak reference keeps a reservation or its capacity owner alive.
+pub(crate) struct CapacityMoveEvidence {
+    source: String,
+    target: String,
+    reservation: Weak<AtomicBool>,
+    capacity: Weak<Capacity>,
+}
+
+impl CapacityMoveEvidence {
+    pub(crate) fn applies_to(&self, from: &str, to: &str) -> bool {
+        if self.source != from || self.target != to {
+            return false;
+        }
+        let (Some(capacity), Some(reservation)) =
+            (self.capacity.upgrade(), self.reservation.upgrade())
+        else {
+            return false;
+        };
+        // Drop releases the exact reservation under this same lock. Observe
+        // its liveness and source capacity at a single linearization point.
+        let accounts = capacity.0.lock().unwrap_or_else(|e| e.into_inner());
+        accounts
+            .get(&self.source)
+            .is_some_and(AccountCapacity::full)
+            && reservation.load(Ordering::Acquire)
+    }
 }
 
 fn own_wait_deadline(now: Instant, deadline: Instant) -> Option<Instant> {
@@ -24,10 +59,11 @@ fn own_wait_deadline(now: Instant, deadline: Instant) -> Option<Instant> {
 }
 
 impl OwnWait {
-    pub(super) fn start(capacity: &Capacity, source: &str, deadline: Instant) -> Option<Self> {
+    pub(super) fn start(capacity: &Arc<Capacity>, source: &str, deadline: Instant) -> Option<Self> {
         let until = own_wait_deadline(Instant::now(), deadline)?;
         capacity.is_capped(source).then(|| Self {
             source: source.to_owned(),
+            capacity: Arc::downgrade(capacity),
             until,
             waited: false,
         })
@@ -38,6 +74,9 @@ impl OwnWait {
     }
 
     pub(super) async fn wait_once(&mut self, capacity: &Capacity) {
+        if !std::ptr::eq(self.capacity.as_ptr(), capacity) {
+            return;
+        }
         self.waited = true;
         #[cfg(feature = "testkit")]
         capacity.before_own_wait().await;
@@ -49,10 +88,13 @@ impl OwnWait {
     }
 
     fn spill_source_at(&self, capacity: &Capacity, now: Instant) -> Option<SpillSource> {
-        (self.waited && now >= self.until && capacity.is_capped(&self.source)).then(|| {
-            SpillSource {
-                source: self.source.clone(),
-            }
+        (std::ptr::eq(self.capacity.as_ptr(), capacity)
+            && self.waited
+            && now >= self.until
+            && capacity.is_capped(&self.source))
+        .then(|| SpillSource {
+            source: self.source.clone(),
+            capacity: self.capacity.clone(),
         })
     }
 }
@@ -63,7 +105,18 @@ impl SpillSource {
     }
 
     pub(super) fn still_capped(&self, capacity: &Capacity) -> bool {
-        capacity.is_capped(&self.source)
+        std::ptr::eq(self.capacity.as_ptr(), capacity) && capacity.is_capped(&self.source)
+    }
+
+    pub(super) fn admit(&self, permit: &Permit) -> Option<CapacityMoveEvidence> {
+        (self.source != permit.account && self.still_capped(&permit.capacity)).then(|| {
+            CapacityMoveEvidence {
+                source: self.source.clone(),
+                target: permit.account.clone(),
+                reservation: Arc::downgrade(&permit.lifetime),
+                capacity: self.capacity.clone(),
+            }
+        })
     }
 }
 #[cfg(feature = "testkit")]
@@ -212,6 +265,7 @@ impl Capacity {
         Some(Permit {
             capacity: self.clone(),
             account: account.into(),
+            lifetime: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -244,6 +298,7 @@ impl Capacity {
 pub(super) struct Permit {
     capacity: Arc<Capacity>,
     account: String,
+    lifetime: Arc<AtomicBool>,
 }
 
 impl Permit {
@@ -267,6 +322,7 @@ impl Drop for Permit {
     fn drop(&mut self) {
         let mut accounts = self.capacity.0.lock().unwrap_or_else(|e| e.into_inner());
         let state = accounts.get_mut(&self.account).expect("reserved account");
+        self.lifetime.store(false, Ordering::Release);
         state.reserved -= 1;
         if state.reserved == 0 && state.cap.is_none() {
             accounts.remove(&self.account);
@@ -277,6 +333,286 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capped_source(capacity: &Arc<Capacity>) -> (Permit, OwnWait) {
+        let live = capacity.reserve("a").unwrap();
+        let rejected = capacity.reserve("a").unwrap();
+        rejected.connection_limit();
+        drop(rejected);
+        let wait = OwnWait::start(capacity, "a", Instant::now() + Duration::from_secs(10)).unwrap();
+        (live, wait)
+    }
+
+    #[tokio::test]
+    async fn n6t_wait_and_spill_reject_another_capacity_owner() {
+        let capacity = Arc::new(Capacity::default());
+        let other = Arc::new(Capacity::default());
+        let (_live, mut wait) = capped_source(&capacity);
+        let (_other_live, _other_wait) = capped_source(&other);
+        wait.wait_once(&other).await;
+        assert!(!wait.waited);
+        assert!(wait.spill_source_at(&capacity, wait.until).is_none());
+        wait.waited = true;
+        assert!(wait.spill_source_at(&other, wait.until).is_none());
+        let source = wait.spill_source_at(&capacity, wait.until).unwrap();
+        assert!(!source.still_capped(&other));
+        let foreign_target = other.reserve("b").unwrap();
+        assert!(source.admit(&foreign_target).is_none());
+    }
+
+    #[test]
+    fn n6t_evidence_matches_only_its_source_and_destination() {
+        let capacity = Arc::new(Capacity::default());
+        let (live, mut wait) = capped_source(&capacity);
+        // Even an elapsed deadline cannot yield a hint without a wait.
+        assert!(wait.spill_source_at(&capacity, wait.until).is_none());
+        wait.waited = true;
+        assert!(
+            wait.spill_source_at(&capacity, wait.until - Duration::from_nanos(1))
+                .is_none()
+        );
+        let source = wait.spill_source_at(&capacity, wait.until).unwrap();
+        assert!(source.admit(&live).is_none());
+        let target = capacity.reserve("b").unwrap();
+        let evidence = source.admit(&target).unwrap();
+        assert!(evidence.applies_to("a", "b"));
+        assert!(!evidence.applies_to("c", "b"));
+        assert!(!evidence.applies_to("a", "c"));
+        assert!(!evidence.applies_to("b", "a"));
+    }
+
+    #[test]
+    fn n6t_evidence_dies_with_exact_destination_permit() {
+        let capacity = Arc::new(Capacity::default());
+        let (_live, mut wait) = capped_source(&capacity);
+        wait.waited = true;
+        let source = wait.spill_source_at(&capacity, wait.until).unwrap();
+        let target = capacity.reserve("b").unwrap();
+        let other_target = capacity.reserve("b").unwrap();
+        let evidence = source.admit(&target).unwrap();
+        assert!(evidence.applies_to("a", "b"));
+        assert_eq!(Arc::strong_count(&target.lifetime), 1);
+        // Keep the allocation alive past slot release, just as a concurrent
+        // proof check may hold an upgraded marker while Permit::drop runs.
+        let retained_marker = target.lifetime.clone();
+        drop(target);
+        assert_eq!(evidence.reservation.strong_count(), 1);
+        assert!(!retained_marker.load(Ordering::Acquire));
+        assert!(
+            !evidence.applies_to("a", "b"),
+            "released reservation allocation is not a live destination permit"
+        );
+        assert!(source.admit(&other_target).unwrap().applies_to("a", "b"));
+        let replacement = capacity.reserve("b").unwrap();
+        assert!(!evidence.applies_to("a", "b"));
+        drop((other_target, replacement));
+    }
+
+    #[test]
+    fn n6t_freeing_source_slot_invalidates_evidence_and_admission() {
+        let capacity = Arc::new(Capacity::default());
+        let (live, mut wait) = capped_source(&capacity);
+        wait.waited = true;
+        let source = wait.spill_source_at(&capacity, wait.until).unwrap();
+        let target = capacity.reserve("b").unwrap();
+        let evidence = source.admit(&target).unwrap();
+        assert!(evidence.applies_to("a", "b"));
+        drop(live);
+        assert!(!evidence.applies_to("a", "b"));
+        assert!(source.admit(&target).is_none());
+    }
+
+    #[test]
+    fn n6t_table_veto_preserves_binding_policy_and_ordinary_move_budget() {
+        use crate::{
+            accounts::Provider,
+            bindings::{BindingTable, Candidate, Decision, DispatchAdmission, MoveObservations},
+        };
+
+        fn exhausted_source(capacity: &Arc<Capacity>, source: &str) -> SpillSource {
+            let mut wait =
+                OwnWait::start(capacity, source, Instant::now() + Duration::from_secs(10)).unwrap();
+            wait.waited = true;
+            wait.spill_source_at(capacity, wait.until).unwrap()
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/ws-capacity-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        for case in ["wrong_target", "wrong_source", "dead_reservation"] {
+            let home = tempfile::tempdir_in(&root).unwrap();
+            let mut config = crate::config::RoutingConfig::default();
+            // One successful ordinary move exhausts this budget. A veto must
+            // leave that move available, and capacity proof must still charge it.
+            config.move_guard.global_ten_minutes = 1;
+            let table = BindingTable::new(home.path(), config).unwrap();
+            let candidates = ["cx-6c0001", "cx-6c0002", "cx-6c0003"].map(|id| {
+                let mut account = crate::accounts::health::tests::fixture();
+                account.provider = Provider::Codex;
+                account.identity = crate::accounts::Identity::Codex {
+                    user_id: None,
+                    account_id: id.into(),
+                    email: "capacity@example.test".into(),
+                };
+                account.id = id.into();
+                account.email = "capacity@example.test".into();
+                Candidate {
+                    account,
+                    quota: None,
+                    inflight: 0,
+                }
+            });
+            let a = candidates[0].account.id.as_str();
+            let b = candidates[1].account.id.as_str();
+            let c = candidates[2].account.id.as_str();
+            let actual_source = if case == "wrong_source" { c } else { a };
+            let actual_target = if case == "wrong_target" { c } else { b };
+            let key = "codex:n6t-capacity-proof";
+            let now = chrono::Utc::now();
+            let pick = |target: &str, admission: DispatchAdmission| {
+                table.choose_with_hold_at_admitted_proof(
+                    Provider::Codex,
+                    Some(key),
+                    None,
+                    None,
+                    &candidates,
+                    &candidates,
+                    MoveObservations::untracked(),
+                    Some(target),
+                    0,
+                    false,
+                    false,
+                    now,
+                    None,
+                    |selected| {
+                        assert_eq!(selected, target, "{case}");
+                        Some(admission)
+                    },
+                )
+            };
+            let Decision::Selected { account, lease, .. } =
+                pick(actual_source, DispatchAdmission::ordinary())
+            else {
+                panic!("initial placement: {case}")
+            };
+            assert_eq!(account, actual_source, "{case}");
+            lease.dispatched();
+            drop(lease);
+            // Default sessions need no durable policy row. Give this fixture
+            // an actual saved anchor so the veto also proves no policy write.
+            table
+                .policies
+                .set_session(
+                    &crate::routing::session_id(key),
+                    Some(crate::routing::Settings {
+                        mode: crate::routing::Mode::Recover,
+                        reset_wait_secs: 0,
+                        on_5h_limit: crate::routing::On5hLimit::Wait,
+                    }),
+                    None,
+                    Some(actual_source),
+                )
+                .unwrap();
+            assert_eq!(
+                table.policies.plan(Some(key)).anchor.as_deref(),
+                Some(actual_source),
+                "{case}: fixture needs a saved policy anchor"
+            );
+
+            let capacity = Arc::new(Capacity::default());
+            let live_a = capacity.reserve(a).unwrap();
+            let rejected_a = capacity.reserve(a).unwrap();
+            rejected_a.connection_limit();
+            drop(rejected_a);
+            let live_c = (case == "wrong_source").then(|| {
+                let live = capacity.reserve(c).unwrap();
+                let rejected = capacity.reserve(c).unwrap();
+                rejected.connection_limit();
+                drop(rejected);
+                live
+            });
+            let source_a = exhausted_source(&capacity, a);
+            let target_b = capacity.reserve(b).unwrap();
+            let another_b = capacity.reserve(b).unwrap();
+            let stale = source_a.admit(&target_b).unwrap();
+            let target_b = if case == "dead_reservation" {
+                drop(target_b);
+                None
+            } else {
+                Some(target_b)
+            };
+
+            let before_binding = table.export().unwrap();
+            let before_policy = table.policies.list();
+            let before_plan = serde_json::to_value(table.policies.plan(Some(key))).unwrap();
+            assert!(
+                matches!(
+                    pick(actual_target, DispatchAdmission::capacity(stale)),
+                    Decision::None
+                ),
+                "{case}: invalid capacity evidence must precede publication"
+            );
+            assert_eq!(table.export().unwrap(), before_binding, "{case}");
+            assert_eq!(table.policies.list(), before_policy, "{case}");
+            assert_eq!(
+                serde_json::to_value(table.policies.plan(Some(key))).unwrap(),
+                before_plan,
+                "{case}"
+            );
+            assert_eq!(
+                table.current(Some(key)).as_deref(),
+                Some(actual_source),
+                "{case}"
+            );
+
+            let valid_source = exhausted_source(&capacity, actual_source);
+            let valid_target = capacity.reserve(actual_target).unwrap();
+            let proof = valid_source.admit(&valid_target).unwrap();
+            let Decision::Selected { account, lease, .. } =
+                pick(actual_target, DispatchAdmission::capacity(proof))
+            else {
+                panic!("veto consumed the only ordinary move: {case}")
+            };
+            assert_eq!(account, actual_target, "{case}");
+            lease.dispatched();
+            drop(lease);
+            assert_eq!(
+                table.current(Some(key)).as_deref(),
+                Some(actual_target),
+                "{case}"
+            );
+            assert_eq!(
+                table.policies.plan(Some(key)).anchor.as_deref(),
+                Some(actual_target),
+                "{case}"
+            );
+
+            let next = if actual_target == b { 2 } else { 1 };
+            assert!(
+                matches!(
+                    table.choose_with_hold_at_admitted_proof(
+                        Provider::Codex,
+                        Some(key),
+                        None,
+                        None,
+                        &candidates[next..next + 1],
+                        &candidates,
+                        MoveObservations::untracked(),
+                        Some(&candidates[next].account.id),
+                        0,
+                        false,
+                        false,
+                        now,
+                        None,
+                        |_| panic!("ordinary move budget was not charged: {case}"),
+                    ),
+                    Decision::MoveHeld { .. }
+                ),
+                "{case}"
+            );
+            drop((live_a, live_c, target_b, another_b, valid_target));
+        }
+    }
 
     #[test]
     fn n10_own_wait_grace_is_inside_the_original_upgrade_envelope() {
