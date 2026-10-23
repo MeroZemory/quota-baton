@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13 N5d 리셋 후 native 재개
-목표: N10 자동 외부 사용·WS spill 관문 완료; N5d 실행 소유자 연결·정확히 한 번 재개 구현
+현재 마일스톤: R12.11 canary 버전 지연 보완 완료
+목표: 이미지 canary 지연 집중 관문 완료·설치 인계; N5d 동일 native 재개 통합 계속
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 16:48 KST (N10 관문 완료·설치 인계; N5d 합성 native 재개 능력 확인, 제품 통합 전)
+갱신: 2026-10-23 17:20 KST (R12.11 집중 관문 완료; N10 설치 수용·N11 fixture6개 분류)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -212,6 +212,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 11:33 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5b 집중 관문 통과; N5c-d·N5i 및 C+E 설치 전이므로 출시 수 유지 |
 | 2026-10-23 14:24 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5c 집중 관문·실제 한/영 클릭4HWND 완료; N10·N5d·통합·설치 전이므로 출시 수 유지 |
 | 2026-10-23 16:48 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N10 집중45·실제 한영4창·두 workspace strict lint·전체 행렬 검증 완료. 기존6실패 재현; 추가 합성 버전 timeout은 변경 없는 복구54 직렬 재실행 통과. 미설치 |
+| 2026-10-23 16:52 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N10 설치 수용·takeover 연결 거절0/1,278; 출시 분모 밖 보호 보완 |
+| 2026-10-23 17:20 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R12.11 집중 관문 완료·self-merge 인계; C+E 전체·통합 예측 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -407,6 +409,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 14:09 | N5c HTTP 전체·WS timeout 진단 | HTTP74 통과; WS140통과/1timeout, 실패 테스트 동일2초 제한 집중 재실행1통과 | 시간 제한·전송/계정/리셋 assertions 유지; panic에 expected stage만 추가 | n5c-final-repair 및 n5c-final-ws-repair/1.log; 첫 WS 실패 원인은 미확정. 나머지 영향·실제 HWND 관문 전 |
 | 2026-10-23 14:24 | N5c 집중 영향·실제 창 관문 | core957·HTTP74·tray12·CLI23 통과; WS140/1timeout 뒤 동일 exact1 통과; strict lint·실제 ko/en4HWND·launch check0 | 권한·원래 리셋/캐시 대기·기한 유지·취소 정리 | 코드744190e와 docs-only dev merge 입력; 비반복 토글 실제 down/up·임시 진단 정확 복원. WS 원실패/UIA enqueue 원인 미확정은 보고서 보존; 전체 C+E/replay 별도 |
 | 2026-10-23 16:48 | N10 자동 외부 사용·WS spill 관문 | 집중45·실제 한영4HWND·default/all-features lint·단독 core·제품 build 통과 | 전체 default2799/6/17; all-features 수치는 fingerprint·기존6실패 원인 대조·복구54 재실행 | e43a37b·7e37088; N10-evidence/delivery-fingerprint.json 입력별 기록. 최초 timeout 원인 미확정·실제24시간 replay 별도 |
+| 2026-10-23 17:20 | R12.11 느린 버전·캐시 집중 관문 | CLI58통과/1명시제외·strict lint·fmt·build·real check0 | 두 실제 hook control101→복원0·입력 동일 | df5bf72; R12.11-evidence/fingerprint.json. 24시간 wall-clock receipt·metadata fingerprint는 바이너리 attestation 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
