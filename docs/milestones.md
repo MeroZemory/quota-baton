@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: L1 P3 브라우저 없는 로그인 합성 관문 완료; P4 칸별 접근 진행
+현재 마일스톤: L1 P3.1 device-code 기본 로그인·Linux 경고 제거 관문 완료; P4 재개
 목표: 공통 코드를 유지하며 홈 서버용 Linux 구현 P0–P4를 완성하기
 핵심 지표: Linux 구현 관문 4/5 (P0–P4); P3 실제 공급자 로그인·P5 서버 수용 전
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-25 04:51 KST (P3 코드 7fb006b; 양쪽 합성 로그인·CLI·경계 및 Windows 전체 관문 집중 복구 통과)
+갱신: 2026-10-25 08:18 KST (P3.1 코드 fe151f5; 양쪽 로그인·Linux strict 0경고·Windows 전체 관문 집중 재검증)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -35,6 +35,25 @@ The Codex main updates this block at each unit and gate close; the design sessio
 9. **UI changes (D27, hard rule):** at least one capture through the real path (spawned core, real AdminClient, real tray process). FakeBridge captures alone do not pass.
 10. **Independent review**, where the brief asks for one: a different model family from the implementer.
 11. **Routing changes (D29):** replay at least 24 complete hours of real, body-free decision inputs through the candidate and the installed router. Follow the evidence rules below. Missing inputs or incomplete coverage do not pass. The explicitly requested R14 first delivery ships its runtime protection before this second-delivery replay gate; its report must retain that outstanding requirement.
+
+For Linux phases, also run the following in the approved Linux container and
+single `qb-linux-target` volume, sequentially with the Windows checks:
+
+```sh
+cargo check --workspace --exclude qb-tray --target x86_64-unknown-linux-gnu
+cargo clippy --workspace --exclude qb-tray --lib --bins --target x86_64-unknown-linux-gnu -- -D warnings
+cargo clippy --workspace --exclude qb-tray --lib --bins --all-features --target x86_64-unknown-linux-gnu -- -D warnings
+cargo clippy --release --workspace --exclude qb-tray --lib --bins --target x86_64-unknown-linux-gnu -- -D warnings
+```
+
+Linux lint covers production libraries and binaries; Linux-compatible unit,
+authenticated HTTP, CLI and platform-boundary tests run separately. Existing
+Windows GUI integration fixtures are not Linux targets. Windows retains the
+full workspace and all-target checks above.
+
+Both target checks remain mandatory. Compiler warnings are repaired rather than
+accepted as a Linux baseline; Windows behavior and platform boundaries remain
+part of the same phase gate.
 
 ### Routing replay evidence (D29)
 
@@ -247,6 +266,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 01:45 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 2/3 | P1 515dc1a; Linux1195/0·HTTP9/0·경계6/0, Windows1180/0·HTTP9/0·CLI608/0/3제외; P2 실제 서비스 관문 전 |
 | 2026-10-25 02:42 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 3/3 | P2 c987f53; systemd255 시작·status·25초 양쪽 포트2380/0·kill 재시작·중지·자격증명 복원; P3–P5 별도 |
 | 2026-10-25 04:51 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 4/5 | 구현 메인이 L1 brief의 구현 단계 기준으로 새 계열 선택; 이전 서버 독립 단계 3/3 종료. P3 7fb006b 합성 관문 통과; 실제 공급자 로그인·P5 서버 수용 제외 |
+| 2026-10-25 08:18 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 4/5 | P3.1 fe151f5 device-code·붙여넣기 전환·Linux release strict 0경고; P4 WIP와 실제 공급자 로그인 별도 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -499,14 +519,17 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 04:51 | L1 P1+P2 설치 수용·정리 | d6d34ab; takeover1089/0·Codex/Claude smoke·DPAPI/연결 계정 보존 | 설계 세션 02:54 설치 확인 | 설계 세션이 blocked 목록의 P2 prep 15경로 삭제 완료; 미해결 정리 없음 |
 | 2026-10-25 04:51 | L1 P3 Windows 합성·회귀 관문 | 기본3519/0/19제외·전체3921/4/36제외 뒤 미변경 자식프로세스 가족10/10·코어1327/0/1제외 | strict 기본/전체 lint·build·읽기 전용 launch-client check | L1-P3.md·p3-delivery-fingerprint.json; 원본 4실패 보존, 원인 환경 단정 없음; 최종 test-only CLI9/9와 strict lint 통과 |
 | 2026-10-25 04:51 | L1 P3 Linux 합성 로그인·CLI | OAuth24·실제 인증 HTTP19·CLI9·입력1·계약/구조15 통과 | 양쪽 check·state/PKCE/replay·비밀 출력 없음 | p3-cli-platform-repair/completion.json; Windows 전용 fixture/옵션 기대 수정, 실제 계정·서버 로그인 미실행 |
+| 2026-10-25 08:18 | L1 P3.1 로그인·Linux 배포 경고 | Linux 기본/전체/release lib-bins strict 0경고·HTTP20·CLI13·경계6; core1248/1 뒤 expiry1 집중 복구 | 기존 저장·PKCE·한 번 발급·취소 후 명시적 fallback | fe151f5; L1-P3.1.md·p31-linux-remaining; 외부 옛 release34건과 자체0건 구분, Linux GUI all-target 미대상 |
+| 2026-10-25 08:18 | L1 P3.1 Windows 회귀·연결 | 기본3535/2/19제외·전체3941/2/36제외 뒤 재개3 동일 바이너리 통과·인수1 재빌드 통과 | 기본/전체 strict lint·fmt·build·실제 프로필 읽기 전용 check | 원본4실패 보존·원인 단정 없음; frozen478파일 동일, p31-windows-close·p31-takeover-focused |
+| 2026-10-25 08:18 | L1 P3 설치 수용 | abf5804; takeover1722/0·Codex/Claude smoke·no-browser help | 설계 세션 Windows 설치 확인 | P3.1은 이번 소스 관문이며 미설치; 실제 공급자 로그인 P5에서 사용자와 수용 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| Linux P3 실제 로그인 | 합성 양쪽 통과; 실제 공급자 0/2 | 서버에서 공급자별 실제 로그인 2/2 | 설계 세션이 사용자와 실제 로그인 수용 |
-| Linux P4 칸별 접근 | 공용 루프백만 제공 | 칸별 Unix 소켓·키·철회·계보 | P4 구현·두 칸 검증 |
-| Linux P5 서버 수용 | Docker systemd255까지 수용 | 실제 서버 로그인·칸 접근·재부팅 | 서버 접근 시 설계 세션 수용; N6r·N7 별도 보류 |
+| Linux P4 칸별 접근 | impl/linux WIP 별도 보존 | 키 정체성·선택 listener·철회·계보 및 두 칸 관문 | P3.1 병합 후 P4 재개·새 최종 관문 |
+| Linux 실제 로그인 | 양쪽 합성 통과; 실제 공급자 0/2 | 공급자별 실제 로그인 2/2 | 설계 세션이 사용자와 P5 수용 |
+| Linux P5 서버 수용 | Docker systemd255까지 수용 | 실제 서버 로그인·칸 접근·재부팅 | 서버 접근 시 설계 세션 수용; N6r·N7 각 브랜치 보류 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

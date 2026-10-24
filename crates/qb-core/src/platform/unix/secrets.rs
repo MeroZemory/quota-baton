@@ -1,3 +1,9 @@
+#[cfg(test)]
+#[path = "secrets/test_permissions.rs"]
+mod test_permissions;
+#[cfg(test)]
+pub(crate) use test_permissions::*;
+
 use super::private_fs;
 use crate::accounts::StoreError;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -59,16 +65,6 @@ pub(crate) fn read_config(home: &Path) -> io::Result<Option<String>> {
 pub(crate) fn create_private_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let (directory, name) = private_fs::parent_and_name(path)?;
     private_fs::create_private_leaf(&directory, &name, bytes)
-}
-
-pub(crate) fn validate_private_file(path: &Path) -> io::Result<()> {
-    let (directory, name) = private_fs::parent_and_name(path)?;
-    private_fs::validate_leaf(&directory, &name)
-}
-
-pub(crate) fn restrict(path: &Path) -> anyhow::Result<()> {
-    validate_private_file(path)?;
-    Ok(())
 }
 
 pub(crate) fn load_existing_secret_file(path: &Path) -> anyhow::Result<String> {

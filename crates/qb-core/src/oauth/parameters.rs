@@ -8,6 +8,10 @@ pub(super) struct Parameters {
     pub provider: Provider,
     pub authorize: String,
     pub token: String,
+    pub device_code: String,
+    pub device_token: String,
+    pub device_interval: Option<std::time::Duration>,
+    pub device_lifetime: std::time::Duration,
     pub profile: String,
     pub client_id: &'static str,
     pub scope: &'static str,
@@ -39,6 +43,10 @@ impl Parameters {
             provider,
             authorize: authorize.into(),
             token: token.into(),
+            device_code: "https://auth.openai.com/api/accounts/deviceauth/usercode".into(),
+            device_token: "https://auth.openai.com/api/accounts/deviceauth/token".into(),
+            device_interval: None,
+            device_lifetime: std::time::Duration::from_secs(900),
             profile: "https://api.anthropic.com/api/oauth/profile".into(),
             client_id,
             scope,
@@ -58,6 +66,9 @@ impl Parameters {
             Provider::Claude => Some("https://platform.claude.com/oauth/code/callback"),
             Provider::Codex => None,
         };
+    }
+    pub fn use_device_redirect(&mut self) {
+        self.manual_redirect = Some("https://auth.openai.com/deviceauth/callback");
     }
     pub fn auth_url(&self, state: &str, verifier: &str) -> String {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -110,6 +121,16 @@ impl Parameters {
             return Err(LoginError::InvalidTestEndpoint);
         }
         self.authorize = test.authorize_url.clone();
+        let origin = reqwest::Url::parse(&test.authorize_url)
+            .map_err(|_| LoginError::InvalidTestEndpoint)?;
+        self.device_code = origin
+            .join("/api/accounts/deviceauth/usercode")
+            .map_err(|_| LoginError::InvalidTestEndpoint)?
+            .into();
+        self.device_token = origin
+            .join("/api/accounts/deviceauth/token")
+            .map_err(|_| LoginError::InvalidTestEndpoint)?
+            .into();
         self.token = test.token_url.clone();
         self.profile = test.profile_url.clone();
         self.port = test.callback_port;
