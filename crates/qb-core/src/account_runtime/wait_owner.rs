@@ -935,6 +935,24 @@ impl ReportMutation for ReportApplication {
 }
 
 impl ReportApplication {
+    // Store stays held through exact permit consumption and deferred publication.
+    // No callback under the proof mutex, and no healthy ShortQuotaProof.
+    pub(super) fn finish_readiness(mut self, readiness: AppliedReadiness, account: &Account) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        if self.id != account.id
+            || !readiness_native_current(account, Utc::now())
+            || owner.proofs.finish_applied_poll(permit).is_err()
+        {
+            return;
+        }
+        owner.deferred.requalify_readiness(account, &readiness);
+    }
+
     pub(super) fn finish(mut self, candidate: Option<ShortQuotaProof>) {
         let Some(proof) = candidate else { return };
         // Persistence may have crossed the deadline. Refuse only optional proof.
@@ -1017,6 +1035,164 @@ impl ReportApplication {
             proof,
         })
     }
+}
+
+// Application-local classification data, not a wait proof or producer receipt.
+// The healthy result can only repair an ALREADY registered original episode.
+pub(super) struct AppliedReadiness {
+    pub(super) observed_at: DateTime<Utc>,
+    pub(super) fresh_until: DateTime<Utc>,
+    pub(super) model: Option<String>,
+}
+pub(super) fn classify_readiness(
+    before: &Account,
+    after: &Account,
+    raw: &Value,
+    model: Option<&str>,
+    applied_at: DateTime<Utc>,
+) -> Option<AppliedReadiness> {
+    if after.provider != crate::accounts::Provider::Codex
+        || !readiness_native_current(after, applied_at)
+        || model.is_some_and(|model| model.is_empty() || model.len() > MAX_MODEL_BYTES)
+    {
+        return None;
+    }
+    let mut expected = before.clone();
+    expected.apply_health_signal(
+        crate::accounts::HealthSignal::UsageSnapshot {
+            snapshot: raw.clone(),
+            model: model.map(str::to_owned),
+            projected_allowance: 0.0,
+        },
+        applied_at,
+    );
+    // Compare INSIDE the reducer closure, before Store increments generation.
+    if &expected != after {
+        return None;
+    }
+    let observed_at: DateTime<Utc> = raw["observed_at"].as_str()?.parse().ok()?;
+    let mut fresh_until = observed_at.checked_add_signed(Duration::seconds(300))?;
+    if observed_at > applied_at || fresh_until <= applied_at {
+        return None;
+    }
+    if !raw["signals"].is_null() && !raw["signals"].is_object() {
+        return None;
+    }
+    if (!raw["scope"].is_null() && raw["scope"] != "account")
+        || (!raw["model"].is_null() && raw["model"].as_str() != model)
+        || (!raw["status"].is_null()
+            && !matches!(raw["status"].as_str(), Some("allowed" | "allowed_warning")))
+    {
+        return None;
+    }
+    for key in ["active_limit", "representative_claim"] {
+        if !raw["signals"][key].is_null() || !raw[key].is_null() {
+            return None;
+        }
+    }
+    for key in ["limit_reached", "serving_from_credits"] {
+        if (!raw["signals"][key].is_null() && raw["signals"][key] != false)
+            || (!raw[key].is_null() && raw[key] != false)
+        {
+            return None;
+        }
+    }
+    if !raw["signals"]["unified_status"].is_null()
+        && !matches!(
+            raw["signals"]["unified_status"].as_str(),
+            Some("allowed" | "allowed_warning")
+        )
+    {
+        return None;
+    }
+    if raw["signals"].as_object().is_some_and(|signals| {
+        signals.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "active_limit"
+                    | "representative_claim"
+                    | "limit_reached"
+                    | "serving_from_credits"
+                    | "unified_status"
+            )
+        })
+    }) {
+        return None;
+    }
+    // Available credits alone do not imply paid serving. Both raw subscription
+    // windows below must independently be healthy, and a native credit-release
+    // state must not supply readiness. Keep actual/historic paid-serving vetoes.
+    if after.quota_credit_releasable
+        || (!raw["paid_serving_observed_at"].is_null() && !crate::credits::serving_ended(raw))
+    {
+        return None;
+    }
+    // Deliberately narrow initial subset of normalized account windows. Unknown
+    // durations/subbuckets refuse rather than silently dropping a blocker.
+    let windows = raw["windows"].as_array()?;
+    if windows.len() != 2 {
+        return None;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for window in windows {
+        let name = window["name"].as_str()?;
+        let seconds = match name {
+            "5h" => 18_000,
+            "7d" => 604_800,
+            _ => return None,
+        };
+        if !seen.insert(name) {
+            return None;
+        }
+        let observed: DateTime<Utc> = window["observed_at"].as_str()?.parse().ok()?;
+        let reset: DateTime<Utc> = window["reset_at"].as_str()?.parse().ok()?;
+        let used = window["used_pct"].as_f64()?;
+        if observed != observed_at
+            || reset <= applied_at
+            || !used.is_finite()
+            || !(0.0..99.0).contains(&used)
+            || (!window["status"].is_null()
+                && !matches!(
+                    window["status"].as_str(),
+                    Some("allowed" | "allowed_warning")
+                ))
+            || (!window["scope"].is_null() && window["scope"] != "account")
+            || (!window["limit_reached"].is_null() && window["limit_reached"] != false)
+            || !window["model"].is_null()
+        {
+            return None;
+        }
+        for (field, value) in [
+            ("window_minutes", seconds / 60),
+            ("limit_window_seconds", seconds),
+            ("window_seconds", seconds),
+        ] {
+            if !window[field].is_null() && window[field].as_u64() != Some(value) {
+                return None;
+            }
+        }
+        fresh_until = fresh_until.min(reset);
+    }
+    Some(AppliedReadiness {
+        observed_at,
+        fresh_until,
+        model: model.map(str::to_owned),
+    })
+}
+pub(super) fn readiness_native_current(account: &Account, now: DateTime<Utc>) -> bool {
+    account.provider == crate::accounts::Provider::Codex
+        && account.user_state == crate::accounts::UserState::Active
+        && !account.drain
+        && !account.auth_probe_pending
+        && account.auth_failures == 0
+        && !account.token_meta.refresh_uncertain
+        && account
+            .token_meta
+            .expires_at
+            .is_none_or(|expiry| expiry > now)
+        && account.payment_until.is_none_or(|until| until <= now)
+        && matches!(account.health, Health::Ready)
+        && account.quota_cooling.is_none()
 }
 
 pub(super) fn classify(
@@ -1331,7 +1507,14 @@ impl AccountRuntime {
             if store.writes_stopped() {
                 return None;
             }
-            let current = store.read_account_unlocked(&id).ok()?;
+            // Native expiry during the later reducer cuts accepted permits.
+            // Settle it BEFORE capturing this new UsagePoll's pre-send origin,
+            // never by recapturing/rebasing a response that has already arrived.
+            let current = if source == ReportSource::UsagePoll {
+                store.expire_health_unlocked(&id).ok()?
+            } else {
+                store.read_account_unlocked(&id).ok()?
+            };
             if current.id != id {
                 return None;
             }

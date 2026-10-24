@@ -945,9 +945,9 @@ pub struct AccountRuntime {
     obs: Arc<Observability>,
     events: broadcast::Sender<Value>,
     limits: Mutex<BTreeMap<String, LimitResponse>>,
-    probes: Mutex<BTreeSet<String>>,
+    probes: Arc<Mutex<BTreeSet<String>>>,
     released_quota: Arc<Mutex<BTreeMap<String, ReleasedQuota>>>,
-    volatile: Mutex<BTreeMap<String, Health>>,
+    volatile: Arc<Mutex<BTreeMap<String, Health>>>,
     selection_owner: selection::SelectionOwner,
     inflight: Arc<Mutex<BTreeMap<String, usize>>>,
     poller: Mutex<Option<Weak<crate::quota::UsagePoller>>>,
@@ -1150,9 +1150,9 @@ impl AccountRuntime {
             obs,
             events,
             limits: Mutex::new(BTreeMap::new()),
-            probes: Mutex::new(BTreeSet::new()),
+            probes: Arc::new(Mutex::new(BTreeSet::new())),
             released_quota: Arc::new(Mutex::new(BTreeMap::new())),
-            volatile: Mutex::new(BTreeMap::new()),
+            volatile: Arc::new(Mutex::new(BTreeMap::new())),
             selection_owner: selection::SelectionOwner::default(),
             inflight: Arc::new(Mutex::new(BTreeMap::new())),
             poller: Mutex::new(None),
@@ -2653,6 +2653,8 @@ impl AccountRuntime {
         let released_quota = self.released_quota.clone();
         let outside_owner = self.outside_owner.clone();
         let outside_inflight = self.inflight.clone();
+        let probes = self.probes.clone();
+        let volatile = self.volatile.clone();
         let (account, snapshot, pending) = tokio::task::spawn_blocking(move || -> Result<_, ()> {
             let _guard = store.transaction().map_err(|_| ())?;
             // Consume the pre-send ordinal before classification, even for a
@@ -2686,6 +2688,7 @@ impl AccountRuntime {
             };
             let mut ran = false;
             let mut candidate = None;
+            let mut readiness = None;
             let account = store
                 .update_metadata_with_cause_unlocked(&account_id, cause, |account| {
                     ran = true;
@@ -2706,6 +2709,13 @@ impl AccountRuntime {
                         applied_at,
                     );
                     if let Some(before) = before {
+                        readiness = wait_owner::classify_readiness(
+                            &before,
+                            account,
+                            &reported,
+                            report_model.as_deref(),
+                            applied_at,
+                        );
                         candidate = wait_owner::classify(
                             &before,
                             account,
@@ -2722,17 +2732,53 @@ impl AccountRuntime {
                 && !store.writes_stopped()
                 && let Some(application) = application
             {
-                match publication {
-                    wait_owner::ReportPublication::Immediate => {
-                        application.finish(candidate);
-                        None
+                // No healthy ShortQuotaProof or new producer receipt. Readiness
+                // is only for existing suspended records and exact durable gen.
+                let readiness_guards = readiness.as_ref().and_then(|_| {
+                    // Hold native runtime vetoes THROUGH publication, in the
+                    // same order as existing registration/consumption gates.
+                    let released = released_quota.lock().ok()?;
+                    let probes = probes.lock().ok()?;
+                    let volatile = volatile.lock().ok()?;
+                    Some((released, probes, volatile))
+                });
+                let readiness = readiness.filter(|_| {
+                    readiness_guards
+                        .as_ref()
+                        .is_some_and(|(released, probes, volatile)| {
+                            !released
+                                .get(&account_id)
+                                .is_some_and(|release| release.pending)
+                                && !probes.contains(&account_id)
+                                && !volatile.contains_key(&account_id)
+                                && store
+                                    .tokens_unlocked(&account)
+                                    .is_ok_and(|tokens| !tokens.access_token.is_empty())
+                        })
+                });
+                if candidate.is_none()
+                    && matches!(
+                        publication,
+                        wait_owner::ReportPublication::Immediate
+                            | wait_owner::ReportPublication::ImmediatePollReceipt
+                    )
+                    && let Some(readiness) = readiness
+                {
+                    application.finish_readiness(readiness, &account);
+                    None
+                } else {
+                    match publication {
+                        wait_owner::ReportPublication::Immediate => {
+                            application.finish(candidate);
+                            None
+                        }
+                        wait_owner::ReportPublication::ImmediatePollReceipt => application
+                            .finish_poll(candidate)
+                            .map(wait_owner::ReportReceipt::Poll),
+                        wait_owner::ReportPublication::DeferredHttp429 => application
+                            .seal_http(candidate, &account)
+                            .map(wait_owner::ReportReceipt::Http),
                     }
-                    wait_owner::ReportPublication::ImmediatePollReceipt => application
-                        .finish_poll(candidate)
-                        .map(wait_owner::ReportReceipt::Poll),
-                    wait_owner::ReportPublication::DeferredHttp429 => application
-                        .seal_http(candidate, &account)
-                        .map(wait_owner::ReportReceipt::Http),
                 }
             } else {
                 None
