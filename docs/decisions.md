@@ -951,6 +951,12 @@ Minutes are dropped once the remainder is a day or more. The provider summary us
 
 Two cores then use some of the same accounts. Each sees the other's use as outside use, so D30 makes it give way automatically. Usage polls show the combined use, so forecasts stay honest.
 
+**Code structure (user direction 2026-10-25).** One codebase made of common code, a Windows part and a Linux part; never a separate Linux copy. Conditional compilation (`#[cfg]`) is used only at module boundaries:
+- a `platform` module per crate exposes one API, with `windows` and `unix` implementations;
+- common code contains no cfg;
+- whole OS-only features (tray, launchers, conversation moves, CPA cutover) are gated once at their module root.
+A static test enforces this, and both targets are checked at every gate.
+
 **Scope.**
 1. **Portable core.** `windows` becomes a target-specific dependency and Windows modules sit behind `cfg(windows)`. Platform traits:
    - secrets: DPAPI on Windows. On Linux, a file encrypted with a key delivered by systemd `LoadCredentialEncrypted=` (systemd-creds: TPM2 if present, else the host key). A 0600 file is allowed only with an explicit config flag.
