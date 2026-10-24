@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: L1 P2 헤드리스 서비스 관문 완료; P0–P2 병합·설치 인계
-목표: 공통 코드를 유지하며 홈 서버용 Linux 헤드리스 코어 P0–P2를 완성하기
-핵심 지표: Linux 서버 독립 단계 3/3 (P0 컴파일, P1 플랫폼, P2 systemd); 전체 L1 서버 수용 전
+현재 마일스톤: L1 P3 브라우저 없는 로그인 합성 관문 완료; P4 칸별 접근 진행
+목표: 공통 코드를 유지하며 홈 서버용 Linux 구현 P0–P4를 완성하기
+핵심 지표: Linux 구현 관문 4/5 (P0–P4); P3 실제 공급자 로그인·P5 서버 수용 전
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-25 02:42 KST (P2 코드 c987f53; 실제 systemd 시작·재로드·복구·중지 및 양쪽 회귀 통과)
+갱신: 2026-10-25 04:51 KST (P3 코드 7fb006b; 양쪽 합성 로그인·CLI·경계 및 Windows 전체 관문 집중 복구 통과)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -246,6 +246,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 00:50 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 1/3 | 사용자 L1 brief의 서버 불필요 단계로 구현 메인이 새 계열 선택. P0 798f8a8 관문 통과; P3–P5 전체 수용과 별도 |
 | 2026-10-25 01:45 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 2/3 | P1 515dc1a; Linux1195/0·HTTP9/0·경계6/0, Windows1180/0·HTTP9/0·CLI608/0/3제외; P2 실제 서비스 관문 전 |
 | 2026-10-25 02:42 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 3/3 | P2 c987f53; systemd255 시작·status·25초 양쪽 포트2380/0·kill 재시작·중지·자격증명 복원; P3–P5 별도 |
+| 2026-10-25 04:51 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 4/5 | 구현 메인이 L1 brief의 구현 단계 기준으로 새 계열 선택; 이전 서버 독립 단계 3/3 종료. P3 7fb006b 합성 관문 통과; 실제 공급자 로그인·P5 서버 수용 제외 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -495,12 +496,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 01:45 | L1 P0 설치 수용 | ae5054c; takeover1700/0·Codex/Claude smoke·DPAPI/연결 계정·실제 dashboard 유지 | 설계 세션 설치 확인 | 00:56 KST 수용 회신; 구현 메인은 설치하지 않음 |
 | 2026-10-25 01:45 | L1 P1 최종 플랫폼 관문 | Linux core1195/0·HTTP9/0·경계6/0; Windows core1180/0·HTTP9/0·CLI608/0/3제외·경계6/0 | 양쪽 check·Windows 기본/전체 strict lint·build·읽기 전용 check | L1-P1.md와 delivery-fingerprint.json; 초기 실패 원본 보존, 마지막 변경은 m0 경로 fixture만 집중 재검증 |
 | 2026-10-25 02:42 | L1 P2 서비스 수용·회귀 | Linux1232/0·HTTP9/0·경계6/0; Windows1180/0·CLI608/0/3제외 | 실제 systemd255 동일 PID 재로드·양쪽 포트25초 실패0 | L1-P2.md; p2-delivery-fingerprint.json; 기본/전체 strict lint·양쪽 check·읽기 전용 launcher 검사 통과 |
+| 2026-10-25 04:51 | L1 P1+P2 설치 수용·정리 | d6d34ab; takeover1089/0·Codex/Claude smoke·DPAPI/연결 계정 보존 | 설계 세션 02:54 설치 확인 | 설계 세션이 blocked 목록의 P2 prep 15경로 삭제 완료; 미해결 정리 없음 |
+| 2026-10-25 04:51 | L1 P3 Windows 합성·회귀 관문 | 기본3519/0/19제외·전체3921/4/36제외 뒤 미변경 자식프로세스 가족10/10·코어1327/0/1제외 | strict 기본/전체 lint·build·읽기 전용 launch-client check | L1-P3.md·p3-delivery-fingerprint.json; 원본 4실패 보존, 원인 환경 단정 없음; 최종 test-only CLI9/9와 strict lint 통과 |
+| 2026-10-25 04:51 | L1 P3 Linux 합성 로그인·CLI | OAuth24·실제 인증 HTTP19·CLI9·입력1·계약/구조15 통과 | 양쪽 check·state/PKCE/replay·비밀 출력 없음 | p3-cli-platform-repair/completion.json; Windows 전용 fixture/옵션 기대 수정, 실제 계정·서버 로그인 미실행 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| Linux P3 로그인 | P0–P2 통과; 실제 계정 미연결 | 두 공급자 코드/redirect·state·PKCE 검증 | 별도 P3 합성 관문 뒤 설계 세션 실제 로그인 |
+| Linux P3 실제 로그인 | 합성 양쪽 통과; 실제 공급자 0/2 | 서버에서 공급자별 실제 로그인 2/2 | 설계 세션이 사용자와 실제 로그인 수용 |
 | Linux P4 칸별 접근 | 공용 루프백만 제공 | 칸별 Unix 소켓·키·철회·계보 | P4 구현·두 칸 검증 |
 | Linux P5 서버 수용 | Docker systemd255까지 수용 | 실제 서버 로그인·칸 접근·재부팅 | 서버 접근 시 설계 세션 수용; N6r·N7 별도 보류 |
 <!-- gaps:end -->
