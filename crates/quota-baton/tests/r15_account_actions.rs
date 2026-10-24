@@ -338,8 +338,11 @@ async fn actual_account_actions_same_body_reaches_real_client() {
         // Immediate second poll is a real core 429, not a fabricated error body.
         assert!(matches!(client.account_action_raw(&h.id, AccountAction::RefreshUsage).await,
             Err(ClientError::Http(StatusCode::TOO_MANY_REQUESTS))));
-        let refused: Value = serde_json::from_slice(&h.body("/refresh-usage", StatusCode::TOO_MANY_REQUESTS)).unwrap();
-        assert_eq!(refused["error"]["code"], "poll_too_soon");
+        let body = h.body("/refresh-usage", StatusCode::TOO_MANY_REQUESTS);
+        let refused: qb_proto::admin_account_error::AccountErrorReply = serde_json::from_slice(&body).unwrap();
+        assert!(serde_json::to_vec(&refused).unwrap() == body);
+        assert_eq!(refused.error.code.as_deref(), Some("poll_too_soon"));
+        assert!(refused.error.retry_after.is_some());
         assert_eq!(h.usage.state.requests().len(), 1);
         // Manual refresh is allowed for disabled owned accounts; exact existing m5 setup.
         h.store.update_metadata(&h.id, |a| a.user_state = UserState::Disabled).unwrap();
@@ -362,8 +365,10 @@ async fn actual_account_actions_same_body_reaches_real_client() {
         assert!(matches!(h.store.load(&h.id).unwrap().health, Health::NeedsRelogin { .. }));
         assert_eq!(h.token.state.requests().len(), 2);
         assert!(matches!(client.refresh_tokens_raw(&h.id).await, Err(ClientError::AccountAction("계정 메뉴에서 다시 로그인하세요"))));
-        let refused: Value = serde_json::from_slice(&h.body("/refresh", StatusCode::CONFLICT)).unwrap();
-        assert_eq!(refused["error"]["code"], "needs_relogin");
+        let body = h.body("/refresh", StatusCode::CONFLICT);
+        let refused: qb_proto::admin_account_error::AccountErrorReply = serde_json::from_slice(&body).unwrap();
+        assert!(serde_json::to_vec(&refused).unwrap() == body);
+        assert_eq!(refused.error.code.as_deref(), Some("needs_relogin"));
         assert_eq!(h.token.state.requests().len(), 2);
         assert!(h.data.state.requests().is_empty());
         assert!(h.captured.lock().unwrap().is_empty());

@@ -650,7 +650,15 @@ fn refresh_result(status: StatusCode, value: &serde_json::Value) -> Result<(), C
             _ => Err(ClientError::AccountAction("갱신 응답을 확인할 수 없습니다")),
         };
     }
-    let message = match value["error"]["code"].as_str() {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    refresh_error_result(status, &bytes)
+}
+
+fn refresh_error_result(status: StatusCode, bytes: &[u8]) -> Result<(), ClientError> {
+    let signal =
+        serde_json::from_slice::<qb_proto::admin_account_error::AccountErrorSignal>(bytes).ok();
+    let code = signal.as_ref().and_then(|signal| signal.code.as_deref());
+    let message = match code {
         Some("linked") => "CPA가 갱신하는 계정입니다",
         Some("drain") => "드레인 해제 후 다시 시도하세요",
         Some("needs_relogin") => "계정 메뉴에서 다시 로그인하세요",
@@ -2035,6 +2043,47 @@ mod r15_account_action_consumer_tests {
             assert!(
                 AdminClient::decode_dashboard_object::<ReleaseHoldWire>(bad.as_bytes()).is_err()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod r15_account_error_reader_tests {
+    use super::*;
+    #[test]
+    fn account_error_tray_allowlist_and_fallback_keep_status() {
+        for (code, expected) in [
+            ("linked", "CPA가 갱신하는 계정입니다"),
+            ("drain", "드레인 해제 후 다시 시도하세요"),
+            ("needs_relogin", "계정 메뉴에서 다시 로그인하세요"),
+            (
+                "uncertain",
+                "이전 갱신 결과가 불확실합니다 · CLI의 --force를 확인하세요",
+            ),
+            ("unavailable", "잠시 후 다시 갱신해 주세요"),
+            ("not_found", "계정을 찾을 수 없습니다"),
+        ] {
+            let raw = format!(
+                r#"{{"error":{{"code":"{code}","message":"synthetic-secret","extra":true}}}}"#
+            );
+            assert!(
+                matches!(refresh_error_result(StatusCode::CONFLICT, raw.as_bytes()),
+                Err(ClientError::AccountAction(text)) if text == expected)
+            );
+        }
+        for raw in [
+            r#"{"error":{"message":"synthetic-secret"}}"#,
+            r#"{"error":{"code":"terminal","outcome":"invalid_grant"}}"#,
+            r#"{"error":{"code":"poll_too_soon","retry_after":3}}"#,
+            r#"{"error":{"code":"future"}}"#,
+            r#"{"error":{"code":"linked","code":"drain"}}"#,
+            r#"[{"code":"linked"}]"#,
+            "not json",
+        ] {
+            assert!(matches!(
+                refresh_error_result(StatusCode::CONFLICT, raw.as_bytes()),
+                Err(ClientError::Http(StatusCode::CONFLICT))
+            ));
         }
     }
 }
