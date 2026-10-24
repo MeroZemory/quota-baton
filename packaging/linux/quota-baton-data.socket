@@ -1,0 +1,12 @@
+# Socket activation: enable only the service.
+[Unit]
+Description=quota-baton data listener
+PartOf=quota-baton.service
+
+[Socket]
+ListenStream=127.0.0.1:10200
+Accept=no
+Service=quota-baton.service
+FileDescriptorName=data
+Backlog=4096
+FlushPending=no

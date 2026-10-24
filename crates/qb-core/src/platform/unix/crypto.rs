@@ -17,6 +17,8 @@ use zeroize::Zeroizing;
 
 use super::private_fs as secure_key;
 
+mod systemd_key;
+
 const PREFIX: &str = "qb-aes256gcm-v1:";
 const DOMAIN: &[u8] = b"quota-baton/linux/account-secret/v1\0";
 const MAX_PLAINTEXT: usize = 1024 * 1024;
@@ -54,14 +56,7 @@ impl SecretProtector {
             secure_key::private_child(&home, "accounts", false).map_err(|_| StoreError::Crypto)?;
         let key = match &config.linux_backend {
             LinuxSecretBackend::SystemdCredential => {
-                let directory = secure_key::private_directory(
-                    credentials_dir
-                        .filter(|path| path.is_absolute())
-                        .ok_or(StoreError::Crypto)?,
-                    true,
-                )
-                .map_err(|_| StoreError::Crypto)?;
-                secure_key::read_key(&directory, "qb-master-key", true)
+                systemd_key::load(credentials_dir.ok_or(StoreError::Crypto)?)
                     .map_err(|_| StoreError::Crypto)?
             }
             LinuxSecretBackend::File0600 => {

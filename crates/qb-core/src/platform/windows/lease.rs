@@ -18,6 +18,10 @@ pub(crate) struct Lease {
 }
 
 impl Lease {
+    pub(crate) fn retain_for_service(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     pub fn acquire(dir: &Path) -> Result<Self, StoreError> {
         let lock = OpenOptions::new()
             .create(true)

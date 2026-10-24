@@ -1,0 +1,50 @@
+# Headless service qualified with systemd 255.
+[Unit]
+Description=quota-baton headless account proxy
+Requires=quota-baton-data.socket quota-baton-admin.socket
+After=quota-baton-data.socket quota-baton-admin.socket
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+Sockets=quota-baton-data.socket quota-baton-admin.socket
+NonBlocking=yes
+User=quota-baton
+Group=quota-baton
+UMask=0077
+StateDirectory=quota-baton
+StateDirectoryMode=0700
+RuntimeDirectory=quota-baton
+RuntimeDirectoryMode=0700
+WorkingDirectory=/var/lib/quota-baton
+Environment=QB_SYSTEMD_MANAGED=1
+LoadCredentialEncrypted=qb-master-key:/etc/credstore.encrypted/qb-master-key
+ExecStart=/usr/local/bin/quota-baton serve
+ExecReload=/usr/local/bin/quota-baton serve --takeover
+KillSignal=SIGTERM
+KillMode=control-group
+# Reload helper is bounded to 55s; manager leaves margin for process teardown.
+TimeoutStartSec=90s
+TimeoutStopSec=35min
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

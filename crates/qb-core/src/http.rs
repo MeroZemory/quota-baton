@@ -1,7 +1,4 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -125,8 +122,8 @@ pub async fn spawn_with_routes(
         secrets.client_key != secrets.admin_token,
         "local secrets must be distinct"
     );
-    let data = bind_listener(config.server.data_port).await?;
-    let admin = bind_listener(config.server.admin_port).await?;
+    let data = crate::platform::bind_listener(config.server.data_port).await?;
+    let admin = crate::platform::bind_listener(config.server.admin_port).await?;
     let data_addr = data.local_addr()?;
     let admin_addr = admin.local_addr()?;
     let (shutdown, mut data_shutdown) = watch::channel(false);
@@ -149,12 +146,16 @@ pub async fn spawn_with_routes(
         .route(
             "/admin/v1/health",
             get(move || async move {
+                if !crate::platform::service::health_ready() {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
                 Json(qb_proto::HealthResponse {
                     ok: true,
                     version: env!("CARGO_PKG_VERSION").into(),
                     pid: std::process::id(),
                     started_at,
                 })
+                .into_response()
             }),
         )
         .merge(extra_admin)
@@ -210,22 +211,6 @@ pub async fn spawn_with_routes(
         shutdown,
         listener_closed: [data_closed_rx, admin_closed_rx],
     })
-}
-
-async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
-            Ok(listener) => return Ok(listener),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::AddrInUse
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
 }
 
 async fn safety(

@@ -1,0 +1,12 @@
+# Socket activation: enable only the service.
+[Unit]
+Description=quota-baton admin listener
+PartOf=quota-baton.service
+
+[Socket]
+ListenStream=127.0.0.1:10201
+Accept=no
+Service=quota-baton.service
+FileDescriptorName=admin
+Backlog=4096
+FlushPending=no

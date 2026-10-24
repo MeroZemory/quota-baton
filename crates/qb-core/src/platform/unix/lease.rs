@@ -7,6 +7,10 @@ pub(crate) struct Lease {
     _file: File,
 }
 impl Lease {
+    pub(crate) fn retain_for_service(&self) -> anyhow::Result<()> {
+        super::service::retain_lease_file(&self._file)
+    }
+
     pub fn acquire(dir: &Path) -> Result<Self, StoreError> {
         let directory =
             private_fs::private_directory(dir, false).map_err(|_| StoreError::LeaseUnavailable)?;

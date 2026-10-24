@@ -112,7 +112,7 @@ fn file_backend_generates_owner_only_key_and_reopens() {
 }
 
 #[test]
-fn systemd_backend_reads_raw_0400_key_without_creating_a_local_key() {
+fn systemd_backend_refuses_writable_fake_0400_credential_without_local_fallback() {
     let fixture = Fixture::new();
     fixture.key(&[42; 32]);
     fs::set_permissions(
@@ -120,9 +120,21 @@ fn systemd_backend_reads_raw_0400_key_without_creating_a_local_key() {
         fs::Permissions::from_mode(0o400),
     )
     .unwrap();
-    let protector = fixture.systemd().unwrap();
-    let ciphertext = protector.encrypt(ID, &tokens()).unwrap();
-    assert_roundtrip(&protector, &ciphertext);
+    assert!(fixture.systemd().is_err());
+    assert_eq!(
+        fs::metadata(fixture.credentials.join("qb-master-key"))
+            .unwrap()
+            .len(),
+        32
+    );
+    assert_eq!(
+        fs::metadata(fixture.credentials.join("qb-master-key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o400
+    );
     assert!(!fixture.home.join("master.key").exists());
 }
 

@@ -24,6 +24,7 @@ pub mod provider_forecast;
 pub mod quota;
 pub mod relay;
 pub mod routing;
+pub mod service;
 pub mod session;
 pub mod usage_forecast;
 pub mod usage_forecast_display;
