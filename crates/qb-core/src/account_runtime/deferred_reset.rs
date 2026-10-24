@@ -1708,12 +1708,7 @@ mod tests {
         };
         // Wait for the actual original native wall/mono reset, not a fabricated
         // DTO or elapsed arbitrary sleep. Bound prevents a broken clock hanging.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(6),
-            tokio::time::sleep_until(wake),
-        )
-        .await
-        .unwrap();
+        wait_until_original_reset(wake, reset).await;
         assert!(Utc::now() >= reset);
         // Synthetic live weak-slot pressure exercises both actual capacity
         // checks without constructing thousands of unrelated native accounts.
@@ -1792,12 +1787,7 @@ mod tests {
                     .save_credentials(&uncertain, &tokens, uncertain.generation)
                     .unwrap();
             }
-            tokio::time::timeout(
-                std::time::Duration::from_secs(6),
-                tokio::time::sleep_until(wake),
-            )
-            .await
-            .unwrap();
+            wait_until_original_reset(wake, reset).await;
             assert!(Utc::now() >= reset);
             if mode != 0 {
                 let expired = f.runtime.store.load(&f.id).unwrap();
@@ -2043,25 +2033,30 @@ mod tests {
             .unwrap();
     }
 
+    async fn wait_until_original_reset(wake: Instant, reset_at: DateTime<Utc>) {
+        let wait_bound =
+            wake.saturating_duration_since(Instant::now()) + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + wait_bound;
+        tokio::time::timeout(wait_bound, tokio::time::sleep_until(wake))
+            .await
+            .unwrap();
+        // The monotonic wake and UTC reset are sampled separately. A virtual
+        // timer returning does not prove UTC advanced; use a real-time budget,
+        // rather than a fixed number of potentially early timer completions.
+        while Utc::now() < reset_at {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "UTC did not reach the original reset");
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
+        }
+    }
+
     async fn original_due(f: &Fixture, scope: &LaunchOwnerScope) -> (Instant, DateTime<Utc>) {
         let (wake, reset_at) = match f.runtime.deferred_reset_status(scope, THREAD) {
             DeferredResetStatus::Waiting { wake, reset_at, .. }
             | DeferredResetStatus::Suspended { wake, reset_at, .. } => (wake, reset_at),
             _ => panic!("original obligation missing"),
         };
-        let wait_bound =
-            wake.saturating_duration_since(Instant::now()) + std::time::Duration::from_secs(5);
-        tokio::time::timeout(wait_bound, async {
-            tokio::time::sleep_until(wake).await;
-            // The production monotonic wake and wall reset are sampled
-            // separately. Wait for both clocks without changing either bound.
-            while Utc::now() < reset_at {
-                let remaining = (reset_at - Utc::now()).to_std().unwrap_or_default();
-                tokio::time::sleep(remaining).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until_original_reset(wake, reset_at).await;
         assert!(Utc::now() >= reset_at);
         (wake, reset_at)
     }

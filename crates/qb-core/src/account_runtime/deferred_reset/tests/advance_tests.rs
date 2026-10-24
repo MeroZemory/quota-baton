@@ -25,12 +25,7 @@ async fn consume_physical(f: &Fixture) -> (DeferredResetId, LaunchOwnerScope, Ob
     else {
         panic!("missing physical episode");
     };
-    tokio::time::timeout(
-        std::time::Duration::from_secs(6),
-        tokio::time::sleep_until(wake),
-    )
-    .await
-    .unwrap();
+    wait_until_original_reset(wake, reset).await;
     assert!(Utc::now() >= reset);
     assert!(
         f.runtime
@@ -55,12 +50,7 @@ async fn n5d_advance_refuses_missing_waiting_ready_and_cancelled_episodes() {
     else {
         panic!("advance must not alter the waiting episode");
     };
-    tokio::time::timeout(
-        std::time::Duration::from_secs(6),
-        tokio::time::sleep_until(wake),
-    )
-    .await
-    .unwrap();
+    wait_until_original_reset(wake, reset).await;
     assert!(Utc::now() >= reset);
     assert!(
         f.runtime
