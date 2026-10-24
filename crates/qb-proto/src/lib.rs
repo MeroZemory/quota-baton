@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod admin_account;
+pub mod admin_account_error;
 pub mod admin_action;
 pub mod admin_adopt;
 pub mod admin_control;

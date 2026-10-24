@@ -681,31 +681,37 @@ async fn release_hold_response(response: reqwest::Response) -> anyhow::Result<se
     decode_account_subset(&bytes, AccountSubset::Released)
 }
 
-async fn account_response(response: reqwest::Response) -> anyhow::Result<serde_json::Value> {
-    let status = response.status();
-    let value: serde_json::Value = response.json().await.unwrap_or_default();
-    // Only allowlisted local error codes are rendered; never echo arbitrary payloads.
-    if !status.is_success() {
-        let message = match value["error"]["code"].as_str() {
-            Some("not_found") => "계정을 찾을 수 없습니다.",
-            Some("linked") => "CPA가 갱신하는 계정입니다.",
-            Some("not_linked") => "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
-            Some("drain") => "드레인 중인 계정은 갱신할 수 없습니다.",
-            Some("needs_relogin") => "다시 로그인해야 하는 계정입니다.",
-            Some("uncertain") => {
-                "이전 갱신 결과가 불확실합니다. 확인 후 --force로 한 번 시도해 주세요."
-            }
-            Some("generation_conflict") => "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
-            Some("identity_conflict") => "계정의 사용자를 확인할 수 없거나 사용자 파일이 겹칩니다.",
-            Some("cpa_running") => "CPA가 아직 이 계정을 갱신할 수 있습니다.",
-            Some("cpa_unknown") => "CPA 실행 상태를 확인할 수 없습니다.",
-            _ => "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요.",
-        };
-        return Err(account_error(message));
+fn account_error_message(bytes: &[u8]) -> &'static str {
+    let signal =
+        serde_json::from_slice::<qb_proto::admin_account_error::AccountErrorSignal>(bytes).ok();
+    let code = signal.as_ref().and_then(|signal| signal.code.as_deref());
+    match code {
+        Some("not_found") => "계정을 찾을 수 없습니다.",
+        Some("linked") => "CPA가 갱신하는 계정입니다.",
+        Some("not_linked") => "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
+        Some("drain") => "드레인 중인 계정은 갱신할 수 없습니다.",
+        Some("needs_relogin") => "다시 로그인해야 하는 계정입니다.",
+        Some("uncertain") => {
+            "이전 갱신 결과가 불확실합니다. 확인 후 --force로 한 번 시도해 주세요."
+        }
+        Some("generation_conflict") => "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
+        Some("identity_conflict") => "계정의 사용자를 확인할 수 없거나 사용자 파일이 겹칩니다.",
+        Some("cpa_running") => "CPA가 아직 이 계정을 갱신할 수 있습니다.",
+        Some("cpa_unknown") => "CPA 실행 상태를 확인할 수 없습니다.",
+        _ => "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요.",
     }
-    Ok(value)
 }
 
+async fn account_response(response: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+    let status = response.status();
+    if !status.is_success() {
+        let bytes = response.bytes().await.unwrap_or_default();
+        return Err(account_error(account_error_message(&bytes)));
+    }
+    // Preserve the existing success reader; its typed migrations are separate.
+    let value: serde_json::Value = response.json().await.unwrap_or_default();
+    Ok(value)
+}
 fn adoption_error(error: qb_core::accounts::adopt::AdoptError) -> anyhow::Error {
     use qb_core::accounts::adopt::AdoptError;
     account_error(match error {
@@ -2794,5 +2800,52 @@ mod r15_account_subset_raw_tests {
         let mut bad = action(true);
         bad["released"] = json!("true");
         rejected(bad.to_string().as_bytes(), AccountSubset::Released);
+    }
+}
+
+#[cfg(test)]
+mod r15_account_error_reader_tests {
+    #[test]
+    fn account_error_cli_allowlist_and_no_payload_echo() {
+        for (code, expected) in [
+            ("not_found", "계정을 찾을 수 없습니다."),
+            ("linked", "CPA가 갱신하는 계정입니다."),
+            ("not_linked", "CPA 연결 계정만 소유권을 이전할 수 있습니다."),
+            ("drain", "드레인 중인 계정은 갱신할 수 없습니다."),
+            ("needs_relogin", "다시 로그인해야 하는 계정입니다."),
+            (
+                "uncertain",
+                "이전 갱신 결과가 불확실합니다. 확인 후 --force로 한 번 시도해 주세요.",
+            ),
+            (
+                "generation_conflict",
+                "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
+            ),
+            (
+                "identity_conflict",
+                "계정의 사용자를 확인할 수 없거나 사용자 파일이 겹칩니다.",
+            ),
+            ("cpa_running", "CPA가 아직 이 계정을 갱신할 수 있습니다."),
+            ("cpa_unknown", "CPA 실행 상태를 확인할 수 없습니다."),
+        ] {
+            let raw = format!(
+                r#"{{"error":{{"code":"{code}","message":"synthetic-secret","extra":true}}}}"#
+            );
+            assert_eq!(super::account_error_message(raw.as_bytes()), expected);
+        }
+        for raw in [
+            r#"{"error":{"message":"synthetic-secret"}}"#,
+            r#"{"error":{"code":"terminal","outcome":"invalid_grant"}}"#,
+            r#"{"error":{"code":"poll_too_soon","retry_after":3}}"#,
+            r#"{"error":{"code":"future","message":"synthetic-secret"}}"#,
+            r#"{"error":{"code":"linked","code":"drain"}}"#,
+            r#"[{"code":"linked"}]"#,
+            "not json",
+        ] {
+            assert_eq!(
+                super::account_error_message(raw.as_bytes()),
+                "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요."
+            );
+        }
     }
 }

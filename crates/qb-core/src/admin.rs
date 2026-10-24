@@ -766,7 +766,9 @@ async fn takeover_account(
             };
             (
                 status,
-                Json(serde_json::json!({"error":{"code":code,"message":message}})),
+                Json(qb_proto::admin_account_error::AccountErrorReply {
+                    error: qb_proto::admin_account_error::AccountErrorDetail::coded(code, message),
+                }),
             )
                 .into_response()
         }
@@ -851,7 +853,9 @@ async fn adopt_account(
             };
             (
                 status,
-                Json(serde_json::json!({"error":{"code":code,"message":message}})),
+                Json(qb_proto::admin_account_error::AccountErrorReply {
+                    error: qb_proto::admin_account_error::AccountErrorDetail::coded(code, message),
+                }),
             )
                 .into_response()
         }
@@ -889,11 +893,46 @@ async fn refresh_account(
                 ManualRefreshError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::CONFLICT,
             };
-            let message = error_value.to_string();
-            let mut value = serde_json::to_value(error_value).unwrap_or_default();
-            value["message"] = serde_json::json!(message);
-            (status, Json(serde_json::json!({"error":value}))).into_response()
+            (status, Json(account_refresh_error(error_value))).into_response()
         }
+    }
+}
+
+fn account_refresh_error(
+    error_value: crate::relay::ManualRefreshError,
+) -> qb_proto::admin_account_error::AccountErrorReply {
+    use crate::relay::ManualRefreshError;
+    let message = error_value.to_string();
+    use qb_proto::admin_account_error::{AccountErrorDetail, AccountErrorReply, RefreshTerminal};
+    let (code, outcome) = match error_value {
+        ManualRefreshError::Linked => ("linked", None),
+        ManualRefreshError::Drain => ("drain", None),
+        ManualRefreshError::NeedsRelogin => ("needs_relogin", None),
+        ManualRefreshError::Uncertain => ("uncertain", None),
+        ManualRefreshError::NotFound => ("not_found", None),
+        ManualRefreshError::Unavailable => ("unavailable", None),
+        ManualRefreshError::Terminal { outcome } => {
+            use crate::relay::ManualRefreshTerminal as T;
+            (
+                "terminal",
+                Some(match outcome {
+                    T::RefreshTokenInvalidated => RefreshTerminal::RefreshTokenInvalidated,
+                    T::RefreshTokenReused => RefreshTerminal::RefreshTokenReused,
+                    T::RefreshTokenExpired => RefreshTerminal::RefreshTokenExpired,
+                    T::RefreshTokenRevoked => RefreshTerminal::RefreshTokenRevoked,
+                    T::InvalidGrant => RefreshTerminal::InvalidGrant,
+                    T::TokenEndpoint401 => RefreshTerminal::TokenEndpoint401,
+                }),
+            )
+        }
+    };
+    AccountErrorReply {
+        error: AccountErrorDetail {
+            code: Some(code.to_owned()),
+            outcome,
+            message,
+            retry_after: None,
+        },
     }
 }
 
@@ -910,16 +949,51 @@ async fn refresh_usage(state: RuntimeAdmin, id: String) -> Response {
                 Some(view) => Json(view).into_response(),
                 None => error(StatusCode::NOT_FOUND, "Account not found"),
             },
-            Err(()) => error(StatusCode::INTERNAL_SERVER_ERROR, "Account state unavailable"),
+            Err(()) => error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Account state unavailable",
+            ),
         },
         Err(PollError::TooSoon { retry_after }) => {
-            let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error":{"code":"poll_too_soon","message":"Usage poll interval has not elapsed","retry_after":retry_after}}))).into_response();
-            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) { response.headers_mut().insert("retry-after", value); }
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(qb_proto::admin_account_error::AccountErrorReply {
+                    error: qb_proto::admin_account_error::AccountErrorDetail {
+                        retry_after: Some(retry_after),
+                        ..qb_proto::admin_account_error::AccountErrorDetail::coded(
+                            "poll_too_soon",
+                            "Usage poll interval has not elapsed",
+                        )
+                    },
+                }),
+            )
+                .into_response();
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert("retry-after", value);
+            }
             response
         }
         Err(PollError::NotFound) => error(StatusCode::NOT_FOUND, "Account not found"),
-        Err(PollError::Excluded) => (StatusCode::CONFLICT, Json(serde_json::json!({"error":{"code":"poll_excluded","message":"Account cannot be polled"}}))).into_response(),
-        Err(PollError::Unavailable) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":{"code":"poll_unavailable","message":"Usage poll unavailable"}}))).into_response(),
+        Err(PollError::Excluded) => (
+            StatusCode::CONFLICT,
+            Json(qb_proto::admin_account_error::AccountErrorReply {
+                error: qb_proto::admin_account_error::AccountErrorDetail::coded(
+                    "poll_excluded",
+                    "Account cannot be polled",
+                ),
+            }),
+        )
+            .into_response(),
+        Err(PollError::Unavailable) => (
+            StatusCode::BAD_GATEWAY,
+            Json(qb_proto::admin_account_error::AccountErrorReply {
+                error: qb_proto::admin_account_error::AccountErrorDetail::coded(
+                    "poll_unavailable",
+                    "Usage poll unavailable",
+                ),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -1421,5 +1495,42 @@ mod r15_protected_sse_tests {
             joined,
             "SSE servers must stop and join within fixture deadline"
         );
+    }
+}
+
+#[cfg(test)]
+mod r15_account_error_producer_tests {
+    use super::*;
+    #[test]
+    fn account_errors_manual_actual_adapter_preserves_original_serde_bytes() {
+        use crate::relay::{ManualRefreshError as E, ManualRefreshTerminal as T};
+        let mut errors = vec![
+            E::Linked,
+            E::Drain,
+            E::NeedsRelogin,
+            E::Uncertain,
+            E::NotFound,
+            E::Unavailable,
+        ];
+        for outcome in [
+            T::RefreshTokenInvalidated,
+            T::RefreshTokenReused,
+            T::RefreshTokenExpired,
+            T::RefreshTokenRevoked,
+            T::InvalidGrant,
+            T::TokenEndpoint401,
+        ] {
+            errors.push(E::Terminal { outcome });
+        }
+        for error in errors {
+            let mut old = serde_json::to_value(&error).unwrap();
+            old["message"] = serde_json::json!(error.to_string());
+            let before = serde_json::to_vec(&serde_json::json!({"error":old})).unwrap();
+            let current = account_refresh_error(error);
+            assert_eq!(serde_json::to_vec(&current).unwrap(), before);
+            let decoded: qb_proto::admin_account_error::AccountErrorReply =
+                serde_json::from_slice(&before).unwrap();
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), before);
+        }
     }
 }
