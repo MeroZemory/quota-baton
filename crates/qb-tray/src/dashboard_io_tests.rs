@@ -1,4 +1,6 @@
 use super::*;
+#[path = "../tests/support/r15_admin_account_fixture.rs"]
+mod admin_fixture;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -82,15 +84,21 @@ impl Fake {
                             .contains("authorization: bearer r7-actor-synthetic")
                     );
                     let path = request.split_whitespace().nth(1).unwrap();
+                    let mut account = admin_fixture::account(
+                        "synthetic-account",
+                        "claude",
+                        admin_fixture::measuring_forecast(),
+                    );
+                    account["email"] = serde_json::json!("actor@example.invalid");
+                    account["plan"] = serde_json::json!("pro");
+                    let state_body =
+                        serde_json::to_string(&serde_json::json!({"accounts":[account]})).unwrap();
                     let (status, body) = if path == "/admin/v1/state" {
                         let previous = s.fetch_add(1, Ordering::SeqCst);
                         if hold_first_state && previous == 0 {
                             h.notified().await;
                         }
-                        (
-                            200,
-                            r#"{"accounts":[{"id":"synthetic-account","provider":"claude","email":"actor@example.invalid","plan":"pro"}]}"#,
-                        )
+                        (200, state_body.as_str())
                     } else if path.starts_with("/admin/v1/sessions?") {
                         if path.ends_with("range=all") {
                             (
