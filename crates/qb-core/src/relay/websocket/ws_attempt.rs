@@ -94,10 +94,10 @@ impl Leg {
     // Caller MUST establish exact terminal attribution. Never use created,
     // first-sent fallback or adjacency. Resolve quota candidate before retire.
     pub(super) fn retire(&self, sent: &Sent) {
-        if let Ok(mut state) = self.0.lock() {
-            if state.current.as_ref().is_some_and(|a| a.sent.matches(sent)) {
-                state.current = None;
-            }
+        if let Ok(mut state) = self.0.lock()
+            && state.current.as_ref().is_some_and(|a| a.sent.matches(sent))
+        {
+            state.current = None;
         }
     }
     pub(super) fn quota_candidate(&self) -> Option<Candidate> {
@@ -120,13 +120,12 @@ impl WriteTicket {
     // Call only after successful LAST-fragment flush. Failed start_send,
     // partial/failed flush, cancellation and abort drop the unfinished ticket.
     pub(super) fn flush(mut self) {
-        if let Ok(mut state) = self.leg.0.lock() {
-            if let Some(attempt) = state.current.as_mut() {
-                if attempt.sent.matches(&self.sent) {
-                    attempt.flushed = true;
-                    self.flushed = true;
-                }
-            }
+        if let Ok(mut state) = self.leg.0.lock()
+            && let Some(attempt) = state.current.as_mut()
+            && attempt.sent.matches(&self.sent)
+        {
+            attempt.flushed = true;
+            self.flushed = true;
         }
     }
 }

@@ -59,10 +59,9 @@ impl<S> ForwardWrite<S> {
             && !self.failed
             && self.accepted_fragments == self.expected_fragments
             && self.flushed_fragments == self.expected_fragments
+            && let Some(ticket) = self.ticket.take()
         {
-            if let Some(ticket) = self.ticket.take() {
-                ticket.flush();
-            }
+            ticket.flush();
         }
         // An unfinished ticket burns witness on failed/partial write.
         drop(self.ticket.take());
