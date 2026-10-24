@@ -157,13 +157,21 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         AccountsCommand::Disable { id } => action(home, config, &id, "disable").await?,
         AccountsCommand::Enable { id } => action(home, config, &id, "enable").await?,
         AccountsCommand::List { detail } => {
-            let accounts = AccountStore::list_metadata(home)?;
-            let forecasts = live_account_views(home, config).await?;
+            let accounts = AccountStore::list_metadata(home)?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            let state = live_account_state(home, config).await?;
+            let english = config.ui.language == qb_core::config::UiLanguage::En;
+            let now = chrono::Utc::now();
+            for line in provider_list_lines(state.as_ref(), &accounts, now, english)? {
+                println_utf8!("{line}");
+            }
+            let forecasts = state.as_ref().map(|state| &state.accounts);
             println_utf8!(
                 "계정 ID\t제공자\t이메일\t요금제\t출처\t연결 방식\t사용 상태\t계정 상태\t만료 시각"
             );
-            for account in accounts {
-                let value = serde_json::to_value(account)?;
+            for value in accounts {
                 println_utf8!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     cell(&value["id"]),
@@ -1091,14 +1099,258 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct CliAccountState {
+    accounts: Vec<serde_json::Value>,
+    #[serde(default)]
+    pools: serde_json::Value,
+}
+
 async fn live_account_views(
     home: &Path,
     config: &Config,
 ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+    Ok(live_account_state(home, config)
+        .await?
+        .map(|state| state.accounts))
+}
+
+fn provider_list_name(
+    a: &qb_tray::v2::Account,
+    rows: &[&qb_tray::v2::Account],
+    english: bool,
+) -> String {
+    let nonempty = |s: &str| !s.trim().is_empty();
+    let name = if let Some(label) = a.label.as_deref().filter(|s| nonempty(s)).filter(|label| {
+        !a.email
+            .as_deref()
+            .is_some_and(|email| *label == email || *label == format!("{email}'s Organization"))
+    }) {
+        label
+    } else if let Some(email) = a.email.as_deref().filter(|s| nonempty(s)) {
+        let local = email.split('@').next().unwrap_or(email);
+        if rows
+            .iter()
+            .filter(|b| {
+                b.email
+                    .as_deref()
+                    .filter(|s| nonempty(s))
+                    .is_some_and(|s| s.split('@').next() == Some(local))
+            })
+            .count()
+            > 1
+        {
+            email
+        } else {
+            local
+        }
+    } else if english {
+        "Unnamed account"
+    } else {
+        "이름 없는 계정"
+    };
+    name.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn provider_list_lines(
+    state: Option<&CliAccountState>,
+    metadata: &[serde_json::Value],
+    now: chrono::DateTime<chrono::Utc>,
+    english: bool,
+) -> serde_json::Result<Vec<String>> {
+    use qb_core::{
+        accounts::{Provider, UserState},
+        provider_forecast::{self, ProviderAccount},
+    };
+    let source = state.map_or(metadata, |state| state.accounts.as_slice());
+    let accounts = source
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<qb_tray::v2::Account>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut lines = Vec::new();
+    for provider in [Provider::Claude, Provider::Codex] {
+        let rows: Vec<_> = accounts
+            .iter()
+            .filter(|a| a.provider == provider.as_str())
+            .collect();
+        let names: Vec<_> = rows
+            .iter()
+            .map(|a| provider_list_name(a, &rows, english))
+            .collect();
+        // The tray owns health/scope visibility; a hidden forecast stays cold.
+        let forecasts: Vec<_> = rows
+            .iter()
+            .map(|a| state.map(|_| qb_tray::v2::summary_forecast(a, now)))
+            .collect();
+        let inputs: Vec<_> = rows
+            .iter()
+            .zip(&names)
+            .zip(&forecasts)
+            .map(|((a, name), forecast)| ProviderAccount {
+                id: &a.id,
+                name,
+                user_state: match a.user_state.as_str() {
+                    "active" => UserState::Active,
+                    "paused" => UserState::Paused,
+                    _ => UserState::Disabled,
+                },
+                drain: a.drain,
+                usable: state.is_some()
+                    && a.pool_eligible == Some(true)
+                    && a.health.kind == "ready"
+                    && !a.probe_pending
+                    && !a.refresh_attention,
+                cooling_until: state
+                    .and_then(|_| {
+                        if a.health.kind == "cooling"
+                            && a.health.scope.as_deref() == Some("account")
+                        {
+                            a.health.until.as_deref()
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|at| at.to_utc()),
+                allow_credits: a.allow_credits,
+                credits_in_use: state.is_some()
+                    && a.provider == "codex"
+                    && a.credits_in_use == Some(true),
+                credits_unlimited: a.credits.as_ref().and_then(|c| c.unlimited),
+                forecast: forecast.as_ref(),
+            })
+            .collect();
+        let eligible = state.and_then(|state| state.pools[provider.as_str()]["eligible"].as_u64());
+        let summary = provider_forecast::summarize(provider, &inputs, eligible, now);
+        lines.push(provider_list_line(&summary, state.is_some(), english));
+    }
+    Ok(lines)
+}
+
+fn provider_list_line(
+    summary: &qb_core::provider_forecast::ProviderSummary,
+    online: bool,
+    english: bool,
+) -> String {
+    use qb_core::provider_forecast::{CreditRunway, SubscriptionOutlook};
+    use qb_core::usage_forecast_display::{forecast_clock, time_left};
+    let provider = match summary.provider {
+        qb_core::accounts::Provider::Claude => "Claude",
+        qb_core::accounts::Provider::Codex => "Codex",
+    };
+    let count = match (english, summary.usable) {
+        (true, Some(n)) => format!("{n} of {} usable", summary.configured),
+        (false, Some(n)) => format!("{}개 중 {n}개 사용 가능", summary.configured),
+        (true, None) => format!("Usable unknown / {} accounts", summary.configured),
+        (false, None) => format!("전체 {}개 · 사용 가능 확인 전", summary.configured),
+    };
+    let mut result = format!("{provider} · {count}");
+    let clock = |at| forecast_clock(summary.as_of, at, english);
+    match &summary.subscription {
+        SubscriptionOutlook::Next(next) => {
+            let left = time_left(summary.as_of, next.at, english)
+                .expect("core selected future exhaustion");
+            result.push_str(&if english {
+                format!(
+                    " · next out: {} · {left} ({})",
+                    next.account.name,
+                    clock(next.at)
+                )
+            } else {
+                format!(
+                    " · 다음 소진 {} · {left} ({})",
+                    next.account.name,
+                    clock(next.at)
+                )
+            });
+        }
+        SubscriptionOutlook::NoExhaustionBeforeReset => result.push_str(if english {
+            " · no exhaustion before reset"
+        } else {
+            " · 초기화 전 소진 없음"
+        }),
+        SubscriptionOutlook::Unknown => result.push_str(if english {
+            " · next exhaustion: Measuring"
+        } else {
+            " · 다음 소진: 측정 중"
+        }),
+    }
+    if let Some(at) = summary.earliest_recovery {
+        result.push_str(&if english {
+            format!(" · earliest recovery {}", clock(at))
+        } else {
+            format!(" · 가장 빠른 회복 {}", clock(at))
+        });
+    }
+    for credit in &summary.credit_continuations {
+        let runway = match &credit.runway {
+            CreditRunway::Unknown => {
+                if english {
+                    "runway unknown".into()
+                } else {
+                    "잔여시간 확인 전".into()
+                }
+            }
+            CreditRunway::Unlimited => {
+                if english {
+                    "unlimited".into()
+                } else {
+                    "무제한".into()
+                }
+            }
+            CreditRunway::Forecast(forecast) => {
+                if let Some(at) = forecast.exhaustion_at.filter(|at| *at > summary.as_of) {
+                    let left =
+                        time_left(summary.as_of, at, english).expect("positive credit interval");
+                    format!("{left} ({})", clock(at))
+                } else if forecast.outcome == qb_core::usage_forecast::ForecastOutcome::Exhausted {
+                    if english {
+                        "exhausted".into()
+                    } else {
+                        "소진".into()
+                    }
+                } else if english {
+                    "no finite estimate".into()
+                } else {
+                    "유한 예측 없음".into()
+                }
+            }
+        };
+        result.push_str(&if english {
+            format!(" · credits continue on {} ({runway})", credit.account.name)
+        } else {
+            format!(" · {} 크레딧으로 계속 사용 ({runway})", credit.account.name)
+        });
+    }
+    let coverage = summary.coverage;
+    result.push_str(&if english {
+        format!(
+            " · forecast measured {}/{} accounts",
+            coverage.measured, coverage.total
+        )
+    } else {
+        format!(" · 예측 측정 {}/{} 계정", coverage.measured, coverage.total)
+    });
+    if !online {
+        result.push_str(if english {
+            " · core offline"
+        } else {
+            " · 코어 중지됨"
+        });
+    }
+    // Pooled runway remains unavailable; no pooled number is rendered here.
+    result
+}
+
+async fn live_account_state(
+    home: &Path,
+    config: &Config,
+) -> anyhow::Result<Option<CliAccountState>> {
     let Some((client, base, token)) = running_admin(home, config).await? else {
         return Ok(None);
     };
-    let state: serde_json::Value = admin_route_response(
+    let state: CliAccountState = admin_route_response(
         client
             .get(format!("{base}/state"))
             .bearer_auth(token.trim())
@@ -1112,12 +1364,7 @@ async fn live_account_views(
     .error_for_status()?
     .json()
     .await?;
-    Ok(Some(
-        state["accounts"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Invalid account state"))?
-            .clone(),
-    ))
+    Ok(Some(state))
 }
 
 fn list_forecast_lines(
@@ -1700,3 +1947,238 @@ mod r1_cpa_status_tests {
 #[cfg(test)]
 #[path = "accounts_cli_r6_tests.rs"]
 mod r6_tests;
+
+#[cfg(test)]
+mod r13f_provider_list_tests {
+    use super::*;
+    use qb_core::usage_forecast::{AccountUsageForecast, ForecastOutcome, Forecasts};
+    use serde_json::{Value, json};
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    }
+    fn row(id: &str) -> Value {
+        json!({"id":id,"provider":"codex","label":id,"email":format!("{id}@example.test"),"user_state":"active","health":{"kind":"ready"},"source":{"kind":"oauth"},"pool_eligible":true,"windows":[{"name":"5h","scope":"account","used_pct":50.,"reset_at":now()+chrono::Duration::hours(3)}]})
+    }
+    fn snapshot(accounts: Vec<Value>, eligible: Value) -> CliAccountState {
+        serde_json::from_value(json!({"accounts":accounts,"pools":{"codex":{"eligible":eligible}}}))
+            .unwrap()
+    }
+    fn forecast() -> AccountUsageForecast {
+        let mut f = Forecasts::default();
+        for (minute, pct) in [(-10, 40.), (-5, 45.), (0, 50.)] {
+            f.observe(
+                "sample-acct",
+                "5h",
+                pct,
+                Some(now() + chrono::Duration::hours(3)),
+                now() + chrono::Duration::minutes(minute),
+            );
+        }
+        f.view("sample-acct", now(), None)
+    }
+    fn codex(state: Option<&CliAccountState>, metadata: &[Value], english: bool) -> String {
+        provider_list_lines(state, metadata, now(), english)
+            .unwrap()
+            .remove(1)
+    }
+    #[test]
+    fn snapshot_usable_count_needs_no_forecast_or_rate_and_never_uses_metadata_online() {
+        let mut paused = row("sample-acct-paused");
+        paused["user_state"] = json!("paused");
+        paused["pool_eligible"] = json!(false);
+        let state = snapshot(
+            vec![row("sample-acct-a"), row("sample-acct-b"), paused],
+            json!(2),
+        );
+        for english in [true, false] {
+            let lines =
+                provider_list_lines(Some(&state), &[row("sample-acct-other")], now(), english)
+                    .unwrap();
+            assert_eq!(lines.len(), 2);
+            assert!(lines[0].starts_with(if english {
+                "Claude · 0 of 0 usable"
+            } else {
+                "Claude · 0개 중 0개 사용 가능"
+            }));
+            let line = &lines[1];
+            assert!(line.starts_with(if english {
+                "Codex · 2 of 3 usable"
+            } else {
+                "Codex · 3개 중 2개 사용 가능"
+            }));
+            assert!(line.contains(if english {
+                "forecast measured 0/2 accounts"
+            } else {
+                "예측 측정 0/2 계정"
+            }));
+            assert!(!line.contains(if english {
+                "next out:"
+            } else {
+                "다음 소진 sample"
+            }));
+        }
+        assert_eq!(state.pools["codex"]["eligible"], 2);
+        let old: CliAccountState =
+            serde_json::from_value(json!({"accounts":[row("sample-acct")]})).unwrap();
+        assert!(codex(Some(&old), &[], true).contains("Usable unknown / 1 accounts"));
+        assert!(codex(None, &[row("sample-acct")], true).contains("Usable unknown / 1 accounts"));
+        assert!(codex(None, &[row("sample-acct")], true).contains("core offline"));
+        assert!(codex(Some(&snapshot(vec![], Value::Null)), &[], true).contains("0 of 0 usable"));
+    }
+    #[test]
+    fn partial_coverage_includes_exhausted_facts_and_unknowns_not_paused_disabled_or_drained() {
+        let mut spent = row("sample-acct-spent");
+        let mut f = Forecasts::default();
+        f.observe(
+            "sample-acct-spent",
+            "5h",
+            100.,
+            Some(now() + chrono::Duration::hours(3)),
+            now() - chrono::Duration::hours(2),
+        );
+        spent["usage_forecast"] = json!(f.view("sample-acct-spent", now(), None));
+        spent["health"] = json!({"kind":"cooling","scope":"account","reason":"quota","until":now()+chrono::Duration::minutes(10)});
+        spent["pool_eligible"] = json!(false);
+        let mut paused = row("sample-acct-paused");
+        paused["user_state"] = json!("paused");
+        let mut drained = row("sample-acct-drained");
+        drained["drain"] = json!(true);
+        let mut disabled = row("sample-acct-disabled");
+        disabled["user_state"] = json!("disabled");
+        let mut relogin = row("sample-acct-relogin");
+        relogin["health"] = json!({"kind":"needs_relogin"});
+        let state = snapshot(
+            vec![
+                spent,
+                row("sample-acct-cold"),
+                paused,
+                drained,
+                disabled,
+                relogin,
+            ],
+            json!(1),
+        );
+        let line = codex(Some(&state), &[], true);
+        assert!(line.contains("1 of 6 usable"));
+        assert!(line.contains("forecast measured 1/3 accounts"));
+        assert!(line.contains(&format!(
+            "earliest recovery {}",
+            qb_core::usage_forecast_display::forecast_clock(
+                now(),
+                now() + chrono::Duration::hours(3),
+                true
+            )
+        )));
+    }
+    #[test]
+    fn shared_forecast_visibility_never_names_hidden_estimates() {
+        let mut a = row("sample-acct");
+        a["usage_forecast"] = json!(forecast());
+        let line = codex(Some(&snapshot(vec![a.clone()], json!(1))), &[], true);
+        assert!(line.contains("next out: sample-acct"));
+        assert!(line.contains("forecast measured 1/1 accounts"));
+        for variant in 0..5 {
+            let mut bad = a.clone();
+            match variant {
+                0 => bad["windows"][0]["scope"] = json!("model:sample"),
+                1 => bad["health"] = json!({"kind":"cooling","scope":"account","reason":"auth"}),
+                2 => bad["usage_forecast"]["as_of"] = json!(now() + chrono::Duration::seconds(1)),
+                3 => {
+                    bad["usage_forecast"]["observed_at"] =
+                        json!(now() - chrono::Duration::minutes(6))
+                }
+                _ => {
+                    bad["usage_forecast"]["windows"][0]["outcome"] =
+                        json!(ForecastOutcome::ResetPending)
+                }
+            }
+            let line = codex(Some(&snapshot(vec![bad], json!(1))), &[], true);
+            assert!(
+                !line.contains("sample-acct"),
+                "hidden account named in estimate: {line}"
+            );
+            assert!(!line.contains("next out:"));
+            assert!(line.contains("1 of 1 usable")); // Authoritative count never forecast-derived.
+        }
+    }
+    #[test]
+    fn actual_credits_without_forecast_differ_from_permission_and_unlimited() {
+        let mut a = row("sample-acct");
+        a["allow_credits"] = json!(true);
+        a["credits"] = json!({"has_credits":true});
+        assert!(
+            !codex(Some(&snapshot(vec![a.clone()], json!(1))), &[], true)
+                .contains("credits continue")
+        );
+        a["credits_in_use"] = json!(true);
+        let line = codex(Some(&snapshot(vec![a.clone()], json!(1))), &[], true);
+        assert!(line.contains("credits continue on sample-acct (runway unknown)"));
+        assert!(line.contains("forecast measured 0/1 accounts"));
+        a["credits"]["unlimited"] = json!(true);
+        assert!(
+            codex(Some(&snapshot(vec![a.clone()], json!(1))), &[], true).contains("(unlimited)")
+        );
+        a["allow_credits"] = json!(false);
+        assert!(!codex(Some(&snapshot(vec![a], json!(1))), &[], true).contains("credits continue"));
+    }
+    #[test]
+    fn finite_and_no_finite_credit_forecasts_stay_monetary_not_unlimited() {
+        use qb_core::usage_forecast::CreditUsageForecast;
+        let mut a = row("sample-acct");
+        a["allow_credits"] = json!(true);
+        a["credits_in_use"] = json!(true);
+        let mut f = forecast();
+        f.credit = Some(CreditUsageForecast {
+            observed_at: now(),
+            balance: 10.,
+            recent_credits_per_hour: Some(0.),
+            measurement_start: Some(now() - chrono::Duration::minutes(10)),
+            exhaustion_at: None,
+            seconds_to_exhaustion: None,
+            outcome: ForecastOutcome::NoFiniteForecast,
+            changing: false,
+            truncated: false,
+        });
+        a["usage_forecast"] = json!(f);
+        let line = codex(Some(&snapshot(vec![a.clone()], json!(1))), &[], true);
+        assert!(line.contains("credits continue on sample-acct (no finite estimate)"));
+        assert!(!line.contains("unlimited"));
+        assert!(!line.contains("next out:"));
+        f.credit.as_mut().unwrap().outcome = ForecastOutcome::Exhaustion;
+        f.credit.as_mut().unwrap().exhaustion_at = Some(now() + chrono::Duration::minutes(20));
+        a["usage_forecast"] = json!(f);
+        assert!(
+            codex(Some(&snapshot(vec![a], json!(1))), &[], true)
+                .contains("credits continue on sample-acct (20m left")
+        );
+    }
+    #[test]
+    fn ordering_and_outside_use_do_not_create_pooled_capacity_or_rate_estimates() {
+        let mut a = row("sample-acct-a");
+        a["usage_forecast"] = json!(forecast());
+        a["outside_used"] = json!(true);
+        let mut b = row("sample-acct-b");
+        b["usage_forecast"] = json!(forecast());
+        let first = codex(
+            Some(&snapshot(vec![b.clone(), a.clone()], json!(2))),
+            &[],
+            true,
+        );
+        assert_eq!(
+            first,
+            codex(
+                Some(&snapshot(vec![a.clone(), b.clone()], json!(2))),
+                &[],
+                true
+            )
+        );
+        assert!(first.contains("next out: sample-acct-a"));
+        a["outside_used"] = json!(false);
+        assert_eq!(
+            first,
+            codex(Some(&snapshot(vec![a, b], json!(2))), &[], true)
+        );
+        assert!(!first.contains("pooled"));
+        assert!(!first.contains("%/"));
+    }
+}

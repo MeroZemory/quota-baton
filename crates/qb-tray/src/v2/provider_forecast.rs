@@ -4,16 +4,7 @@ use super::{
     AccountRow, account_cooling, actual_credits, provider_label, summary_forecast, timestamp,
 };
 use chrono::{DateTime, Utc};
-use qb_core::{
-    usage_forecast::ForecastOutcome,
-    usage_forecast_display::{forecast_clock, limiting_window, time_left},
-};
-
-struct Next<'a> {
-    at: DateTime<Utc>,
-    reset: DateTime<Utc>,
-    row: &'a AccountRow,
-}
+use qb_core::usage_forecast_display::{forecast_clock, time_left};
 
 pub(super) fn line(
     provider: &str,
@@ -22,89 +13,57 @@ pub(super) fn line(
     now: DateTime<Utc>,
     english: bool,
 ) -> String {
-    // Usable m includes every configured account, including cooling/disabled.
-    // Forecast coverage m is enabled, non-drained accounts, including cooling
-    // and unknown/relogin rows. They never silently disappear from coverage.
-    let mut enabled = 0usize;
-    let mut measured = 0usize;
-    let mut safe_usable = 0u64;
-    let mut next: Option<Next<'_>> = None;
-    let mut recovery = None;
-    let mut credit_first: Option<&AccountRow> = None;
-    let mut credit_count = 0usize;
-    for row in rows {
-        let a = &row.raw;
-        if a.user_state != "active" || a.drain {
-            continue;
-        }
-        enabled += 1;
-        let mut account_recovery: Option<DateTime<Utc>> = None;
-        if account_cooling(a)
-            && let Some(at) = a
-                .health
-                .until
-                .as_deref()
-                .and_then(timestamp)
-                .filter(|at| *at > now)
-        {
-            account_recovery = Some(at);
-        }
-        // The pool count is authoritative; per-account pool membership is
-        // required to attach a future exhaustion or credit label to a name.
-        let usable = a.pool_eligible == Some(true)
-            && a.health.kind == "ready"
-            && !a.probe_pending
-            && !a.refresh_attention;
-        let forecast = summary_forecast(a, now);
-        let window = limiting_window(&forecast);
-        // Coverage describes the measured subscription forecast even when
-        // permitted credits keep that account serving after it runs out.
-        measured += usize::from(window.is_some());
-        if let Some(at) = window
-            .filter(|w| w.outcome == ForecastOutcome::Exhausted)
-            .and_then(|w| w.reset_at)
-            .filter(|at| *at > now)
-        {
-            account_recovery = Some(account_recovery.map_or(at, |previous| previous.max(at)));
-        }
-        // Every known blocker of this account must clear; different accounts
-        // can recover independently, so only then take the provider minimum.
-        if let Some(at) = account_recovery {
-            recovery = Some(recovery.map_or(at, |previous: DateTime<Utc>| previous.min(at)));
-        }
-        if usable && actual_credits(a) && a.allow_credits {
-            credit_count += 1;
-            if credit_first.is_none_or(|first| (&row.name, &a.id) < (&first.name, &first.raw.id)) {
-                credit_first = Some(row);
+    use qb_core::{
+        accounts::{Provider, UserState},
+        provider_forecast::{ProviderAccount, SubscriptionOutlook},
+    };
+    let provider_kind = match provider {
+        "claude" => Provider::Claude,
+        "codex" => Provider::Codex,
+        _ => return provider_label(provider).to_owned(),
+    };
+    let forecasts: Vec<_> = rows
+        .iter()
+        .map(|row| summary_forecast(&row.raw, now))
+        .collect();
+    let accounts: Vec<_> = rows
+        .iter()
+        .zip(&forecasts)
+        .map(|(row, forecast)| {
+            let a = &row.raw;
+            ProviderAccount {
+                id: &a.id,
+                name: &row.name,
+                user_state: if a.user_state == "active" {
+                    UserState::Active
+                } else {
+                    UserState::Paused
+                },
+                drain: a.drain,
+                usable: a.pool_eligible == Some(true)
+                    && a.health.kind == "ready"
+                    && !a.probe_pending
+                    && !a.refresh_attention,
+                cooling_until: if account_cooling(a) {
+                    a.health.until.as_deref().and_then(timestamp)
+                } else {
+                    None
+                },
+                allow_credits: a.allow_credits,
+                credits_in_use: actual_credits(a),
+                credits_unlimited: a.credits.as_ref().and_then(|c| c.unlimited),
+                forecast: Some(forecast),
             }
-            // A spent subscription window does not exhaust an account that
-            // is actually continuing on permitted credits. Credit runway
-            // remains separate detail, not invented subscription capacity.
-            continue;
-        }
-        let Some(window) = window else {
-            continue;
-        };
-        if !usable {
-            continue;
-        }
-        if window.outcome == ForecastOutcome::NoExhaustionBeforeReset {
-            safe_usable += 1;
-        }
-        if window.outcome != ForecastOutcome::Exhaustion {
-            continue;
-        }
-        let (Some(at), Some(reset)) = (window.exhaustion_at, window.reset_at) else {
-            continue;
-        };
-        if next.as_ref().is_none_or(|previous| {
-            (at, &row.name, &a.id) < (previous.at, &previous.row.name, &previous.row.raw.id)
-        }) {
-            next = Some(Next { at, reset, row });
-        }
-    }
-    let total = rows.len();
-    let eligible = if rows.is_empty() { Some(0) } else { eligible };
+        })
+        .collect();
+    let summary = qb_core::provider_forecast::summarize(provider_kind, &accounts, eligible, now);
+    let total = summary.configured;
+    let eligible = summary.usable;
+    let measured = summary.coverage.measured;
+    let enabled = summary.coverage.total;
+    let recovery = summary.earliest_recovery;
+    let credit_first = summary.credit_continuations.first();
+    let credit_count = summary.credit_continuations.len();
     let count = match (english, eligible) {
         (true, Some(n)) => format!("{n} of {total} usable"),
         (false, Some(n)) => format!("{total}개 중 {n}개 사용 가능"),
@@ -112,26 +71,30 @@ pub(super) fn line(
         (false, None) => format!("전체 {total}개 · 사용 가능 확인 전"),
     };
     let mut result = format!("{} · {count}", provider_label(provider));
-    if let Some(next) = next {
+    result.push_str(&if english {
+        format!(" · forecast measured {measured}/{enabled} accounts")
+    } else {
+        format!(" · 예측 측정 {measured}/{enabled} 계정")
+    });
+    if let SubscriptionOutlook::Next(next) = &summary.subscription {
         // The known reset of the next account that will actually run out is
         // relevant recovery; unrelated healthy-window resets are not.
-        recovery = Some(recovery.map_or(next.reset, |at| at.min(next.reset)));
         let left = time_left(now, next.at, english).expect("core selected future exhaustion");
         let clock = forecast_clock(now, next.at, english);
         result.push_str(&if english {
             format!(
                 " · next out: {} in {} ({clock})",
-                next.row.name,
+                next.account.name,
                 left.strip_suffix(" left").unwrap_or(&left)
             )
         } else {
             format!(
                 " · 다음 소진 {} {} 후 ({clock})",
-                next.row.name,
+                next.account.name,
                 left.strip_suffix(" 남음").unwrap_or(&left)
             )
         });
-    } else if eligible.is_some_and(|n| n > 0 && n == safe_usable) {
+    } else if summary.subscription == SubscriptionOutlook::NoExhaustionBeforeReset {
         result.push_str(if english {
             " · no exhaustion before reset"
         } else {
@@ -153,12 +116,19 @@ pub(super) fn line(
         });
     }
     if let Some(row) = credit_first {
-        result.push_str(&match (english, credit_count) {
-            (true, 1) => format!(" · credits continue on {}", row.name),
-            (true, n) => format!(" · credits continue on {} +{}", row.name, n - 1),
-            (false, 1) => format!(" · {} 크레딧으로 계속 사용", row.name),
-            (false, n) => format!(" · {} 외 {}개 크레딧으로 계속 사용", row.name, n - 1),
+        let runway = credit_runway(&row.runway, now, english);
+        result.push_str(&if english {
+            format!(" · credits continue on {} ({runway})", row.account.name)
+        } else {
+            format!(" · {} 크레딧으로 계속 사용 ({runway})", row.account.name)
         });
+        if credit_count > 1 {
+            result.push_str(&if english {
+                format!(" +{}", credit_count - 1)
+            } else {
+                format!(" 외 {}개", credit_count - 1)
+            });
+        }
     }
     if measured < enabled {
         result.push_str(&if english {
@@ -174,6 +144,41 @@ pub(super) fn line(
     result
 }
 
+fn credit_runway(
+    runway: &qb_core::provider_forecast::CreditRunway,
+    now: DateTime<Utc>,
+    english: bool,
+) -> String {
+    use qb_core::{provider_forecast::CreditRunway, usage_forecast::ForecastOutcome};
+    match runway {
+        CreditRunway::Unknown => if english {
+            "remaining time unknown"
+        } else {
+            "잔여시간 확인 전"
+        }
+        .into(),
+        CreditRunway::Unlimited => if english { "unlimited" } else { "무제한" }.into(),
+        CreditRunway::Forecast(forecast) => {
+            if let Some(at) = forecast.exhaustion_at.filter(|at| *at > now) {
+                format!(
+                    "{} ({})",
+                    time_left(now, at, english).expect("future credit exhaustion"),
+                    forecast_clock(now, at, english)
+                )
+            } else if forecast.outcome == ForecastOutcome::Exhausted {
+                if english { "exhausted" } else { "소진" }.into()
+            } else {
+                if english {
+                    "no finite estimate"
+                } else {
+                    "유한 예측 없음"
+                }
+                .into()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +188,7 @@ mod tests {
     };
     use chrono::{Duration, TimeZone};
     use qb_core::usage_forecast::{
-        AccountUsageForecast, ForecastBasis, UsageProjection, WindowUsageForecast,
+        AccountUsageForecast, ForecastBasis, ForecastOutcome, UsageProjection, WindowUsageForecast,
     };
     use serde_json::{Value, json};
 
@@ -600,6 +605,96 @@ mod tests {
                 );
                 assert!(text.ends_with(&expected), "{text}; expected {expected}");
             }
+        }
+    }
+    #[test]
+    fn provider_coverage_always_names_measured_and_active_non_drained_total() {
+        for language in [UiLanguage::En, UiLanguage::Ko] {
+            let english = language == UiLanguage::En;
+            for measured in 0..=2 {
+                let mut a = account("a", vec![window("5h", Some(10))]);
+                let mut b = account("b", vec![window("5h", Some(20))]);
+                if measured < 1 {
+                    a.as_object_mut().unwrap().remove("usage_forecast");
+                }
+                if measured < 2 {
+                    b.as_object_mut().unwrap().remove("usage_forecast");
+                }
+                let mut paused = account("paused", vec![window("5h", Some(1))]);
+                paused["user_state"] = json!("paused");
+                let mut disabled = paused.clone();
+                disabled["id"] = json!("disabled");
+                disabled["user_state"] = json!("disabled");
+                let mut drained = account("drained", vec![window("5h", Some(1))]);
+                drained["drain"] = json!(true);
+                let view = project(
+                    vec![a, b, paused, disabled, drained],
+                    Some(2),
+                    language,
+                    now(),
+                );
+                let text = &view.summaries[1].forecast_line;
+                let expected = if english {
+                    format!("forecast measured {measured}/2 accounts")
+                } else {
+                    format!("예측 측정 {measured}/2 계정")
+                };
+                assert_eq!(text.matches(expected.as_str()).count(), 1, "{text}");
+                assert!(text.contains(if english {
+                    "2 of 5 usable"
+                } else {
+                    "5개 중 2개 사용 가능"
+                }));
+            }
+            let empty = line("codex", &[], None, now(), english);
+            assert!(empty.contains(if english {
+                "forecast measured 0/0 accounts"
+            } else {
+                "예측 측정 0/0 계정"
+            }));
+        }
+    }
+
+    #[test]
+    fn first_credit_runway_precedes_other_accounts_and_ignores_input_order() {
+        use qb_core::usage_forecast::CreditUsageForecast;
+
+        let mut a = account("a", vec![window("5h", Some(10))]);
+        a["allow_credits"] = json!(true);
+        a["credits_in_use"] = json!(true);
+        a["credits"] = json!({"unlimited":true});
+        let mut b = account("b", vec![window("5h", Some(20))]);
+        b["allow_credits"] = json!(true);
+        b["credits_in_use"] = json!(true);
+        b["usage_forecast"]["credit"] = json!(CreditUsageForecast {
+            observed_at: now(),
+            balance: 10.0,
+            recent_credits_per_hour: Some(30.0),
+            measurement_start: Some(now() - Duration::minutes(10)),
+            exhaustion_at: Some(now() + Duration::minutes(20)),
+            seconds_to_exhaustion: Some(1200),
+            outcome: ForecastOutcome::Exhaustion,
+            changing: false,
+            truncated: false,
+        });
+        for language in [UiLanguage::En, UiLanguage::Ko] {
+            let forward = project(vec![a.clone(), b.clone()], Some(2), language, now());
+            let reverse = project(vec![b.clone(), a.clone()], Some(2), language, now());
+            let text = &forward.summaries[1].forecast_line;
+            assert_eq!(text, &reverse.summaries[1].forecast_line);
+            assert!(
+                text.contains(if language == UiLanguage::En {
+                    "credits continue on a (unlimited) +1"
+                } else {
+                    "a 크레딧으로 계속 사용 (무제한) 외 1개"
+                }),
+                "{text}"
+            );
+            assert!(!text.contains("+1 (unlimited)"));
+            assert!(!text.contains("외 1개 크레딧으로 계속 사용 (무제한)"));
+            // The displayed monetary detail belongs to a, not b's finite ETA.
+            assert!(!text.contains("20m left"));
+            assert!(!text.contains("20분 남음"));
         }
     }
 }

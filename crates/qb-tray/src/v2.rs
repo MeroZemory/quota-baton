@@ -865,7 +865,9 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
 
 /// Re-evaluate the typed display at the projection clock, honoring explicit
 /// model scope. Hidden/blocked rows retain their original detail in the tooltip.
-fn summary_forecast(
+/// Account-scoped, health-filtered estimates shared by provider summaries in
+/// the tray and CLI. Hidden or missing estimates remain cold, never inferred.
+pub fn summary_forecast(
     a: &Account,
     now: DateTime<Utc>,
 ) -> qb_core::usage_forecast::AccountUsageForecast {
