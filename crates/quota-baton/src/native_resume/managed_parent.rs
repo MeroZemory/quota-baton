@@ -1121,6 +1121,22 @@ fn dispatch_loop<N: Write, U: Write>(
             // ONLY the dedicated std thread, ONLY inside committed callback,
             // and NO ingress/mailbox mutex across this bounded exchange.
             let consumed = runtime.block_on(core.consume(episode, deadline));
+            #[cfg(all(feature = "testkit", debug_assertions, not(test)))]
+            super::diagnostic(match &consumed {
+                Ok(Consumption::Granted(_)) => "consume-granted",
+                Ok(Consumption::Refused(_)) => "consume-refused",
+                Err(super::control_actor::Error::Core(super::core_control::Error::Protocol)) => {
+                    "consume-protocol"
+                }
+                Err(super::control_actor::Error::Core(super::core_control::Error::Closed)) => {
+                    "consume-closed"
+                }
+                Err(super::control_actor::Error::Timeout)
+                | Err(super::control_actor::Error::Core(super::core_control::Error::Timeout)) => {
+                    "consume-timeout"
+                }
+                Err(_) => "consume-actor",
+            });
             #[cfg(all(feature = "testkit", debug_assertions))]
             observation::emit(Event::Consumed {
                 episode,
