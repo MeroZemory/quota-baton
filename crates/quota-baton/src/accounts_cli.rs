@@ -167,7 +167,10 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
             for line in provider_list_lines(state.as_ref(), &accounts, now, english)? {
                 println_utf8!("{line}");
             }
-            let forecasts = state.as_ref().map(|state| &state.accounts);
+            let forecasts = state
+                .as_ref()
+                .map(|state| cli_account_rows(&state.accounts))
+                .transpose()?;
             println_utf8!(
                 "계정 ID\t제공자\t이메일\t요금제\t출처\t연결 방식\t사용 상태\t계정 상태\t만료 시각"
             );
@@ -1099,8 +1102,8 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-type CliAccountState = qb_proto::AdminState<
-    serde_json::Value,
+type CliAccountState<Account = qb_proto::AdminAccount> = qb_proto::AdminState<
+    Account,
     qb_proto::admin_warning::AdminWarning,
     Option<qb_proto::admin_pool::ReadPools>,
 >;
@@ -1109,9 +1112,19 @@ async fn live_account_views(
     home: &Path,
     config: &Config,
 ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
-    Ok(live_account_state(home, config)
+    live_account_state(home, config)
         .await?
-        .map(|state| state.accounts))
+        .map(|state| cli_account_rows(&state.accounts))
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// Presentation boundary only: live decoding has already checked the complete
+/// shared account. Preserve existing readers, object source and forecast facts.
+fn cli_account_rows<Account: serde::Serialize>(
+    accounts: &[Account],
+) -> serde_json::Result<Vec<serde_json::Value>> {
+    accounts.iter().map(serde_json::to_value).collect()
 }
 
 fn provider_list_name(
@@ -1151,8 +1164,8 @@ fn provider_list_name(
     name.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn provider_list_lines(
-    state: Option<&CliAccountState>,
+fn provider_list_lines<Account: serde::Serialize>(
+    state: Option<&CliAccountState<Account>>,
     metadata: &[serde_json::Value],
     now: chrono::DateTime<chrono::Utc>,
     english: bool,
@@ -1161,7 +1174,10 @@ fn provider_list_lines(
         accounts::{Provider, UserState},
         provider_forecast::{self, ProviderAccount},
     };
-    let source = state.map_or(metadata, |state| state.accounts.as_slice());
+    let live = state
+        .map(|state| cli_account_rows(&state.accounts))
+        .transpose()?;
+    let source = live.as_deref().unwrap_or(metadata);
     let accounts = source
         .iter()
         .cloned()
@@ -1965,6 +1981,9 @@ mod r6_tests;
 #[cfg(test)]
 mod r13f_provider_list_tests {
     use super::*;
+    // These sparse cases exercise the existing provider-line presentation
+    // adapter. They are not current /state transport fixtures.
+    type CliAccountState = super::CliAccountState<serde_json::Value>;
     use qb_core::usage_forecast::{AccountUsageForecast, ForecastOutcome, Forecasts};
     use serde_json::{Value, json};
     fn now() -> chrono::DateTime<chrono::Utc> {
@@ -2210,6 +2229,78 @@ mod r13f_provider_list_tests {
         );
         assert!(!first.contains("pooled"));
         assert!(!first.contains("%/"));
+    }
+
+    #[test]
+    fn complete_shared_cli_transport_keeps_account_facts_and_usable_count_without_rate() {
+        let account = json!({
+            "outside_used":false,"pool_eligible":true,"takeover_pending":false,
+            "quota_cooling":null,"quota_credit_releasable":false,"observed_at":null,
+            "quota_notice":null,"credits_in_use":false,
+            "usage_forecast":{"as_of":now(),"observed_at":null,"windows":[],
+                "earliest_window":null,"credit":null,"truncated":false},
+            "has_alternative":false,"id":"sample-acct-cli","generation":1,
+            "last_refresh_at":null,"provider":"codex","label":"sample-acct-cli",
+            "email":"sample-acct-cli@example.test","plan":null,"user_state":"active",
+            "source":{"kind":"takeover","from":"sample-acct-origin","at":now()},
+            "health":{"kind":"ready"},"probe_pending":false,
+            "pacing":{"backoff_until":null,"step":0,"release_interval_ms":0,"waiting":0},
+            "windows":[],"credits":null,"last_used_at":null,"bound_sessions":0,
+            "token_expires_at":null,"drain":false,"allow_credits":false,
+            "refresh_attention":false,"active_sessions":0,"spread_threshold":0
+        });
+        let wire = json!({
+            "accounts":[account.clone()],
+            "pools":{"claude":{"eligible":0,"cooling":{},"unavailable":0},
+                "codex":{"eligible":1,"cooling":{},"unavailable":0}}
+        });
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let state = decode_cli_account_state(&bytes).unwrap();
+        assert_eq!(state.accounts[0].generation, 1);
+        assert!(!state.accounts[0].takeover_pending);
+        let rows = cli_account_rows(&state.accounts).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&rows[0]).unwrap(),
+            serde_json::to_vec(&account).unwrap()
+        );
+        assert_eq!(rows[0]["source"], account["source"]);
+        assert!(rows[0].get("last_relevant_state_at").is_none());
+        for (english, expected) in [
+            (true, "Codex · 1 of 1 usable"),
+            (false, "Codex · 1개 중 1개 사용 가능"),
+        ] {
+            let lines = provider_list_lines(Some(&state), &[], now(), english).unwrap();
+            assert_eq!(lines.len(), 2);
+            assert!(lines[1].starts_with(expected));
+            assert!(!lines[1].contains("next out:"));
+            assert!(!lines[1].contains("pooled"));
+        }
+        let complete = String::from_utf8(bytes).unwrap();
+        for first in ["null", "\"bad\"", "2"] {
+            let duplicate = complete.replacen(
+                "\"generation\":1",
+                &format!("\"generation\":{first},\"generation\":1"),
+                1,
+            );
+            assert_ne!(complete, duplicate);
+            assert!(decode_cli_account_state(duplicate.as_bytes()).is_err());
+        }
+        let mut missing = wire;
+        missing["accounts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("generation");
+        assert!(decode_cli_account_state(&serde_json::to_vec(&missing).unwrap()).is_err());
+    }
+
+    #[test]
+    fn typed_cli_rejects_sparse_live_accounts_instead_of_inventing_facts() {
+        for wire in [
+            br#"{"accounts":[{"id":"sample-acct"}]}"#.as_slice(),
+            br#"{"accounts":[{"id":"sample-acct","id":"sample-acct-other"}]}"#.as_slice(),
+        ] {
+            assert!(decode_cli_account_state(wire).is_err());
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
 pub(crate) mod deferred_reset;
 pub(crate) use deferred_reset::{DeferredResetId, DeferredResetStatus};
+mod admin_view;
+pub(crate) use admin_view::pools as account_pools;
 mod outside_owner;
 mod outside_usage;
 mod selection;
@@ -40,17 +42,25 @@ use crate::{
 // Complete usage polls may retire a window. Retain its bounded samples in memory,
 // but never expose a forecast for a window absent from the current snapshot.
 fn visible_usage_forecast(
-    mut forecast: crate::usage_forecast::AccountUsageForecast,
+    forecast: crate::usage_forecast::AccountUsageForecast,
     snapshot: &Value,
     credits_in_use: bool,
 ) -> crate::usage_forecast::AccountUsageForecast {
-    forecast.windows.retain(|window| {
+    visible_usage_forecast_for_names(forecast, credits_in_use, |name| {
         snapshot["windows"].as_array().is_some_and(|windows| {
             windows
                 .iter()
-                .any(|current| current["name"].as_str() == Some(&window.name))
+                .any(|current| current["name"].as_str() == Some(name))
         })
-    });
+    })
+}
+
+fn visible_usage_forecast_for_names(
+    mut forecast: crate::usage_forecast::AccountUsageForecast,
+    credits_in_use: bool,
+    mut visible: impl FnMut(&str) -> bool,
+) -> crate::usage_forecast::AccountUsageForecast {
+    forecast.windows.retain(|window| visible(&window.name));
     forecast.earliest_window = forecast.windows.iter().filter(|window| {
         matches!(window.outcome, crate::usage_forecast::ForecastOutcome::Exhausted | crate::usage_forecast::ForecastOutcome::Exhaustion)
             && matches!((window.exhaustion_at, window.reset_at), (Some(at), Some(reset)) if at < reset)
@@ -2151,6 +2161,16 @@ impl AccountRuntime {
     }
 
     pub async fn views(&self) -> Result<Vec<Value>, ()> {
+        self.typed_views()
+            .await?
+            .into_iter()
+            .map(admin_view::base_value)
+            .collect()
+    }
+
+    pub async fn typed_views(&self) -> Result<Vec<qb_proto::AdminAccount>, ()> {
+        use qb_proto::admin_account::*;
+
         let store = self.store.clone();
         let (accounts, credential_ids, takeover_fenced) = tokio::task::spawn_blocking(move || {
             let accounts = store.list().map_err(|_| ())?;
@@ -2285,60 +2305,163 @@ impl AccountRuntime {
                 })
             });
         }
-        Ok(accounts.iter().map(|a| {
-            let quota_notice = notices.get(&a.id).map(|entry| entry.notice.clone());
-            let has_alternative = eligible.iter().any(|other| other.id != a.id && other.provider == a.provider);
-            // Reuse actual successful C9 paid-serving context, not capability,
-            // allowance, or a projected meter. C5 accepts the upstream credit
-            // claim even when its displayed percent is rounded below 100.
-            let credits_in_use = a.provider == Provider::Codex && a.allow_credits
-                && quota_notice.as_ref().is_some_and(|notice| notice["action"] == "credits");
-            let quota = self.obs.quota_snapshot(&a.id).unwrap_or_default();
-            let pacing = self.pacing_snapshot(&a.id);
-            let backoff_until = pacing.rate_backoff_until.and_then(|until| {
-                let remaining = until.saturating_duration_since(Instant::now());
-                chrono::Duration::from_std(remaining).ok().map(|d| Utc::now() + d)
-            });
-            let health=self.volatile.lock().ok().and_then(|v|v.get(&a.id).cloned()).unwrap_or(a.health.clone());
-            let pending = self.probing(&a.id) || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
-            let quota_credit_releasable = a.quota_credit_releasable
-                && a.payment_until.is_none_or(|until| until <= now)
-                && !pending && !a.auth_probe_pending && a.auth_failures == 0
-                && !takeover_fenced.contains(&a.id) && !self.blocked_in_memory(&a.id);
-            let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
-            let usage_forecast = visible_usage_forecast(self.obs.dashboard().usage_forecast(&a.id, now, None), &quota, credits_in_use);
-            json!({"outside_used":self.outside_used(&a.id),"pool_eligible":a.user_state == UserState::Active && !pending && !takeover_fenced.contains(&a.id) && health["kind"] == "ready","takeover_pending":takeover_fenced.contains(&a.id),"quota_cooling":a.quota_cooling,"quota_credit_releasable":quota_credit_releasable,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"usage_forecast":usage_forecast,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":takeover_fenced.contains(&a.id) || self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
-        }).collect())
+        accounts
+            .iter()
+            .map(|a| {
+                let quota_notice = notices.get(&a.id).map(|entry| entry.notice.clone());
+                let has_alternative = eligible
+                    .iter()
+                    .any(|other| other.id != a.id && other.provider == a.provider);
+                // Reuse actual successful C9 paid-serving context, not capability,
+                // allowance, or a projected meter. C5 accepts the upstream credit
+                // claim even when its displayed percent is rounded below 100.
+                let credits_in_use = a.provider == Provider::Codex
+                    && a.allow_credits
+                    && quota_notice
+                        .as_ref()
+                        .is_some_and(|notice| notice["action"] == "credits");
+                let quota = self.obs.quota_snapshot(&a.id).unwrap_or_default();
+                let pacing = self.pacing_snapshot(&a.id);
+                let backoff_until = pacing.rate_backoff_until.and_then(|until| {
+                    let remaining = until.saturating_duration_since(Instant::now());
+                    chrono::Duration::from_std(remaining)
+                        .ok()
+                        .map(|d| Utc::now() + d)
+                });
+                let health = self
+                    .volatile
+                    .lock()
+                    .ok()
+                    .and_then(|v| v.get(&a.id).cloned())
+                    .unwrap_or(a.health.clone());
+                let pending = self.probing(&a.id)
+                    || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
+                let quota_credit_releasable = a.quota_credit_releasable
+                    && a.payment_until.is_none_or(|until| until <= now)
+                    && !pending
+                    && !a.auth_probe_pending
+                    && a.auth_failures == 0
+                    && !takeover_fenced.contains(&a.id)
+                    && !self.blocked_in_memory(&a.id);
+                let health = if pending {
+                    AdminHealth::Cooling {
+                        reason: AdminHealthReason::Auth,
+                        until: admin_view::time(Utc::now()),
+                        scope: "account".to_owned(),
+                        probe_pending: Some(true),
+                    }
+                } else {
+                    admin_view::health(&health)
+                };
+                let usage_forecast = visible_usage_forecast(
+                    self.obs.dashboard().usage_forecast(&a.id, now, None),
+                    &quota,
+                    credits_in_use,
+                );
+                Ok(AdminAccount {
+                    outside_used: self.outside_used(&a.id),
+                    pool_eligible: a.user_state == UserState::Active
+                        && !pending
+                        && !takeover_fenced.contains(&a.id)
+                        && matches!(health, AdminHealth::Ready),
+                    takeover_pending: takeover_fenced.contains(&a.id),
+                    quota_cooling: a.quota_cooling.as_ref().map(|value| AdminQuotaCooling {
+                        window: value.window.clone(),
+                        reset_at: admin_view::time(value.reset_at),
+                        started_at: admin_view::time(value.started_at),
+                    }),
+                    quota_credit_releasable,
+                    observed_at: serde_json::from_value(quota["observed_at"].clone())
+                        .map_err(|_| ())?,
+                    quota_notice: quota_notice
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|_| ())?,
+                    credits_in_use,
+                    usage_forecast: admin_view::wire(&usage_forecast)?,
+                    has_alternative,
+                    id: a.id.clone(),
+                    generation: a.generation,
+                    last_refresh_at: a.token_meta.last_refresh_at.map(admin_view::time),
+                    provider: match a.provider {
+                        Provider::Claude => AdminProvider::Claude,
+                        Provider::Codex => AdminProvider::Codex,
+                    },
+                    label: a.label.clone(),
+                    email: a.email.clone(),
+                    plan: quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),
+                    user_state: match a.user_state {
+                        UserState::Active => AdminUserState::Active,
+                        UserState::Paused => AdminUserState::Paused,
+                        UserState::Disabled => AdminUserState::Disabled,
+                    },
+                    source: admin_view::source(&a.source)?,
+                    health,
+                    probe_pending: pending,
+                    pacing: AdminPacing {
+                        backoff_until: backoff_until.map(admin_view::time),
+                        step: pacing.rate_step,
+                        release_interval_ms: pacing.rate_release_interval.as_millis() as u64,
+                        waiting: pacing.waiting as u64,
+                    },
+                    windows: serde_json::from_value(Value::Array(
+                        quota["windows"].as_array().cloned().unwrap_or_default(),
+                    ))
+                    .map_err(|_| ())?,
+                    credits: serde_json::from_value(quota["credits"].clone()).map_err(|_| ())?,
+                    last_used_at: None,
+                    bound_sessions: 0,
+                    token_expires_at: a.token_meta.expires_at.map(admin_view::time),
+                    drain: a.drain,
+                    allow_credits: a.allow_credits,
+                    refresh_attention: takeover_fenced.contains(&a.id)
+                        || self
+                            .refresh_attention
+                            .lock()
+                            .map(|f| f.contains(&a.id))
+                            .unwrap_or(false),
+                    active_sessions: 0,
+                    spread_threshold: 0,
+                })
+            })
+            .collect()
     }
 
-    /// Build account views with the live affinity statistics held by the
-    /// bindings store.  AccountRuntime does not own that store, so callers
-    /// that expose the complete AccountView pass it explicitly.
+    /// Compatibility serialization for callers that still consume account JSON.
     pub async fn views_with_bindings(
         &self,
         bindings: &crate::bindings::BindingTable,
     ) -> Result<Vec<Value>, ()> {
-        let mut views = self.views().await?;
+        self.typed_views_with_bindings(bindings)
+            .await?
+            .into_iter()
+            .map(admin_view::bound_value)
+            .collect()
+    }
+
+    /// Construct and update the shared contract directly; no account JSON builder.
+    pub async fn typed_views_with_bindings(
+        &self,
+        bindings: &crate::bindings::BindingTable,
+    ) -> Result<Vec<qb_proto::AdminAccount>, ()> {
+        let mut views = self.typed_views().await?;
         for view in &mut views {
-            if let Some(id) = view["id"].as_str().map(str::to_owned) {
-                let (count, last_used) = bindings.account_stats(&id);
-                view["bound_sessions"] = json!(count);
-                view["last_used_at"] = json!(last_used);
-                let active = bindings.active_sessions(&id, Utc::now());
-                view["active_sessions"] = json!(active);
-                view["spread_threshold"] = json!(bindings.spread_threshold_for(&id));
-                let mut forecast = self.obs.dashboard().usage_forecast(
-                    &id,
-                    Utc::now(),
-                    bindings.account_count_changed_at(&id),
-                );
-                forecast = visible_usage_forecast(
-                    forecast,
-                    view,
-                    view["credits_in_use"].as_bool() == Some(true),
-                );
-                view["usage_forecast"] = json!(forecast);
-            }
+            let (count, last_used) = bindings.account_stats(&view.id);
+            view.bound_sessions = count as u64;
+            view.last_used_at = last_used.map(admin_view::time);
+            let active = bindings.active_sessions(&view.id, Utc::now());
+            view.active_sessions = active as u64;
+            view.spread_threshold = bindings.spread_threshold_for(&view.id) as u64;
+            let forecast = self.obs.dashboard().usage_forecast(
+                &view.id,
+                Utc::now(),
+                bindings.account_count_changed_at(&view.id),
+            );
+            let forecast =
+                visible_usage_forecast_for_names(forecast, view.credits_in_use, |name| {
+                    view.windows.iter().any(|window| window.name == name)
+                });
+            view.usage_forecast = admin_view::wire(&forecast)?;
         }
         Ok(views)
     }
