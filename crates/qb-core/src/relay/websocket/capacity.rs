@@ -19,6 +19,7 @@ pub(super) struct OwnWait {
 }
 
 /// A capacity-only hint. Binding admission must independently recheck the source.
+#[cfg(test)]
 pub(super) struct SpillSource {
     source: String,
     capacity: Weak<Capacity>,
@@ -83,22 +84,27 @@ impl OwnWait {
         capacity.wait_until(self.until).await;
     }
 
-    pub(super) fn spill_source(&self, capacity: &Capacity) -> Option<SpillSource> {
-        self.spill_source_at(capacity, Instant::now())
+    pub(super) fn exhausted(&self, capacity: &Capacity) -> bool {
+        self.exhausted_at(capacity, Instant::now())
     }
 
-    fn spill_source_at(&self, capacity: &Capacity, now: Instant) -> Option<SpillSource> {
-        (std::ptr::eq(self.capacity.as_ptr(), capacity)
+    fn exhausted_at(&self, capacity: &Capacity, now: Instant) -> bool {
+        std::ptr::eq(self.capacity.as_ptr(), capacity)
             && self.waited
             && now >= self.until
-            && capacity.is_capped(&self.source))
-        .then(|| SpillSource {
+            && capacity.is_capped(&self.source)
+    }
+
+    #[cfg(test)]
+    fn spill_source_at(&self, capacity: &Capacity, now: Instant) -> Option<SpillSource> {
+        self.exhausted_at(capacity, now).then(|| SpillSource {
             source: self.source.clone(),
             capacity: self.capacity.clone(),
         })
     }
 }
 
+#[cfg(test)]
 impl SpillSource {
     pub(super) fn source(&self) -> &str {
         &self.source
@@ -358,6 +364,20 @@ mod tests {
         drop(rejected);
         let wait = OwnWait::start(capacity, "a", Instant::now() + Duration::from_secs(10)).unwrap();
         (live, wait)
+    }
+
+    #[test]
+    fn r13h_own_wait_exhaustion_requires_same_owner_elapsed_wait_and_live_cap() {
+        let capacity = Arc::new(Capacity::default());
+        let other = Arc::new(Capacity::default());
+        let (live, mut wait) = capped_source(&capacity);
+        assert!(!wait.exhausted_at(&capacity, wait.until));
+        wait.waited = true;
+        assert!(!wait.exhausted_at(&other, wait.until));
+        assert!(!wait.exhausted_at(&capacity, wait.until - Duration::from_nanos(1)));
+        assert!(wait.exhausted_at(&capacity, wait.until));
+        drop(live);
+        assert!(!wait.exhausted_at(&capacity, wait.until));
     }
 
     #[tokio::test]

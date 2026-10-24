@@ -489,3 +489,165 @@ fn r14_guard_veto_preserves_overload_mark() {
     );
     assert!(table.data.lock().unwrap().overload_marks.contains_key(key));
 }
+
+// These fixtures exercise the real selection -> permit -> policy -> rebind path.
+#[test]
+fn r13_h_hold_timeout_preserves_committed_emergency_return_reason() {
+    let (_root, table, mut cs, now) = r13_h_arrived_source();
+    cs[1].account.user_state = UserState::Paused;
+    cs[2].account.user_state = UserState::Paused;
+    let decision = table.choose_with_hold_at_admitted_proof(
+        Provider::Claude,
+        Some("claude:r13-h"),
+        None,
+        None,
+        &cs,
+        &cs,
+        MoveObservations::same(MoveObservation::before_collection()),
+        None,
+        100,
+        false,
+        true,
+        now,
+        None,
+        |_| Some(DispatchAdmission::ordinary()),
+    );
+    match decision {
+        Decision::Selected { account, moves, .. } => {
+            assert_eq!(account, cs[0].account.id);
+            assert_eq!(moves.len(), 1);
+            assert_eq!(
+                moves[0].reason,
+                "ping_pong_return_forced_by_unusable_source"
+            );
+        }
+        other => panic!("timed-out sole return: {other:?}"),
+    }
+    assert_eq!(table.move_guard.lock().unwrap().recent_moves(now).len(), 2);
+}
+
+fn r13_h_arrived_source() -> (
+    tempfile::TempDir,
+    Arc<BindingTable>,
+    Vec<Candidate>,
+    DateTime<Utc>,
+) {
+    let root = fixture_dir();
+    let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+    let now = Utc::now();
+    let cs = vec![
+        candidate("cl-111111", 10., 10, 2),
+        candidate("cl-222222", 20., 20, 3),
+        candidate("cl-333333", 90., 30, 4),
+    ];
+    selected(pick(
+        &table,
+        "claude:r13-h",
+        &cs,
+        &cs[0].account.id,
+        now,
+        |_| true,
+    ));
+    selected(pick(
+        &table,
+        "claude:r13-h",
+        &cs,
+        &cs[1].account.id,
+        now,
+        |_| true,
+    ));
+    (root, table, cs, now)
+}
+fn r13_h_recover(
+    table: &Arc<BindingTable>,
+    candidates: &[Candidate],
+    sources: &[Candidate],
+    observations: MoveObservations,
+    now: DateTime<Utc>,
+    admit: bool,
+) -> Decision {
+    table.choose_with_hold_at_admitted_proof(
+        Provider::Claude,
+        Some("claude:r13-h"),
+        None,
+        None,
+        candidates,
+        sources,
+        observations,
+        None,
+        100,
+        false,
+        false,
+        now,
+        None,
+        |_| admit.then(DispatchAdmission::ordinary),
+    )
+}
+#[test]
+fn r13_h_actual_sole_return_is_recorded_and_failed_admission_does_not_charge() {
+    let (_root, table, mut cs, now) = r13_h_arrived_source();
+    cs[1].account.user_state = UserState::Paused;
+    cs[2].account.user_state = UserState::Paused;
+    let observation = MoveObservations::same(MoveObservation::before_collection());
+    assert!(matches!(
+        r13_h_recover(&table, &cs, &cs, observation, now, false),
+        Decision::None
+    ));
+    assert_eq!(table.move_guard.lock().unwrap().recent_moves(now).len(), 1);
+    match r13_h_recover(&table, &cs, &cs, observation, now, true) {
+        Decision::Selected { account, moves, .. } => {
+            assert_eq!(account, cs[0].account.id);
+            assert_eq!(moves.len(), 1);
+            assert_eq!(
+                moves[0].reason,
+                "ping_pong_return_forced_by_unusable_source"
+            );
+        }
+        other => panic!("sole return: {other:?}"),
+    }
+    assert_eq!(table.move_guard.lock().unwrap().recent_moves(now).len(), 2);
+}
+#[test]
+fn r13_h_actual_alternative_is_chosen_and_source_only_alternative_vetoes_rescue() {
+    for filtered in [false, true] {
+        let (_root, table, mut cs, now) = r13_h_arrived_source();
+        cs[1].account.user_state = UserState::Paused;
+        let candidates = if filtered { &cs[..2] } else { &cs[..] };
+        let decision = r13_h_recover(
+            &table,
+            candidates,
+            &cs,
+            MoveObservations::same(MoveObservation::before_collection()),
+            now,
+            true,
+        );
+        if filtered {
+            assert!(matches!(decision, Decision::MoveHeld { .. }));
+            assert_eq!(
+                table.current(Some("claude:r13-h")),
+                Some(cs[1].account.id.clone())
+            );
+        } else {
+            assert_eq!(selected(decision), cs[2].account.id);
+        }
+    }
+}
+#[test]
+fn r13_h_healthy_stale_and_untracked_sources_cannot_grant_sole_return() {
+    for state in ["healthy", "stale", "untracked"] {
+        let stale = MoveObservation::before_collection();
+        let (_root, table, mut cs, now) = r13_h_arrived_source();
+        cs[2].account.user_state = UserState::Paused;
+        if state != "healthy" {
+            cs[1].account.user_state = UserState::Paused;
+        }
+        let observations = match state {
+            "stale" => MoveObservations::same(stale),
+            "untracked" => MoveObservations::untracked(),
+            _ => MoveObservations::same(MoveObservation::before_collection()),
+        };
+        let decision = r13_h_recover(&table, &cs[..1], &cs, observations, now, true);
+        assert!(!matches!(decision, Decision::Selected { .. }), "{state}");
+        assert_eq!(table.move_guard.lock().unwrap().recent_moves(now).len(), 1);
+    }
+}

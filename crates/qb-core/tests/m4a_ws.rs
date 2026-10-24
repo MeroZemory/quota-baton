@@ -583,7 +583,7 @@ async fn c6_3_ws_connection_limit_frame_not_held() {
 }
 
 #[tokio::test]
-async fn r12_9_upgrade_connection_limit_spreads_while_old_socket_stays_live() {
+async fn r13_h_bound_upgrade_connection_limit_falls_back_without_moving_and_new_session_places() {
     let h = Harness::new(2).await;
     h.fake.state.keep_old_connections();
     let (mut first, original) = h.connect().await;
@@ -592,24 +592,60 @@ async fn r12_9_upgrade_connection_limit_spreads_while_old_socket_stays_live() {
         r#"{"error":{"code":"websocket_connection_limit_reached","message":"never-ledger-capacity-payload"}}"#,
         HeaderMap::new(),
     );
-    // This session is sticky on the first account, so the injected rejection
-    // must be learned before its upgrade can spread to the other account.
-    let (mut second, destination) = h.connect().await;
-    assert_ne!(destination, original);
+    let moves_before = h
+        .ledger()
+        .iter()
+        .filter(|row| row["event"] == "binding_move")
+        .count();
+    let waits_before = h.state.ws_capacity_waits_for_test();
+    // The same bound session learns the upstream cap and keeps its HTTP account.
+    let (status, body) = tokio::time::timeout(Duration::from_secs(3), h.error())
+        .await
+        .expect("bound capacity fallback must remain bounded");
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(body["error"]["type"], "websocket_capacity");
+    assert!(h.state.ws_capacity_waits_for_test() > waits_before);
+    assert_eq!(
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-ws-session"))
+            .as_deref(),
+        Some(original.as_str())
+    );
+    assert_eq!(
+        h.fake.state.requests().len(),
+        2,
+        "bound cap must not dial an alternative"
+    );
+    assert_eq!(
+        h.ledger()
+            .iter()
+            .filter(|row| row["event"] == "binding_move")
+            .count(),
+        moves_before
+    );
+    // A different, previously unbound session may still use ordinary placement.
     let mut request = h.request();
     request
         .headers_mut()
         .insert("session-id", "synthetic-capacity-new".parse().unwrap());
     let (mut third, response) = connect_async(request).await.unwrap();
+    let destination = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap();
+    assert_ne!(destination, original);
     assert_eq!(
-        response.headers()["x-quota-baton-account"],
-        destination.as_str()
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-capacity-new"))
+            .as_deref(),
+        Some(destination)
     );
     let requests = h.fake.state.requests();
     assert_eq!(
         requests.len(),
-        4,
-        "one rejection, then no further dial to capped account"
+        3,
+        "one rejected bound upgrade, then one new-session dial to the alternative"
     );
     assert_eq!(
         requests[0].headers["authorization"],
@@ -618,10 +654,6 @@ async fn r12_9_upgrade_connection_limit_spreads_while_old_socket_stays_live() {
     assert_ne!(
         requests[1].headers["authorization"],
         requests[2].headers["authorization"]
-    );
-    assert_eq!(
-        requests[2].headers["authorization"],
-        requests[3].headers["authorization"]
     );
     for id in &h.ids {
         let account = h.store.load(id).unwrap();
@@ -643,7 +675,6 @@ async fn r12_9_upgrade_connection_limit_spreads_while_old_socket_stays_live() {
             .any(|row| row.to_string().contains("never-ledger-capacity-payload"))
     );
     first.close(None).await.unwrap();
-    second.close(None).await.unwrap();
     third.close(None).await.unwrap();
 }
 
@@ -773,7 +804,9 @@ async fn r12_9_losing_actual_upgrade_slot_race_preserves_binding_and_old_create(
     drop(b_live);
     capacity_count(&h, b, 0).await;
     let (collected, resume) = h.state.pause_next_ws_selection();
-    let request = h.request();
+    // Bound A now returns 426 before selection. Race a genuinely new session
+    // for B's last slot while retaining the original A binding/socket.
+    let request = session_request(&h, "synthetic-losing-new");
     let losing = tokio::spawn(async move { connect_async(request).await });
     tokio::time::timeout(Duration::from_secs(2), collected)
         .await
@@ -803,6 +836,13 @@ async fn r12_9_losing_actual_upgrade_slot_race_preserves_binding_and_old_create(
             .current(Some("codex:synthetic-ws-session"))
             .as_deref(),
         Some(a.as_str())
+    );
+    assert!(
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-losing-new"))
+            .is_none(),
+        "losing new session must not publish a binding"
     );
     let before = h.fake.state.requests().len();
     h.fake.state.set_echo(true);
@@ -938,7 +978,12 @@ async fn r12_9_timed_out_blocking_admission_cannot_move_binding_or_break_old_cre
     drop(b_live);
     capacity_count(&h, b, 0).await;
     let (entered, resume) = h.state.pause_next_ws_admission();
-    let request = h.request();
+    // A bound capped session no longer reaches alternative admission. Use a
+    // genuinely new session to retain the detached-selector authority test.
+    let mut request = h.request();
+    request
+        .headers_mut()
+        .insert("session-id", "synthetic-unbound-admission".parse().unwrap());
     let waiting_since = std::time::Instant::now();
     let pending = tokio::spawn(async move { connect_async(request).await });
     tokio::time::timeout(Duration::from_secs(2), entered)
@@ -978,6 +1023,13 @@ async fn r12_9_timed_out_blocking_admission_cannot_move_binding_or_break_old_cre
         Some(a.as_str())
     );
     assert_eq!(h.state.ws_reserved_for_test(b), 0);
+    assert!(
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-unbound-admission"))
+            .is_none(),
+        "expired unbound selector must not publish a new binding"
+    );
     h.fake.state.set_echo(true);
     create(&mut original, "detached-admission-survivor").await;
     let Message::Text(echo) = receive(&mut original).await else {
@@ -1054,24 +1106,35 @@ async fn r12_9_healthy_strict_anchor_waits_for_own_slot_despite_free_other_accou
 async fn r12_9_capacity_wait_and_predial_selection_cancel_on_drain() {
     // Repeat at a capacity wait and while candidate selection is suspended.
     for paused_selection in [false, true] {
-        let h = Harness::new(1).await;
+        let h = Harness::new(if paused_selection { 2 } else { 1 }).await;
         h.fake.state.keep_old_connections();
         let mut live = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
-        let (collected, resume) = h.state.pause_next_ws_selection();
-        let request = h.request();
+        // Bound capped requests stop before selection. Only the unbound case
+        // can reach the selector, using the second account's free capacity.
+        let selection = paused_selection.then(|| h.state.pause_next_ws_selection());
+        let request = if paused_selection {
+            session_request(&h, "synthetic-drain-new")
+        } else {
+            h.request()
+        };
         let pending = tokio::spawn(async move { connect_async(request).await });
-        collected.await.unwrap();
-        let mut resume = Some(resume);
-        if !paused_selection {
-            resume.take().unwrap().send(()).unwrap();
+        let resume = if let Some((collected, resume)) = selection {
+            tokio::time::timeout(Duration::from_secs(2), collected)
+                .await
+                .expect("new-session upgrade must reach predial selection")
+                .unwrap();
+            Some(resume)
+        } else {
             capacity_wait_started(&h).await;
-        }
+            None
+        };
         let before = h.fake.state.requests().len();
         let state = h.state.clone();
         let drain = tokio::spawn(async move { state.begin_drain().await });
         h.state.wait_for_drain_start().await;
         // Freeing the old slot during drain must not authorize another dial.
         let _ = live.close(None).await;
+        drop(live);
         let Error::Http(response) = tokio::time::timeout(Duration::from_secs(2), pending)
             .await
             .expect("drain cancels queued upgrade promptly")
@@ -1083,6 +1146,16 @@ async fn r12_9_capacity_wait_and_predial_selection_cancel_on_drain() {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "1");
         assert_eq!(h.fake.state.requests().len(), before);
+        capacity_count(&h, &h.ids[0], 0).await;
+        if paused_selection {
+            assert!(
+                h.state
+                    .bindings
+                    .current(Some("codex:synthetic-drain-new"))
+                    .is_none()
+            );
+            assert_eq!(h.state.ws_reserved_for_test(&h.ids[1]), 0);
+        }
         drop(resume);
         drain.await.unwrap().unwrap();
     }
@@ -1141,11 +1214,9 @@ async fn r12_9_capped_upgrade_cancels_while_drain_waits_for_detached_refresh() {
         .expect("detached synthetic refresh started")
         .unwrap();
     h.pins.clear();
-    let (collected, resume) = h.state.pause_next_ws_selection();
+    // This bound capped request waits on its own slot before selection.
     let request = h.request();
     let queued = tokio::spawn(async move { connect_async(request).await });
-    collected.await.unwrap();
-    resume.send(()).unwrap();
     capacity_wait_started(&h).await;
     let state = h.state.clone();
     let drain = tokio::spawn(async move { state.begin_drain().await });
@@ -1187,13 +1258,44 @@ async fn r12_9_capped_upgrade_cancels_while_drain_waits_for_detached_refresh() {
 }
 
 #[tokio::test]
-async fn r12_9_stream_rejection_close_spreads_and_records_connection_code() {
+async fn r13_h_stream_rejection_close_keeps_binding_and_records_connection_code() {
     let h = Harness::new(2).await;
     h.fake.state.keep_old_connections();
     let mut live = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
-    let (mut next, destination) = h.connect().await;
-    assert_eq!(destination, h.ids[1]);
+    let before = h.fake.state.requests().len();
+    let moves_before = h
+        .ledger()
+        .iter()
+        .filter(|row| row["event"] == "binding_move")
+        .count();
+    let (status, body) = tokio::time::timeout(Duration::from_secs(3), h.error())
+        .await
+        .expect("bound stream-cap fallback must remain bounded");
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(body["error"]["type"], "websocket_capacity");
+    assert_eq!(
+        h.state.bindings.current(Some("codex:synthetic-ws-session")),
+        Some(h.ids[0].clone())
+    );
+    assert_eq!(
+        h.fake.state.requests().len(),
+        before,
+        "known bound cap must not dial another account"
+    );
+    assert_eq!(h.state.ws_reserved_for_test(&h.ids[1]), 0);
+    for id in &h.ids {
+        let account = h.store.load(id).unwrap();
+        assert_eq!(account.health, Health::Ready);
+        assert_eq!(account.auth_failures, 0);
+        assert_eq!(account.payment_failures, 0);
+    }
     let rows = h.ledger();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"] == "binding_move")
+            .count(),
+        moves_before
+    );
     let diagnostic = rows
         .iter()
         .find(|row| row["outcome"] == "ws_connection_error")
@@ -1215,7 +1317,8 @@ async fn r12_9_stream_rejection_close_spreads_and_records_connection_code() {
             .any(|row| row.to_string().contains("never-ledger-stream-body"))
     );
     live.close(None).await.unwrap();
-    next.close(None).await.unwrap();
+    drop(live);
+    capacity_count(&h, &h.ids[0], 0).await;
 }
 
 #[tokio::test]
@@ -3738,14 +3841,14 @@ async fn r14_ws_upgrade_unknown_model_claims_cost_only_on_actual_create() {
 }
 
 #[tokio::test]
-async fn r14_ws_breaker_refuses_return_before_third_upgrade() {
+async fn r13_h_ws_sole_fresh_return_reaches_third_upgrade() {
     let h = Harness::new_with_budget_options(2, false, false, None, Some((3, 1)), None).await;
     let (mut first, original) = h.connect().await;
     first.close(None).await.unwrap();
     drop(first);
     capacity_count(&h, &original, 0).await;
-    // Leave a healthy A without changing its semantic evidence. Resuming a
-    // paused A would correctly authorize a return with changed evidence.
+    // Leave healthy A unchanged, so the later return must use fresh
+    // unusable-source evidence rather than destination recovery evidence.
     let replacement = h.ids.iter().find(|id| **id != original).unwrap().clone();
     h.pins.set(Provider::Codex, None, replacement.clone());
     let (mut second, selected) = h.connect().await;
@@ -3760,29 +3863,37 @@ async fn r14_ws_breaker_refuses_return_before_third_upgrade() {
         .change(&replacement, Some(UserState::Paused), None, None, None)
         .await
         .unwrap();
-    let started = std::time::Instant::now();
-    let (status, error) = h.error().await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(error["error"]["type"], "account_move_guard");
-    assert!(started.elapsed() >= Duration::from_millis(700));
-    assert!(started.elapsed() < Duration::from_secs(4));
+    let (mut third, returned) = h.connect().await;
+    assert_eq!(returned, original);
     assert_eq!(
         h.fake.state.requests().len(),
-        2,
-        "refused return must never reach upstream upgrade"
+        3,
+        "sole fresh return must complete the third actual upstream upgrade"
     );
     assert_eq!(
         h.state.bindings.current(Some(R14_WS_KEY)),
-        Some(replacement.clone())
+        Some(original.clone())
     );
     let rows = h.ledger();
-    assert!(rows.iter().any(|row| row["event"] == "binding_move_refused"
-        && row["from"] == replacement
-        && row["to"] == original
-        && row["reason"] == "ping_pong"));
-    assert!(!rows.iter().any(|row| row["event"] == "binding_move"
-        && row["from"] == replacement
-        && row["to"] == original));
+    assert!(
+        !rows.iter().any(|row| row["event"] == "binding_move_refused"
+            && row["from"] == replacement
+            && row["to"] == original)
+    );
+    let returns: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row["event"] == "binding_move" && row["from"] == replacement && row["to"] == original
+        })
+        .collect();
+    assert_eq!(returns.len(), 1);
+    assert_eq!(
+        returns[0]["reason"],
+        "ping_pong_return_forced_by_unusable_source"
+    );
+    third.close(None).await.unwrap();
+    drop(third);
+    capacity_count(&h, &original, 0).await;
 }
 
 #[tokio::test]

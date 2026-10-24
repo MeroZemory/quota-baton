@@ -90,7 +90,158 @@ impl SelectionReason {
         }
     }
 }
+/// Created only by selection under mutations, from policy/entitlement-filtered full
+/// candidates. A caller's pin or a raw account count cannot create this fact.
+pub(super) struct SoleEligibleTarget {
+    from: String,
+    to: String,
+    model: Option<String>,
+    at: DateTime<Utc>,
+}
+impl SoleEligibleTarget {
+    pub(super) fn applies_to(
+        &self,
+        from: &str,
+        to: &str,
+        model: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> bool {
+        self.from == from && self.to == to && self.model.as_deref() == model && self.at == at
+    }
+}
+
 impl BindingTable {
+    /// Preserve C7 ranking, but try non-return alternatives before declaring a
+    /// newly unusable source stranded. Admission/policy commit still run once.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn select_with_return_guard(
+        &self,
+        d: &Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        sources: &[Candidate],
+        entitled_targets: Option<&BTreeSet<String>>,
+        observations: MoveObservations,
+        pinned: Option<&str>,
+        now: DateTime<Utc>,
+        hold_allowed: bool,
+        preference: Option<&launch::SelectionPreference<'_>>,
+    ) -> (PreviewDecision, SelectionReason, Option<SoleEligibleTarget>) {
+        let selected = self.select_ordered(
+            d,
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            pinned,
+            now,
+            hold_allowed,
+            preference,
+        );
+        let PreviewDecision::Selected { account } = &selected.0 else {
+            return (selected.0, selected.1, None);
+        };
+        let Some(from) = self.rebind_budget_source(d, provider, key, account) else {
+            return (selected.0, selected.1, None);
+        };
+        let Some(source) = sources.iter().find(|c| c.account.id == from) else {
+            return (selected.0, selected.1, None);
+        };
+        let source = effective_account(source, d, &self.config, model, now);
+        if crate::accounts::health::UnusableEvidence::observe(
+            &source,
+            model,
+            Self::accepted_in(d, key, &from),
+            now,
+        )
+        .is_none()
+        {
+            return (selected.0, selected.1, None);
+        }
+        let policy_key = launch::policy_key(d, key);
+        let outside_unknown = d.outside_unknown
+            || d.outside_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire));
+        // Full health-owner evidence proves absence of another target; retry or
+        // transport exclusion alone must never manufacture sole eligibility.
+        let viable: BTreeSet<_> = sources
+            .iter()
+            .filter(|c| {
+                c.account.id != from
+                    && c.account.provider == provider
+                    && !c.account.drain
+                    && effective_account(c, d, &self.config, model, now).eligible_at(model, now)
+                    && !outside_unknown
+                    && !d.outside_used.contains(&c.account.id)
+                    && entitled_targets.is_none_or(|ids| ids.contains(&c.account.id))
+                    && self.policies.permits_dispatch(policy_key, &c.account.id)
+            })
+            .map(|c| c.account.id.as_str())
+            .collect();
+        if viable.len() == 1 && viable.contains(account.as_str()) {
+            let proof = SoleEligibleTarget {
+                from,
+                to: account.clone(),
+                model: model.map(str::to_owned),
+                at: now,
+            };
+            return (selected.0, selected.1, Some(proof));
+        }
+        let guard_key = key
+            .map(group)
+            .map(|key| launch::ownership_group(d, key).to_owned())
+            .unwrap_or_else(|| format!("unidentified:{}", provider.as_str()));
+        let guard = self.move_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let alternatives: Vec<_> = candidates
+            .iter()
+            .filter(|c| viable.contains(c.account.id.as_str()))
+            .filter(|c| {
+                !guard.return_blocked(
+                    &guard_key,
+                    &c.account.id,
+                    semantic_evidence(Some(&effective_account(c, d, &self.config, model, now))),
+                    observations,
+                    now,
+                )
+            })
+            .cloned()
+            .collect();
+        let selected_blocked = candidates
+            .iter()
+            .find(|c| c.account.id == *account)
+            .is_some_and(|c| {
+                guard.return_blocked(
+                    &guard_key,
+                    account,
+                    semantic_evidence(Some(&effective_account(c, d, &self.config, model, now))),
+                    observations,
+                    now,
+                )
+            });
+        drop(guard);
+        if selected_blocked && !alternatives.is_empty() {
+            let alternative = self.select_ordered(
+                d,
+                provider,
+                key,
+                parent,
+                model,
+                &alternatives,
+                pinned,
+                now,
+                hold_allowed,
+                preference,
+            );
+            return (alternative.0, alternative.1, None);
+        }
+        (selected.0, selected.1, None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn select_ordered(
         &self,
