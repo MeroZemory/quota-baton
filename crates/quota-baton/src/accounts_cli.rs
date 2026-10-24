@@ -1099,12 +1099,8 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct CliAccountState {
-    accounts: Vec<serde_json::Value>,
-    #[serde(default)]
-    pools: serde_json::Value,
-}
+type CliAccountState =
+    qb_proto::AdminState<serde_json::Value, serde_json::Value, serde_json::Value>;
 
 async fn live_account_views(
     home: &Path,
@@ -1350,7 +1346,7 @@ async fn live_account_state(
     let Some((client, base, token)) = running_admin(home, config).await? else {
         return Ok(None);
     };
-    let state: CliAccountState = admin_route_response(
+    let body = admin_route_response(
         client
             .get(format!("{base}/state"))
             .bearer_auth(token.trim())
@@ -1362,9 +1358,17 @@ async fn live_account_state(
     )
     .await?
     .error_for_status()?
-    .json()
+    .bytes()
     .await?;
-    Ok(Some(state))
+    Ok(Some(decode_cli_account_state(&body)?))
+}
+
+// Decode raw response bytes: Value-first parsing would discard duplicate keys.
+fn decode_cli_account_state(body: &[u8]) -> serde_json::Result<CliAccountState> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let state = qb_proto::admin_state::deserialize_compat(&mut deserializer, true)?;
+    deserializer.end()?;
+    Ok(state)
 }
 
 fn list_forecast_lines(
@@ -1960,8 +1964,11 @@ mod r13f_provider_list_tests {
         json!({"id":id,"provider":"codex","label":id,"email":format!("{id}@example.test"),"user_state":"active","health":{"kind":"ready"},"source":{"kind":"oauth"},"pool_eligible":true,"windows":[{"name":"5h","scope":"account","used_pct":50.,"reset_at":now()+chrono::Duration::hours(3)}]})
     }
     fn snapshot(accounts: Vec<Value>, eligible: Value) -> CliAccountState {
-        serde_json::from_value(json!({"accounts":accounts,"pools":{"codex":{"eligible":eligible}}}))
-            .unwrap()
+        qb_proto::admin_state::deserialize_compat(
+            json!({"accounts":accounts,"pools":{"codex":{"eligible":eligible}}}),
+            true,
+        )
+        .unwrap()
     }
     fn forecast() -> AccountUsageForecast {
         let mut f = Forecasts::default();
@@ -2018,8 +2025,11 @@ mod r13f_provider_list_tests {
             }));
         }
         assert_eq!(state.pools["codex"]["eligible"], 2);
-        let old: CliAccountState =
-            serde_json::from_value(json!({"accounts":[row("sample-acct")]})).unwrap();
+        let old: CliAccountState = qb_proto::admin_state::deserialize_compat(
+            json!({"accounts":[row("sample-acct")]}),
+            true,
+        )
+        .unwrap();
         assert!(codex(Some(&old), &[], true).contains("Usable unknown / 1 accounts"));
         assert!(codex(None, &[row("sample-acct")], true).contains("Usable unknown / 1 accounts"));
         assert!(codex(None, &[row("sample-acct")], true).contains("core offline"));
@@ -2180,5 +2190,38 @@ mod r13f_provider_list_tests {
         );
         assert!(!first.contains("pooled"));
         assert!(!first.contains("%/"));
+    }
+
+    #[test]
+    fn raw_cli_state_decoder_rejects_duplicates_before_value_collapse() {
+        for wire in [
+            r#"{"accounts":[],"accounts":[]}"#,
+            r#"{"accounts":null,"accounts":[]}"#,
+            r#"{"accounts":[],"inflight":{"requests":1,"requests":2}}"#,
+            r#"{"accounts":[],"inflight":{"requests":null,"requests":2}}"#,
+            r#"{"accounts":[],"inflight":{"bytes":1,"bytes":2}}"#,
+            r#"{"accounts":[],"inflight":{"bytes":null,"bytes":2}}"#,
+            r#"{"accounts":[],"memory":{"private_bytes":1,"private_bytes":2}}"#,
+            r#"{"accounts":[],"memory":{"private_bytes":null,"private_bytes":2}}"#,
+            r#"{"accounts":[],"bindings":{"count":1,"count":2}}"#,
+            r#"{"accounts":[],"bindings":{"count":null,"count":2}}"#,
+            r#"{"accounts":[],"capabilities":{"account_adopt":true,"account_adopt":false,"manual_refresh":true,"account_takeover":true}}"#,
+        ] {
+            assert!(decode_cli_account_state(wire.as_bytes()).is_err(), "{wire}");
+        }
+        let legacy = decode_cli_account_state(
+            br#"{"accounts":[],"inflight":{"requests":4},"memory":{},"bindings":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.inflight.requests, 4);
+        assert_eq!(legacy.inflight.bytes, 0);
+        assert_eq!(legacy.memory.private_bytes, 0);
+        assert_eq!(legacy.bindings.count, 0);
+        assert!(legacy.pools.is_null());
+        assert_eq!(legacy.draining, None);
+        assert_eq!(legacy.capabilities, None);
+        assert!(decode_cli_account_state(b"{}").is_err());
+        assert!(decode_cli_account_state(br#"{"accounts":null}"#).is_err());
+        assert!(decode_cli_account_state(br#"{"accounts":[]} {}"#).is_err());
     }
 }

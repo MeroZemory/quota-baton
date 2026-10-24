@@ -32,6 +32,7 @@ tokio-tungstenite.workspace = true
 cc = "=1.8.0"
 
 [dev-dependencies]
+qb-proto = { workspace = true, features = ["contract-tests"] }
 async-stream.workspace = true
 axum.workspace = true
 bytes.workspace = true

@@ -200,7 +200,7 @@ fn publish_read(read: super::client::TrayRead) -> Result<()> {
             now,
             elapsed(),
         );
-    *model().lock().unwrap_or_else(|e| e.into_inner()) = (rows, read.snapshot.version, core_ok);
+    *model().lock().unwrap_or_else(|e| e.into_inner()) = (rows, read.snapshot.0.version, core_ok);
     *LAST_SUCCESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     invalidate_model();
     Ok(())

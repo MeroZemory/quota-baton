@@ -1222,6 +1222,7 @@ dependencies = [
  "chrono",
  "clap",
  "qb-core",
+ "qb-proto",
  "qb-testkit",
  "reqwest",
  "serde",
