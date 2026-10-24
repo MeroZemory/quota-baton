@@ -64,7 +64,13 @@ fn require<T, E>(result: Result<T, E>) -> T {
 }
 
 async fn bounded<F: Future>(future: F) -> F::Output {
-    require(tokio::time::timeout(Duration::from_secs(5), future).await)
+    bounded_stage(std::any::type_name::<F>(), future).await
+}
+
+async fn bounded_stage<F: Future>(stage: &str, future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(5), future)
+        .await
+        .unwrap_or_else(|_| panic!("synthetic poll-reset stage timed out: {stage}"))
 }
 
 async fn signal(semaphore: &Semaphore) {
@@ -81,6 +87,7 @@ struct Upstream {
     requests: Mutex<Vec<(Method, String)>>,
     arrived: Semaphore,
     returned: Semaphore,
+    finished: Semaphore,
     creates: Semaphore,
     pongs: Semaphore,
     pong_bytes: Mutex<Vec<Vec<u8>>>,
@@ -114,6 +121,23 @@ impl Upstream {
         }
         assert_eq!(self.unexpected.load(Ordering::SeqCst), 0);
     }
+
+    async fn release_after_cancel(&self, release: oneshot::Sender<()>, stage: &str) {
+        // Closing the requesting transport may already have dropped Axum's
+        // handler/receiver. A successful send can also race handler cancellation
+        // before it observes release. Neither outcome promises a returned body.
+        let _ = release.send(());
+        require(bounded_stage(stage, self.finished.acquire()).await).forget();
+    }
+}
+
+struct UsageCompletion(Arc<Upstream>);
+
+impl Drop for UsageCompletion {
+    fn drop(&mut self) {
+        // Runs on both normal return and canceled HTTP handler destruction.
+        self.0.finished.add_permits(1);
+    }
 }
 
 async fn usage(State(state): State<Arc<Upstream>>, request: Request) -> Response {
@@ -130,6 +154,7 @@ async fn usage(State(state): State<Arc<Upstream>>, request: Request) -> Response
         state.unexpected.fetch_add(1, Ordering::SeqCst);
         return StatusCode::BAD_GATEWAY.into_response();
     };
+    let _completion = UsageCompletion(state.clone());
     if reply.release.await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -217,6 +242,7 @@ impl Fixture {
             requests: Mutex::default(),
             arrived: Semaphore::new(0),
             returned: Semaphore::new(0),
+            finished: Semaphore::new(0),
             creates: Semaphore::new(0),
             pongs: Semaphore::new(0),
             pong_bytes: Mutex::default(),
@@ -249,6 +275,9 @@ impl Fixture {
         config.server.data_port = 0;
         config.server.admin_port = 0;
         config.websocket.idle_close_secs = 60;
+        // Preserve real std/Tokio clock alignment across later WS upgrades.
+        // Success jitter is at most 1.1s with this fixture-only C9 interval.
+        config.quota.poll_min_interval_secs = 1;
         // All possible HTTP/token/catalog endpoints are synthetic loopback.
         config.upstream.codex_base = upstream_base.clone();
         config.upstream.anthropic_base = upstream_base.clone();
@@ -421,7 +450,7 @@ impl Drop for Fixture {
 async fn ping(socket: &mut Socket) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let payload = format!("poll-pending-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-    bounded(async {
+    bounded_stage("correlated data/control Pong", async {
         require(
             socket
                 .send(Message::Ping(payload.as_bytes().to_vec().into()))
@@ -440,7 +469,7 @@ async fn ping(socket: &mut Socket) {
 }
 
 async fn assert_text(socket: &mut Socket, expected: &str) {
-    bounded(async {
+    bounded_stage("original application text after controls", async {
         loop {
             match socket.next().await {
                 Some(Ok(Message::Ping(_))) => require(socket.flush().await),
@@ -460,12 +489,12 @@ async fn assert_text(socket: &mut Socket, expected: &str) {
 }
 
 async fn close_data(socket: &mut Socket) {
-    require(bounded(socket.close(None)).await);
+    require(bounded_stage("data close: send client Close", socket.close(None)).await);
     assert_closed(socket).await;
 }
 
 async fn assert_closed(socket: &mut Socket) {
-    bounded(async {
+    bounded_stage("data close: terminal without application data", async {
         loop {
             match socket.next().await {
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -535,8 +564,10 @@ async fn delayed_c9_data_ping_and_close_cancel_without_owner_or_obligation_leak(
     // Keeping the owner live prevents owner shutdown from hiding a leak.
     close_data(&mut data).await;
     assert!(scope.live());
-    require(release.send(()));
-    signal(&fixture.upstream.returned).await;
+    fixture
+        .upstream
+        .release_after_cancel(release, "data close: C9 handler completed or canceled")
+        .await;
     ping(&mut owner).await;
     fixture.upstream.assert_gets(1);
     assert!(matches!(
@@ -612,8 +643,10 @@ async fn delayed_c9_upstream_close_replays_original_error_and_cannot_register_la
     assert!(scope.root().is_none());
     // Keep the actual control owner alive after the late HTTP response, so
     // closing that owner cannot hide a stray asynchronous registration.
-    require(release.send(()));
-    signal(&fixture.upstream.returned).await;
+    fixture
+        .upstream
+        .release_after_cancel(release, "upstream close: C9 handler completed or canceled")
+        .await;
     ping(&mut owner).await;
     assert!(scope.live());
     assert!(matches!(
@@ -634,9 +667,12 @@ async fn partial_c9_cannot_borrow_cached_weekly_or_rewrite_original_error() {
     // or proof constructor. Nothing from this healthy report can register.
     let seed = fixture.upstream.enqueue(usage_body(20, 30, reset));
     require(seed.send(()));
-    bounded(fixture.relay.quota.poll(&fixture.account))
-        .await
-        .unwrap_or_else(|error| panic!("synthetic seed C9 GET failed: {error:?}"));
+    bounded_stage(
+        "partial test: seed C9 GET",
+        fixture.relay.quota.poll(&fixture.account),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("synthetic seed C9 GET failed: {error:?}"));
     signal(&fixture.upstream.arrived).await;
     signal(&fixture.upstream.returned).await;
     let cached = fixture
@@ -651,11 +687,10 @@ async fn partial_c9_cannot_borrow_cached_weekly_or_rewrite_original_error() {
         .find(|window| window["name"] == "7d")
         .unwrap()
         .clone();
-    // Advance only Tokio's scheduling clock past the capped regular interval,
-    // with no live upgrades. Resume before subsequent real loopback socket I/O.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(3601)).await;
-    tokio::time::resume();
+    // The WS ingress creates std::time deadlines and converts them to Tokio
+    // instants. A Tokio-only +3601s jump makes those deadlines already expired.
+    // Wait past the fixture's real 1s C9 interval plus its maximum 10% jitter.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
     let mut partial = usage_body(100, 30, reset);
     partial["rate_limit"]
         .as_object_mut()
