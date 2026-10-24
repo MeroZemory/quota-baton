@@ -245,6 +245,7 @@ impl Default for Session {
     }
 }
 #[derive(Clone, Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default)]
 pub struct SessionDetail {
     #[serde(flatten)]
@@ -257,6 +258,7 @@ pub struct SessionDetail {
     pub timeline_known: bool,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default)]
 pub struct Placement {
     pub at: Option<DateTime<Utc>>,
@@ -267,12 +269,14 @@ pub struct Placement {
     pub next_turn_cache: Option<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default)]
 pub struct Failover {
     pub from: String,
     pub to: String,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default)]
 pub struct RequestSummary {
     pub ts: Option<DateTime<Utc>>,
@@ -2821,3 +2825,5 @@ mod native_claude_move_label_tests {
 }
 
 mod sessions_wire;
+
+mod detail_wire;

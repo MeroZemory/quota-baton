@@ -80,8 +80,7 @@ impl AdminClient {
         let bytes = self
             .dashboard_bytes(&format!("/admin/v1/sessions?range={}", range.query()))
             .await?;
-        let wire: qb_proto::admin_sessions::SessionsView = serde_json::from_slice(&bytes)
-            .map_err(|_| ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다"))?;
+        let wire: qb_proto::admin_sessions::SessionsView = Self::decode_dashboard_object(&bytes)?;
         Ok(wire.into())
     }
 
@@ -136,15 +135,17 @@ impl AdminClient {
         {
             return Err(ClientError::AccountAction("세션 번호가 올바르지 않습니다"));
         }
-        let detail: qb_tray::dashboard_model::SessionDetail = self
-            .dashboard_get(&format!("/admin/v1/sessions/{id}"), "id")
+        let bytes = self
+            .dashboard_bytes(&format!("/admin/v1/sessions/{id}"))
             .await?;
-        if detail.session.id != id {
+        let wire: qb_proto::admin_session_detail::SessionDetail =
+            Self::decode_dashboard_object(&bytes)?;
+        if wire.session.id.as_str() != id {
             return Err(ClientError::AccountAction(
                 "대시보드 세션 응답이 요청과 다릅니다",
             ));
         }
-        Ok(detail)
+        Ok(wire.into())
     }
 
     pub async fn dashboard_activity(
@@ -176,6 +177,18 @@ impl AdminClient {
         required: &str,
     ) -> Result<T, ClientError> {
         Self::decode_dashboard(self.dashboard_value(path).await?, required)
+    }
+
+    pub(crate) fn decode_dashboard_object<T: DeserializeOwned>(
+        bytes: &[u8],
+    ) -> Result<T, ClientError> {
+        let invalid = || ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다");
+        // Preserve the previous named-object boundary without normalizing raw
+        // JSON through Value before the DTO can reject duplicate fields.
+        if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+            return Err(invalid());
+        }
+        serde_json::from_slice(bytes).map_err(|_| invalid())
     }
 
     pub(crate) fn decode_dashboard<T: DeserializeOwned>(
@@ -1427,6 +1440,60 @@ mod r7_dashboard_client_tests {
         });
         (AdminClient::new(port, "synthetic-r7-admin").unwrap(), task)
     }
+    fn detail_body(id: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(r#"{"id":"123456abcdef","provider":"codex","client":{"kind":"codex_cli","product":"synthetic","version":"1"},"label":{"text":"synthetic-folder","source":"claude_project","best_effort":true},"account":"cx-000001","first_seen_at":"2026-10-24T00:00:00Z","bound_since":"2026-10-24T00:00:00Z","last_used_at":"2026-10-24T00:00:00Z","active":true,"inflight":{"requests":2,"oldest_started_at":"2026-10-24T00:00:00Z","ws_open":1,"ws_response_in_flight":true},"inflight_known":false,"pacing_wait":{"waiting":2,"since":"2026-10-24T00:00:00Z"},"routing":{"action_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","on_5h_limit":"move","mode":"recover"},"quota_wait":{"waiting":1,"reset_at":"2026-10-24T00:00:00Z"},"quota_wait_known":true,"model":"synthetic","subagents_today":1,"requests_today":5,"failures_today":2,"rate_wait_today":{"count":1,"total_ms":9},"moves_today":[{"at":"2026-10-24T00:00:00Z","from":"cl-000002","to":"cx-000001","reason":"reset_hold_timeout","next_turn_cache":"miss"}],"first_account_today":"cl-000002","marked_for_move":true,"counters_complete":false,"truncated":true,"subagents_known":false,"moves_known":false,"metadata_truncated":true,"original_short_id":"12345678","recent_requests":[{"ts":"2026-10-24T00:00:00Z","outcome":"relayed_rate429","status":429,"ttfb_ms":3,"dur_ms":17,"rate_wait_ms":10,"rate_retries":4294967295,"failover":{"from":"cl-000002","to":"cx-000001"}},{"ts":"2026-10-24T00:00:00Z","outcome":"ok","status":200,"ttfb_ms":1,"dur_ms":4,"rate_wait_ms":0,"rate_retries":0,"failover":null}],"timeline":[{"at":"2026-10-24T00:00:00Z","kind":"placed","account":"cl-000002","from":null,"reason":"new","next_turn_cache":null},{"at":"2026-10-24T00:00:00Z","kind":"move","account":"cx-000001","from":"cl-000002","reason":"reset_hold_timeout","next_turn_cache":"hit"}],"recent_requests_known":false,"timeline_known":false}"#).unwrap();
+        value["id"] = serde_json::json!(id);
+        serde_json::to_string(&value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dashboard_detail_exact_wire_rejects_missing_and_duplicate_fields_without_echo() {
+        let complete = detail_body("123456abcdef");
+        let (client, task) = fake(&complete, None).await;
+        let detail = client.dashboard_session("123456abcdef").await.unwrap();
+        assert!(detail.session.label.as_ref().unwrap().best_effort);
+        assert_eq!(detail.original_short_id.as_deref(), Some("12345678"));
+        assert_eq!(detail.recent_requests.len(), 2);
+        assert!(!detail.recent_requests_known && !detail.timeline_known);
+        task.await.unwrap();
+        let mut missing_original: serde_json::Value = serde_json::from_str(&complete).unwrap();
+        missing_original
+            .as_object_mut()
+            .unwrap()
+            .remove("original_short_id");
+        let mut missing_status: serde_json::Value = serde_json::from_str(&complete).unwrap();
+        missing_status["recent_requests"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        let duplicate = complete.replacen(
+            "\"timeline_known\":",
+            "\"timeline_known\":false,\"timeline_known\":",
+            1,
+        );
+        for body in [
+            serde_json::to_string(&missing_original).unwrap(),
+            serde_json::to_string(&missing_status).unwrap(),
+            duplicate,
+            r#"{"id":"123456abcdef","original_short_id":"12345678"}"#.into(),
+        ] {
+            let (client, task) = fake(&body, None).await;
+            let error = client.dashboard_session("123456abcdef").await.unwrap_err();
+            assert!(!error.to_string().contains("12345678"));
+            task.await.unwrap();
+        }
+        let (client, task) = fake("", Some(8 * 1024 * 1024 + 1)).await;
+        assert!(
+            client
+                .dashboard_session("123456abcdef")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("너무 큽니다")
+        );
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn dashboard_empty_container_is_valid_but_missing_schema_never_becomes_no_sessions() {
         let body = r#"{"now":"2026-10-24T00:00:00Z","active_window_secs":60,"sessions":[],"truncated":false,"move_cost":null}"#;
@@ -1441,6 +1508,7 @@ mod r7_dashboard_client_tests {
         );
         task.await.unwrap();
         for body in [
+            r#"[null,"2026-10-24T00:00:00Z",60,[],false]"#,
             r#"{"error":"synthetic-secret-must-not-echo"}"#,
             r#"{"sessions":null}"#,
             r#"{"sessions":[]}"#,
@@ -1468,11 +1536,8 @@ mod r7_dashboard_client_tests {
                 .contains("너무 큽니다")
         );
         task.await.unwrap();
-        let (client, task) = fake(
-            r#"{"id":"000000000000","original_short_id":"12345678"}"#,
-            None,
-        )
-        .await;
+        let other = detail_body("000000000000");
+        let (client, task) = fake(&other, None).await;
         let error = client.dashboard_session("123456abcdef").await.unwrap_err();
         assert!(error.to_string().contains("요청과 다릅니다"));
         assert!(!error.to_string().contains("12345678"));
