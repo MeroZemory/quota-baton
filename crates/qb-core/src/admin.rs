@@ -415,26 +415,11 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
     match state
         .relay
         .accounts
-        .views_with_bindings(&state.relay.bindings)
+        .typed_views_with_bindings(&state.relay.bindings)
         .await
     {
         Ok(accounts) => {
-            let pools = crate::account_runtime::typed_pool_counts(&accounts);
-            // Transitional producer seam: views_with_bindings still builds Value.
-            // Validate its completed facts once; never rerun forecast/eligibility.
-            let accounts = match accounts
-                .into_iter()
-                .map(serde_json::from_value::<qb_proto::AdminAccount>)
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(accounts) => accounts,
-                Err(_) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Account state unavailable",
-                    );
-                }
-            };
+            let pools = crate::account_runtime::account_pools(&accounts);
             Json(qb_proto::AdminState {
                 pools,
                 warnings: state.relay.recent_warnings(),
