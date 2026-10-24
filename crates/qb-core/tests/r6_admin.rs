@@ -471,3 +471,167 @@ async fn r6_admin_cancelled_commit_after_token_post_persists_once_and_replays_co
     h.stop().await;
     fake.abort();
 }
+
+// Separate synthetic account import: no takeover/profile/upstream request.
+fn r15_control_account(h: &Harness) -> String {
+    let dir = h.root.path().join("r15-control-cpa");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("synthetic.json"), serde_json::to_vec(&json!({
+        "type":"codex","email":"control@example.invalid","account_id":"synthetic-control-origin",
+        "access_token":"synthetic-control-access","refresh_token":"synthetic-control-refresh",
+        "expired":"2099-01-01T00:00:00Z","last_refresh":"2026-10-24T00:00:00Z"
+    })).unwrap()).unwrap();
+    let rows = qb_core::accounts::import::run(
+        &h.store,
+        &dir,
+        &["codex:control@example.invalid".into()],
+        false,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    rows[0].id.clone().unwrap()
+}
+
+#[tokio::test]
+async fn r15_lifecycle_real_protected_body_preserves_domain_bindings_and_release_order() {
+    for route in ["drain", "shutdown"] {
+        let h = Harness::new().await;
+        let id = r15_control_account(&h);
+        // Restore through the existing validated recovery API, not a new proof
+        // constructor or a persisted schema change. This is no routing proof.
+        let at = chrono::Utc::now();
+        h.state
+            .bindings
+            .import(json!({"schema":1,"bindings":[
+                {"key":"codex:synthetic-sparse","account":id,"last_used":at},
+                {"key":"codex:synthetic-observed","account":id,"last_used":at,
+                 "accepted":true,"first_seen_at":at-chrono::Duration::hours(1),"bound_since":at,
+                 "client_kind":"codex_cli"}
+            ]}))
+            .unwrap();
+        let exported = h.state.bindings.export().unwrap();
+        let url = format!("http://{}/admin/v1/lifecycle/{route}", h.servers.admin_addr);
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let denied = h
+                .client
+                .post(&url)
+                .json(&json!({"drain_timeout_secs":1}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+            denied.bytes().await.unwrap();
+            assert!(!h.state.is_draining());
+            let request = h
+                .client
+                .post(&url)
+                .bearer_auth(ADMIN)
+                .json(&json!({"drain_timeout_secs":1}))
+                .send();
+            let owner = async {
+                // Mirror the production owner: freeze -> stop listeners ->
+                // actual lease release. Never signal success before drain-ready.
+                h.state.wait_for_drain().await;
+                h.servers.shutdown();
+                h.servers.wait_for_listener_close().await;
+                h.state.release_lease_after_drain();
+            };
+            let (response, ()) = tokio::join!(request, owner);
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let body = response.bytes().await.unwrap();
+            let decoded: qb_proto::admin_control::LifecycleReply<Value> =
+                serde_json::from_slice(&body).unwrap();
+            assert!(decoded.lease_released);
+            assert_eq!(decoded.bindings.as_array().unwrap().len(), 2);
+            assert_eq!(decoded.bindings, exported["bindings"]);
+            let expected = json!({"bindings":exported["bindings"],"lease_released":true});
+            assert!(
+                serde_json::to_vec(&expected).unwrap().as_slice() == body.as_ref(),
+                "lifecycle projected fields/order changed"
+            );
+            assert!(
+                serde_json::to_vec(&decoded).unwrap().as_slice() == body.as_ref(),
+                "same protected lifecycle body did not roundtrip"
+            );
+            let fields: Vec<_> = serde_json::from_slice::<Value>(&body)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(fields, ["bindings", "lease_released"]);
+            // The real account-store lease, not merely a wire boolean, was freed.
+            let successor = AccountStore::acquire(h.store.home()).unwrap();
+            drop(successor);
+            assert!(h.fake.state.requests().is_empty());
+        })
+        .await
+        .expect("synthetic lifecycle contract deadline");
+        h.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn r15_debug_pin_real_protected_post_delete_bodies_keep_exact_ack() {
+    let h = Harness::new().await;
+    let id = r15_control_account(&h);
+    let pins = Arc::new(DebugPins::default());
+    let mut config = Config::default();
+    config.server.data_port = 0;
+    config.server.admin_port = 0;
+    let servers = http::spawn_with_admin(
+        &config,
+        LocalSecrets {
+            client_key: "synthetic-client".into(),
+            admin_token: ADMIN.into(),
+        },
+        qb_core::debug_pin::routes(h.store.clone(), pins.clone()),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let url = format!("http://{}/admin/v1/debug/pin", servers.admin_addr);
+        for method in [reqwest::Method::POST, reqwest::Method::DELETE] {
+            let mut denied = h.client.request(method.clone(), &url);
+            if method == reqwest::Method::POST {
+                denied = denied.json(&json!({"account_id":id}));
+            }
+            let response = denied.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            response.bytes().await.unwrap();
+            let mut request = h.client.request(method.clone(), &url).bearer_auth(ADMIN);
+            if method == reqwest::Method::POST {
+                request = request.json(&json!({"account_id":id}));
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let body = response.bytes().await.unwrap();
+            let decoded: qb_proto::admin_control::DebugPinReply =
+                serde_json::from_slice(&body).unwrap();
+            assert!(decoded.ok);
+            assert!(
+                body.as_ref() == br#"{"ok":true}"#,
+                "pin acknowledgement shape changed"
+            );
+            assert!(
+                serde_json::to_vec(&decoded).unwrap().as_slice() == body.as_ref(),
+                "same protected pin body did not roundtrip"
+            );
+            assert_eq!(
+                pins.get(Provider::Codex, None),
+                (method == reqwest::Method::POST).then(|| id.clone())
+            );
+        }
+        assert!(h.fake.state.requests().is_empty());
+        servers.shutdown();
+        servers.wait_for_listener_close().await;
+    })
+    .await
+    .expect("synthetic debug pin contract deadline");
+    drop(servers);
+    h.stop().await;
+}

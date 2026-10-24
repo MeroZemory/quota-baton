@@ -120,8 +120,9 @@ impl AdminClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let ack: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if ack.get("updated").and_then(serde_json::Value::as_bool) != Some(true) {
+        let ack: qb_proto::admin_action::UpdatedReply =
+            Self::decode_dashboard_object(&bytes).map_err(|_| invalid())?;
+        if !ack.updated {
             return Err(invalid());
         }
         Ok(())
@@ -1643,6 +1644,32 @@ mod n5c_urgency_client_tests {
             ));
         }
     }
+    #[tokio::test]
+    async fn r15_urgency_ack_requires_raw_object_unique_boolean_true() {
+        assert!(
+            exchange(reply("  {\"updated\":true}\n"), true)
+                .await
+                .is_ok()
+        );
+        for body in [
+            r#"[true]"#,
+            r#"[{"updated":true}]"#,
+            r#"true"#,
+            r#"null"#,
+            r#"{"updated":null}"#,
+            r#"{"updated":1}"#,
+            r#"{"updated":false,"updated":true}"#,
+            r#"{"updated":true,"updated":true}"#,
+            r#"{"updated":true,"updated":false}"#,
+            r#"{"updated":true} {}"#,
+        ] {
+            assert!(matches!(
+                exchange(reply(body), true).await,
+                Err(ClientError::AccountAction(_))
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn n5c_urgency_client_rejects_display_ids_before_io_and_bounds_chunked_ack() {
         let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
