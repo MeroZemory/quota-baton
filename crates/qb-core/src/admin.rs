@@ -418,33 +418,51 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
         .views_with_bindings(&state.relay.bindings)
         .await
     {
-        Ok(accounts) => Json(qb_proto::AdminState {
-            pools: crate::account_runtime::typed_pool_counts(&accounts),
-            warnings: state.relay.recent_warnings(),
-            draining: Some(state.relay.is_draining()),
-            capabilities: Some(qb_proto::StateCapabilities {
-                account_adopt: true,
-                manual_refresh: true,
-                account_takeover: true,
-            }),
-            accounts,
-            inflight: qb_proto::StateInflight {
-                requests: state
-                    .relay
-                    .inflight_requests
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                bytes: state.relay.budget.used() as u64,
-            },
-            memory: qb_proto::StateMemory {
-                private_bytes: crate::guard::private_bytes(),
-            },
-            bindings: qb_proto::StateBindings {
-                count: state.relay.bindings.count() as u64,
-            },
-            data_port: state.data_port,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        })
-        .into_response(),
+        Ok(accounts) => {
+            let pools = crate::account_runtime::typed_pool_counts(&accounts);
+            // Transitional producer seam: views_with_bindings still builds Value.
+            // Validate its completed facts once; never rerun forecast/eligibility.
+            let accounts = match accounts
+                .into_iter()
+                .map(serde_json::from_value::<qb_proto::AdminAccount>)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(accounts) => accounts,
+                Err(_) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Account state unavailable",
+                    );
+                }
+            };
+            Json(qb_proto::AdminState {
+                pools,
+                warnings: state.relay.recent_warnings(),
+                draining: Some(state.relay.is_draining()),
+                capabilities: Some(qb_proto::StateCapabilities {
+                    account_adopt: true,
+                    manual_refresh: true,
+                    account_takeover: true,
+                }),
+                accounts,
+                inflight: qb_proto::StateInflight {
+                    requests: state
+                        .relay
+                        .inflight_requests
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    bytes: state.relay.budget.used() as u64,
+                },
+                memory: qb_proto::StateMemory {
+                    private_bytes: crate::guard::private_bytes(),
+                },
+                bindings: qb_proto::StateBindings {
+                    count: state.relay.bindings.count() as u64,
+                },
+                data_port: state.data_port,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            })
+            .into_response()
+        }
         Err(()) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Account state unavailable",

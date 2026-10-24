@@ -235,7 +235,7 @@ impl AdminClient {
         &self,
         id: &str,
         patch: AccountPatch,
-    ) -> Result<TrayAccount, ClientError> {
+    ) -> Result<PresentationAccount, ClientError> {
         self.send_json(
             reqwest::Method::PATCH,
             &format!("/admin/v1/accounts/{id}"),
@@ -248,7 +248,7 @@ impl AdminClient {
         &self,
         id: &str,
         action: AccountAction,
-    ) -> Result<TrayAccount, ClientError> {
+    ) -> Result<PresentationAccount, ClientError> {
         test_response_delay().await;
         let response = self
             .account_action_request(id, action)
@@ -585,15 +585,15 @@ pub fn classify_health(health: HealthResponse) -> CoreHealth {
 }
 
 #[derive(Debug, Clone)]
-pub struct TrayRead {
+pub struct TrayRead<S = TraySnapshot> {
     pub health: CoreHealth,
-    pub snapshot: TraySnapshot,
+    pub snapshot: S,
 }
 
 /// Convert the admin snapshot into the model consumed by both the live
 /// Direct2D flyout and the WIC review renderer.
-pub fn layout_rows(
-    read: &TrayRead,
+pub fn layout_rows<S: Serialize>(
+    read: &TrayRead<S>,
     now: std::time::SystemTime,
 ) -> anyhow::Result<Vec<qb_tray::Row>> {
     let json = serde_json::to_string(&read.snapshot)?;
@@ -707,7 +707,7 @@ mod quota_wire_tests {
     fn snapshot_and_flat_core_warning_share_typed_context_without_using_raw_reasons() {
         let context = json!({"window":"5h", "model_limited":true, "reset_at":null, "action":"failover",
             "next_account":"b", "earliest_account":"c", "observed_at":"2026-10-18T12:00:00Z"});
-        let account: TrayAccount =
+        let account: PresentationAccount =
             serde_json::from_value(json!({"id":"a", "quota_notice":context})).unwrap();
         let mut warning = context.clone();
         warning["kind"] = json!("quota_notice");
@@ -724,23 +724,25 @@ mod quota_wire_tests {
         let warning: TrayWarning =
             serde_json::from_value(json!({"kind":"quota_notice","account":"a"})).unwrap();
         assert!(warning.quota_notice().is_none());
-        let account: TrayAccount = serde_json::from_value(json!({"allow_credits":true})).unwrap();
+        let account: PresentationAccount =
+            serde_json::from_value(json!({"allow_credits":true})).unwrap();
         assert!(account.quota_notice.is_none());
     }
 }
 
 pub type StateWarning = qb_proto::admin_warning::AdminWarning<chrono::DateTime<chrono::Utc>>;
 pub type StatePools = Option<qb_proto::admin_pool::ReadPools>;
-type TrayState = qb_proto::admin_state::AdminState<TrayAccount, StateWarning, StatePools>;
+#[path = "client/presentation.rs"]
+pub mod presentation;
+pub use presentation::{PresentationAccount, PresentationSnapshot};
 
-/// Typed transport envelope plus explicit legacy-read and presentation adapters.
-/// Nested account migration remains separate.
+/// Raw current /state payload. Account fields are the exact shared contract;
+/// legacy envelope defaults remain at the explicit envelope read boundary.
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
-pub struct TraySnapshot(pub TrayState);
-
+pub struct TraySnapshot(pub qb_proto::AdminState<qb_proto::AdminAccount, StateWarning, StatePools>);
 impl std::ops::Deref for TraySnapshot {
-    type Target = TrayState;
+    type Target = qb_proto::AdminState<qb_proto::AdminAccount, StateWarning, StatePools>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -755,120 +757,13 @@ impl<'de> Deserialize<'de> for TraySnapshot {
         qb_proto::admin_state::deserialize_compat(deserializer, false).map(Self)
     }
 }
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct TrayAccount {
-    #[serde(default)]
-    pub has_alternative: bool,
-    #[serde(default)]
-    pub quota_notice: Option<qb_tray::QuotaNotice>,
-    #[serde(default)]
-    pub last_relevant_state_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub provider: String,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(default)]
-    pub email: Option<String>,
-    #[serde(default)]
-    pub plan: Option<String>,
-    #[serde(default)]
-    pub user_state: String,
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub health: serde_json::Value,
-    #[serde(default)]
-    pub probe_pending: bool,
-    #[serde(default)]
-    pub windows: Vec<QuotaWindow>,
-    #[serde(default)]
-    pub usage_forecast: Option<qb_core::usage_forecast::AccountUsageForecast>,
-    #[serde(default)]
-    pub credits: Option<serde_json::Value>,
-    #[serde(default)]
-    pub credits_in_use: Option<bool>,
-    #[serde(default)]
-    pub pool_eligible: Option<bool>,
-    #[serde(default)]
-    pub quota_cooling: Option<serde_json::Value>,
-    #[serde(default)]
-    pub quota_credit_releasable: bool,
-    #[serde(default)]
-    pub observed_at: Option<String>,
-    #[serde(default)]
-    pub last_used_at: Option<String>,
-    #[serde(default)]
-    pub bound_sessions: u64,
-    #[serde(default)]
-    pub active_sessions: u64,
-    #[serde(default)]
-    pub spread_threshold: u64,
-    #[serde(default)]
-    pub token_expires_at: Option<String>,
-    #[serde(default)]
-    pub last_refresh_at: Option<String>,
-    #[serde(default)]
-    pub drain: bool,
-    #[serde(default)]
-    pub allow_credits: bool,
-    #[serde(default)]
-    pub outside_used: bool,
-    #[serde(default)]
-    pub refresh_attention: bool,
-    #[serde(default, deserialize_with = "decode_source")]
-    pub source: String,
-    #[serde(default)]
-    pub pacing: qb_tray::Pacing,
-}
-
-fn decode_source<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(match value {
-        serde_json::Value::String(value) => {
-            if value == "takeover" {
-                "oauth".into()
-            } else {
-                value
-            }
-        }
-        serde_json::Value::Object(mut object) => {
-            let kind = object
-                .remove("kind")
-                .and_then(|kind| kind.as_str().map(str::to_owned));
-            if kind.as_deref() == Some("cpa") {
-                match object.get("mode").and_then(serde_json::Value::as_str) {
-                    Some(mode @ ("linked" | "adopted")) => mode.to_owned(),
-                    _ => "⚠ source decode error (unknown mode)".into(),
-                }
-            } else {
-                kind.map(|kind| {
-                    if kind == "takeover" {
-                        "oauth".into()
-                    } else {
-                        kind
-                    }
-                })
-                .unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
-            }
-        }
-        _ => "⚠ source decode error".into(),
-    })
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct QuotaWindow {
-    pub name: String,
-    pub used_pct: Option<f64>,
-    pub reset_at: Option<String>,
-    pub status: Option<String>,
-    #[serde(default)]
-    pub observed_at: Option<String>,
-    #[serde(default)]
-    pub scope: Option<String>,
+impl TraySnapshot {
+    /// A pure, temporary presentation copy. No normalization/default writes back
+    /// into the raw snapshot. Existing date validation and source tags stay in
+    /// the incumbent presentation decoder.
+    pub fn presentation(&self) -> serde_json::Result<PresentationSnapshot> {
+        serde_json::from_value(serde_json::to_value(self)?)
+    }
 }
 
 #[cfg(test)]
@@ -887,7 +782,7 @@ mod n10_outside_usage_transport_tests {
             if let Some(flag) = flag {
                 wire["accounts"][0]["outside_used"] = flag.into();
             }
-            let snapshot: TraySnapshot = serde_json::from_value(wire).unwrap();
+            let snapshot: PresentationSnapshot = serde_json::from_value(wire).unwrap();
             assert_eq!(snapshot.accounts[0].outside_used, flag.unwrap_or(false));
             let read = TrayRead {
                 snapshot,
@@ -930,7 +825,7 @@ mod r5_transport_tests {
             "windows":[{"name":"5h","used_pct":100.0,"reset_at":reset,"observed_at":at,"scope":"account"}],
             "pacing":{"backoff_until":reset,"waiting":2,"step":3,"release_interval_ms":500}
         }]});
-        let snapshot: TraySnapshot = serde_json::from_value(input).unwrap();
+        let snapshot: PresentationSnapshot = serde_json::from_value(input).unwrap();
         let serialized = serde_json::to_value(&snapshot).unwrap();
         let account = &serialized["accounts"][0];
         assert_eq!(account["credits_in_use"], true);
@@ -970,7 +865,7 @@ mod r5_transport_tests {
 
 /// Render a compact Korean tooltip line without exposing any secret fields.
 #[cfg(test)]
-pub fn render_status_line(read: &TrayRead) -> String {
+pub fn render_status_line(read: &TrayRead<PresentationSnapshot>) -> String {
     match &read.health {
         CoreHealth::Unreachable { .. } => "코어: 연결할 수 없음".to_owned(),
         CoreHealth::Unhealthy { .. } => "코어: 비정상".to_owned(),
@@ -1000,7 +895,7 @@ pub fn render_status_line(read: &TrayRead) -> String {
 /// flyout consumes the same rows; this compact encoder keeps the aid usable in
 /// CI without a desktop compositor.
 #[cfg(test)]
-pub fn render_flyout(read: &TrayRead) -> String {
+pub fn render_flyout(read: &TrayRead<PresentationSnapshot>) -> String {
     let mut lines = vec![render_status_line(read)];
     for provider in ["claude", "codex"] {
         let accounts = read
@@ -1101,7 +996,7 @@ mod tests {
 
     #[test]
     fn parses_synthetic_state_snapshot() {
-        let snapshot: TraySnapshot = serde_json::from_str(r#"{
+        let snapshot: PresentationSnapshot = serde_json::from_str(r#"{
           "accounts":[{"id":"cx-test","provider":"codex","label":"합성","email":null,
             "plan":"plus","user_state":"active","health":{"kind":"ready"},
             "windows":[{"name":"5h","used_pct":42.5,"reset_at":"2030-01-01T00:00:00Z","status":"ok"}],
@@ -1131,7 +1026,7 @@ mod tests {
 
     #[test]
     fn decodes_source_object_and_keeps_malformed_source_visible() {
-        let snapshot: TraySnapshot = serde_json::from_value(serde_json::json!({
+        let snapshot: PresentationSnapshot = serde_json::from_value(serde_json::json!({
             "accounts": [
                 {"id":"oauth", "source":{"kind":"oauth","mode":"owned","future":true}},
                 {"id":"linked", "source":{"kind":"cpa","mode":"linked","dir":"ignored"}},
@@ -1188,7 +1083,7 @@ mod tests {
 
     #[test]
     fn renders_korean_read_only_account_rows_without_secrets() {
-        let snapshot: TraySnapshot = serde_json::from_value(serde_json::json!({
+        let snapshot: PresentationSnapshot = serde_json::from_value(serde_json::json!({
             "accounts": [{"id":"synthetic-id","provider":"codex","email":"fixture@example.invalid",
               "user_state":"active","health":{"kind":"ready"},"windows":[{"name":"5h","used_pct":42.0}]}],
             "data_port":10200,"version":"synthetic"
@@ -1490,7 +1385,7 @@ mod r6_takeover_tests {
             serde_json::json!("takeover"),
             serde_json::json!({"kind":"takeover","from":"DO NOT LEAK","at":"now"}),
         ] {
-            let account: TrayAccount =
+            let account: PresentationAccount =
                 serde_json::from_value(serde_json::json!({"source":source})).unwrap();
             assert_eq!(account.source, "oauth");
             assert!(

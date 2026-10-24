@@ -450,7 +450,13 @@ where
 {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(match value {
-        serde_json::Value::String(value) => value,
+        serde_json::Value::String(value) => {
+            if value == "takeover" {
+                "oauth".into()
+            } else {
+                value
+            }
+        }
         serde_json::Value::Object(mut object) => {
             let kind = object
                 .remove("kind")
@@ -461,7 +467,14 @@ where
                     _ => "⚠ source decode error (unknown mode)".into(),
                 }
             } else {
-                kind.unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
+                kind.map(|kind| {
+                    if kind == "takeover" {
+                        "oauth".into()
+                    } else {
+                        kind
+                    }
+                })
+                .unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
             }
         }
         _ => "⚠ source decode error".into(),

@@ -187,13 +187,14 @@ fn elapsed() -> std::time::Duration {
 fn publish_read(read: super::client::TrayRead) -> Result<()> {
     let now = SystemTime::now();
     let rows = super::client::layout_rows(&read, now)?;
+    let presentation = read.snapshot.presentation()?;
     let core_ok = matches!(&read.health, super::client::CoreHealth::Healthy(_));
     let attention = qb_tray::badge(&rows, core_ok) != qb_tray::Badge::Normal;
     notices()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .snapshot(
-            &read.snapshot,
+            &presentation,
             core_ok,
             attention,
             rows.len(),
@@ -3018,7 +3019,7 @@ pub fn run(
         let json = std::fs::read_to_string(fixture)?;
         let state: qb_tray::State = serde_json::from_str(&json)?;
         let rows = qb_tray::parse_state_at(&json, now)?;
-        let snapshot: super::client::TraySnapshot = serde_json::from_str(&json)?;
+        let snapshot: super::client::PresentationSnapshot = serde_json::from_str(&json)?;
         notices()
             .lock()
             .unwrap_or_else(|e| e.into_inner())

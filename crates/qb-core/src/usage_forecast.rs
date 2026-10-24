@@ -12,7 +12,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
 
 const MAX_ACCOUNTS: usize = 128;
 const MAX_WINDOWS_PER_ACCOUNT: usize = 16;
@@ -20,80 +19,12 @@ const MAX_SAMPLES_PER_SERIES: usize = 256;
 const RECENT_SECONDS: i64 = 30 * 60;
 const MIN_SECONDS: f64 = 10.0 * 60.0;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ForecastBasis {
-    Recent,
-    Average,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ForecastOutcome {
-    Measuring,
-    ResetPending,
-    Exhausted,
-    NoFiniteForecast,
-    NoExhaustionBeforeReset,
-    Exhaustion,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct UsageProjection {
-    pub pct_per_hour: f64,
-    pub measurement_start: DateTime<Utc>,
-    pub exhaustion_at: Option<DateTime<Utc>>,
-    pub seconds_to_exhaustion: Option<i64>,
-    pub outcome: ForecastOutcome,
-    pub changing: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct WindowUsageForecast {
-    pub name: String,
-    pub window_seconds: i64,
-    pub observed_at: DateTime<Utc>,
-    pub used_pct: f64,
-    pub reset_at: Option<DateTime<Utc>>,
-    pub awaiting_usage: bool,
-    pub recent_pct_per_hour: Option<f64>,
-    pub average_pct_per_hour: Option<f64>,
-    pub recent_span_start: Option<DateTime<Utc>>,
-    pub measurement_start: Option<DateTime<Utc>>,
-    pub basis: Option<ForecastBasis>,
-    pub exhaustion_at: Option<DateTime<Utc>>,
-    pub seconds_to_exhaustion: Option<i64>,
-    pub outcome: ForecastOutcome,
-    pub changing: bool,
-    pub secondary_recent: Option<UsageProjection>,
-    /// Samples were compacted at capacity; interpolation is approximate but
-    /// keeps the requested span covered. Reset/top-up starts a fresh track.
-    pub truncated: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct CreditUsageForecast {
-    pub observed_at: DateTime<Utc>,
-    pub balance: f64,
-    pub recent_credits_per_hour: Option<f64>,
-    pub measurement_start: Option<DateTime<Utc>>,
-    pub exhaustion_at: Option<DateTime<Utc>>,
-    pub seconds_to_exhaustion: Option<i64>,
-    pub outcome: ForecastOutcome,
-    pub changing: bool,
-    pub truncated: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct AccountUsageForecast {
-    pub as_of: DateTime<Utc>,
-    pub observed_at: Option<DateTime<Utc>>,
-    pub windows: Vec<WindowUsageForecast>,
-    /// Only finite exhaustion before a known reset participates. Credits do not.
-    pub earliest_window: Option<String>,
-    pub credit: Option<CreditUsageForecast>,
-    pub truncated: bool,
-}
+// One shared wire schema; all numerical estimation stays in this module.
+pub use qb_proto::admin_account::{ForecastBasis, ForecastOutcome};
+pub type UsageProjection = qb_proto::admin_account::UsageProjection<DateTime<Utc>>;
+pub type WindowUsageForecast = qb_proto::admin_account::WindowUsageForecast<DateTime<Utc>>;
+pub type CreditUsageForecast = qb_proto::admin_account::CreditUsageForecast<DateTime<Utc>>;
+pub type AccountUsageForecast = qb_proto::admin_account::AccountUsageForecast<DateTime<Utc>>;
 
 #[derive(Clone, Debug)]
 struct Sample {
