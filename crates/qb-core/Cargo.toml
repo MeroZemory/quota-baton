@@ -38,6 +38,7 @@ zeroize.workspace = true
 qb-proto.workspace = true
 
 [dev-dependencies]
+qb-tray = { path = "../qb-tray" }
 qb-proto = { workspace = true, features = ["contract-tests"] }
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 quote = "=1.0.47"

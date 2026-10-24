@@ -152,7 +152,11 @@ impl Harness {
             .await
             .unwrap();
         assert_eq!(response.status(), expected);
-        let text = response.text().await.unwrap();
+        let body = response.bytes().await.unwrap();
+        if expected == StatusCode::OK {
+            r15_takeover_body(&body, value["phase"].as_str().unwrap());
+        }
+        let text = std::str::from_utf8(&body).unwrap();
         for secret in [
             ACCESS,
             REFRESH,
@@ -167,7 +171,7 @@ impl Harness {
                 "admin response must omit credentials"
             );
         }
-        serde_json::from_str(&text).unwrap()
+        serde_json::from_str(text).unwrap()
     }
     async fn stop(self) {
         self.state.shutdown_refreshes().await.unwrap();
@@ -723,6 +727,154 @@ async fn r15_debug_pin_real_protected_post_delete_bodies_keep_exact_ack() {
         })
         .await
         .expect("synthetic debug pin contract deadline");
+    })
+    .catch_unwind()
+    .await;
+    r15_finish(h, secondary, body).await;
+}
+
+// Shared contract and existing presentation each consume the ORIGINAL body.
+fn r15_takeover_body(body: &[u8], phase: &str) {
+    fn exact<T: serde::Serialize + serde::de::DeserializeOwned>(body: &[u8]) {
+        let reply: T = serde_json::from_slice(body)
+            .unwrap_or_else(|_| panic!("takeover body violates response contract"));
+        assert!(
+            serde_json::to_vec(&reply).unwrap() == body,
+            "takeover original body changed bytes"
+        );
+    }
+    match phase {
+        "inspect" => {
+            exact::<qb_proto::admin_takeover::TakeoverInspect>(body);
+            exact::<qb_tray::client::TakeoverInspect>(body);
+        }
+        "commit" => {
+            exact::<qb_proto::admin_takeover::TakeoverCommit>(body);
+            exact::<qb_tray::client::TakeoverCommit>(body);
+        }
+        _ => panic!("unexpected successful takeover phase"),
+    }
+}
+
+#[tokio::test]
+async fn r15_takeover_actual_body_through_real_tray_inspect_commit_and_replay() {
+    let h = Harness::new().await;
+    let mut secondary = None;
+    let body = std::panic::AssertUnwindSafe(async {
+        let source = h.write(Provider::Codex);
+        let original = fs::read(&source).unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let capture = captured.clone();
+        let routes = admin::runtime_routes(h.state.clone(), 0).route_layer(
+            axum::middleware::map_response(move |response: axum::response::Response| {
+                let capture = capture.clone();
+                async move {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let (parts, body) = response.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let mut rows = capture.lock().unwrap();
+                    assert!(rows.len() < 3, "bounded takeover capture");
+                    rows.push(bytes.to_vec());
+                    drop(rows);
+                    axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+                }
+            }),
+        );
+        let mut config = Config::default();
+        config.server.data_port = 0;
+        config.server.admin_port = 0;
+        // This config binds listeners only; the existing RelayState retains all
+        // fixture loopback token/profile/data endpoints and synthetic source.
+        secondary = Some(
+            http::spawn_with_routes(
+                &config,
+                LocalSecrets {
+                    client_key: "synthetic-client".into(),
+                    admin_token: ADMIN.into(),
+                },
+                axum::Router::new(),
+                routes,
+            )
+            .await
+            .unwrap(),
+        );
+        let client =
+            qb_tray::client::AdminClient::new(secondary.as_ref().unwrap().admin_addr.port(), ADMIN)
+                .unwrap();
+        let take = |phase| {
+            let rows = std::mem::take(&mut *captured.lock().unwrap());
+            assert_eq!(rows.len(), 1, "capture only the consumed takeover reply");
+            let body = rows.into_iter().next().unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            for secret in [
+                ACCESS,
+                REFRESH,
+                NEW_ACCESS,
+                NEW_REFRESH,
+                "access_token",
+                "refresh_token",
+                "secret_dpapi",
+            ] {
+                assert!(!text.contains(secret), "takeover reply exposed credentials");
+            }
+            r15_takeover_body(&body, phase);
+            body
+        };
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let path = h.source.to_str().unwrap();
+            let inspect = client.takeover_inspect("codex", path).await.unwrap();
+            let raw = take("inspect");
+            assert!(
+                serde_json::to_vec(&inspect).unwrap() == raw,
+                "real tray inspect changed consumed bytes"
+            );
+            assert!(inspect.can_confirm());
+            assert!(h.store.list().unwrap().is_empty());
+            assert!(
+                fs::read(&source).unwrap() == original,
+                "inspect mutated source"
+            );
+            h.rotation();
+            let commit = client
+                .takeover_commit("codex", path, &inspect, false)
+                .await
+                .unwrap();
+            let raw = take("commit");
+            assert!(
+                serde_json::to_vec(&commit).unwrap() == raw,
+                "real tray commit changed consumed bytes"
+            );
+            assert!(commit.refresh.ok);
+            assert!(commit.refresh.token_expires_at.is_some());
+            assert!(!source.exists());
+            assert!(
+                fs::read(commit.renamed_to.as_ref().unwrap()).unwrap() == original,
+                "retired fixture source changed"
+            );
+            let account = h.store.load(&commit.id).unwrap();
+            assert!(matches!(account.source, Source::Takeover { .. }));
+            assert!(h.store.tokens(&account).unwrap().access_token == NEW_ACCESS);
+            let replay = client
+                .takeover_commit("codex", path, &inspect, false)
+                .await
+                .unwrap();
+            let replay_raw = take("commit");
+            assert!(serde_json::to_vec(&replay).unwrap() == replay_raw);
+            assert!(raw == replay_raw, "completed replay changed response bytes");
+            assert_eq!(
+                h.fake
+                    .state
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method == reqwest::Method::POST)
+                    .count(),
+                1
+            );
+        })
+        .await
+        .expect("synthetic takeover client deadline");
+        drop(client);
+        assert!(captured.lock().unwrap().is_empty());
     })
     .catch_unwind()
     .await;
