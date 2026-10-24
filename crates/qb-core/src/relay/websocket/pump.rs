@@ -1544,17 +1544,17 @@ impl PhysicalLeg {
             return;
         };
         let mut slot = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(physical) = slot.as_mut() {
-            if physical.request.is_none_or(|request| {
+        if let Some(physical) = slot.as_mut()
+            && physical.request.is_none_or(|request| {
                 current
                     .get(&request)
                     .is_some_and(|active| active.response_id.as_deref() == Some(id))
-            }) {
-                match physical.response_id.as_deref() {
-                    None => physical.response_id = Some(id.to_owned()),
-                    Some(previous) if previous != id => self.witness.ambiguous(),
-                    _ => {}
-                }
+            })
+        {
+            match physical.response_id.as_deref() {
+                None => physical.response_id = Some(id.to_owned()),
+                Some(previous) if previous != id => self.witness.ambiguous(),
+                _ => {}
             }
         }
     }
@@ -1605,16 +1605,15 @@ impl PhysicalLeg {
         let physical = slot.as_ref()?;
         // Unknown explicit IDs cannot claim an unrelated actual send. ID-less
         // quota errors still require the helper's single untainted sent witness.
-        if let Some(id) = physical_response_id(event).ok()? {
-            if physical.response_id.as_deref() != Some(id)
+        if let Some(id) = physical_response_id(event).ok()?
+            && (physical.response_id.as_deref() != Some(id)
                 || !physical.request.is_none_or(|request| {
                     current
                         .get(&request)
                         .is_some_and(|active| active.response_id.as_deref() == Some(id))
-                })
-            {
-                return None;
-            }
+                }))
+        {
+            return None;
         }
         Some(QuotaCandidateSnapshot {
             candidate: self.witness.quota_candidate()?,
@@ -1889,14 +1888,14 @@ fn guarded_upstream_write<S>(
     message: Message,
     reservation: Reservation,
     delivered: Delivered,
-    model: Option<String>,
-    managed: bool,
+    model_gate: (Option<String>, bool),
     physical: Arc<PhysicalLeg>,
 ) -> Write<S>
 where
     S: Sink<Message> + Send + Unpin + 'static,
     S::Error: Send,
 {
+    let (model, managed) = model_gate;
     if matches!(message, Message::Text(_) | Message::Binary(_))
         && let Some(relay) = &context.relay
     {
@@ -2909,7 +2908,7 @@ async fn run_with_read_timeout(
                         }
                         let fallback_model = if let Message::Text(text) = &message { super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()) } else { None };
                         to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
-                            Delivered { bytes, request, terminal: None, completed: false }, fallback_model, managed_socket, physical.clone()));
+                            Delivered { bytes, request, terminal: None, completed: false }, (fallback_model, managed_socket), physical.clone()));
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
                 }
