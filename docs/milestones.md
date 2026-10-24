@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: L1 P1 플랫폼 관문 완료; P2 systemd 서비스 구현·수용 진행
+현재 마일스톤: L1 P2 헤드리스 서비스 관문 완료; P0–P2 병합·설치 인계
 목표: 공통 코드를 유지하며 홈 서버용 Linux 헤드리스 코어 P0–P2를 완성하기
-핵심 지표: Linux 서버 독립 단계 2/3 (P0 컴파일, P1 플랫폼, P2 systemd); 전체 L1 서버 수용 전
+핵심 지표: Linux 서버 독립 단계 3/3 (P0 컴파일, P1 플랫폼, P2 systemd); 전체 L1 서버 수용 전
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-25 01:45 KST (P1 코드 515dc1a; 양쪽 check·Windows strict lint·Linux/Windows core·HTTP 회귀 통과)
+갱신: 2026-10-25 02:42 KST (P2 코드 c987f53; 실제 systemd 시작·재로드·복구·중지 및 양쪽 회귀 통과)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -245,6 +245,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 17:49 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | R15 공유 응답 계약 최종 관문 완료; 원본 실패16 집중 복구·전체 기능3899/코어1310 통과·실제 화면 검수; 통합 숫자/실제 재생 미수용 |
 | 2026-10-25 00:50 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 1/3 | 사용자 L1 brief의 서버 불필요 단계로 구현 메인이 새 계열 선택. P0 798f8a8 관문 통과; P3–P5 전체 수용과 별도 |
 | 2026-10-25 01:45 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 2/3 | P1 515dc1a; Linux1195/0·HTTP9/0·경계6/0, Windows1180/0·HTTP9/0·CLI608/0/3제외; P2 실제 서비스 관문 전 |
+| 2026-10-25 02:42 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 3/3 | P2 c987f53; systemd255 시작·status·25초 양쪽 포트2380/0·kill 재시작·중지·자격증명 복원; P3–P5 별도 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -493,14 +494,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 00:50 | L1 P0 Windows 보존·Linux 컴파일 | 코어1179·HTTP9·CLI605+수정1·help 기본2/전체2·경계5 통과 | 양쪽 check·strict lint·Windows smoke | 원래 CLI child-name 실패 보존 후 해당 fixture 수정 검증; P1 credential backend는 미구현 |
 | 2026-10-25 01:45 | L1 P0 설치 수용 | ae5054c; takeover1700/0·Codex/Claude smoke·DPAPI/연결 계정·실제 dashboard 유지 | 설계 세션 설치 확인 | 00:56 KST 수용 회신; 구현 메인은 설치하지 않음 |
 | 2026-10-25 01:45 | L1 P1 최종 플랫폼 관문 | Linux core1195/0·HTTP9/0·경계6/0; Windows core1180/0·HTTP9/0·CLI608/0/3제외·경계6/0 | 양쪽 check·Windows 기본/전체 strict lint·build·읽기 전용 check | L1-P1.md와 delivery-fingerprint.json; 초기 실패 원본 보존, 마지막 변경은 m0 경로 fixture만 집중 재검증 |
+| 2026-10-25 02:42 | L1 P2 서비스 수용·회귀 | Linux1232/0·HTTP9/0·경계6/0; Windows1180/0·CLI608/0/3제외 | 실제 systemd255 동일 PID 재로드·양쪽 포트25초 실패0 | L1-P2.md; p2-delivery-fingerprint.json; 기본/전체 strict lint·양쪽 check·읽기 전용 launcher 검사 통과 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| Linux P2 서비스 | 실제 Ubuntu24.04/systemd255 fixture 부팅; listener·reload 후보 준비 | 실제 시작·status·kill 재시작·25초 연결 거절0 | 자격증명 전달과 durable cleanup 뒤 socket 유지 exec 통합·검증 |
-| Linux 서버 전체 수용 | P0/P1 플랫폼 관문 통과; P3–P5 미수용 | 브라우저 없는 로그인·칸별 접근·실제 서버 수용 | P2 이후 별도 관문 진행 |
-| N6r·N7 보류 | 각 브랜치·준비 자료에 보존 | 사용자 작업 순서와 별도 실제 재생·보정 수용 | Linux 우선 작업 뒤 별도 재개; dev 병합 안 함 |
+| Linux P3 로그인 | P0–P2 통과; 실제 계정 미연결 | 두 공급자 코드/redirect·state·PKCE 검증 | 별도 P3 합성 관문 뒤 설계 세션 실제 로그인 |
+| Linux P4 칸별 접근 | 공용 루프백만 제공 | 칸별 Unix 소켓·키·철회·계보 | P4 구현·두 칸 검증 |
+| Linux P5 서버 수용 | Docker systemd255까지 수용 | 실제 서버 로그인·칸 접근·재부팅 | 서버 접근 시 설계 세션 수용; N6r·N7 별도 보류 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
