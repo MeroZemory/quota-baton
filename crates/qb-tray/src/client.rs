@@ -1231,7 +1231,7 @@ fn takeover_commit_body(
         "inspect_digest":inspect.inspect_digest,"replace":replace,"keep_source":false})
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct TakeoverInspect {
     pub email: Option<String>,
     pub plan: Option<String>,
@@ -1326,14 +1326,14 @@ fn display_field(value: &str) -> String {
         .collect()
 }
 #[allow(dead_code)]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct TakeoverCommit {
     pub id: String,
     pub renamed_to: Option<String>,
     pub refresh: TakeoverRefresh,
 }
 #[allow(dead_code)]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct TakeoverRefresh {
     pub ok: bool,
     pub token_expires_at: Option<String>,

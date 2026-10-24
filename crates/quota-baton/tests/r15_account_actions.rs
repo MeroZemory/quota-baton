@@ -328,10 +328,11 @@ async fn actual_account_actions_same_body_reaches_real_client() {
                 "limit_window_seconds":18000,"reset_at":Utc::now().timestamp()+3600}},
             "plan_type":"plus", "credits":{"has_credits":true,"unlimited":false,"balance":10}
         }).to_string()));
-        let display = client.account_action(&h.id, AccountAction::RefreshUsage).await.unwrap();
-        let raw: qb_proto::AdminAccount = h.presentation_body("/refresh-usage");
-        assert_eq!(display.id, raw.id);
-        assert_eq!(display.plan.as_deref(), Some("plus"));
+        let refreshed = client.account_action_raw(&h.id, AccountAction::RefreshUsage).await.unwrap();
+        let AccountActionResponse::Usage(raw) = refreshed else { panic!("wrong usage graph"); };
+        h.same_body("/refresh-usage", &raw);
+        assert_eq!(raw.id, h.id);
+        assert_eq!(raw.plan.as_deref(), Some("plus"));
         assert!(raw.windows.iter().any(|w| w.used_pct == Some(25.0)));
         assert_eq!(h.usage.state.requests().len(), 1);
         // Immediate second poll is a real core 429, not a fabricated error body.
