@@ -82,3 +82,30 @@ fn name_only_configuration_keeps_identity_without_declaring_a_listener() {
     let only: Config = toml::from_str("[[boxes]]\nname='key-only'\n").unwrap();
     assert!(declared_listeners(&only).is_empty());
 }
+
+#[test]
+fn explicit_tcp_listener_is_refused_before_registry_io() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".sandbox/tests/box-service-selection");
+    std::fs::create_dir_all(&base).unwrap();
+    let parent = tempfile::tempdir_in(base).unwrap();
+    let home = parent.path().join("uncreated-home");
+    assert!(!home.try_exists().unwrap());
+    let config: Config =
+        toml::from_str("[[boxes]]\nname='tcp-only'\nlisten='tcp:127.0.0.1:10301'\n").unwrap();
+    config.validate_boxes().unwrap();
+
+    let error = match BoxService::prepare(&home, &config) {
+        Err(error) => error,
+        Ok(_) => panic!("explicit TCP listener must be refused"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "TCP box listeners are not available in this build"
+    );
+    assert!(!home.try_exists().unwrap());
+}

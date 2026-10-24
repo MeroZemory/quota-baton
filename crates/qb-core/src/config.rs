@@ -1366,14 +1366,16 @@ mod box_config_tests {
             });
             assert!(config.validate_boxes().is_err(), "{name:?}");
         }
-        let mut config = Config::default();
-        config.boxes = vec![
-            BoxConfig {
-                name: "sample-box".into(),
-                listen: Some(BoxListen::Unix),
-            };
-            2
-        ];
+        let mut config = Config {
+            boxes: vec![
+                BoxConfig {
+                    name: "sample-box".into(),
+                    listen: Some(BoxListen::Unix),
+                };
+                2
+            ],
+            ..Config::default()
+        };
         assert!(config.validate_boxes().is_err());
         config.boxes = (0..257)
             .map(|index| BoxConfig {
