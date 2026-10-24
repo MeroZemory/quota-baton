@@ -28,7 +28,6 @@ mod affinity;
 pub(crate) use admission::DispatchAdmission;
 mod capacity_spill;
 mod launch;
-pub(crate) use capacity_spill::CapacitySpillPermit;
 mod move_guard;
 pub(crate) mod quota_wait;
 mod rebind;
@@ -485,6 +484,7 @@ struct Data {
     overload_marks: BTreeMap<String, OverloadMark>,
     successes: BTreeMap<String, DateTime<Utc>>,
     placements: BTreeMap<String, PlacementState>,
+    #[cfg(test)]
     capacity_spills: BTreeMap<String, u64>,
     outside_used: BTreeSet<String>,
     outside_unknown: bool,
@@ -650,6 +650,7 @@ impl BindingTable {
             to,
             from.and_then(|id| candidates.iter().find(|c| c.account.id == id)),
             candidates,
+            None,
             observations,
             model,
             proposed_reason,
@@ -666,6 +667,7 @@ impl BindingTable {
         to: &str,
         source: Option<&Candidate>,
         candidates: &[Candidate],
+        sole_target: Option<&selection::SoleEligibleTarget>,
         observations: MoveObservations,
         model: Option<&str>,
         proposed_reason: &str,
@@ -700,6 +702,7 @@ impl BindingTable {
                 semantic_evidence(source_account.as_ref()),
                 semantic_evidence(target_account.as_ref()),
                 unusable.as_ref(),
+                sole_target.is_some_and(|proof| proof.applies_to(from, to, model, now)),
                 observations,
                 now,
             );
@@ -2705,13 +2708,16 @@ impl BindingTable {
             coverage: Some(coverage),
             model_move: false,
         });
-        let (choice, selection) = self.select_ordered(
+        let (choice, selection, sole_target) = self.select_with_return_guard(
             &d,
             provider,
             key,
             parent,
             model,
             candidates,
+            move_evidence,
+            None,
+            observations,
             pinned,
             now,
             hold_allowed,
@@ -2805,6 +2811,7 @@ impl BindingTable {
             &account,
             guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id)),
             candidates,
+            sole_target.as_ref(),
             observations,
             model,
             reason,

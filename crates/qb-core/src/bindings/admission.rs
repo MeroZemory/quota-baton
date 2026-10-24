@@ -20,6 +20,7 @@ impl DispatchAdmission {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(proof: crate::relay::CapacityMoveEvidence) -> Self {
         Self {
             capacity: Some(proof),

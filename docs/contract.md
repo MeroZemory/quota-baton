@@ -167,7 +167,7 @@ Credit snapshots merge once, in observation order, and the exact merged result i
 
 `health` and `user_state` are persisted in the account file and survive restarts. A `cooling` whose `until` has already passed when it is loaded becomes `ready`.
 
-**WebSocket connection capacity (R12.9).** A `400 websocket_connection_limit_reached` is a WS-only per-account capacity observation, not a health transition. Pending dials and live upstream sockets reserve slots atomically. A rejected dial learns a conservative cap from the other reserved sockets (minimum one probe slot); an in-stream error learns from the current reserved count and is still relayed immediately. New upgrades exclude full accounts and may use another eligible account under the session policy; strict anchors wait. If every usable account is full, wait only inside the existing WS upgrade deadline. Dropping a pending or live socket releases its reservation. With no local sockets, a rejected dial backs off 250 ms before probing. The cap is process-local and independent of quota and request-rate pacing. In-stream ledger rows include a sanitized upstream error code, never the error message or payload.
+**WebSocket connection capacity (R12.9).** A `400 websocket_connection_limit_reached` is a WS-only per-account capacity observation, not a health transition. Pending dials and live upstream sockets reserve slots atomically. A rejected dial learns a conservative cap from the other reserved sockets (minimum one probe slot); an in-stream error learns from the current reserved count and is still relayed immediately. Unbound sessions exclude full accounts and may place on another eligible account under the session policy. A bound session waits briefly for its own slot, then receives 426 for same-account HTTP fallback; capacity alone never moves its binding. All waits stay inside the original upgrade deadline. Dropping a pending or live socket releases its reservation. With no local sockets, a rejected dial backs off 250 ms before probing. The cap is process-local and independent of quota and request-rate pacing. In-stream ledger rows include a sanitized upstream error code, never the error message or payload.
 
 ## C6. Upstream outcome mapping
 
@@ -219,7 +219,7 @@ These are used only when no genuine upstream response is available. They MUST be
 | codex (WebSocket) | `{"type":"error","status":<code>,"error":{...same...}}`. `status` is mandatory, because Codex ignores error frames without it. |
 
 Rules for answering a WebSocket upgrade:
-- quota-baton MUST NOT itself answer an upgrade with 426. Codex treats 426 as a permanent switch of that session to HTTP.
+- A locally capacity-blocked upgrade receives 426 after its bounded own-slot wait (R13.G/R13.H). Codex switches that session to HTTP; preserve the account binding. Other upgrade errors keep their existing classification.
 - An upgrade answered with 429 `usage_limit_reached`, or with 400, is terminal for Codex (`responses_websocket.rs:559-571`, `api_bridge.rs:175-206`).
 - A 502 is retryable and consumes one of Codex's 5 retries.
 
@@ -510,12 +510,11 @@ Saved routing anchors remain source authority when a binding image is absent
 or stale. An unavailable detector state is conservative placement protection,
 not positive outside-use attribution or an authentication failure.
 
-A session at its account's learned WebSocket capacity first waits for its own
-slot within the original upgrade deadline. A spill pays the ordinary D20
-placement charge and weak-evidence cap. Only one spilled session may land on
-each destination until fresh post-spill usage evidence arrives for its tracked
-windows. Cached values, reset timestamps and incomplete coverage do not reopen
-that spill allowance. A freshly reset destination still has weak evidence.
+A bound session at its account's learned WebSocket capacity first waits briefly
+for its own slot within the original upgrade deadline, then receives 426 for
+same-account HTTP fallback. Capacity never authorizes a binding move. New
+sessions retain ordinary D20/D30 placement and weak-evidence protection. A
+freshly reset destination still has weak evidence.
 
 ## C8. Session keys and the allowed body peek
 
