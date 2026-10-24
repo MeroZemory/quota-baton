@@ -164,13 +164,13 @@ async fn set_pin(
     state
         .pins
         .set(account.provider, request.session_key, request.account_id);
-    Json(serde_json::json!({"ok":true})).into_response()
+    Json(qb_proto::admin_control::DebugPinReply { ok: true }).into_response()
 }
 
-async fn clear_pin(State(state): State<PinState>) -> Json<serde_json::Value> {
+async fn clear_pin(State(state): State<PinState>) -> Json<qb_proto::admin_control::DebugPinReply> {
     state.pins.clear();
     tracing::warn!("Phase 0 account pins cleared");
-    Json(serde_json::json!({"ok":true}))
+    Json(qb_proto::admin_control::DebugPinReply { ok: true })
 }
 
 #[cfg(test)]

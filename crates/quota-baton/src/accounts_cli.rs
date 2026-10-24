@@ -645,6 +645,25 @@ fn adoption_error(error: qb_core::accounts::adopt::AdoptError) -> anyhow::Error 
     })
 }
 
+// Deserialize original successful bytes before any Value normalization.
+// Error statuses retain the existing allowlisted account error behavior.
+async fn adoption_response(
+    response: reqwest::Response,
+) -> anyhow::Result<qb_core::accounts::adopt::AdoptResult> {
+    if !response.status().is_success() {
+        account_response(response).await?;
+        return Err(account_error(
+            "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요.",
+        ));
+    }
+    let bytes = response.bytes().await?;
+    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(account_error("소유권 이전 응답 형식이 올바르지 않습니다."));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| account_error("소유권 이전 응답 형식이 올바르지 않습니다."))
+}
+
 async fn adopt_accounts(
     home: &Path,
     config: &Config,
@@ -678,7 +697,9 @@ async fn adopt_accounts(
     };
     println_utf8!("계정 ID\t결과\t토큰 출처\t만료 시각");
     for id in ids {
-        let result = if let Some((client, base, token)) = &admin {
+        let result: qb_core::accounts::adopt::AdoptResult = if let Some((client, base, token)) =
+            &admin
+        {
             let state = account_response(
                 admin_route_response(
                     client
@@ -700,7 +721,7 @@ async fn adopt_accounts(
                 .ok_or_else(|| {
                     account_error("계정을 찾을 수 없거나 코어가 소유권 이전을 지원하지 않습니다.")
                 })?;
-            account_response(
+            adoption_response(
                 admin_route_response(
                     client
                         .post(format!("{base}/accounts/{id}/adopt"))
@@ -723,52 +744,50 @@ async fn adopt_accounts(
             let store = local.as_ref().expect("local lease").clone();
             let from = from.clone();
             let account_id = id.clone();
-            serde_json::to_value(
-                tokio::task::spawn_blocking(move || {
-                    let account = store
-                        .load(&account_id)
-                        .map_err(qb_core::accounts::adopt::AdoptError::from)?;
-                    qb_core::accounts::adopt::run(
-                        &store,
-                        &account_id,
-                        AdoptRequest {
-                            from,
-                            expected_generation: account.generation,
-                        },
-                    )
-                })
-                .await?
-                .map_err(adoption_error)?,
-            )?
+            tokio::task::spawn_blocking(move || {
+                let account = store
+                    .load(&account_id)
+                    .map_err(qb_core::accounts::adopt::AdoptError::from)?;
+                qb_core::accounts::adopt::run(
+                    &store,
+                    &account_id,
+                    AdoptRequest {
+                        from,
+                        expected_generation: account.generation,
+                    },
+                )
+            })
+            .await?
+            .map_err(adoption_error)?
         };
-        let origin = match result["from"].as_str() {
-            Some("cpa_file") => "CPA 파일",
-            Some("backup") => "백업",
+        let origin = match result.from.as_str() {
+            "cpa_file" => "CPA 파일",
+            "backup" => "백업",
             _ => "저장된 토큰",
         };
         println_utf8!(
             "{}\t직접 갱신으로 전환\t{}\t{}",
             id,
             origin,
-            cell(&result["token_expires_at"])
+            cell(&serde_json::to_value(result.token_expires_at)?)
         );
-        for warning in result["warnings"].as_array().into_iter().flatten() {
-            let message = match warning.as_str() {
-                Some("cpa_file_missing") => "CPA 파일이 없어 다른 자료를 사용했습니다.",
-                Some("cpa_file_unreadable") => {
+        for warning in result.warnings {
+            use qb_proto::admin_adopt::AdoptWarning;
+            let message = match warning {
+                AdoptWarning::CpaFileMissing => "CPA 파일이 없어 다른 자료를 사용했습니다.",
+                AdoptWarning::CpaFileUnreadable => {
                     "읽을 수 없는 CPA 파일이 있어 다른 자료를 사용했습니다."
                 }
-                Some("backup_missing" | "backup_unreadable") => {
+                AdoptWarning::BackupMissing | AdoptWarning::BackupUnreadable => {
                     "백업을 읽을 수 없어 저장된 자료를 사용했습니다."
                 }
-                Some("older_or_unordered_candidate_ignored") => {
+                AdoptWarning::OlderOrUnorderedCandidateIgnored => {
                     "오래되었거나 시각을 비교할 수 없는 토큰은 사용하지 않았습니다."
                 }
-                Some("email_updated") => "같은 계정의 이메일 표시를 갱신했습니다.",
-                Some("stored_tokens_may_need_relogin") => {
+                AdoptWarning::EmailUpdated => "같은 계정의 이메일 표시를 갱신했습니다.",
+                AdoptWarning::StoredTokensMayNeedRelogin => {
                     "저장된 토큰의 만료 또는 불확실 상태를 확인해 주세요."
                 }
-                _ => continue,
             };
             println_utf8!("계정 {}: {}", id, message);
         }
@@ -2444,5 +2463,44 @@ mod r15_pool_warning_transport_tests {
         // /state does not adopt the separate SSE quota_notice schema.
         let raw = r#"{"accounts":[],"warnings":[{"kind":"quota_notice","account":"a"}]}"#;
         assert!(decode_cli_account_state(raw.as_bytes()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r15_adoption_contract_tests {
+    #[tokio::test]
+    async fn cli_adoption_reader_preserves_the_entire_shared_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let raw = br#"{"id":"sample-acct","generation":2,"from":"store","token_expires_at":null,"last_refresh_at":null,"warnings":["stored_tokens_may_need_relogin"]}"#;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let byte = socket.read_u8().await.unwrap();
+                request.push(byte);
+                assert!(request.len() < 8192);
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                raw.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(raw).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}"))
+            .send()
+            .await
+            .unwrap();
+        let reply = super::adoption_response(response).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(serde_json::to_vec(&reply).unwrap(), raw);
     }
 }

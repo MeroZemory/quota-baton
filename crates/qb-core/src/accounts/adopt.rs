@@ -39,28 +39,9 @@ pub struct AdoptRequest {
     pub expected_generation: u64,
 }
 
-/// Codes only: never paths, file contents, tokens, or parser error strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdoptWarning {
-    CpaFileMissing,
-    CpaFileUnreadable,
-    BackupMissing,
-    BackupUnreadable,
-    OlderOrUnorderedCandidateIgnored,
-    EmailUpdated,
-    StoredTokensMayNeedRelogin,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct AdoptResult {
-    pub id: String,
-    pub generation: u64,
-    pub from: String,
-    pub token_expires_at: Option<DateTime<Utc>>,
-    pub last_refresh_at: Option<DateTime<Utc>>,
-    pub warnings: Vec<AdoptWarning>,
-}
+/// Shared current response leaves; storage and adoption policy remain local.
+pub use qb_proto::admin_adopt::AdoptWarning;
+pub type AdoptResult = qb_proto::admin_adopt::AdoptReply<DateTime<Utc>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdoptError {

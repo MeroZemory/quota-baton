@@ -1403,7 +1403,11 @@ async fn r2a_adoption_admin_enforces_c2_generation_and_metadata_contract() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let result: Value = response.json().await.unwrap();
+        let body = response.bytes().await.unwrap();
+        let shared: qb_proto::admin_adopt::AdoptReply<chrono::DateTime<chrono::Utc>> =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(serde_json::to_vec(&shared).unwrap(), body.as_ref());
+        let result = serde_json::to_value(shared).unwrap();
         assert_eq!(result["id"], h.id);
         assert_eq!(result["generation"], before.generation + 1);
         assert_eq!(result["from"], "store");

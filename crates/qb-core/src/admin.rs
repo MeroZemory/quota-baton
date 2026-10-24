@@ -426,10 +426,13 @@ async fn lifecycle_drain(
         )
         .await
         {
-            Ok(()) => Json(serde_json::json!({
-                "bindings": bindings.get("bindings").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "lease_released": true
-            }))
+            Ok(()) => Json(qb_proto::admin_control::LifecycleReply {
+                bindings: bindings
+                    .get("bindings")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                lease_released: true,
+            })
             .into_response(),
             Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "Lease handover timed out"),
         },
