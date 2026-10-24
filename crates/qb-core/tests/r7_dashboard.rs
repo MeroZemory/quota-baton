@@ -122,6 +122,10 @@ impl Harness {
             let shared: qb_proto::admin_sessions::SessionsView =
                 serde_json::from_slice(&bytes).unwrap();
             assert_eq!(serde_json::to_value(shared).unwrap(), value);
+        } else if path.starts_with("sessions/") {
+            let shared: qb_proto::admin_session_detail::SessionDetail =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_value(shared).unwrap(), value);
         }
         value
     }
@@ -429,6 +433,12 @@ async fn r7_http_authenticated_views_strip_private_label_and_preserve_upstream_b
     assert_eq!(detail["label"]["text"], LABEL);
     assert_eq!(detail["model"], "header-model");
     assert_eq!(detail["client"]["kind"], "codex_cli");
+    assert_eq!(detail["id"], Harness::id());
+    assert!(detail["label"]["best_effort"].is_boolean());
+    assert_eq!(detail["recent_requests"].as_array().unwrap().len(), 1);
+    assert!(detail["timeline"].is_array());
+    assert!(detail["recent_requests_known"].is_boolean());
+    assert!(detail["timeline_known"].is_boolean());
     let list = h.get("sessions?range=all").await;
     assert_eq!(
         list["sessions"][0]["label"]["best_effort"],

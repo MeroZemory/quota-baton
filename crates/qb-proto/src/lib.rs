@@ -4,6 +4,7 @@ pub mod admin_account;
 pub mod admin_launch;
 pub mod admin_login;
 pub mod admin_pool;
+pub mod admin_session_detail;
 pub mod admin_sessions;
 pub mod admin_state;
 pub use admin_account::AdminAccount;
