@@ -1436,8 +1436,18 @@ async fn login_interaction(
                 }
             } => {
                 input = None;
-                let line = line.map_err(|_| anyhow::anyhow!("로그인 입력을 읽지 못했습니다."))??;
-                if device || offer_paste {
+                let line = line.map_err(|_| anyhow::anyhow!("로그인 입력을 읽지 못했습니다."))?;
+                let eof = line.as_ref().err().is_some_and(|error| {
+                    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                        error.kind() == std::io::ErrorKind::UnexpectedEof
+                    })
+                });
+                let line = if eof {
+                    zeroize::Zeroizing::new(String::new())
+                } else {
+                    line?
+                };
+                if eof || device || offer_paste {
                     anyhow::ensure!(line.is_empty(), "붙여넣기 로그인으로 전환하려면 먼저 Enter를 누르세요.");
                     if let Some(id) = active_id.as_deref() {
                         let terminal = tokio::select! {
@@ -1462,6 +1472,11 @@ async fn login_interaction(
                             LoginState::Cancelled | LoginState::Expired => *active_id = None,
                             _ => anyhow::bail!("기존 로그인 종료를 확인하지 못했습니다. 다시 시작해 주세요."),
                         }
+                    }
+                    if eof {
+                        return Err(account_error(
+                            "로그인 코드를 입력하지 않았습니다. 계정 정보는 변경하지 않았습니다.",
+                        ));
                     }
                     device = false;
                     offer_paste = false;
@@ -1603,10 +1618,14 @@ fn read_login_line(
     use std::io::BufRead;
     let mut input = zeroize::Zeroizing::new(Vec::with_capacity(8193));
     reader.take(8193).read_until(b'\n', &mut input)?;
-    anyhow::ensure!(
-        !input.is_empty() && input.len() <= 8192,
-        "로그인 입력 길이를 확인해 주세요."
-    );
+    if input.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "로그인 입력이 끝났습니다.",
+        )
+        .into());
+    }
+    anyhow::ensure!(input.len() <= 8192, "로그인 입력 길이를 확인해 주세요.");
     let value =
         std::str::from_utf8(&input).map_err(|_| anyhow::anyhow!("로그인 입력을 확인해 주세요."))?;
     let value = zeroize::Zeroizing::new(value.trim_end_matches(['\r', '\n']).to_owned());

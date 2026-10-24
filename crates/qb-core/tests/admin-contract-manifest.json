@@ -1228,7 +1228,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 207,
+        "line": 210,
         "rule": "admin-json",
         "snippet": "json!({\"account\":a.id,\"forecast\":self.observability.forecast_view(&a.id,\r\n                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})",
         "field": "",
@@ -1242,7 +1242,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 1934,
+        "line": 1937,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\"type\": kind, \"message\": message}})",
         "field": "",
