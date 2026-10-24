@@ -182,17 +182,32 @@ quota-baton accounts login claude --no-browser
 quota-baton accounts login codex --no-browser
 ```
 
-Open the printed authorization URL on a computer with a browser. For Claude,
-paste the displayed authorization code (including its state suffix) into the
-waiting CLI. For Codex, copy the final `http://localhost:1455/auth/callback?...`
-address from the browser address bar, even if that local page cannot connect,
-and paste it into the waiting CLI. The headless core does not need a callback
-listener for either paste flow. Treat the code and final redirect URL as secrets;
-do not put them into shell commands, tickets or logs.
+Codex defaults to device-code login: open the printed verification URL on a
+computer with a browser and enter the displayed user code. The core polls at the
+server's interval and shows the remaining expiry, at most fifteen minutes. It
+does not automatically request another code after expiry or a rate limit.
 
-Each login expires after ten minutes and accepts one submission. State and PKCE
-checks are shared with the browser flow. Invalid or reused input requires a new
-login. Ctrl+C cancels the pending login and releases its account-store lease.
+If device-code login is unavailable, enable it in your personal ChatGPT Security
+settings, or ask your workspace admin to allow it. You can press Enter while
+waiting to switch immediately to paste-redirect login; unavailable or rate-limited
+starts also offer this fallback. The old login is cancelled and checked first.
+If it completed just before cancellation, the CLI reports success instead of
+starting another login.
+
+For the Codex paste fallback, open its authorization URL and copy the final
+`http://localhost:1455/auth/callback?...` address from the browser address bar,
+even if that local page cannot connect, then paste it into the waiting CLI.
+Claude continues to use its authorization URL and displayed code (including the
+state suffix). Neither paste flow needs a callback listener on the headless core.
+Treat pasted codes and final redirect URLs as secrets; do not put them into shell
+commands, tickets or logs. The device user code is displayed only for this login;
+access and refresh tokens are never printed.
+
+Each paste login expires after ten minutes and accepts one submission. State and
+PKCE checks are shared with the browser flow. Invalid or reused input requires a
+new login. An explicitly requested paste fallback gets a new ten-minute budget;
+device polling never extends the device code's expiry. Ctrl+C cancels the pending
+login and releases a standalone CLI's account-store lease.
 The usual login without `--no-browser` retains the browser and loopback callback
 flow.
 

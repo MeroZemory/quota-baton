@@ -5,14 +5,14 @@ use qb_testkit::{ScriptedResponse, ScriptedUpstream};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-struct Fixture {
-    service: LoginService,
-    fake: ScriptedUpstream,
+pub(super) struct Fixture {
+    pub(super) service: LoginService,
+    pub(super) fake: ScriptedUpstream,
     _home: tempfile::TempDir,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -45,7 +45,7 @@ impl Fixture {
         }
     }
 
-    fn params(&self, provider: Provider) -> Parameters {
+    pub(super) fn params(&self, provider: Provider) -> Parameters {
         let mut params = Parameters::new(provider);
         params.authorize = format!("{}/authorize", self.fake.url);
         params.token = format!("{}/token", self.fake.url);
@@ -53,7 +53,7 @@ impl Fixture {
         params
     }
 
-    fn script_success(&self, provider: Provider) {
+    pub(super) fn script_success(&self, provider: Provider) {
         let claims = json!({"email":"manual@example.invalid", "https://api.openai.com/auth": {
             "chatgpt_account_id":"synthetic-manual-account", "chatgpt_user_id":"synthetic-manual-user"
         }});
@@ -97,7 +97,7 @@ fn paste(start: &LoginStart, provider: Provider, state: &str) -> String {
     }
 }
 
-async fn terminal(service: &LoginService, id: &str) -> LoginStatus {
+pub(super) async fn terminal(service: &LoginService, id: &str) -> LoginStatus {
     let mut status = service.session(id).unwrap().status.subscribe();
     tokio::time::timeout(Duration::from_secs(5), async {
         while status.borrow().status == LoginState::Pending {
@@ -389,6 +389,20 @@ async fn manual_expiry_during_exchange_never_saves_or_reexchanges() {
             .start_parameters(fixture.params(provider), false, true)
             .await
             .unwrap();
+        // Consume599s awaiting input, before HTTP/exchange timeouts start.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(599)).await;
+        tokio::time::resume();
+        assert_eq!(
+            fixture
+                .service
+                .status(&start.login_id)
+                .await
+                .unwrap()
+                .status,
+            LoginState::Pending
+        );
+        assert!(fixture.fake.state.requests().is_empty());
         let input = paste(&start, provider, &auth_field(&start, "state"));
         fixture
             .service
@@ -399,9 +413,20 @@ async fn manual_expiry_during_exchange_never_saves_or_reexchanges() {
             .await
             .unwrap()
             .unwrap();
-        // Pause only after actual local I/O reached the gated fake exchange.
+        // Actual token request remains held. Cross login expiry without
+        // crossing the request's5s / exchange's30s timeout.
+        assert_eq!(fixture.fake.state.requests().len(), 1);
+        assert_eq!(
+            fixture
+                .service
+                .status(&start.login_id)
+                .await
+                .unwrap()
+                .status,
+            LoginState::Pending
+        );
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
         assert_eq!(
             terminal(&fixture.service, &start.login_id).await.status,
             LoginState::Expired

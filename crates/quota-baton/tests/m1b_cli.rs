@@ -9,6 +9,207 @@ use std::{
 
 const SECRET: &str = "synthetic-provider-code-and-token-never-print";
 
+fn device_start(expires_in: u64) -> Reply {
+    Reply {
+        method: "POST",
+        path: "/admin/v1/accounts/login",
+        status: "200 OK",
+        body: serde_json::json!({"login_id":"synthetic-login",
+            "auth_url":"https://auth.openai.com/codex/device",
+            "device":{"verification_url":"https://auth.openai.com/codex/device",
+                "user_code":"ABCD-EFGH","expires_in":expires_in}}),
+        request: Some(
+            serde_json::json!({"provider":"codex","replace_linked":false,"no_browser":true}),
+        ),
+    }
+}
+
+fn device_pending() -> Reply {
+    Reply {
+        method: "GET",
+        path: "/admin/v1/accounts/login/synthetic-login",
+        status: "200 OK",
+        body: serde_json::json!({"status":"pending"}),
+        request: None,
+    }
+}
+
+fn paste_replies() -> Vec<Reply> {
+    vec![
+        Reply {
+            method: "POST",
+            path: "/admin/v1/accounts/login",
+            status: "200 OK",
+            body: serde_json::json!({"login_id":"synthetic-paste","auth_url":"https://auth.openai.com/oauth/authorize"}),
+            request: Some(
+                serde_json::json!({"provider":"codex","replace_linked":false,"no_browser":true,"paste_redirect":true}),
+            ),
+        },
+        Reply {
+            method: "POST",
+            path: "/admin/v1/accounts/login/synthetic-paste/submit",
+            status: "200 OK",
+            body: serde_json::json!({"status":"pending"}),
+            request: Some(
+                serde_json::json!({"input":format!("http://localhost:1455/auth/callback?code={SECRET}&state=synthetic")}),
+            ),
+        },
+        Reply {
+            method: "GET",
+            path: "/admin/v1/accounts/login/synthetic-paste",
+            status: "200 OK",
+            body: serde_json::json!({"status":"pending"}),
+            request: None,
+        },
+        Reply {
+            method: "GET",
+            path: "/admin/v1/accounts/login/synthetic-paste",
+            status: "200 OK",
+            body: serde_json::json!({"status":"completed","account_id":SECRET}),
+            request: None,
+        },
+    ]
+}
+
+#[test]
+fn device_enter_cancels_checks_terminal_then_starts_one_paste_with_retained_input() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let home = fixture(listener.local_addr().unwrap().port());
+    let mut replies = vec![
+        health("200 OK", true),
+        device_start(900),
+        device_pending(),
+        cancel(),
+        Reply {
+            method: "GET",
+            path: "/admin/v1/accounts/login/synthetic-login",
+            status: "200 OK",
+            body: serde_json::json!({"status":"cancelled"}),
+            request: None,
+        },
+    ];
+    replies.extend(paste_replies());
+    let server = serve_manual(listener, replies);
+    let input = format!("\nhttp://localhost:1455/auth/callback?code={SECRET}&state=synthetic\n");
+    let result = output_with_stdin(
+        command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
+        Some(input.as_bytes()),
+        false,
+    );
+    server.join().unwrap();
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert_eq!(stdout.matches("ABCD-EFGH").count(), 1);
+    assert!(stdout.contains("ChatGPT Security"));
+    assert!(stdout.contains("workspace admin"));
+    assert!(stdout.contains("로그인을 완료했습니다"));
+    no_secrets(&result);
+}
+
+#[test]
+fn completed_device_cancel_race_never_starts_paste() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let home = fixture(listener.local_addr().unwrap().port());
+    let server = serve_manual(
+        listener,
+        vec![
+            health("200 OK", true),
+            device_start(900),
+            device_pending(),
+            cancel(),
+            Reply {
+                method: "GET",
+                path: "/admin/v1/accounts/login/synthetic-login",
+                status: "200 OK",
+                body: serde_json::json!({"status":"completed","account_id":SECRET}),
+                request: None,
+            },
+        ],
+    );
+    let result = output_with_stdin(
+        command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
+        Some(b"\n"),
+        false,
+    );
+    server.join().unwrap();
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("로그인을 완료했습니다"));
+    assert!(!stdout.contains("/oauth/authorize"));
+    no_secrets(&result);
+}
+
+#[test]
+fn fixed_device_start_errors_offer_one_explicit_paste_without_code_retry() {
+    use qb_core::oauth::LoginError;
+    for error in [LoginError::DeviceUnavailable, LoginError::DeviceRateLimited] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let home = fixture(listener.local_addr().unwrap().port());
+        let mut replies = vec![
+            health("200 OK", true),
+            Reply {
+                method: "POST",
+                path: "/admin/v1/accounts/login",
+                status: "400 Bad Request",
+                body: serde_json::json!({"error":{"message":error.to_string()}}),
+                request: Some(
+                    serde_json::json!({"provider":"codex","replace_linked":false,"no_browser":true}),
+                ),
+            },
+        ];
+        replies.extend(paste_replies());
+        let server = serve_manual(listener, replies);
+        let input =
+            format!("\nhttp://localhost:1455/auth/callback?code={SECRET}&state=synthetic\n");
+        let result = output_with_stdin(
+            command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
+            Some(input.as_bytes()),
+            false,
+        );
+        server.join().unwrap();
+        assert!(result.status.success());
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("Enter"));
+        if matches!(error, LoginError::DeviceUnavailable) {
+            assert!(stdout.contains("ChatGPT Security"));
+            assert!(stdout.contains("workspace admin"));
+        } else {
+            assert!(stdout.contains("자동 요청하지 않습니다"));
+        }
+        no_secrets(&result);
+    }
+}
+
+#[test]
+fn device_deadline_expires_without_requesting_another_code() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let home = fixture(listener.local_addr().unwrap().port());
+    let server = serve_manual(
+        listener,
+        vec![
+            health("200 OK", true),
+            device_start(1),
+            device_pending(),
+            cancel(),
+        ],
+    );
+    let result = output_with_stdin(
+        command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
+        None,
+        true,
+    );
+    server.join().unwrap();
+    assert!(!result.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(combined.contains("만료"));
+    assert_eq!(combined.matches("ABCD-EFGH").count(), 1);
+    no_secrets(&result);
+}
+
 #[cfg(windows)]
 #[path = "m1b_cli/windows.rs"]
 mod platform;
@@ -218,14 +419,28 @@ fn serve_replies(
                 );
             }
             let body = reply.body.to_string();
-            write!(stream, "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                reply.status, body.len(), body).unwrap();
+            let written = write!(
+                stream,
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.status,
+                body.len(),
+                body
+            );
+            if manual && reply.method == "GET" && written.is_err() {
+                // Enter may also cancel a status request after its headers
+                // arrived. Keep its response available for the next poll.
+                continue 'requests;
+            }
+            written.unwrap();
             if !keep_pending {
                 let cancelled = reply.path.ends_with("/cancel");
+                let cancelled_path = reply.path.strip_suffix("/cancel");
                 replies.remove(index);
                 if manual && cancelled {
                     replies.retain(|reply| {
-                        !(reply.method == "GET" && reply.body["status"] == "pending")
+                        !(reply.method == "GET"
+                            && reply.body["status"] == "pending"
+                            && Some(reply.path) == cancelled_path)
                     });
                 }
             }
