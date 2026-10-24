@@ -87,7 +87,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |
 | R16.5 | 완료: 7cab418 잔여량 이력 유지·소진0·리셋100·한영 결과 문구. 집중466·strict lint·실제 core/AdminClient/tray10HWND·export2PNG 확인. 19353ac 설치 수용(06:58)·takeover 거절0/1,920; 다음 N5a |
 | R14.2 | 완료(N6 최소): 기본 꺼짐·schema3·bounded 7일 보존·off switch·실제 합성 HTTP/종료 집중 관문. 초기 cut/전체 owner/실제24시간 replay는 N6t/N6r 별도; 128 MiB 기록 활성화. 설치 동결 해제: 여러 epoch의 24시간 export 허용, epoch별 초기 상태·loss manifest로 각각 재생한 뒤 합산; 단일 epoch를 기다리지 않음 |
-| R13.H | 긴급 진행: bound WS 용량 제한은 같은 계정 HTTP 426 경로, 새 출발 계정 소진 후 유일한 복귀처에 한정된 복귀 예외·이동 예산 보존. 집중 관문 후 dev 병합, 설치는 S2 |
+| R13.H | 집중 관문 완료·dev 병합 인계: bound WS 용량 제한은 같은 계정 HTTP 426 경로, 새 출발 계정 소진 후 유일한 복귀처에 한정된 복귀 예외·이동 예산 보존. 집중 관문 후 dev 병합, 설치는 S2 |
 | R15 | 보존·일시 중단(N8): 공유 admin 응답·실제 transport·정적 guard 진행분은 impl/r15에 커밋. R13.H 관문 뒤 계정 오류 lint/manifest와 최종 행렬·실제 경로 캡처 재개. brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |

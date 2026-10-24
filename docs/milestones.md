@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13 Part F 기본 사실 관문 완료 · N8/R15 공유 계약 시작
-목표: CLI·tray·dashboard의 제공자 요약을 한 계산으로 맞추고 검증 없는 통합 잔여시간을 표시하지 않기
-핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); native 설치 수용·실제 보정 후속
+현재 마일스톤: R13.H 집중 관문 완료 · 설치 인계 후 N8/R15 재개
+목표: WS 연결 수 제한으로 계정을 이동하지 않고, 사용 불가 계정에서 유일한 복귀처로 안전하게 복구하기
+핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 숫자 통합 예측·실제 재생은 미수용
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 13:26 KST (기본 사실 관문 완료·원본 행렬 실패와 집중 복구 지문 보존; pooled 미표시)
+갱신: 2026-10-24 16:11 KST (R13.H 합성 실제 HTTP/WS 집중 관문·독립 소스 검토 완료; 설치 S2)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -240,6 +240,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 12:05 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5d-native 일반 release 실제 HTTP/WS·중지/입력 취소·정상 종료7/7 관문 완료; 설치 수용 전 |
 | 2026-10-24 12:42 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R13 F 기본 사실 공통화 bc2a34a 집중503·실제10HWND/2PNG 수용; 전체 관문 진행·미병합·미설치, pooled 실측 보정 미완 |
 | 2026-10-24 13:26 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | 제공자 기본 사실 관문 완료; 실제24시간 보정·pooled 숫자 미수용으로 출시 수 유지 |
+| 2026-10-24 16:11 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | 설계 세션의 N5d-native 12:10 설치 수용 반영; R13.H 집중 관문은 출시 수 변화 없음, pooled 숫자 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -467,14 +468,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 12:05 | N5d-native 일반 제품 최종 관문 | ownership39·entry13·하네스11·native7/7·strict lint·release/read-only/fmt0 | 동일 대화 reset 후1회 재개·중지/입력0재개·소유 프로세스/홈 정리 | f154b6a; n5d-ordinary-final-fingerprint.json. 원본 workspace 실패와 집중 복구 입력별 재사용, 새 전체 green 합계 아님 |
 | 2026-10-24 12:42 | R13 F 제공자 기본 사실 집중 관문 | core9·CLI6·tray477·DTO/layout11 = 503 통과; strict 세 범위·build/fmt/diff0, 실제 한영10HWND/2PNG | 공유 계산·사용 가능 수와 측정 비율 구분·크레딧 잔여시간 대상 명시 | bc2a34a; R13.F-evidence/focused-fingerprint.json. 독립 표시 결함2개 정확 red2→수정, Python 사전도구32통과는 합성만; 전체 행렬·숫자 예측 미수용 |
 | 2026-10-24 13:26 | R13 F 기본 사실 전체 관문·집중 복구 | 기본3310/1/19·전체3707/10/36 원본 보존; 단독 core1276/0/1·양 strict lint/build0 | launcher 기본·전체 각1, R9 단위2·복구20 통과 | bc2a34a·5f6d5f6; delivery-fingerprint.json. R9 dev 소스 동일, 병렬 실패 원인 미확정; 새 전체 green 합계 아님 |
+| 2026-10-24 16:11 | R13.H WS 용량·제한된 복귀 | 앞선 core1160·최종 core6/WS5·원본 WS148/1의 실패 기대 집중 복구·기본/전체 strict core lint·fmt/diff 통과 | 3세션 같은 계정 HTTP·유일 복귀·대안 선택·중복 예외 및 전역 예산 거부 | R13.H-evidence/delivery-fingerprint.json; 미사용 테스트 재수출 제거·실패 원본 보존·명시적 lease 종료, 전체 workspace/설치 미주장 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| C+E native 설치 | 일반 release native7/7 관문 완료·미설치 | 설계 세션 설치·실제 확인 | 병합 해시와 지원 버전/범위 인계 |
-| 제공자 통합 예측 | 기본 사실 공통화 관문 완료·실제12PNG 수용; pooled 미출시 | 실측 보정·실제24시간 백테스트 | 기본 사실 설치 인계; 실제 export 요청·N8 공유 계약 진행 |
-| 실제24시간 라우팅 재생 | 최소 기록·typed rebind 설치, 복원 초기 상태/adapter 미완 | epoch별 실제 초기 상태·loss·동일 router 대조 | N6r 생산자·읽기·복원 adapter 구현, export 근거 구분 |
+| R13.H 사용자 멈춤 수정 | 집중 관문 통과·미설치 | 설계 세션 실제 설치와 영향 세션 확인 | 병합 해시 인계·설치 S2 |
+| 공유 admin 계약 | R15 다수 transport/guard 단위 커밋·보존 | 오류 lint/manifest·최종 행렬·실제 경로 캡처 | impl/r15 보존점에서 재개 |
+| 통합 숫자 예측·실제 재생 | 기본 사실 설치, 실제 export 수령 | 실제24시간 보정·epoch별 복원 대조 | N7 백테스트와 N6r 생산자/reader/adapter |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
