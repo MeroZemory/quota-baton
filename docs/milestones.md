@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13.H 집중 관문 완료 · 설치 인계 후 N8/R15 재개
+현재 마일스톤: N8/R15 응답·정적 집중 통과, 전체 관문과 실제 화면 검증 중
 목표: WS 연결 수 제한으로 계정을 이동하지 않고, 사용 불가 계정에서 유일한 복귀처로 안전하게 복구하기
 핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 숫자 통합 예측·실제 재생은 미수용
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 16:11 KST (R13.H 합성 실제 HTTP/WS 집중 관문·독립 소스 검토 완료; 설치 S2)
+갱신: 2026-10-24 16:19 KST (오류 계약과 최종 정적 집중 통과; 전체 관문 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -485,13 +485,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 15:07 | R15 계약 정적 검사·CLI 원본 검증 | 실제 syn guard8·CLI4·all-feature strict lint/fmt/diff0 | 43파일·정확한97허용 목록; 새 JSON·필수필드 default 무단 추가 거부 | aeeefac; guard-cli-fingerprint.json; 후속 오류 타입 적용 후 재검사 |
 | 2026-10-24 15:10 | R15 실제 인수·사용량 반환값 보존 | proto 인수2·실제 r6 HTTP7·실제 AdminClient 계정1·all-feature strict lint/fmt/diff0 | 확인·실행·완료재실행의 실제 반환값과 원본응답 일치; Usage 원본 비교 보강 | 0e314a2; takeover-actual-fingerprint.json; 전체 관문 별도 |
 | 2026-10-24 16:11 | R13.H WS 용량·제한된 복귀 | 앞선 core1160·최종 core6/WS5·원본 WS148/1의 실패 기대 집중 복구·기본/전체 strict core lint·fmt/diff 통과 | 3세션 같은 계정 HTTP·유일 복귀·대안 선택·중복 예외 및 전역 예산 거부 | R13.H-evidence/delivery-fingerprint.json; 미사용 테스트 재수출 제거·실패 원본 보존·명시적 lease 종료, 전체 workspace/설치 미주장 |
+| 2026-10-24 16:19 | R15 계정 오류 응답 공유 계약 | proto·core·tray·CLI·실제 HTTP 오류·strict lint·syn guard 집중 통과 | code/outcome/message/retry_after 순서·생략·기존 분류 보존; 정확한7허용 제거·선택3필드 검토 | 7f419f5; account-errors-fingerprint.json; 전체 관문 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | R13.H 사용자 멈춤 수정 | 집중 관문 통과·미설치 | 설계 세션 실제 설치와 영향 세션 확인 | 병합 해시 인계·설치 S2 |
-| 공유 admin 계약 | R15 다수 transport/guard 단위 커밋·보존 | 오류 lint/manifest·최종 행렬·실제 경로 캡처 | impl/r15 보존점에서 재개 |
+| 공유 admin 계약 | R15 다수 transport/guard 단위 커밋·보존 | 오류 lint/manifest 통과·최종 행렬·실제 경로 캡처 | impl/r15 소스 고정 후 전체 관문 |
 | 통합 숫자 예측·실제 재생 | 기본 사실 설치, 실제 export 수령 | 실제24시간 보정·epoch별 복원 대조 | N7 백테스트와 N6r 생산자/reader/adapter |
 <!-- gaps:end -->
 
