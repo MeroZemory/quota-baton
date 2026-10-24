@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 
 /// Deliberately no Debug: even a thread identifier is private session metadata.
@@ -85,6 +85,10 @@ pub enum Event {
     Ready {
         episode: u64,
     },
+    /// The same registered episode awaits fresh evidence. Never a grant.
+    Pending {
+        episode: u64,
+    },
     Granted {
         episode: u64,
     },
@@ -119,9 +123,10 @@ impl Reply {
                 episode,
                 reset_unix_ms,
             } => self.request_id.is_some() && *episode != 0 && *reset_unix_ms > 0,
-            Event::Ready { episode } | Event::Granted { episode } | Event::Advanced { episode } => {
-                self.request_id.is_some() && *episode != 0
-            }
+            Event::Ready { episode }
+            | Event::Pending { episode }
+            | Event::Granted { episode }
+            | Event::Advanced { episode } => self.request_id.is_some() && *episode != 0,
             Event::Due { episode } | Event::Cancelled { episode } => *episode != 0,
             Event::Refused { .. } => self.request_id.is_some(),
         }

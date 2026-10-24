@@ -93,6 +93,7 @@ pub(crate) enum Observation {
 
 pub(crate) enum Inspection {
     Ready,
+    Pending,
     Refused(#[allow(dead_code)] Refusal),
 }
 
@@ -332,6 +333,7 @@ impl Correlation {
             (Kind::Observe, Event::Waiting { episode, .. }) => self.bind_episode(*episode)?,
             (Kind::Observe, Event::Due { episode }) => self.record_due(*episode)?,
             (Kind::Inspect(expected), Event::Ready { episode })
+            | (Kind::Inspect(expected), Event::Pending { episode })
             | (Kind::Cancel(expected), Event::Cancelled { episode })
                 if expected == *episode => {}
             (Kind::Consume(episode), Event::Granted { .. }) if reply.grants(id, episode) => {
@@ -483,6 +485,7 @@ impl CoreControl {
             .event
         {
             Event::Ready { .. } => Ok(Inspection::Ready),
+            Event::Pending { .. } => Ok(Inspection::Pending),
             Event::Refused { reason } => Ok(Inspection::Refused(reason)),
             _ => unreachable!("correlation validates inspect event"),
         }
@@ -686,6 +689,7 @@ mod tests {
     fn pure_correlation_never_grants_on_ready_wrong_request_or_wrong_episode() {
         for (id, event) in [
             (2, Event::Ready { episode: 7 }),
+            (2, Event::Pending { episode: 7 }),
             (1, Event::Granted { episode: 7 }),
             (2, Event::Granted { episode: 8 }),
         ] {

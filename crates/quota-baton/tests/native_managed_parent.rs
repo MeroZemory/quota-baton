@@ -1936,3 +1936,43 @@ async fn managed_missing_stop_read_reply_times_out_without_retry_and_keeps_ui() 
         drop(run);proof.cleaned(false);
     }).await;
 }
+
+#[tokio::test]
+async fn managed_pending_keeps_original_ticket_without_final_get_then_resumes_once() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("Pending ended ordinary run"); }
+            () = async {
+                stopped_dialogue(&mut ui, &proof).await;
+                waiting(&mut core).await;
+                core_reply(&mut core, None, Event::Due { episode: EPISODE }).await;
+                let first = core_request(&mut core).await;
+                assert!(matches!(first.command, Command::Inspect { episode: EPISODE }));
+                core_reply(&mut core, Some(first.request_id), Event::Pending { episode: EPISODE }).await;
+                // No new evidence: neither a native final read nor another core
+                // inspection may occur. The original stop read is already done.
+                assert!(timeout(Duration::from_millis(40), core.next()).await.is_err());
+                let frames = proof.state.lock().unwrap().input.clone();
+                assert!(!frames.split(|b| *b == b'\n')
+                    .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+                    .any(|frame| frame["id"] == format!("{PREFIX}1")));
+                assert_eq!(proof.automatic_count(), 0);
+                ready(&mut core, &proof).await;
+                final_native_reply(&proof);
+                let consume = core_request(&mut core).await;
+                assert!(matches!(consume.command, Command::Consume { episode: EPISODE }));
+                core_reply(&mut core, Some(consume.request_id), Event::Granted { episode: EPISODE }).await;
+                let command = proof.wait_native_frame(&json!(format!("{PREFIX}2"))).await;
+                assert_eq!(command["params"]["origin"], "automatic");
+                assert_eq!(proof.automatic_count(), 1);
+                ordinary_still_live(&mut ui, &proof, 98).await;
+            } => {}
+        }
+        drop(run);
+        proof.cleaned(false);
+    }).await;
+}

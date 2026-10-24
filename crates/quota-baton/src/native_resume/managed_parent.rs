@@ -1322,7 +1322,14 @@ fn dispatch_loop<N: Write, U: Write>(
                     episode,
                     ready: matches!(inspected, Ok(Inspection::Ready)),
                 });
-                if matches!(inspected, Ok(Inspection::Ready)) && shared.enter_physical(deadline) {
+                if matches!(inspected, Ok(Inspection::Pending)) {
+                    // Retain the original stopped ticket and ingress checkpoint.
+                    // Only a later evidence-driven Due can trigger another Inspect;
+                    // Pending never performs a native goal read or resume write.
+                    phase = AutoPhase::Waiting { ticket, episode };
+                } else if matches!(inspected, Ok(Inspection::Ready))
+                    && shared.enter_physical(deadline)
+                {
                     let result = parent.begin_final_read(ticket);
                     if result
                         == Err(parent_dispatch::Error::Dispatch(

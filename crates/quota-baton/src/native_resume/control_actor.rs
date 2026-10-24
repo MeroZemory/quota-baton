@@ -11,7 +11,8 @@
 //! next_due is polled continuously after Waiting: ONLY an actor command, actor
 //! shutdown, hint receiver loss or that lifetime deadline can interrupt it.
 //! Ordinary UI/native ingress must NOT be sent as actor commands. Early Inspect
-//! or Consume terminates the episode; no inspect retry after refusal is supported.
+//! or Consume terminates the episode. Only typed Pending preserves the same
+//! episode for a later evidence-driven Due; a refusal remains terminal.
 //!
 //! run spawns nothing. Outer parent retains/aborts/joins its task and both jobs.
 //! Drop of run closes control, including a polled operation. Like CoreControl,
@@ -443,61 +444,72 @@ async fn episode(
         }
     };
     reply.send(Ok(observed)).map_err(|_| Error::ReplyLost)?;
-    if waiting {
-        let due = tokio::select! {
-            biased;
-            _ = io.shutdown.cancelled() => Err(Interrupted::Error(Error::Cancelled)),
-            _ = io.hints.closed() => Err(Interrupted::Error(Error::HintLost)),
-            next = io.commands.recv() => Err(Interrupted::Command(next)),
-            result = async {
-                match lifetime {
-                    Some(lifetime) => control.next_due(lifetime).await,
-                    None => control.next_due_until_cancelled().await,
-                }
-            } => result.map_err(|error| Interrupted::Error(Error::Core(error))),
-        };
-        match due {
-            Ok(due) if due == episode => {}
-            Ok(_) => return Err(Error::Phase),
-            Err(error) => return Err(terminate(control, error)),
-        }
-    }
-    emit_due(io, episode)?;
-
-    let inspect_deadline = bounded_deadline(Instant::now() + COMMAND_LIMIT, lifetime);
-    let inspect = match command(io, Some(inspect_deadline)).await {
-        Ok(command) => command,
-        Err(error) => return Err(terminate(control, error)),
-    };
-    let Command::Inspect {
-        episode: expected,
-        deadline,
-        mut reply,
-    } = inspect
-    else {
-        return Err(terminate(control, Interrupted::Command(Some(inspect))));
-    };
-    if expected != episode {
-        reply.send(Err(Error::Phase)).ok();
-        return Err(Error::Phase);
-    }
-    let deadline = bounded_deadline(deadline, lifetime);
-    let inspected =
-        match exchange(control.inspect(episode, deadline), &mut reply, io, deadline).await {
-            Ok(result) => result,
-            Err(error) => {
-                let error = terminate(control, error);
-                let _ = reply.send(Err(error));
-                return Err(error);
+    let mut waiting = waiting;
+    loop {
+        if waiting {
+            let due = tokio::select! {
+                biased;
+                _ = io.shutdown.cancelled() => Err(Interrupted::Error(Error::Cancelled)),
+                _ = io.hints.closed() => Err(Interrupted::Error(Error::HintLost)),
+                next = io.commands.recv() => Err(Interrupted::Command(next)),
+                result = async {
+                    match lifetime {
+                        Some(lifetime) => control.next_due(lifetime).await,
+                        None => control.next_due_until_cancelled().await,
+                    }
+                } => result.map_err(|error| Interrupted::Error(Error::Core(error))),
+            };
+            match due {
+                Ok(due) if due == episode => {}
+                Ok(_) => return Err(Error::Phase),
+                Err(error) => return Err(terminate(control, error)),
             }
+        }
+        emit_due(io, episode)?;
+
+        let inspect_deadline = bounded_deadline(Instant::now() + COMMAND_LIMIT, lifetime);
+        let inspect = match command(io, Some(inspect_deadline)).await {
+            Ok(command) => command,
+            Err(error) => return Err(terminate(control, error)),
         };
-    let ready = matches!(inspected, Inspection::Ready);
-    if !ready {
-        control.close();
-    }
-    reply.send(Ok(inspected)).map_err(|_| Error::ReplyLost)?;
-    if !ready {
-        return Err(Error::Refused);
+        let Command::Inspect {
+            episode: expected,
+            deadline,
+            mut reply,
+        } = inspect
+        else {
+            return Err(terminate(control, Interrupted::Command(Some(inspect))));
+        };
+        if expected != episode {
+            reply.send(Err(Error::Phase)).ok();
+            return Err(Error::Phase);
+        }
+        let deadline = bounded_deadline(deadline, lifetime);
+        let inspected =
+            match exchange(control.inspect(episode, deadline), &mut reply, io, deadline).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let error = terminate(control, error);
+                    let _ = reply.send(Err(error));
+                    return Err(error);
+                }
+            };
+        let ready = matches!(inspected, Inspection::Ready);
+        let pending = matches!(inspected, Inspection::Pending);
+        if !ready && !pending {
+            control.close();
+        }
+        reply.send(Ok(inspected)).map_err(|_| Error::ReplyLost)?;
+        if pending {
+            // Keep this owner and correlation; no repeated Observe or idle timer.
+            // A Due queued while Inspect awaited is retained by CoreControl.
+            waiting = true;
+            continue;
+        }
+        if !ready {
+            return Err(Error::Refused);
+        }
+        break;
     }
 
     let consume_deadline = bounded_deadline(Instant::now() + COMMAND_LIMIT, lifetime);

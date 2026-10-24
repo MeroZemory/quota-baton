@@ -74,6 +74,7 @@ fn hints_and_other_request_or_episode_grants_never_admit_activation() {
         json!({"type":"waiting", "episode":7,"reset_unix_ms":123}),
         json!({"type":"due", "episode":7}),
         json!({"type":"ready", "episode":7}),
+        json!({"type":"pending", "episode":7}),
         json!({"type":"advanced", "episode":7}),
         json!({"type":"cancelled", "episode":7}),
         json!({"type":"refused", "reason":"not_due"}),
@@ -110,6 +111,27 @@ fn advanced_is_only_a_correlated_prior_episode_receipt() {
         }
     }
     assert!(serde_json::from_value::<Reply>(json!({"version":VERSION,"request_id":1,"event":{"type":"advanced","episode":7,"next_episode":8}})).is_err());
+}
+
+#[test]
+fn pending_is_correlated_nonzero_and_never_an_activation_grant() {
+    for request_id in [None, Some(0), Some(1)] {
+        for episode in [0, 7] {
+            let reply = Reply {
+                version: VERSION,
+                request_id,
+                event: Event::Pending { episode },
+            };
+            assert_eq!(reply.valid_shape(), request_id == Some(1) && episode == 7);
+            assert!(!reply.grants(1, 7));
+        }
+    }
+    let old = Reply {
+        version: VERSION - 1,
+        request_id: Some(1),
+        event: Event::Ready { episode: 7 },
+    };
+    assert!(!old.valid_shape());
 }
 
 #[test]
