@@ -2210,6 +2210,7 @@ async fn run_with_read_timeout(
     let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
     let mut pending_quota: Option<PendingQuotaError> = None;
     let mut quota_replay: Option<QuotaErrorReplay> = None;
+    let mut deferred_upstream: Option<(Message, Reservation)> = None;
     let mut pending_rate_redial: Option<PendingRateResend> = None;
     let mut rate_redial: Option<RateRedial> = None;
     let mut deferred_client: Option<(Message, Reservation)> = None;
@@ -2327,6 +2328,7 @@ async fn run_with_read_timeout(
             end_deadline = Instant::now() + CLOSE_TIMEOUT;
         }
         if ending.is_some() {
+            deferred_upstream = None;
             pending_quota = None;
             quota_replay = None;
             physical.witness.close();
@@ -2344,6 +2346,32 @@ async fn run_with_read_timeout(
                 to_upstream = None;
             }
             deferred_client = None;
+        }
+        // Transport controls may overtake a retained quota application error.
+        // An extra application cancels that registration and is replayed only
+        // after the original error, through the ordinary upstream path below.
+        if (pending_quota.is_some()
+            || quota_replay
+                .as_ref()
+                .is_some_and(|error| error.publication.is_some()))
+            && to_client.is_none()
+            && deferred_upstream
+                .as_ref()
+                .is_some_and(|(message, _)| matches!(message, Message::Ping(_) | Message::Pong(_)))
+            && let Some((message, reservation)) = deferred_upstream.take()
+        {
+            let bytes = message.len();
+            to_client = Some(write(
+                client_sink.take().unwrap(),
+                message,
+                reservation,
+                Delivered {
+                    bytes,
+                    request: None,
+                    terminal: None,
+                    completed: false,
+                },
+            ));
         }
         if to_client.is_none()
             && let Some(message) = pending_launch_error.take()
@@ -2394,6 +2422,11 @@ async fn run_with_read_timeout(
             || rate_redial.is_some()
             || pending_quota.is_some()
             || quota_replay.is_some();
+        let pending_upstream_controls = !draining
+            && (pending_quota.is_some()
+                || quota_replay
+                    .as_ref()
+                    .is_some_and(|error| error.publication.is_some()));
         let quota_handoff_deadline = quota_replay
             .as_ref()
             .filter(|error| error.publication.is_some())
@@ -2933,15 +2966,57 @@ async fn run_with_read_timeout(
                     Delivered { bytes, request, terminal, completed }, accepted));
             }
             incoming = async {
-                if let Some(error) = quota_replay.take() {
-                    (Some(Ok(error.message)), Some((error.reservation, error.request)))
+                if pending_upstream_controls {
+                    (upstream_read.next().await, None, None)
+                } else if let Some(error) = quota_replay.take() {
+                    (Some(Ok(error.message)), Some((error.reservation, error.request)), None)
+                } else if let Some((message, reservation)) = deferred_upstream.take() {
+                    (Some(Ok(message)), None, Some(reservation))
                 } else {
-                    (upstream_read.next().await, None)
+                    (upstream_read.next().await, None, None)
                 }
-            }, if to_client.is_none() && rate_redial.is_none() && ending.is_none()
-                && pending_quota.is_none()
-                && quota_replay.as_ref().is_none_or(|error| error.publication.is_none()) => {
-                let (message, replayed) = incoming;
+            }, if ending.is_none() && (pending_upstream_controls
+                || (to_client.is_none() && rate_redial.is_none() && pending_quota.is_none()
+                    && quota_replay.as_ref().is_none_or(|error| error.publication.is_none()))) => {
+                let (message, replayed, retained) = incoming;
+                if pending_upstream_controls {
+                last_activity = Instant::now();
+                upstream_activity = last_activity;
+                let message = match message {
+                    Some(Ok(message)) => Some(message),
+                    _ => None,
+                };
+                if matches!(message.as_ref(), Some(Message::Ping(_))) && to_upstream.is_none() {
+                    to_upstream = Some(flush(upstream_sink.take().unwrap()));
+                }
+                let control = matches!(message.as_ref(), Some(Message::Ping(_) | Message::Pong(_)));
+                if !control {
+                    // The exact physical leg no longer justifies publishing
+                    // this pending quota error. Never retain its poll authority
+                    // across a peer close, EOF or another application event.
+                    physical.witness.close();
+                    if let Some(pending) = pending_quota.take() {
+                        quota_replay = Some(pending.error);
+                    }
+                    if let Some(error) = quota_replay.as_mut() {
+                        error.publication = None;
+                    }
+                }
+                if let Some(message) = message {
+                    if deferred_upstream.is_some() {
+                        // One extra frame is the bound even for a peer sending
+                        // controls faster than a blocked client can receive.
+                        ending = Some((Some(CloseFrame { code: 1009.into(), reason: "".into() }), "upstream_pending_overflow"));
+                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    } else {
+                        let reservation = context.budget.reserve_message(message.len());
+                        deferred_upstream = Some((message, reservation));
+                    }
+                }
+                // EOF is observed now and revokes registration immediately.
+                // The normal reader sees EOF again after the original error.
+                    continue;
+                }
                 last_activity = Instant::now();
                 upstream_activity = last_activity;
                 match message {
@@ -2972,7 +3047,7 @@ async fn run_with_read_timeout(
                         let (reservation, request) = if let Some((reservation, request)) = replayed {
                             (reservation, Some(request))
                         } else {
-                            (context.budget.reserve_message(bytes), response_completion(&mut current, event.as_ref()))
+                            (retained.unwrap_or_else(|| context.budget.reserve_message(bytes)), response_completion(&mut current, event.as_ref()))
                         };
                         if let Some(event) = event.as_ref() { physical.observe_created(event, &current); }
                         if request.is_none() && connection_errors < 16
@@ -3230,6 +3305,7 @@ async fn run_with_read_timeout(
     }
     drop(pending_quota);
     drop(quota_replay);
+    drop(deferred_upstream);
     physical.witness.close();
     // End waits and release retained slots before the close handshake and the
     // completion snapshot. Direct cancellation still uses the Drop fallback.

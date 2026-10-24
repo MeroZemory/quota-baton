@@ -118,3 +118,7 @@ pub(super) async fn register(
         owner: original_owner,
     })
 }
+
+#[cfg(test)]
+#[path = "poll_reset_tests.rs"]
+mod tests;
