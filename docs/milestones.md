@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N8/R15 실제 계정 전송 공유 계약 단위 완료
+현재 마일스톤: N8/R15 직접 계정 생산자·CLI·현재 HTTP fixture 단위 완료
 목표: CLI·tray·dashboard의 제공자 요약을 한 계산으로 맞추고 검증 없는 통합 잔여시간을 표시하지 않기
 핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); pooled 실제 보정·백테스트 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 13:59 KST (실제 서버→AdminClient 중첩 정보 보존 통과; 직접 생산자·전체 R15 미완료)
+갱신: 2026-10-24 14:07 KST (직접 typed 계정·CLI·현재 fixture 통과; 호환 해석 엄격성·나머지 응답·전체 R15 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -472,12 +472,13 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 13:38 | R15 유한 라우팅 속성 단위 | 7검사·독립 fixture1580·retry122, strict core lint·fmt/diff0 | 실제 binding transaction·C7 fallback/관측 소진·이동 예산/왕복 억제 | 8a2019e; routing-properties-fingerprint.json. 실제 소켓/24시간 replay 아님; 테스트 import2와 module 순서 보완 |
 | 2026-10-24 13:49 | R15 pool·경고 공유 계약 단위 | proto23·core1160·실제HTTP1·tray354·CLI8·notice18·forecast전송30 통과, workspace strict lint·fmt/diff0 | 원래 경고 순서·pool의 알 수 없음·raw 중복키 거절·capture 허용목록 유지 | 3bdaf59; pool-warning-fingerprint.json. 제네릭 추론 명시 보완, 실제 populated 중첩 계약·계정·정적/전체 관문 별도 |
 | 2026-10-24 13:59 | R15 실제 계정 중첩 전송 단위 | proto28·실제 core→AdminClient1·source 전송5·실제HTTP1·forecast37, workspace strict lint·fmt/diff0 | 동일 응답의 전체 키·값 보존 및 인수 계정 기존 갱신 메뉴 | ed2dd97; account-transport-fingerprint.json. 실제 기존 정보 손실 red→수정, cross-client 테스트만 rustfmt 동일성 보완; 직접 typed 생산자·CLI·fixture·전체 관문 별도 |
+| 2026-10-24 14:07 | R15 직접 계정 생산자·CLI·현재 fixture | core1164·CLI2·실제AdminClient1·tray354·전송31·한영표시3·dashboard I/O6, strict lint·fmt/diff0 | 권위32키 직접 구성·기존30키 wrapper 보존·미지정 필드 조작 없는 합성 현재 응답 | bb2c637·72bd38e; account-producer-fingerprint.json. unused test-helper 범위 보완, 0개 filter 제외 후 실제6개 확인; 정적/다른 응답/최종 관문 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R15 공유 계약 | 실제 서버→AdminClient 계정 중첩 전송 통과 | 직접 생산자·CLI·나머지 응답·정적/실제 경로·전체 관문 | typed 생산자와 fixture 통합 |
+| R15 공유 계약 | 직접 계정 생산자·CLI·실제 전송·현재 fixture 통과 | 나머지 응답·호환 엄격성·정적/실제 경로·전체 관문 | 공유 나머지 응답·정적 guard 통합 |
 | 제공자 통합 예측 | 기본 사실 공통화 관문 완료·실제12PNG 수용; pooled 미출시 | 제공 export 보정·실제24시간 백테스트 | 기본 사실 설치 수용; 제공된 body-free export 분석·N8 공유 계약 진행 |
 | 실제24시간 라우팅 재생 | 최소 기록·typed rebind 설치, 복원 초기 상태/adapter 미완 | epoch별 실제 초기 상태·loss·동일 router 대조 | N6r 생산자·읽기·복원 adapter 구현, export 근거 구분 |
 <!-- gaps:end -->
