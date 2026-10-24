@@ -21,8 +21,6 @@ fn bind_errors_distinguish_busy_denied_and_unavailable() {
     assert!(ipv6_unavailable(&Error::from(ErrorKind::Unsupported)));
     assert!(!ipv6_unavailable(&Error::from(ErrorKind::PermissionDenied)));
     assert!(!ipv6_unavailable(&Error::from(ErrorKind::AddrInUse)));
-    #[cfg(windows)]
-    assert!(ipv6_unavailable(&Error::from_raw_os_error(10047)));
 }
 
 async fn ipv4_only() -> Listeners {

@@ -1943,6 +1943,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 #[path = "takeover_engine_tests.rs"]
 mod takeover_engine_tests;

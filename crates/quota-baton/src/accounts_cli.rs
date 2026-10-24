@@ -1,13 +1,7 @@
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Subcommand, ValueEnum};
 use qb_core::{accounts::AccountStore, config::Config};
-use qb_proto::{
-    CpaImportRequest, ImportMode,
-    admin_login::{LoginStart, LoginState, LoginStatus},
-};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use qb_proto::admin_login::{LoginStart, LoginState, LoginStatus};
+use std::{path::Path, time::Duration};
 
 #[derive(Debug)]
 pub enum UsageCliError {
@@ -33,72 +27,42 @@ impl std::fmt::Display for AccountCliError {
     }
 }
 impl std::error::Error for AccountCliError {}
-fn account_error(message: &'static str) -> anyhow::Error {
+pub(crate) fn account_error(message: &'static str) -> anyhow::Error {
     AccountCliError(message).into()
 }
 
 #[derive(Subcommand)]
 pub enum AccountsCommand {
+    #[command(flatten)]
+    Platform(crate::platform::AccountsPlatformCommand),
     #[command(about = "브라우저로 계정에 로그인합니다")]
+    #[command(display_order = 0)]
     Login {
         #[arg(value_enum)]
         provider: LoginProvider,
-        #[arg(long, help = "CPA 연결을 해제하고 직접 로그인 계정으로 전환합니다")]
-        replace_linked: bool,
+        #[command(flatten)]
+        options: crate::platform::LoginOptions,
         #[arg(long, help = "브라우저를 열지 않고 로그인 주소만 표시합니다")]
         no_browser: bool,
     },
-    #[command(about = "다른 앱에서 계정의 토큰 관리 권한을 가져옵니다")]
-    Takeover {
-        #[arg(value_enum)]
-        provider: LoginProvider,
-        path: PathBuf,
-        #[arg(long)]
-        replace: bool,
-        #[arg(long)]
-        keep_source: bool,
-        #[arg(long, help = "경고와 계정 확인 후 가져오기를 승인합니다")]
-        yes: bool,
-    },
     #[command(about = "계정 목록을 확인합니다")]
+    #[command(display_order = 2)]
     List {
         #[arg(long, help = "사용량 예측의 속도·근거·모든 구간을 자세히 표시합니다")]
         detail: bool,
     },
     #[command(about = "계정 사용을 일시 중지합니다")]
+    #[command(display_order = 3)]
     Pause { id: String },
     #[command(about = "계정 사용을 재개합니다")]
+    #[command(display_order = 4)]
     Resume { id: String },
-    #[command(about = "계정을 비활성화합니다")]
-    Disable { id: String },
-    #[command(about = "계정을 활성화합니다")]
-    Enable { id: String },
     #[command(about = "계정 사용량을 갱신합니다")]
+    #[command(display_order = 7)]
     RefreshUsage { id: String },
     #[command(about = "사용량 한도를 해제하고 다음 요청으로 다시 시도합니다")]
+    #[command(display_order = 8)]
     ReleaseHold { id: String },
-    #[command(about = "CPA 연결 계정을 직접 갱신하도록 전환합니다")]
-    Adopt {
-        #[arg(required = true, num_args = 1..)]
-        ids: Vec<String>,
-        #[arg(
-            long,
-            default_value = "cpa-file",
-            help = "store, cpa-file 또는 백업 파일/폴더 경로"
-        )]
-        from: String,
-    },
-    #[command(about = "계정 토큰을 지금 갱신합니다")]
-    Refresh {
-        id: String,
-        #[arg(long, help = "이전 갱신 결과가 불확실해도 한 번 시도합니다")]
-        force: bool,
-    },
-    #[command(about = "CPA 계정을 가져옵니다")]
-    Import {
-        #[command(subcommand)]
-        source: ImportSource,
-    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -116,49 +80,29 @@ impl From<LoginProvider> for qb_core::accounts::Provider {
     }
 }
 
-#[derive(Subcommand)]
-pub enum ImportSource {
-    Cpa(CpaArgs),
-}
-
-#[derive(Args)]
-pub struct CpaArgs {
-    #[arg(long, help = "CPA 인증 폴더를 지정합니다")]
-    dir: Option<PathBuf>,
-    #[arg(long, num_args = 1.., help = "provider:email 형식으로 활성화할 계정을 지정합니다")]
-    activate: Vec<String>,
-    #[arg(long, help = "저장하지 않고 결과를 확인합니다")]
-    dry_run: bool,
-    #[arg(long, help = "이 옵션 대신 accounts adopt 명령을 사용해 주세요")]
-    adopt: bool,
-}
-
 pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyhow::Result<()> {
     match command {
+        AccountsCommand::Platform(command) => {
+            crate::platform::run_accounts(command, home, config).await?
+        }
         AccountsCommand::Login {
             provider,
-            replace_linked,
+            options,
             no_browser,
         } => {
-            login(home, config, provider.into(), replace_linked, no_browser).await?;
+            login(
+                home,
+                config,
+                provider.into(),
+                options.replace_linked(),
+                no_browser,
+            )
+            .await?;
         }
-        AccountsCommand::Takeover {
-            provider,
-            path,
-            replace,
-            keep_source,
-            yes,
-        } => {
-            takeover(home, config, provider, path, replace, keep_source, yes).await?;
-        }
-        AccountsCommand::Adopt { ids, from } => adopt_accounts(home, config, ids, from).await?,
-        AccountsCommand::Refresh { id, force } => refresh_tokens(home, config, id, force).await?,
         AccountsCommand::ReleaseHold { id } => release_hold(home, config, &id).await?,
         AccountsCommand::RefreshUsage { id } => refresh_usage(home, config, &id).await?,
         AccountsCommand::Pause { id } => action(home, config, &id, "pause").await?,
         AccountsCommand::Resume { id } => action(home, config, &id, "resume").await?,
-        AccountsCommand::Disable { id } => action(home, config, &id, "disable").await?,
-        AccountsCommand::Enable { id } => action(home, config, &id, "enable").await?,
         AccountsCommand::List { detail } => {
             let accounts = AccountStore::list_metadata(home)?
                 .into_iter()
@@ -203,114 +147,11 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
                 }
             }
         }
-        AccountsCommand::Import {
-            source: ImportSource::Cpa(args),
-        } => {
-            if args.adopt {
-                return Err(account_error(
-                    "소유권 이전은 accounts adopt 명령을 사용해 주세요.",
-                ));
-            }
-            let dir = match args.dir {
-                Some(dir) => dir,
-                None => PathBuf::from(
-                    std::env::var_os("USERPROFILE")
-                        .ok_or_else(|| anyhow::anyhow!("USERPROFILE is missing"))?,
-                )
-                .join(".cli-proxy-api/auths"),
-            };
-            let request = CpaImportRequest {
-                source: "cpa".into(),
-                mode: ImportMode::Linked,
-                dir: Some(dir.clone()),
-                activate: args.activate.clone(),
-                dry_run: args.dry_run,
-            };
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
-                .timeout(Duration::from_secs(5))
-                .build()?;
-            let base = format!("http://127.0.0.1:{}/admin/v1", config.server.admin_port);
-            let token = std::fs::read_to_string(home.join("admin.token")).ok();
-            let mut probe = client.get(format!("{base}/health"));
-            if let Some(token) = &token {
-                probe = probe.bearer_auth(token.trim());
-            }
-            let rows = match probe.send().await {
-                Ok(health) => {
-                    admin_route_response(health, &client, &base, token.as_deref().unwrap_or(""))
-                        .await?
-                        .error_for_status()?;
-                    let response = client
-                        .post(format!("{base}/accounts/import"))
-                        .timeout(Duration::from_secs(60))
-                        .bearer_auth(token.as_deref().unwrap_or("").trim())
-                        .json(&request)
-                        .send()
-                        .await?;
-                    let bytes = admin_route_response(
-                        response,
-                        &client,
-                        &base,
-                        token.as_deref().unwrap_or(""),
-                    )
-                    .await?
-                    .error_for_status()?
-                    .bytes()
-                    .await?;
-                    decode_account_subset(&bytes, AccountSubset::Import)?
-                }
-                Err(error) if error.is_connect() => {
-                    if args.dry_run {
-                        serde_json::to_value(qb_core::accounts::import::preview(
-                            home,
-                            &dir,
-                            &args.activate,
-                        )?)?
-                    } else {
-                        let store = AccountStore::acquire(home)?;
-                        serde_json::to_value(qb_core::accounts::import::run(
-                            &store,
-                            &dir,
-                            &args.activate,
-                            false,
-                        )?)?
-                    }
-                }
-                Err(error) => return Err(error.into()),
-            };
-            println_utf8!("계정 ID\t제공자\t이메일\t요금제\t만료 시각\t사용 상태\t결과\t이유");
-            for row in rows
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("Invalid import response"))?
-            {
-                println_utf8!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    cell(&row["id"]),
-                    cell(&row["provider"]),
-                    cell(&row["email"]),
-                    cell(&row["plan"]),
-                    cell(&row["expires_at"]),
-                    translated(&row["user_state"]),
-                    translated(&row["action"]),
-                    if row["reason"] == "older_token" {
-                        format!(
-                            "이전 토큰 (저장 시각 {} > 파일 시각 {})",
-                            cell(&row["stored_timestamp"]),
-                            cell(&row["file_timestamp"])
-                        )
-                    } else {
-                        translated(&row["reason"])
-                    }
-                );
-            }
-        }
     }
     Ok(())
 }
 
-fn translated(value: &serde_json::Value) -> String {
+pub(crate) fn translated(value: &serde_json::Value) -> String {
     match value.as_str() {
         Some("active") => "활성".into(),
         Some("paused") => "일시 중지".into(),
@@ -336,7 +177,7 @@ fn translated(value: &serde_json::Value) -> String {
     }
 }
 
-fn health_label(value: &serde_json::Value) -> String {
+pub(crate) fn health_label(value: &serde_json::Value) -> String {
     match value["kind"].as_str() {
         Some("ready") => "준비됨".into(),
         Some("cooling") => "대기 중".into(),
@@ -345,7 +186,7 @@ fn health_label(value: &serde_json::Value) -> String {
     }
 }
 
-fn cell(value: &serde_json::Value) -> String {
+pub(crate) fn cell(value: &serde_json::Value) -> String {
     let text = match value {
         serde_json::Value::Null => "-".into(),
         serde_json::Value::String(text) => text.clone(),
@@ -364,7 +205,7 @@ fn cell(value: &serde_json::Value) -> String {
 }
 
 // A responding admin server owns the store even if authentication or health fails.
-async fn running_admin(
+pub(crate) async fn running_admin(
     home: &Path,
     config: &Config,
 ) -> anyhow::Result<Option<(reqwest::Client, String, String)>> {
@@ -421,7 +262,7 @@ impl std::fmt::Display for AdminVersionMismatch {
 }
 impl std::error::Error for AdminVersionMismatch {}
 
-fn safe_version(value: &serde_json::Value) -> String {
+pub(crate) fn safe_version(value: &serde_json::Value) -> String {
     value
         .as_str()
         .filter(|version| {
@@ -435,7 +276,11 @@ fn safe_version(value: &serde_json::Value) -> String {
         .to_owned()
 }
 
-fn missing_admin_route(status: reqwest::StatusCode, path: &str, value: &serde_json::Value) -> bool {
+pub(crate) fn missing_admin_route(
+    status: reqwest::StatusCode,
+    path: &str,
+    value: &serde_json::Value,
+) -> bool {
     // Resource absence is not evidence of an absent API route.
     let account_resource = path
         .strip_prefix("/admin/v1/accounts/")
@@ -448,7 +293,7 @@ fn missing_admin_route(status: reqwest::StatusCode, path: &str, value: &serde_js
         || (status == reqwest::StatusCode::NOT_FOUND && !(account_resource && resource_missing))
 }
 
-async fn admin_route_response(
+pub(crate) async fn admin_route_response(
     response: reqwest::Response,
     client: &reqwest::Client,
     base: &str,
@@ -485,144 +330,9 @@ async fn admin_route_response(
     Err(AdminVersionMismatch(version).into())
 }
 
-fn takeover_inspect_lines(value: &serde_json::Value, keep_source: bool) -> Vec<String> {
-    let mut lines = vec![format!(
-        "가져오면 quota-baton이 이 계정의 토큰을 관리합니다. 원래 앱({})은 로그아웃되며, 다시 쓰려면 그 앱에서 새로 로그인해야 합니다. 원래 앱이 켜져 있으면 먼저 종료하세요.",
-        cell(&value["source_path"])
-    )];
-    if keep_source {
-        lines.push("강한 경고: --keep-source는 원본 토큰 파일을 남깁니다. 원래 앱이 이 토큰을 다시 갱신하면 전체 토큰 계열이 폐기되어 양쪽 모두 다시 로그인해야 할 수 있습니다. 원래 앱을 실행하지 마세요.".into());
-    }
-    for (key, label) in [
-        ("email", "이메일"),
-        ("plan", "요금제"),
-        ("provider_account_id", "제공자 계정 ID"),
-        ("source_path", "원본 경로"),
-        ("source_last_refresh", "원본 최근 갱신"),
-        ("source_mtime", "원본 수정 시각"),
-        ("owner_alive", "원래 앱 실행 중"),
-        ("existing_id", "기존 계정 ID"),
-    ] {
-        let display = if key == "owner_alive" {
-            match value[key].as_bool() {
-                Some(true) => "감지됨 · 먼저 종료하세요".into(),
-                Some(false) => "감지되지 않음 (최선의 확인)".into(),
-                None => "알 수 없음".into(),
-            }
-        } else {
-            cell(&value[key])
-        };
-        lines.push(format!("{label}: {display}"));
-    }
-    lines
-}
-
-fn takeover_result_line(value: &serde_json::Value) -> String {
-    format!(
-        "계정 {}: 가져오기 완료 · 원본 이름 변경 {} · 갱신 {} · 만료 {}",
-        cell(&value["id"]),
-        cell(&value["renamed_to"]),
-        match value["refresh"]["ok"].as_bool() {
-            Some(true) => "성공",
-            Some(false) | None => "확인 필요",
-        },
-        cell(&value["refresh"]["token_expires_at"])
-    )
-}
-
 // Original live bytes -> phase-specific shared DTO -> existing display reader.
-async fn takeover_response<T: serde::de::DeserializeOwned + serde::Serialize>(
-    response: reqwest::Response,
-) -> anyhow::Result<serde_json::Value> {
-    if !response.status().is_success() {
-        return account_response(response).await;
-    }
-    let bytes = response.bytes().await?;
-    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-        return Err(account_error(
-            "계정 가져오기 응답 형식이 올바르지 않습니다.",
-        ));
-    }
-    let wire: T = serde_json::from_slice(&bytes)
-        .map_err(|_| account_error("계정 가져오기 응답 형식이 올바르지 않습니다."))?;
-    Ok(serde_json::to_value(wire)?)
-}
 
-async fn takeover(
-    home: &Path,
-    config: &Config,
-    provider: LoginProvider,
-    path: PathBuf,
-    replace: bool,
-    keep_source: bool,
-    yes: bool,
-) -> anyhow::Result<()> {
-    let (client, base, token) = running_admin(home, config)
-        .await?
-        .ok_or_else(|| account_error("계정을 가져오려면 인증된 코어를 먼저 실행해 주세요."))?;
-    // Resolve relative paths for the core without reading any source file locally.
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut request = serde_json::json!({
-        "provider": qb_core::accounts::Provider::from(provider), "path": path,
-        "phase": "inspect", "replace": replace, "keep_source": keep_source,
-    });
-    let inspect = takeover_response::<qb_proto::admin_takeover::TakeoverInspect>(
-        admin_route_response(
-            client
-                .post(format!("{base}/accounts/takeover"))
-                .bearer_auth(token.trim())
-                .json(&request)
-                .send()
-                .await?,
-            &client,
-            &base,
-            &token,
-        )
-        .await?,
-    )
-    .await?;
-    for line in takeover_inspect_lines(&inspect, keep_source) {
-        println_utf8!("{line}");
-    }
-    if !yes {
-        return Err(TakeoverInspectOnly.into());
-    }
-    let digest = inspect["inspect_digest"]
-        .as_str()
-        .filter(|digest| !digest.is_empty())
-        .ok_or_else(|| account_error("확인 다이제스트가 없습니다. 코어 응답을 확인해 주세요."))?;
-    request["phase"] = serde_json::json!("commit");
-    request["inspect_digest"] = serde_json::json!(digest);
-    let result = takeover_response::<qb_proto::admin_takeover::TakeoverCommit>(
-        admin_route_response(
-            client
-                .post(format!("{base}/accounts/takeover"))
-                .timeout(Duration::from_secs(40))
-                .bearer_auth(token.trim())
-                .json(&request)
-                .send()
-                .await?,
-            &client,
-            &base,
-            &token,
-        )
-        .await?,
-    )
-    .await?;
-    println_utf8!("{}", takeover_result_line(&result));
-    if result["refresh"]["ok"].as_bool() != Some(true) {
-        return Err(account_error(
-            "계정은 가져왔지만 갱신을 확인하지 못했습니다. 계정 상태를 확인해 주세요.",
-        ));
-    }
-    Ok(())
-}
-
-fn valid_account_id(id: &str) -> anyhow::Result<()> {
+pub(crate) fn valid_account_id(id: &str) -> anyhow::Result<()> {
     if qb_core::observability::safe_identifier(id).is_none() {
         return Err(account_error("계정 ID를 확인해 주세요."));
     }
@@ -632,13 +342,14 @@ fn valid_account_id(id: &str) -> anyhow::Result<()> {
 // Select the response contract at the request call site, never by trying
 // permissive DTO alternatives against a normalized Value.
 #[derive(Clone, Copy)]
-enum AccountSubset {
+pub(crate) enum AccountSubset {
+    #[allow(dead_code)] // Used by the Windows command extension and contract tests.
     Import,
     Action,
     Released,
 }
 
-fn decode_account_subset(
+pub(crate) fn decode_account_subset(
     bytes: &[u8],
     expected: AccountSubset,
 ) -> anyhow::Result<serde_json::Value> {
@@ -672,7 +383,9 @@ fn decode_account_subset(
     serde_json::from_slice(bytes).map_err(|_| invalid())
 }
 
-async fn release_hold_response(response: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+pub(crate) async fn release_hold_response(
+    response: reqwest::Response,
+) -> anyhow::Result<serde_json::Value> {
     if !response.status().is_success() {
         // Keep the existing allowlisted status/code classifier unchanged.
         return account_response(response).await;
@@ -681,7 +394,7 @@ async fn release_hold_response(response: reqwest::Response) -> anyhow::Result<se
     decode_account_subset(&bytes, AccountSubset::Released)
 }
 
-fn account_error_message(bytes: &[u8]) -> &'static str {
+pub(crate) fn account_error_message(bytes: &[u8]) -> &'static str {
     let signal =
         serde_json::from_slice::<qb_proto::admin_account_error::AccountErrorSignal>(bytes).ok();
     let code = signal.as_ref().and_then(|signal| signal.code.as_deref());
@@ -702,7 +415,9 @@ fn account_error_message(bytes: &[u8]) -> &'static str {
     }
 }
 
-async fn account_response(response: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+pub(crate) async fn account_response(
+    response: reqwest::Response,
+) -> anyhow::Result<serde_json::Value> {
     let status = response.status();
     if !status.is_success() {
         let bytes = response.bytes().await.unwrap_or_default();
@@ -712,270 +427,16 @@ async fn account_response(response: reqwest::Response) -> anyhow::Result<serde_j
     let value: serde_json::Value = response.json().await.unwrap_or_default();
     Ok(value)
 }
-fn adoption_error(error: qb_core::accounts::adopt::AdoptError) -> anyhow::Error {
-    use qb_core::accounts::adopt::AdoptError;
-    account_error(match error {
-        AdoptError::NotFound => "계정을 찾을 수 없습니다.",
-        AdoptError::NotLinked => "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
-        AdoptError::Generation { .. } => "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
-        AdoptError::IdentityMismatch | AdoptError::AmbiguousIdentity => {
-            "계정의 사용자를 확인할 수 없거나 사용자 파일이 겹칩니다."
-        }
-        AdoptError::CpaRunning => "CPA가 아직 이 계정을 갱신할 수 있습니다.",
-        AdoptError::ProbeUnavailable => "CPA 실행 상태를 확인할 수 없습니다.",
-        AdoptError::SourceIo | AdoptError::Store(_) => "계정 자료를 읽거나 저장할 수 없습니다.",
-    })
-}
 
 // Deserialize original successful bytes before any Value normalization.
 // Error statuses retain the existing allowlisted account error behavior.
-async fn adoption_response(
-    response: reqwest::Response,
-) -> anyhow::Result<qb_core::accounts::adopt::AdoptResult> {
-    if !response.status().is_success() {
-        account_response(response).await?;
-        return Err(account_error(
-            "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요.",
-        ));
-    }
-    let bytes = response.bytes().await?;
-    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-        return Err(account_error("소유권 이전 응답 형식이 올바르지 않습니다."));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| account_error("소유권 이전 응답 형식이 올바르지 않습니다."))
-}
 
-async fn adopt_accounts(
+pub(crate) async fn action(
     home: &Path,
     config: &Config,
-    ids: Vec<String>,
-    from: String,
+    id: &str,
+    action: &str,
 ) -> anyhow::Result<()> {
-    use qb_core::accounts::adopt::{AdoptFrom, AdoptRequest, AdoptSource};
-    for id in &ids {
-        valid_account_id(id)?;
-    }
-    let from = match from.as_str() {
-        "store" => AdoptFrom::Source(AdoptSource::Store),
-        "cpa-file" | "cpa_file" => AdoptFrom::Source(AdoptSource::CpaFile),
-        _ => {
-            let path = PathBuf::from(from);
-            AdoptFrom::Path {
-                path: if path.is_absolute() {
-                    path
-                } else {
-                    std::env::current_dir()?.join(path)
-                },
-            }
-        }
-    };
-    let admin = running_admin(home, config).await?;
-    // A responding core always owns the lease, including on auth/health failure.
-    let local = if admin.is_none() {
-        Some(std::sync::Arc::new(AccountStore::acquire(home)?))
-    } else {
-        None
-    };
-    println_utf8!("계정 ID\t결과\t토큰 출처\t만료 시각");
-    for id in ids {
-        let result: qb_core::accounts::adopt::AdoptResult = if let Some((client, base, token)) =
-            &admin
-        {
-            let state = account_response(
-                admin_route_response(
-                    client
-                        .get(format!("{base}/state"))
-                        .bearer_auth(token.trim())
-                        .send()
-                        .await?,
-                    client,
-                    base,
-                    token,
-                )
-                .await?,
-            )
-            .await?;
-            let generation = state["accounts"]
-                .as_array()
-                .and_then(|accounts| accounts.iter().find(|account| account["id"] == id))
-                .and_then(|account| account["generation"].as_u64())
-                .ok_or_else(|| {
-                    account_error("계정을 찾을 수 없거나 코어가 소유권 이전을 지원하지 않습니다.")
-                })?;
-            adoption_response(
-                admin_route_response(
-                    client
-                        .post(format!("{base}/accounts/{id}/adopt"))
-                        .timeout(Duration::from_secs(35))
-                        .bearer_auth(token.trim())
-                        .json(&AdoptRequest {
-                            from: from.clone(),
-                            expected_generation: generation,
-                        })
-                        .send()
-                        .await?,
-                    client,
-                    base,
-                    token,
-                )
-                .await?,
-            )
-            .await?
-        } else {
-            let store = local.as_ref().expect("local lease").clone();
-            let from = from.clone();
-            let account_id = id.clone();
-            tokio::task::spawn_blocking(move || {
-                let account = store
-                    .load(&account_id)
-                    .map_err(qb_core::accounts::adopt::AdoptError::from)?;
-                qb_core::accounts::adopt::run(
-                    &store,
-                    &account_id,
-                    AdoptRequest {
-                        from,
-                        expected_generation: account.generation,
-                    },
-                )
-            })
-            .await?
-            .map_err(adoption_error)?
-        };
-        let origin = match result.from.as_str() {
-            "cpa_file" => "CPA 파일",
-            "backup" => "백업",
-            _ => "저장된 토큰",
-        };
-        println_utf8!(
-            "{}\t직접 갱신으로 전환\t{}\t{}",
-            id,
-            origin,
-            cell(&serde_json::to_value(result.token_expires_at)?)
-        );
-        for warning in result.warnings {
-            use qb_proto::admin_adopt::AdoptWarning;
-            let message = match warning {
-                AdoptWarning::CpaFileMissing => "CPA 파일이 없어 다른 자료를 사용했습니다.",
-                AdoptWarning::CpaFileUnreadable => {
-                    "읽을 수 없는 CPA 파일이 있어 다른 자료를 사용했습니다."
-                }
-                AdoptWarning::BackupMissing | AdoptWarning::BackupUnreadable => {
-                    "백업을 읽을 수 없어 저장된 자료를 사용했습니다."
-                }
-                AdoptWarning::OlderOrUnorderedCandidateIgnored => {
-                    "오래되었거나 시각을 비교할 수 없는 토큰은 사용하지 않았습니다."
-                }
-                AdoptWarning::EmailUpdated => "같은 계정의 이메일 표시를 갱신했습니다.",
-                AdoptWarning::StoredTokensMayNeedRelogin => {
-                    "저장된 토큰의 만료 또는 불확실 상태를 확인해 주세요."
-                }
-            };
-            println_utf8!("계정 {}: {}", id, message);
-        }
-    }
-    Ok(())
-}
-
-async fn manual_refresh_response(
-    response: reqwest::Response,
-) -> anyhow::Result<qb_proto::admin_refresh::ManualRefreshReply> {
-    if !response.status().is_success() {
-        account_response(response).await?;
-        return Err(account_error(
-            "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요.",
-        ));
-    }
-    let bytes = response.bytes().await?;
-    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-        return Err(account_error("갱신 응답 형식이 올바르지 않습니다."));
-    }
-    serde_json::from_slice(&bytes).map_err(|_| account_error("갱신 응답 형식이 올바르지 않습니다."))
-}
-
-async fn refresh_tokens(
-    home: &Path,
-    config: &Config,
-    id: String,
-    force: bool,
-) -> anyhow::Result<()> {
-    valid_account_id(&id)?;
-    let summary = if let Some((client, base, token)) = running_admin(home, config).await? {
-        manual_refresh_response(
-            admin_route_response(
-                client
-                    .post(format!("{base}/accounts/{id}/refresh"))
-                    .timeout(Duration::from_secs(40))
-                    .bearer_auth(token.trim())
-                    .json(&serde_json::json!({"force":force}))
-                    .send()
-                    .await?,
-                &client,
-                &base,
-                &token,
-            )
-            .await?,
-        )
-        .await?
-    } else {
-        let store = std::sync::Arc::new(AccountStore::acquire(home)?);
-        let obs = std::sync::Arc::new(qb_core::observability::Observability::new(home, None)?);
-        let relay = qb_core::relay::RelayState::new(
-            store,
-            config,
-            obs.clone(),
-            std::sync::Arc::new(qb_core::debug_pin::DebugPins::default()),
-        )?;
-        #[cfg(debug_assertions)]
-        let relay = {
-            let mut relay = relay;
-            for (provider, endpoint) in [
-                (
-                    qb_core::accounts::Provider::Claude,
-                    &config.upstream.claude_token_endpoint,
-                ),
-                (
-                    qb_core::accounts::Provider::Codex,
-                    &config.upstream.codex_token_endpoint,
-                ),
-            ] {
-                if let Some(endpoint) = endpoint {
-                    relay = relay.with_token_endpoint(provider, endpoint.clone());
-                }
-            }
-            relay
-        };
-        let result = relay.refresh_account_typed(id.clone(), force).await;
-        let mut warned = false;
-        // Never drop a lease while detached consumption or an unsaved rotation survives.
-        while relay.shutdown_refreshes().await.is_err() {
-            if !warned {
-                println_utf8!(
-                    "갱신 결과를 저장하는 동안 계정 잠금을 유지합니다. 저장 공간과 권한을 확인해 주세요."
-                );
-                warned = true;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        obs.flush()?;
-        result?
-    };
-    if summary.outcome == qb_proto::admin_refresh::RefreshOutcome::Success {
-        println_utf8!(
-            "계정 {}: 갱신 완료 · 만료 {} · 최근 갱신 {}",
-            id,
-            cell(&serde_json::to_value(summary.token_expires_at)?),
-            cell(&serde_json::to_value(summary.last_refresh_at)?)
-        );
-        Ok(())
-    } else {
-        Err(account_error(
-            "갱신 자격 증명이 무효화되거나 만료됐습니다. 다시 로그인해 주세요.",
-        ))
-    }
-}
-
-async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow::Result<()> {
     let state = match action {
         "pause" => qb_core::accounts::UserState::Paused,
         "disable" => qb_core::accounts::UserState::Disabled,
@@ -1021,7 +482,7 @@ async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow:
     Ok(())
 }
 
-async fn release_hold(home: &Path, config: &Config, id: &str) -> anyhow::Result<()> {
+pub(crate) async fn release_hold(home: &Path, config: &Config, id: &str) -> anyhow::Result<()> {
     use std::io::{IsTerminal, Write};
     valid_account_id(id)?;
     if !std::io::stdin().is_terminal() {
@@ -1064,7 +525,7 @@ async fn release_hold(home: &Path, config: &Config, id: &str) -> anyhow::Result<
     Ok(())
 }
 
-async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result<()> {
+pub(crate) async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         qb_core::observability::safe_identifier(id).is_some(),
         "계정 ID를 확인해 주세요."
@@ -1097,7 +558,7 @@ async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result
     Ok(())
 }
 
-fn status_heading(home: &Path, running: bool) -> anyhow::Result<Vec<String>> {
+pub(crate) fn status_heading(home: &Path, running: bool) -> anyhow::Result<Vec<String>> {
     let mut lines = vec![format!(
         "코어: {}",
         if running {
@@ -1106,7 +567,7 @@ fn status_heading(home: &Path, running: bool) -> anyhow::Result<Vec<String>> {
             "중지됨 (저장된 상태)"
         }
     )];
-    lines.extend(crate::cutover::cpa_dependency_note(home)?);
+    lines.extend(crate::platform::cpa_dependency_note(home)?);
     Ok(lines)
 }
 
@@ -1230,13 +691,13 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-type CliAccountState<Account = qb_proto::AdminAccount> = qb_proto::AdminState<
+pub(crate) type CliAccountState<Account = qb_proto::AdminAccount> = qb_proto::AdminState<
     Account,
     qb_proto::admin_warning::AdminWarning,
     Option<qb_proto::admin_pool::ReadPools>,
 >;
 
-async fn live_account_views(
+pub(crate) async fn live_account_views(
     home: &Path,
     config: &Config,
 ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
@@ -1249,15 +710,15 @@ async fn live_account_views(
 
 /// Presentation boundary only: live decoding has already checked the complete
 /// shared account. Preserve existing readers, object source and forecast facts.
-fn cli_account_rows<Account: serde::Serialize>(
+pub(crate) fn cli_account_rows<Account: serde::Serialize>(
     accounts: &[Account],
 ) -> serde_json::Result<Vec<serde_json::Value>> {
     accounts.iter().map(serde_json::to_value).collect()
 }
 
-fn provider_list_name(
-    a: &qb_tray::v2::Account,
-    rows: &[&qb_tray::v2::Account],
+pub(crate) fn provider_list_name(
+    a: &crate::account_display::Account,
+    rows: &[&crate::account_display::Account],
     english: bool,
 ) -> String {
     let nonempty = |s: &str| !s.trim().is_empty();
@@ -1292,7 +753,7 @@ fn provider_list_name(
     name.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn provider_list_lines<Account: serde::Serialize>(
+pub(crate) fn provider_list_lines<Account: serde::Serialize>(
     state: Option<&CliAccountState<Account>>,
     metadata: &[serde_json::Value],
     now: chrono::DateTime<chrono::Utc>,
@@ -1309,7 +770,7 @@ fn provider_list_lines<Account: serde::Serialize>(
     let accounts = source
         .iter()
         .cloned()
-        .map(serde_json::from_value::<qb_tray::v2::Account>)
+        .map(serde_json::from_value::<crate::account_display::Account>)
         .collect::<Result<Vec<_>, _>>()?;
     let mut lines = Vec::new();
     for provider in [Provider::Claude, Provider::Codex] {
@@ -1324,7 +785,7 @@ fn provider_list_lines<Account: serde::Serialize>(
         // The tray owns health/scope visibility; a hidden forecast stays cold.
         let forecasts: Vec<_> = rows
             .iter()
-            .map(|a| state.map(|_| qb_tray::v2::summary_forecast(a, now)))
+            .map(|a| state.map(|_| crate::account_display::summary_forecast(a, now)))
             .collect();
         let inputs: Vec<_> = rows
             .iter()
@@ -1378,7 +839,7 @@ fn provider_list_lines<Account: serde::Serialize>(
     Ok(lines)
 }
 
-fn provider_list_line(
+pub(crate) fn provider_list_line(
     summary: &qb_core::provider_forecast::ProviderSummary,
     online: bool,
     english: bool,
@@ -1493,7 +954,7 @@ fn provider_list_line(
     result
 }
 
-async fn live_account_state(
+pub(crate) async fn live_account_state(
     home: &Path,
     config: &Config,
 ) -> anyhow::Result<Option<CliAccountState>> {
@@ -1518,14 +979,14 @@ async fn live_account_state(
 }
 
 // Decode raw response bytes: Value-first parsing would discard duplicate keys.
-fn decode_cli_account_state(body: &[u8]) -> serde_json::Result<CliAccountState> {
+pub(crate) fn decode_cli_account_state(body: &[u8]) -> serde_json::Result<CliAccountState> {
     let mut deserializer = serde_json::Deserializer::from_slice(body);
     let state = qb_proto::admin_state::deserialize_compat(&mut deserializer, true)?;
     deserializer.end()?;
     Ok(state)
 }
 
-fn list_forecast_lines(
+pub(crate) fn list_forecast_lines(
     account: Option<&serde_json::Value>,
     running: bool,
     detail: bool,
@@ -1554,7 +1015,7 @@ fn list_forecast_lines(
     ]
 }
 
-fn forecast_lines(account: Option<&serde_json::Value>, running: bool) -> Vec<String> {
+pub(crate) fn forecast_lines(account: Option<&serde_json::Value>, running: bool) -> Vec<String> {
     if !running {
         return vec!["소진 예측: 코어가 꺼져 있어 측정할 수 없음".into()];
     }
@@ -1572,7 +1033,7 @@ fn forecast_lines(account: Option<&serde_json::Value>, running: bool) -> Vec<Str
     }
 }
 
-fn status_window_label(name: &str) -> String {
+pub(crate) fn status_window_label(name: &str) -> String {
     match name {
         "5h" => "5시간".into(),
         "7d" => "7일".into(),
@@ -1581,7 +1042,7 @@ fn status_window_label(name: &str) -> String {
     }
 }
 
-fn status_window_names(accounts: &[serde_json::Value]) -> Vec<String> {
+pub(crate) fn status_window_names(accounts: &[serde_json::Value]) -> Vec<String> {
     let mut names = Vec::new();
     for account in accounts {
         for window in account["windows"].as_array().into_iter().flatten() {
@@ -1595,7 +1056,7 @@ fn status_window_names(accounts: &[serde_json::Value]) -> Vec<String> {
     names
 }
 
-fn percentage(window: &serde_json::Value, now: std::time::SystemTime) -> String {
+pub(crate) fn percentage(window: &serde_json::Value, now: std::time::SystemTime) -> String {
     // Reuse the existing chrono-backed timestamp type without a new CLI dependency.
     let timestamp = qb_core::accounts::TokenMeta {
         expires_at: serde_json::from_value(window["reset_at"].clone()).ok(),
@@ -1616,7 +1077,7 @@ fn percentage(window: &serde_json::Value, now: std::time::SystemTime) -> String 
         .unwrap_or_else(|| "-".into())
 }
 
-enum LoginBackend {
+pub(crate) enum LoginBackend {
     Admin {
         client: reqwest::Client,
         base: String,
@@ -1627,7 +1088,7 @@ enum LoginBackend {
 
 // These CLI responses have always required named object fields. Delegate the
 // original map directly, retaining the shared DTO's duplicate-key checks.
-struct LoginObject<T>(T);
+pub(crate) struct LoginObject<T>(T);
 #[cfg(test)]
 mod r15_login_object_tests {
     use super::*;
@@ -1729,7 +1190,7 @@ impl LoginBackend {
     }
 }
 
-async fn login(
+pub(crate) async fn login(
     home: &Path,
     config: &Config,
     provider: qb_core::accounts::Provider,
@@ -1834,7 +1295,7 @@ async fn login(
             "로그인 주소를 확인해 주세요."
         );
         println_utf8!("로그인 주소: {}", url.as_str());
-        if !no_browser && open_browser(url.as_str()).is_err() {
+        if !no_browser && crate::platform::open_browser(url.as_str()).is_err() {
             println_utf8!("브라우저를 열지 못했습니다. 위 주소를 직접 열어 주세요.");
         }
         println_utf8!("로그인 대기 중입니다. 취소하려면 Ctrl+C를 누르세요.");
@@ -1897,7 +1358,7 @@ async fn login(
     result
 }
 
-async fn finish_offline_login(
+pub(crate) async fn finish_offline_login(
     service: qb_core::oauth::LoginService,
     obs: std::sync::Arc<qb_core::observability::Observability>,
 ) -> anyhow::Result<()> {
@@ -1907,7 +1368,7 @@ async fn finish_offline_login(
     flushed
 }
 
-fn login_failure(error: Option<&str>) -> &'static str {
+pub(crate) fn login_failure(error: Option<&str>) -> &'static str {
     use qb_core::oauth::LoginError;
     match error {
         Some(error)
@@ -1962,202 +1423,12 @@ mod m1b_fixes_tests;
 
 #[cfg(test)]
 #[test]
-fn import_owned_account_reason_has_korean_label() {
+pub(crate) fn import_owned_account_reason_has_korean_label() {
     assert_eq!(
         translated(&serde_json::json!("owned_account")),
         "이미 소유한 계정"
     );
 }
-
-#[cfg(windows)]
-fn open_browser(url: &str) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "shell32")]
-    unsafe extern "system" {
-        fn ShellExecuteW(
-            window: *mut std::ffi::c_void,
-            operation: *const u16,
-            file: *const u16,
-            parameters: *const u16,
-            directory: *const u16,
-            show: i32,
-        ) -> *mut std::ffi::c_void;
-    }
-    let operation: Vec<u16> = "open\0".encode_utf16().collect();
-    let file: Vec<u16> = std::ffi::OsStr::new(url)
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    // ShellExecute receives the validated URL as data, without a command shell.
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-        )
-    };
-    if result as isize <= 32 {
-        return Err(std::io::Error::other("브라우저를 열지 못했습니다."));
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn open_browser(url: &str) -> std::io::Result<()> {
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let status = std::process::Command::new(program).arg(url).status()?;
-    if !status.success() {
-        return Err(std::io::Error::other("브라우저를 열지 못했습니다."));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod r1_cpa_status_tests {
-    use super::*;
-    use crate::cutover::cpa_dependency_tests::{account, scratch};
-    use serde_json::json;
-
-    #[test]
-    fn r162_accounts_list_detail_flag_defaults_off() {
-        use clap::Parser;
-        #[derive(Parser)]
-        struct Args {
-            #[command(subcommand)]
-            command: AccountsCommand,
-        }
-        assert!(matches!(
-            Args::try_parse_from(["synthetic", "list"]).unwrap().command,
-            AccountsCommand::List { detail: false }
-        ));
-        assert!(matches!(
-            Args::try_parse_from(["synthetic", "list", "--detail"])
-                .unwrap()
-                .command,
-            AccountsCommand::List { detail: true }
-        ));
-    }
-
-    #[test]
-    fn r162_accounts_list_summary_shared_and_detail_legacy_preserved() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-10-23T00:00:00Z")
-            .unwrap()
-            .to_utc();
-        let mut samples = qb_core::usage_forecast::Forecasts::default();
-        samples.observe(
-            "synthetic",
-            "5h",
-            50.,
-            Some(now + chrono::Duration::hours(3)),
-            now,
-        );
-        let forecast = samples.view("synthetic", now, None);
-        let account = json!({"usage_forecast":forecast,"credits_in_use":true});
-        for english in [false, true] {
-            assert_eq!(
-                list_forecast_lines(Some(&account), true, false, english),
-                vec![qb_core::usage_forecast_display::summary(&forecast, english).text]
-            );
-        }
-        let detail = list_forecast_lines(Some(&account), true, true, false);
-        assert_eq!(detail, forecast_lines(Some(&account), true));
-        assert_eq!(
-            detail,
-            qb_core::usage_forecast_display::lines(&forecast, true)
-        );
-        assert!(detail.iter().any(|line| line.contains("25.0%/시간")));
-        assert!(detail.iter().any(|line| line.contains("크레딧")));
-        for account in [None, Some(&json!({}))] {
-            assert_eq!(
-                list_forecast_lines(account, true, false, false),
-                vec!["측정 중"]
-            );
-            assert_eq!(
-                list_forecast_lines(account, false, false, true),
-                vec!["Measuring"]
-            );
-        }
-        assert!(list_forecast_lines(None, false, true, false)[0].contains("코어가 꺼져"));
-    }
-
-    #[test]
-    fn r13_forecast_cli_handles_old_core_offline_and_shared_text() {
-        assert!(forecast_lines(None, false)[0].contains("코어가 꺼져"));
-        assert_eq!(
-            forecast_lines(Some(&json!({})), true),
-            vec!["소진 예측: 측정 중"]
-        );
-        let dto = qb_core::usage_forecast::Forecasts::default().view(
-            "cx-123abc",
-            std::time::SystemTime::now().into(),
-            None,
-        );
-        let account = json!({"usage_forecast":dto,"credits_in_use":true});
-        assert_eq!(
-            forecast_lines(Some(&account), true),
-            qb_core::usage_forecast_display::lines(&dto, true)
-        );
-    }
-
-    #[test]
-    fn r1_cpa_status_heading_shares_wire_note_online_and_offline() {
-        let dir = scratch();
-        for (label, mode, state) in [
-            ("one", "linked", "active"),
-            ("two", "linked", "active"),
-            ("paused", "linked", "paused"),
-            ("disabled", "linked", "disabled"),
-            ("owned", "owned", "active"),
-            ("adopted", "adopted", "active"),
-        ] {
-            account(dir.path(), label, mode, state, json!({"kind":"ready"}));
-        }
-        let _lease = AccountStore::acquire(dir.path()).unwrap();
-        for running in [false, true] {
-            let lines = status_heading(dir.path(), running).unwrap();
-            assert_eq!(lines.len(), 2);
-            assert_eq!(
-                lines[0],
-                if running {
-                    "코어: 실행 중"
-                } else {
-                    "코어: 중지됨 (저장된 상태)"
-                }
-            );
-            assert_eq!(
-                lines[1],
-                "CPA는 계속 실행되어야 합니다 (연결 계정 2개의 토큰 갱신)"
-            );
-        }
-    }
-
-    #[test]
-    fn r1_cpa_status_heading_omits_note_without_active_linked_accounts() {
-        let dir = scratch();
-        for (label, mode, state) in [
-            ("paused", "linked", "paused"),
-            ("disabled", "linked", "disabled"),
-            ("owned", "owned", "active"),
-            ("adopted", "adopted", "active"),
-        ] {
-            account(dir.path(), label, mode, state, json!({"kind":"ready"}));
-        }
-        for running in [false, true] {
-            assert_eq!(status_heading(dir.path(), running).unwrap().len(), 1);
-        }
-    }
-}
-
-#[cfg(test)]
-#[path = "accounts_cli_r6_tests.rs"]
-mod r6_tests;
 
 #[cfg(test)]
 mod r13f_provider_list_tests {
@@ -2569,45 +1840,6 @@ mod r15_pool_warning_transport_tests {
         // /state does not adopt the separate SSE quota_notice schema.
         let raw = r#"{"accounts":[],"warnings":[{"kind":"quota_notice","account":"a"}]}"#;
         assert!(decode_cli_account_state(raw.as_bytes()).is_err());
-    }
-}
-
-#[cfg(test)]
-mod r15_adoption_contract_tests {
-    #[tokio::test]
-    async fn cli_adoption_reader_preserves_the_entire_shared_reply() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let raw = br#"{"id":"sample-acct","generation":2,"from":"store","token_expires_at":null,"last_refresh_at":null,"warnings":["stored_tokens_may_need_relogin"]}"#;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let byte = socket.read_u8().await.unwrap();
-                request.push(byte);
-                assert!(request.len() < 8192);
-            }
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                raw.len()
-            );
-            socket.write_all(header.as_bytes()).await.unwrap();
-            socket.write_all(raw).await.unwrap();
-        });
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .get(format!("http://127.0.0.1:{port}"))
-            .send()
-            .await
-            .unwrap();
-        let reply = super::adoption_response(response).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(serde_json::to_vec(&reply).unwrap(), raw);
     }
 }
 

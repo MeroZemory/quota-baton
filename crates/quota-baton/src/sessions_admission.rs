@@ -549,13 +549,11 @@ mod tests {
         )
         .unwrap();
         fs::write(home.join("codex.cmd"), b"@echo off\r\necho probe>\"%QB_HOME%\\version-probed\"\r\necho codex-cli 0.999.0\r\nexit /b 0\r\n").unwrap();
+        // libtest names omit the crate prefix, but retain the full module path.
+        let module = module_path!().split_once("::").unwrap().1;
+        let probe = format!("{module}::launch_validation_probe");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "sessions_admission::tests::launch_validation_probe",
-                "--test-threads=1",
-            ])
+            .args(["--ignored", "--exact", probe.as_str(), "--test-threads=1"])
             .env("QB_HOME", &home)
             .env("CODEX_HOME", &target)
             .status()

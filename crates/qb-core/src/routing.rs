@@ -397,52 +397,16 @@ fn load(path: &Path) -> Result<Option<State>> {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         bail!("routing policy must be a regular non-link file");
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            bail!("routing policy reparse point refused");
-        }
-        crate::local_secrets::restrict(path)?;
-    }
+    crate::platform::routing_policy_preopen(path, &metadata)?;
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000);
-    }
+    crate::platform::configure_snapshot_open(&mut options);
     let file = options.open(path)?;
     let actual = file.metadata()?;
     if !actual.is_file() || actual.len() > MAX_FILE {
         bail!("invalid routing policy handle");
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if actual.file_attributes() & 0x400 != 0 {
-            bail!("routing policy reparse handle refused");
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if actual.uid() != unsafe { libc::geteuid() } || actual.mode() & 0o077 != 0 {
-            bail!("routing policy requires owner-only permissions");
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if actual.file_attributes() & 0x400 != 0 {
-            bail!("routing policy reparse handle refused");
-        }
-    }
+    crate::platform::routing_policy_handle_check(&actual)?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FILE {
@@ -4442,52 +4406,56 @@ mod tests {
         );
     }
     #[cfg(windows)]
-    #[test]
-    fn policy_create_replace_and_load_have_one_protected_owner_ace() {
-        let home = home();
-        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
-        for n in 0..2 {
-            store
-                .put_project(
-                    None,
-                    Project {
-                        name: format!("fixture-{n}"),
-                        settings: Settings::default(),
-                    },
-                )
-                .unwrap();
-            let saved = home.path().join("acl.txt");
-            let output = std::process::Command::new("icacls.exe")
-                .arg(&store.path)
-                .arg("/save")
-                .arg(&saved)
-                .arg("/q")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "synthetic policy ACL inspection failed"
-            );
-            let bytes = fs::read(&saved).unwrap();
-            let text = if bytes.starts_with(&[255, 254]) || bytes.contains(&0) {
-                let offset = usize::from(bytes.starts_with(&[255, 254])) * 2;
-                String::from_utf16(
-                    &bytes[offset..]
-                        .chunks_exact(2)
-                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap()
-            } else {
-                String::from_utf8(bytes).unwrap()
-            };
-            assert!(text.contains("D:P"), "policy ACL must be protected");
-            assert_eq!(
-                text.matches("(A;").count(),
-                1,
-                "only the current owner may access intent"
-            );
-            assert!(PolicyStore::new(home.path(), Settings::default()).is_ok());
+    mod windows_acl {
+        use super::*;
+
+        #[test]
+        fn policy_create_replace_and_load_have_one_protected_owner_ace() {
+            let home = home();
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            for n in 0..2 {
+                store
+                    .put_project(
+                        None,
+                        Project {
+                            name: format!("fixture-{n}"),
+                            settings: Settings::default(),
+                        },
+                    )
+                    .unwrap();
+                let saved = home.path().join("acl.txt");
+                let output = std::process::Command::new("icacls.exe")
+                    .arg(&store.path)
+                    .arg("/save")
+                    .arg(&saved)
+                    .arg("/q")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "synthetic policy ACL inspection failed"
+                );
+                let bytes = fs::read(&saved).unwrap();
+                let text = if bytes.starts_with(&[255, 254]) || bytes.contains(&0) {
+                    let offset = usize::from(bytes.starts_with(&[255, 254])) * 2;
+                    String::from_utf16(
+                        &bytes[offset..]
+                            .chunks_exact(2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                } else {
+                    String::from_utf8(bytes).unwrap()
+                };
+                assert!(text.contains("D:P"), "policy ACL must be protected");
+                assert_eq!(
+                    text.matches("(A;").count(),
+                    1,
+                    "only the current owner may access intent"
+                );
+                assert!(PolicyStore::new(home.path(), Settings::default()).is_ok());
+            }
         }
     }
     #[test]

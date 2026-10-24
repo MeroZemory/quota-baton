@@ -67,54 +67,12 @@ impl DecodeCache {
     }
 }
 
-// Only fixed local disks/RAM disks qualify. Never issue path metadata against
-// UNC, a mapped network drive, unknown media, or a reparse prefix.
-#[cfg(windows)]
 fn local_drive(letter: u8) -> Option<PathBuf> {
-    use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
-    let drive = [
-        u16::from(letter.to_ascii_uppercase()),
-        u16::from(b':'),
-        u16::from(b'\\'),
-        0,
-    ];
-    let kind = unsafe { GetDriveTypeW(PCWSTR(drive.as_ptr())) };
-    matches!(kind, 3 | 6)
-        .then(|| PathBuf::from(format!("{}:\\", char::from(letter.to_ascii_uppercase()))))
-}
-#[cfg(not(windows))]
-fn local_drive(_letter: u8) -> Option<PathBuf> {
-    None
+    crate::platform::resolver_local_drive(letter)
 }
 
 fn local_scan_root(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        use std::path::{Component, Prefix};
-        let mut parts = path.components();
-        let Some(Component::Prefix(prefix)) = parts.next() else {
-            return false;
-        };
-        let letter = match prefix.kind() {
-            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
-            _ => return false,
-        };
-        if !matches!(parts.next(), Some(Component::RootDir)) {
-            return false;
-        }
-        if path.as_os_str().len() > SLUG_BYTES
-            || path.components().count() > ROOT_DEPTH
-            || parts.any(|part| !matches!(part, Component::Normal(_)))
-        {
-            return false;
-        }
-        local_drive(letter).is_some()
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        false
-    }
+    crate::platform::resolver_local_scan_root(path, SLUG_BYTES, ROOT_DEPTH)
 }
 
 fn encode_name(name: &str) -> String {
@@ -310,12 +268,8 @@ fn ordinary(path: &Path, directory: bool) -> bool {
     if meta.file_type().is_symlink() {
         return false;
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes() & 0x400 != 0 {
-            return false;
-        }
+    if crate::platform::metadata_is_reparse(&meta) {
+        return false;
     }
     if directory {
         meta.is_dir()

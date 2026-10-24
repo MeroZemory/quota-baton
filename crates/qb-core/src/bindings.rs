@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -1077,44 +1077,17 @@ pub(crate) fn read_binding_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
     {
         return Err(invalid());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return Err(invalid());
-        }
-        crate::local_secrets::restrict(path).map_err(std::io::Error::other)?;
-    }
+    crate::platform::binding_snapshot_preopen(path, &metadata)?;
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
+    crate::platform::configure_snapshot_open(&mut options);
     let file = options.open(path)?;
     let actual = file.metadata()?;
     if !actual.is_file() || actual.len() > SNAPSHOT_MAX_BYTES {
         return Err(invalid());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if actual.file_attributes() & 0x400 != 0 {
-            return Err(invalid());
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if actual.uid() != unsafe { libc::geteuid() } || actual.mode() & 0o077 != 0 {
-            return Err(invalid());
-        }
+    if !crate::platform::binding_snapshot_handle_trusted(&actual) {
+        return Err(invalid());
     }
     let mut bytes = Vec::new();
     file.take(SNAPSHOT_MAX_BYTES + 1).read_to_end(&mut bytes)?;
@@ -3380,55 +3353,7 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
     m
 }
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        #[cfg(windows)]
-        crate::local_secrets::restrict(&tmp).map_err(std::io::Error::other)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            use windows::{
-                Win32::Storage::FileSystem::{
-                    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-                },
-                core::PCWSTR,
-            };
-            let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-            let dst: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            unsafe {
-                MoveFileExW(
-                    PCWSTR(src.as_ptr()),
-                    PCWSTR(dst.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            }
-            .map_err(std::io::Error::other)
-        }
-        #[cfg(not(windows))]
-        {
-            fs::rename(&tmp, path)?;
-            fs::File::open(
-                path.parent()
-                    .ok_or_else(|| std::io::Error::other("missing state directory"))?,
-            )?
-            .sync_all()
-        }
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
-    }
-    result
+    crate::platform::atomic_write_binding(path, bytes)
 }
 
 #[cfg(test)]
@@ -4810,14 +4735,7 @@ mod tests {
             let raw=br#"{"schema":1,"bindings":[{"key":"codex:old","account":"cx-a","account":"cx-b","last_used":"2026-10-20T00:00:00Z"}]}"#;
             fs::write(&path, raw).unwrap();
             crate::local_secrets::restrict(&path).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                assert_eq!(
-                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                    0o600
-                );
-            }
+            crate::platform::test_assert_snapshot_owner_only(&path);
             let cfg = RoutingConfig::default();
             cfg.validate().unwrap();
             if strict {
@@ -4989,11 +4907,7 @@ mod tests {
             assert_eq!(t.export().unwrap(), before);
             assert_eq!(fs::read(&path).ok(), existed);
             fs::write(&t.path, serde_json::to_vec(&value).unwrap()).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&t.path, fs::Permissions::from_mode(0o600)).unwrap();
-            }
+            crate::platform::test_set_snapshot_owner_only(&t.path);
             let config = RoutingConfig::default();
             config.validate().unwrap();
             let Err(error) = BindingTable::new(dir.path(), config) else {

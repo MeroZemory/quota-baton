@@ -211,18 +211,7 @@ fn bind_error(error: &std::io::Error, port: u16) -> LoginError {
 }
 
 fn ipv6_unavailable(error: &std::io::Error) -> bool {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
-    ) {
-        return true;
-    }
-    // Windows WSAEAFNOSUPPORT may map to Uncategorized.
-    #[cfg(windows)]
-    if error.raw_os_error() == Some(10047) {
-        return true;
-    }
-    false
+    crate::platform::ipv6_unavailable(error)
 }
 
 #[cfg(test)]
