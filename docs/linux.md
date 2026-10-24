@@ -171,6 +171,31 @@ done
 Keep key/state unchanged. The previous binary must understand current durable
 data; this does not claim schema downgrade compatibility.
 
+## Browserless account login
+
+Run the CLI in the same service-user environment and data home as the running
+core. It uses the authenticated admin API when the core is running; a standalone
+login uses the same account store and still requires its exclusive lease.
+
+```bash
+quota-baton accounts login claude --no-browser
+quota-baton accounts login codex --no-browser
+```
+
+Open the printed authorization URL on a computer with a browser. For Claude,
+paste the displayed authorization code (including its state suffix) into the
+waiting CLI. For Codex, copy the final `http://localhost:1455/auth/callback?...`
+address from the browser address bar, even if that local page cannot connect,
+and paste it into the waiting CLI. The headless core does not need a callback
+listener for either paste flow. Treat the code and final redirect URL as secrets;
+do not put them into shell commands, tickets or logs.
+
+Each login expires after ten minutes and accepts one submission. State and PKCE
+checks are shared with the browser flow. Invalid or reused input requires a new
+login. Ctrl+C cancels the pending login and releases its account-store lease.
+The usual login without `--no-browser` retains the browser and loopback callback
+flow.
+
 ## Qualification and limits
 
 The P2 fixture used systemd 255 and glibc 2.39. Reload retained the same PID and

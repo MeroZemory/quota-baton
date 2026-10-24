@@ -9,6 +9,13 @@ use std::{
 
 const SECRET: &str = "synthetic-provider-code-and-token-never-print";
 
+#[cfg(windows)]
+#[path = "m1b_cli/windows.rs"]
+mod platform;
+#[cfg(unix)]
+#[path = "m1b_cli/unix.rs"]
+mod platform;
+
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_quota-baton"));
     command.env("QB_HOME", home).stdin(Stdio::null());
@@ -16,6 +23,15 @@ fn command(home: &Path) -> Command {
 }
 
 fn output(command: &mut Command) -> Output {
+    output_with_stdin(command, None, false)
+}
+
+// Keep a pending pipe open until the child exits, without joining a writer or
+// relying on terminal input. This also exercises cancellation with no input.
+fn output_with_stdin(command: &mut Command, input: Option<&[u8]>, pending: bool) -> Output {
+    if input.is_some() || pending {
+        command.stdin(Stdio::piped());
+    }
     let child = Arc::new(Mutex::new(
         command
             .stdout(Stdio::piped())
@@ -23,6 +39,11 @@ fn output(command: &mut Command) -> Output {
             .spawn()
             .unwrap(),
     ));
+    let mut stdin = child.lock().unwrap().stdin.take();
+    if let Some(input) = input {
+        stdin.as_mut().unwrap().write_all(input).unwrap();
+        drop(stdin.take());
+    }
     let (stdout, stderr) = {
         let mut child = child.lock().unwrap();
         (child.stdout.take().unwrap(), child.stderr.take().unwrap())
@@ -42,6 +63,9 @@ fn output(command: &mut Command) -> Output {
         if receiver.recv_timeout(Duration::from_secs(15)).is_err() {
             let mut child = watched.lock().unwrap();
             let _ = child.kill();
+            true
+        } else {
+            false
         }
     });
     let deadline = Instant::now() + Duration::from_secs(16);
@@ -53,7 +77,7 @@ fn output(command: &mut Command) -> Output {
         std::thread::sleep(Duration::from_millis(10));
     };
     let _ = stop.send(());
-    watchdog.join().unwrap();
+    assert!(!watchdog.join().unwrap(), "CLI exceeded test deadline");
     Output {
         status,
         stdout: stdout.join().unwrap(),
@@ -62,7 +86,11 @@ fn output(command: &mut Command) -> Output {
 }
 
 fn fixture(port: u16) -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .join(".sandbox/tests");
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
     std::fs::write(
@@ -83,10 +111,23 @@ struct Reply {
 }
 
 fn serve(listener: TcpListener, replies: Vec<Reply>) -> std::thread::JoinHandle<()> {
+    serve_replies(listener, replies, false)
+}
+
+fn serve_manual(listener: TcpListener, replies: Vec<Reply>) -> std::thread::JoinHandle<()> {
+    serve_replies(listener, replies, true)
+}
+
+fn serve_replies(
+    listener: TcpListener,
+    mut replies: Vec<Reply>,
+    manual: bool,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(12);
-        for reply in replies {
+        'requests: while !replies.is_empty() {
+            assert!(Instant::now() < deadline, "mock admin accept timed out");
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -112,10 +153,35 @@ fn serve(listener: TcpListener, replies: Vec<Reply>) -> std::thread::JoinHandle<
                 assert!(bytes.len() < 16 * 1024);
                 let mut chunk = [0; 1024];
                 let count = stream.read(&mut chunk).unwrap();
+                if manual && count == 0 && bytes.is_empty() {
+                    // Selecting ready stdin can cancel an in-flight status
+                    // request after connect, before any HTTP bytes are sent.
+                    continue 'requests;
+                }
                 assert!(count > 0);
                 bytes.extend_from_slice(&chunk[..count]);
             };
             let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+            let request_line = headers.lines().next().unwrap();
+            let index = if manual {
+                replies
+                    .iter()
+                    .position(|reply| {
+                        request_line == format!("{} {} HTTP/1.1", reply.method, reply.path)
+                    })
+                    .expect("unexpected manual-login request")
+            } else {
+                0
+            };
+            // Input and status polling race in the real CLI. Until submission,
+            // status must stay pending; completion cannot consume the input.
+            let keep_pending = manual
+                && replies[index].body["status"] == "pending"
+                && replies[index].method == "GET"
+                && replies.iter().any(|reply| {
+                    reply.path.ends_with("/submit") || reply.path.ends_with("/cancel")
+                });
+            let reply = &replies[index];
             assert_eq!(
                 headers.lines().next().unwrap(),
                 format!("{} {} HTTP/1.1", reply.method, reply.path)
@@ -145,15 +211,24 @@ fn serve(listener: TcpListener, replies: Vec<Reply>) -> std::thread::JoinHandle<
                 assert!(count > 0);
                 bytes.extend_from_slice(&chunk[..count]);
             }
-            if let Some(request) = reply.request {
+            if let Some(request) = &reply.request {
                 assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(&bytes[header_end..]).unwrap(),
+                    &serde_json::from_slice::<serde_json::Value>(&bytes[header_end..]).unwrap(),
                     request
                 );
             }
             let body = reply.body.to_string();
             write!(stream, "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 reply.status, body.len(), body).unwrap();
+            if !keep_pending {
+                let cancelled = reply.path.ends_with("/cancel");
+                replies.remove(index);
+                if manual && cancelled {
+                    replies.retain(|reply| {
+                        !(reply.method == "GET" && reply.body["status"] == "pending")
+                    });
+                }
+            }
         }
     })
 }
@@ -192,9 +267,13 @@ fn login_help_and_provider_validation() {
     let help = output(command(home.path()).args(["accounts", "login", "--help"]));
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    for word in ["claude", "codex", "--replace-linked", "--no-browser"] {
+    for word in ["claude", "codex", "--no-browser"] {
         assert!(help.contains(word));
     }
+    assert_eq!(
+        help.contains("--replace-linked"),
+        platform::REPLACE_LINKED_SUPPORTED
+    );
     let invalid =
         output(command(home.path()).args(["accounts", "login", "unknown", "--no-browser"]));
     assert!(!invalid.status.success());
@@ -202,7 +281,10 @@ fn login_help_and_provider_validation() {
 
 #[test]
 fn online_login_polls_both_providers_without_browser_and_forwards_override() {
-    for (provider, replace) in [("claude", false), ("codex", true)] {
+    for (provider, replace) in [
+        ("claude", false),
+        ("codex", platform::REPLACE_LINKED_SUPPORTED),
+    ] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let home = fixture(listener.local_addr().unwrap().port());
         let host = if provider == "claude" {
@@ -214,7 +296,7 @@ fn online_login_polls_both_providers_without_browser_and_forwards_override() {
         let (client_id, redirect, scope) = if provider == "claude" {
             (
                 "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                "http://localhost:54545/callback",
+                "https://platform.claude.com/oauth/code/callback",
                 "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
             )
         } else {
@@ -243,7 +325,12 @@ fn online_login_polls_both_providers_without_browser_and_forwards_override() {
             ]);
         }
         let url = url.to_string();
-        let server = serve(
+        let submitted = if provider == "claude" {
+            format!("{SECRET}#synthetic-state")
+        } else {
+            format!("{redirect}?code={SECRET}&state=synthetic-state")
+        };
+        let server = serve_manual(
             listener,
             vec![
                 health("200 OK", true),
@@ -253,8 +340,15 @@ fn online_login_polls_both_providers_without_browser_and_forwards_override() {
                     status: "200 OK",
                     body: serde_json::json!({"login_id":"synthetic-login","auth_url":url}),
                     request: Some(
-                        serde_json::json!({"provider":provider,"replace_linked":replace}),
+                        serde_json::json!({"provider":provider,"replace_linked":replace,"no_browser":true}),
                     ),
+                },
+                Reply {
+                    method: "POST",
+                    path: "/admin/v1/accounts/login/synthetic-login/submit",
+                    status: "200 OK",
+                    body: serde_json::json!({"status":"pending"}),
+                    request: Some(serde_json::json!({"input":submitted})),
                 },
                 Reply {
                     method: "GET",
@@ -277,7 +371,8 @@ fn online_login_polls_both_providers_without_browser_and_forwards_override() {
         if replace {
             cmd.arg("--replace-linked");
         }
-        let result = output(&mut cmd);
+        let result =
+            output_with_stdin(&mut cmd, Some(format!("{submitted}\r\n").as_bytes()), false);
         server.join().unwrap();
         assert!(result.status.success());
         let stdout = String::from_utf8(result.stdout.clone()).unwrap();
@@ -327,7 +422,9 @@ fn terminal_failures_hide_raw_provider_payload_and_close_login() {
                     path: "/admin/v1/accounts/login",
                     status: "200 OK",
                     body: serde_json::json!({"login_id":"synthetic-login","auth_url":"https://auth.openai.com/oauth/authorize"}),
-                    request: Some(serde_json::json!({"provider":"codex","replace_linked":false})),
+                    request: Some(
+                        serde_json::json!({"provider":"codex","replace_linked":false,"no_browser":true}),
+                    ),
                 },
                 Reply {
                     method: "GET",
@@ -339,10 +436,100 @@ fn terminal_failures_hide_raw_provider_payload_and_close_login() {
                 cancel(),
             ],
         );
-        let result =
-            output(command(home.path()).args(["accounts", "login", "codex", "--no-browser"]));
+        let result = output_with_stdin(
+            command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
+            None,
+            true,
+        );
         server.join().unwrap();
         assert!(!result.status.success());
+        no_secrets(&result);
+    }
+}
+
+#[test]
+fn manual_pending_stdin_does_not_block_cancelled_login_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let home = fixture(listener.local_addr().unwrap().port());
+    let server = serve(
+        listener,
+        vec![
+            health("200 OK", true),
+            Reply {
+                method: "POST",
+                path: "/admin/v1/accounts/login",
+                status: "200 OK",
+                body: serde_json::json!({"login_id":"synthetic-login","auth_url":"https://auth.openai.com/oauth/authorize"}),
+                request: Some(
+                    serde_json::json!({"provider":"codex","replace_linked":false,"no_browser":true}),
+                ),
+            },
+            Reply {
+                method: "GET",
+                path: "/admin/v1/accounts/login/synthetic-login",
+                status: "200 OK",
+                body: serde_json::json!({"status":"pending"}),
+                request: None,
+            },
+            Reply {
+                method: "GET",
+                path: "/admin/v1/accounts/login/synthetic-login",
+                status: "200 OK",
+                body: serde_json::json!({"status":"cancelled","error":SECRET}),
+                request: None,
+            },
+        ],
+    );
+    let result = output_with_stdin(
+        command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
+        None,
+        true,
+    );
+    server.join().unwrap();
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("로그인을 취소했습니다"));
+    no_secrets(&result);
+}
+
+#[test]
+fn manual_eof_and_invalid_input_cancel_without_printing_secrets() {
+    let mut invalid = SECRET.as_bytes().to_vec();
+    invalid.extend_from_slice(b"\xff\n");
+    for input in [None, Some(invalid.as_slice())] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let home = fixture(listener.local_addr().unwrap().port());
+        let server = serve_manual(
+            listener,
+            vec![
+                health("200 OK", true),
+                Reply {
+                    method: "POST",
+                    path: "/admin/v1/accounts/login",
+                    status: "200 OK",
+                    body: serde_json::json!({"login_id":"synthetic-login","auth_url":"https://auth.openai.com/oauth/authorize"}),
+                    request: Some(
+                        serde_json::json!({"provider":"codex","replace_linked":false,"no_browser":true}),
+                    ),
+                },
+                Reply {
+                    method: "GET",
+                    path: "/admin/v1/accounts/login/synthetic-login",
+                    status: "200 OK",
+                    body: serde_json::json!({"status":"pending"}),
+                    request: None,
+                },
+                cancel(),
+            ],
+        );
+        let result = output_with_stdin(
+            command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
+            input,
+            false,
+        );
+        server.join().unwrap();
+        assert!(!result.status.success());
+        assert!(!String::from_utf8_lossy(&result.stdout).contains("로그인을 완료했습니다"));
+        assert!(!home.path().join("accounts").exists());
         no_secrets(&result);
     }
 }

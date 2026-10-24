@@ -20,6 +20,8 @@ pub struct LoginRequest {
     pub provider: crate::accounts::Provider,
     #[serde(default)]
     pub replace_linked: bool,
+    #[serde(default)]
+    pub no_browser: bool,
 }
 
 pub fn login_routes(service: crate::oauth::LoginService) -> Router {
@@ -33,6 +35,10 @@ pub fn login_routes(service: crate::oauth::LoginService) -> Router {
             "/admin/v1/accounts/login/{login_id}/cancel",
             post(cancel_login),
         )
+        .route(
+            "/admin/v1/accounts/login/{login_id}/submit",
+            post(submit_login).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
         .with_state(service)
 }
 async fn start_login(
@@ -42,11 +48,44 @@ async fn start_login(
     let Ok(Json(request)) = request else {
         return error(StatusCode::BAD_REQUEST, "로그인 요청이 올바르지 않습니다.");
     };
-    match service
-        .start(request.provider, request.replace_linked)
-        .await
-    {
+    let started = if request.no_browser {
+        service
+            .start_manual(request.provider, request.replace_linked)
+            .await
+    } else {
+        service
+            .start(request.provider, request.replace_linked)
+            .await
+    };
+    match started {
         Ok(start) => Json(start).into_response(),
+        Err(error) => login_error(error),
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginSubmission {
+    input: String,
+}
+impl Drop for LoginSubmission {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.input);
+    }
+}
+
+async fn submit_login(
+    State(service): State<crate::oauth::LoginService>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Result<Json<LoginSubmission>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = request else {
+        return error(StatusCode::BAD_REQUEST, "로그인 입력이 올바르지 않습니다.");
+    };
+    match service.submit_manual(&id, &request.input).await {
+        Ok(()) => match service.status(&id).await {
+            Ok(status) => Json(status).into_response(),
+            Err(error) => login_error(error),
+        },
         Err(error) => login_error(error),
     }
 }

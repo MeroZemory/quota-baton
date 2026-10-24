@@ -11,6 +11,7 @@ fn session(state: LoginState, finished_at: Option<tokio::time::Instant>) -> Arc<
         status,
         cancel,
         finished_at: Mutex::new(finished_at),
+        manual: None,
     })
 }
 

@@ -13,6 +13,7 @@ pub(super) struct Parameters {
     pub scope: &'static str,
     pub path: String,
     pub port: u16,
+    manual_redirect: Option<&'static str>,
 }
 impl Parameters {
     pub fn new(provider: Provider) -> Self {
@@ -43,10 +44,20 @@ impl Parameters {
             scope,
             path: path.into(),
             port,
+            manual_redirect: None,
         }
     }
     pub fn redirect(&self) -> String {
+        if let Some(redirect) = self.manual_redirect {
+            return redirect.to_owned();
+        }
         format!("http://localhost:{}{}", self.port, self.path)
+    }
+    pub fn use_manual_redirect(&mut self) {
+        self.manual_redirect = match self.provider {
+            Provider::Claude => Some("https://platform.claude.com/oauth/code/callback"),
+            Provider::Codex => None,
+        };
     }
     pub fn auth_url(&self, state: &str, verifier: &str) -> String {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));

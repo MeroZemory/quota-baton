@@ -142,7 +142,7 @@ async fn read_callback(
     parse_target(target, path, expected_state)
 }
 
-fn parse_target(
+pub(super) fn parse_target(
     target: &str,
     path: &str,
     expected_state: &str,
