@@ -138,6 +138,13 @@ fn ephemeral_title_start_does_not_replace_correlated_foreground_selection() {
         "objective":"user objective", "origin":"user", "status":"active"}),
     );
     response(&mut c, json!(2), json!({"goal":snapshot("active")}));
+    ui(
+        &mut c,
+        json!(11),
+        "thread/unsubscribe",
+        json!({"threadId":"title-thread"}),
+    );
+    response(&mut c, json!(11), json!({"status":"unsubscribed"}));
     quota(&mut c);
     read_goal(&mut c, snapshot("usageLimited"));
     assert_eq!(c.stopped_ticket().unwrap().thread_id(), "thread-a");
