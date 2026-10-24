@@ -155,10 +155,12 @@ impl Record {
             && account.identity == self.identity
             && account.source == self.source
             && account.allow_credits == self.qualification.allow_credits
-            && account.quota_credit_releasable == self.qualification.quota_credit_releasable
     }
     fn same_hold(&self, account: &Account) -> bool {
         self.same_identity(account)
+            // This belongs to the original cooling hold, not account identity:
+            // native expiry clears it before the final consume transaction.
+            && account.quota_credit_releasable == self.qualification.quota_credit_releasable
             && matches!(&account.health, Health::Cooling { reason: HealthReason::Quota, until, scope }
                 if *until == self.qualification.reset_at && *scope == self.qualification.scope)
             && account.quota_cooling.as_ref().is_some_and(|hold| {
@@ -1213,6 +1215,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_reset_hold(60)
+        }
+        fn with_reset_hold(reset_hold_secs: u64) -> Self {
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../.sandbox/r13-part-c/n5d-native/fixtures");
             std::fs::create_dir_all(&base).unwrap();
@@ -1231,7 +1236,14 @@ mod tests {
                 .unwrap();
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let runtime = AccountRuntime::new(store, obs, 0.0);
-            let table = BindingTable::new(home.path(), RoutingConfig::default()).unwrap();
+            let table = BindingTable::new(
+                home.path(),
+                RoutingConfig {
+                    reset_hold_secs,
+                    ..RoutingConfig::default()
+                },
+            )
+            .unwrap();
             let models = BTreeSet::from([MODEL.to_owned(), "synthetic-other".to_owned()]);
             table
                 .place_launch(
@@ -1525,6 +1537,125 @@ mod tests {
         assert_eq!(
             f.runtime.deferred_reset_status(&f.lease.scope(), THREAD),
             DeferredResetStatus::Empty
+        );
+    }
+
+    #[tokio::test]
+    async fn n5d_poll_credit_release_native_expiry_consumes_exactly_once() {
+        let f = Fixture::with_reset_hold(0);
+        let reset = Utc::now() + Duration::seconds(2);
+        f.poll(reset, true).await;
+        let before = f.runtime.store.load(&f.id).unwrap();
+        assert!(
+            before.quota_credit_releasable,
+            "poll limit is credit-releasable independently of permission"
+        );
+        assert!(!before.allow_credits);
+        let operation = Fixture::initial_operation();
+        let _caller = operation.caller_guard();
+        let fallback = f.fallback(&operation);
+        let (id, scope) = f
+            .runtime
+            .register_initial_deferred_reset(&f.table, f.request(&operation), &fallback, &f.pin)
+            .unwrap()
+            .expect("same full poll must register");
+        let original = original_due(&f, &scope).await;
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+        );
+        let after = f.runtime.store.load(&f.id).unwrap();
+        assert!(matches!(after.health, Health::Ready));
+        assert!(
+            !after.quota_credit_releasable,
+            "native reset clears only the old limit's release flag"
+        );
+        assert_original_episode(&f, &scope, id, original);
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_some(),
+            "native expiry may clear the old quota flag without changing account identity"
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn n5d_poll_credit_release_metadata_change_cancels_original_episode() {
+        let f = Fixture::with_reset_hold(0);
+        f.poll(Utc::now() + Duration::minutes(2), true).await;
+        let operation = Fixture::initial_operation();
+        let _caller = operation.caller_guard();
+        let fallback = f.fallback(&operation);
+        let (id, scope) = f
+            .runtime
+            .register_initial_deferred_reset(&f.table, f.request(&operation), &fallback, &f.pin)
+            .unwrap()
+            .unwrap();
+        f.runtime
+            .store
+            .update_metadata(&f.id, |account| {
+                account.quota_credit_releasable = false;
+            })
+            .unwrap();
+        assert_eq!(
+            f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Cancelled
+        );
+        assert_eq!(
+            f.runtime
+                .inspect_deferred_reset_state(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap(),
+            DeferredResetInspection::Refused
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+                .is_none(),
+            "a generic flag edit cannot borrow expiry authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn n5d_poll_credit_release_independent_expiry_keeps_original_episode() {
+        let f = Fixture::with_reset_hold(0);
+        f.poll(Utc::now() + Duration::seconds(2), true).await;
+        let operation = Fixture::initial_operation();
+        let _caller = operation.caller_guard();
+        let fallback = f.fallback(&operation);
+        let (id, scope) = f
+            .runtime
+            .register_initial_deferred_reset(&f.table, f.request(&operation), &fallback, &f.pin)
+            .unwrap()
+            .unwrap();
+        let original = original_due(&f, &scope).await;
+        let after = f.runtime.store.load(&f.id).unwrap();
+        assert!(matches!(after.health, Health::Ready) && !after.quota_credit_releasable);
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+        );
+        assert_original_episode(&f, &scope, id, original);
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_none()
         );
     }
 
