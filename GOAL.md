@@ -87,7 +87,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |
 | R16.5 | 완료: 7cab418 잔여량 이력 유지·소진0·리셋100·한영 결과 문구. 집중466·strict lint·실제 core/AdminClient/tray10HWND·export2PNG 확인. 19353ac 설치 수용(06:58)·takeover 거절0/1,920; 다음 N5a |
 | R14.2 | 완료(N6 최소): 기본 꺼짐·schema3·bounded 7일 보존·off switch·실제 합성 HTTP/종료 집중 관문. 초기 cut/전체 owner/실제24시간 replay는 N6t/N6r 별도; 128 MiB 기록 활성화. 설치 동결 해제: 여러 epoch의 24시간 export 허용, epoch별 초기 상태·loss manifest로 각각 재생한 뒤 합산; 단일 epoch를 기다리지 않음 |
-| R15 | 진행(N8): 상태/health 792559a·pool/경고 3bdaf59 공유 계약 단위 및 라우팅 속성7 통과. 실제HTTP·raw 전송·strict lint 통과; 계정 전송 ed2dd97 실제 core→AdminClient 보존 통과; 직접 생산자·CLI bb2c637 및 현재 fixture72bd38e 통과; 실제 호환 엄격성0287d76·launch/login 공유 전송 집중 통과; 세션 목록·상세와 action/error 공유 응답 집중 통과(022d13f). 이력·나머지 응답·정적·실제 경로·전체 관문 남음. 실제 보정 분석과 독립; brief `R15-contract.md` |
+| R15 | 진행(N8): 상태/health 792559a·pool/경고 3bdaf59 공유 계약 단위 및 라우팅 속성7 통과. 실제HTTP·raw 전송·strict lint 통과; 계정 전송 ed2dd97 실제 core→AdminClient 보존 통과; 직접 생산자·CLI bb2c637 및 현재 fixture72bd38e 통과; 실제 호환 엄격성0287d76·launch/login 공유 전송 집중 통과; 세션 목록·상세와 action/error 공유 응답 집중 통과(022d13f). 이력 공유 계약 b0b471d 집중 통과. 나머지 응답·정적·실제 경로·전체 관문 남음. 실제 보정 분석과 독립; brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
