@@ -475,6 +475,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 14:07 | R15 직접 계정 생산자·CLI·현재 fixture | core1164·CLI2·실제AdminClient1·tray354·전송31·한영표시3·dashboard I/O6, strict lint·fmt/diff0 | 권위32키 직접 구성·기존30키 wrapper 보존·미지정 필드 조작 없는 합성 현재 응답 | bb2c637·72bd38e; account-producer-fingerprint.json. unused test-helper 범위 보완, 0개 filter 제외 후 실제6개 확인; 정적/다른 응답/최종 관문 별도 |
 | 2026-10-24 14:15 | R15 실제 호환 decoder 엄격 검사 | proto·실제 Tray/CLI·실제HTTP·tray lib·strict lint/fmt/diff 통과 | 알 수 없는 root/metric 필드 baseline101→수정0·archive 별도 호환 | 0287d76; live-compat-strict-fingerprint.json. 나머지 응답/정적/최종 관문 별도 |
 | 2026-10-24 14:16 | R15 launch/login 공유 전송 | proto·실제 launch/login HTTP·tray355·CLI launch/account·strict lint/fmt 통과 | 동일 실제 body 왕복·login 객체/중복키 경계 유지 | 523c351; launch-login-fingerprint.json. 배열 허용 source 지적 보완; R15 전체 관문 별도 |
+| 2026-10-24 14:22 | R15 세션 목록 공유 계약 | proto44·명시 adapter1·실제 client2·snapshot4·실제 dashboard HTTP5·strict lint/fmt/diff0 | 현재 목록28키·best_effort 보존·필수/null/중복키 | 6ff90ae; sessions-list-fingerprint.json. 독립 검수 fixture 누락3건 보완; 상세/나머지/최종 관문 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
