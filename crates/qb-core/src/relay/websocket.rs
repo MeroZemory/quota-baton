@@ -401,7 +401,7 @@ async fn upgrade_inner(
             };
         }
         // Recovery authority precedes any capacity queue. The source remains
-        // only a hint; final selection and spill admission revalidate it.
+        // only a hint; final selection and capacity admission revalidate it.
         completion.record.timeout_phase = Some("binding_authority".into());
         let binding_hint = {
             let table = state.bindings.clone();
@@ -451,12 +451,44 @@ async fn upgrade_inner(
                 capped.remove(source);
             }
         }
-        let spill_source = own_wait
+        let own_wait_exhausted = own_wait
             .as_ref()
-            .and_then(|wait| wait.spill_source(&state.ws_capacity));
+            .is_some_and(|wait| wait.exhausted(&state.ws_capacity));
+        // A full socket pool is a transport constraint, not an unusable
+        // account. Preserve the binding and let Codex retry over HTTP.
+        if own_wait_exhausted {
+            if state.is_draining() {
+                return handover_response();
+            }
+            let policy = state.bindings.routing_plan(session.key.as_deref());
+            if policy.settings.mode == crate::routing::Mode::Strict
+                && (state.bindings.policies.strict_dispatch_blocked()
+                    || policy.anchor.as_deref().is_some_and(|anchor| {
+                        !state
+                            .bindings
+                            .permits_dispatch(session.key.as_deref(), anchor)
+                    }))
+            {
+                completion.policy_blocked = true;
+                return state
+                    .unavailable(completion, Provider::Codex, true, None)
+                    .await;
+            }
+            // The hint may have changed while its blocking read was pending.
+            // Recollect rather than applying a prior source's capacity result.
+            if state.bindings.capacity_source(session.key.as_deref()) != source
+                || source
+                    .as_deref()
+                    .is_none_or(|source| !state.ws_capacity.is_capped(source))
+            {
+                own_wait = None;
+                continue;
+            }
+            completion.end_attempt();
+            return capacity_http_fallback();
+        }
         if let Some(wait) = own_wait.as_mut()
             && capped.contains(wait.source())
-            && spill_source.is_none()
         {
             completion.end_attempt();
             completion.record.timeout_phase = Some("source_capacity".into());
@@ -492,14 +524,8 @@ async fn upgrade_inner(
                 (candidate.account.id != *source).then_some(candidate.account.id)
             }));
         }
-        let reserved = Arc::new(std::sync::Mutex::new(
-            None::<(
-                capacity::Permit,
-                Option<crate::bindings::CapacitySpillPermit>,
-            )>,
-        ));
+        let reserved = Arc::new(std::sync::Mutex::new(None::<capacity::Permit>));
         let admission_denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let own_wait_exhausted = spill_source.is_some();
         let admit = {
             let state = state.clone();
             // The blocking selector must not keep a cancelled upgrade alive.
@@ -533,48 +559,18 @@ async fn upgrade_inner(
                     && source != account
                     && !failed.contains(source)
                     && state.ws_capacity.is_capped(source)
-                    && spill_source
-                        .as_ref()
-                        .is_none_or(|proof| proof.source() != source)
                 {
                     // A cap/binding change after collection cannot manufacture
-                    // an exhausted own-wait for the newly observed source.
+                    // permission to move away from the newly observed source.
                     denied.store(true, Ordering::Release);
                     return None;
                 }
-                // Capacity is reserved before the atomic spill fence, and both
-                // reservations roll back if publication/caller ownership fails.
-                let (spill, admission) = if let Some(source) = &spill_source
-                    && account != source.source()
-                {
-                    let Some(proof) = source.admit(&permit) else {
-                        denied.store(true, Ordering::Release);
-                        return None;
-                    };
-                    let spill = match state.bindings.admit_capacity_spill(
-                        key.as_deref(),
-                        source.source(),
-                        account,
-                    ) {
-                        Ok(spill) => spill,
-                        Err(()) => {
-                            denied.store(true, Ordering::Release);
-                            return None;
-                        }
-                    };
-                    (
-                        Some(spill),
-                        crate::bindings::DispatchAdmission::capacity(proof),
-                    )
-                } else {
-                    (None, crate::bindings::DispatchAdmission::ordinary())
-                };
                 let mut reserved = reserved.lock().unwrap_or_else(|e| e.into_inner());
                 if state.is_draining() || std::time::Instant::now() >= deadline {
                     return None;
                 }
-                *reserved = Some((permit, spill));
-                Some(admission)
+                *reserved = Some(permit);
+                Some(crate::bindings::DispatchAdmission::ordinary())
             })
         };
         completion.policy_blocked = false;
@@ -640,19 +636,13 @@ async fn upgrade_inner(
                 if capacity_blocked {
                     completion.end_attempt();
                     completion.record.timeout_phase = Some("destination_capacity".into());
-                    // An exhausted own-slot grace already permits the ordinary
-                    // guarded spill attempt above. If it cannot land, HTTP can
-                    // still serve this binding without a socket reservation.
                     // Unbound/racing admissions get one short queue too; never
                     // renew it on each selection or consume the connect budget.
+                    // HTTP can serve without reserving an upstream socket.
                     let wait_deadline = *capacity_wait_deadline.get_or_insert_with(|| {
                         let now = std::time::Instant::now();
-                        if own_wait_exhausted {
-                            now
-                        } else {
-                            now + (upgrade_deadline.saturating_duration_since(now) / 2)
-                                .min(Duration::from_millis(250))
-                        }
+                        now + (upgrade_deadline.saturating_duration_since(now) / 2)
+                            .min(Duration::from_millis(250))
                     });
                     if state.ws_capacity.wait_until(wait_deadline).await {
                         continue;
@@ -675,14 +665,11 @@ async fn upgrade_inner(
             }
             Err(_) => return network_failure(),
         };
-        let (capacity_permit, spill_permit) = reserved
+        let capacity_permit = reserved
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("selected WS account has an admitted slot");
-        if let Some(spill) = spill_permit {
-            spill.commit();
-        }
         tried.insert(account.id.clone());
         completion.record.timeout_phase = Some("credential_gate".into());
         let (mut account, mut tokens) = match state

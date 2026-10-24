@@ -128,6 +128,7 @@ struct Movement {
     departure_evidence: u64,
     to: String,
     destination_evidence: u64,
+    emergency_return: bool,
 }
 
 // A shared failure moves many sessions, but consumes only one global incident.
@@ -158,6 +159,7 @@ pub(crate) struct Permit {
     to: String,
     departure_evidence: u64,
     destination_evidence: u64,
+    emergency_return: bool,
 }
 
 /// Minted only by a successful breaker commit. Neither selectors nor storage
@@ -184,6 +186,9 @@ impl CommittedMove {
 }
 
 impl Permit {
+    pub(super) fn emergency_return(&self) -> bool {
+        self.emergency_return
+    }
     pub(super) fn applies_to(&self, key: &str, from: &str, to: &str, now: DateTime<Utc>) -> bool {
         self.key == key && self.from == from && self.to == to && self.at == now
     }
@@ -219,6 +224,7 @@ impl Breaker {
         departure_evidence: u64,
         destination_evidence: u64,
         source_unusable: Option<&crate::accounts::health::UnusableEvidence>,
+        sole_target: bool,
         observations: Observations,
         now: DateTime<Utc>,
     ) -> Result<Permit, Denied> {
@@ -230,6 +236,7 @@ impl Breaker {
             departure_evidence,
             destination_evidence,
             source_unusable.is_some_and(|proof| proof.applies_to(from, now)),
+            sole_target,
             observations,
             now,
         )
@@ -259,6 +266,7 @@ impl Breaker {
             departure_evidence,
             destination_evidence,
             source_unusable,
+            false,
             observations,
             now,
         )
@@ -274,6 +282,7 @@ impl Breaker {
         departure_evidence: u64,
         destination_evidence: u64,
         source_unusable: bool,
+        sole_target: bool,
         observations: Observations,
         now: DateTime<Utc>,
     ) -> Result<Permit, Denied> {
@@ -321,23 +330,13 @@ impl Breaker {
         {
             return Err(denial(Refusal::Capacity, now + Duration::minutes(10)));
         }
+        let mut emergency_return = false;
         if let Some(history) = self.sessions.get(key) {
             if history.len() >= RECORDS {
                 return Err(denial(
                     Refusal::Capacity,
                     history[0].at + Duration::hours(1),
                 ));
-            }
-            if let Some(left) = history
-                .iter()
-                .rev()
-                .find(|m| m.from == to && m.at + Duration::minutes(30) > now)
-                && (left.departure_evidence == 0
-                    || destination_evidence == 0
-                    || left.departure_evidence == destination_evidence
-                    || !observations.target.after(left.committed))
-            {
-                return Err(denial(Refusal::PingPong, left.at + Duration::minutes(30)));
             }
             // A differing old snapshot is not a failure since arrival. Stale,
             // equal or untracked observations keep the ordinary budget/hold.
@@ -349,7 +348,25 @@ impl Breaker {
                         && last.destination_evidence != 0
                         && last.destination_evidence != departure_evidence
                 });
-            if !fresh_unusable {
+            if let Some(left) = history
+                .iter()
+                .rev()
+                .find(|m| m.from == to && m.at + Duration::minutes(30) > now)
+                && (left.departure_evidence == 0
+                    || destination_evidence == 0
+                    || left.departure_evidence == destination_evidence
+                    || !observations.target.after(left.committed))
+            {
+                if !sole_target || !fresh_unusable {
+                    return Err(denial(Refusal::PingPong, left.at + Duration::minutes(30)));
+                }
+                emergency_return = true;
+            }
+            // One emergency return may cross soft session limits. It remains
+            // charged and cannot repeatedly bypass them within retained history.
+            let rescued = history.iter().any(|m| m.emergency_return);
+            let rescue_allowance = emergency_return && !rescued;
+            if (!fresh_unusable || emergency_return || rescued) && !rescue_allowance {
                 let recent: Vec<_> = history
                     .iter()
                     .filter(|m| m.at + Duration::minutes(10) > now)
@@ -378,6 +395,30 @@ impl Breaker {
             to: to.into(),
             departure_evidence,
             destination_evidence,
+            emergency_return,
+        })
+    }
+
+    pub(super) fn return_blocked(
+        &self,
+        key: &str,
+        to: &str,
+        destination_evidence: u64,
+        observations: Observations,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let now = self.last_now.map_or(now, |prior| now.max(prior));
+        self.sessions.get(key).is_some_and(|history| {
+            history
+                .iter()
+                .rev()
+                .find(|m| m.from == to && m.at + Duration::minutes(30) > now)
+                .is_some_and(|left| {
+                    left.departure_evidence == 0
+                        || destination_evidence == 0
+                        || left.departure_evidence == destination_evidence
+                        || !observations.target.after(left.committed)
+                })
         })
     }
 
@@ -418,6 +459,7 @@ impl Breaker {
                 departure_evidence: permit.departure_evidence,
                 to: permit.to,
                 destination_evidence: permit.destination_evidence,
+                emergency_return: permit.emergency_return,
             });
         Ok(committed)
     }
@@ -507,6 +549,7 @@ mod tests {
                     2,
                     1,
                     proof,
+                    false,
                     observations,
                     now,
                 )
@@ -524,6 +567,7 @@ mod tests {
                 2,
                 1,
                 Some(&valid),
+                false,
                 observations,
                 now,
             )
@@ -576,7 +620,7 @@ mod tests {
         move_at(&mut b, "s", "d", "e", false, 3600).unwrap();
     }
     #[test]
-    fn r14_breaker_fresh_unusable_never_overrides_pingpong_or_global() {
+    fn r14_breaker_fresh_unusable_return_requires_sole_target_and_never_overrides_global() {
         let mut b = Breaker::default();
         move_at(&mut b, "s", "a", "b", false, 0).unwrap();
         assert_eq!(
@@ -584,19 +628,23 @@ mod tests {
             Refusal::PingPong
         );
         let p = b
-            .prepare(
+            .prepare_checked(
                 &Limits::default(),
                 "s",
                 "b",
                 "a",
                 2,
-                2,
+                1,
+                true,
                 true,
                 Observations::same(Observation::before_collection()),
                 now() + Duration::seconds(2),
             )
             .unwrap();
+        assert!(p.emergency_return());
         b.commit(p, "a").unwrap();
+        assert_eq!(b.sessions["s"].len(), 2);
+        assert_eq!(b.global.len(), 2);
         for i in 0..4 {
             move_at(&mut b, &format!("other{i}"), "a", "b", false, 3 + i).unwrap();
         }
@@ -1060,5 +1108,102 @@ mod tests {
         );
         assert_eq!(breaker.global.len(), 2);
         assert_eq!(breaker.sessions["session"].len(), 1);
+    }
+    #[test]
+    fn r13_h_rescue_is_charged_once_then_session_and_global_limits_hold() {
+        let mut b = Breaker::default();
+        move_at(&mut b, "s", "a", "b", false, 0).unwrap();
+        let rescue = b
+            .prepare_checked(
+                &Limits::default(),
+                "s",
+                "b",
+                "a",
+                2,
+                1,
+                true,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap();
+        b.commit(rescue, "a").unwrap();
+        // Fresh failures and even changed target evidence cannot replenish rescue.
+        for target_evidence in [1, 3] {
+            assert_eq!(
+                b.prepare_checked(
+                    &Limits::default(),
+                    "s",
+                    "a",
+                    "b",
+                    4,
+                    target_evidence,
+                    true,
+                    true,
+                    Observations::same(Observation::before_collection()),
+                    now() + Duration::seconds(1)
+                )
+                .unwrap_err()
+                .reason,
+                Refusal::SessionTenMinutes
+            );
+        }
+        let second = b
+            .prepare_checked(
+                &Limits::default(),
+                "s",
+                "a",
+                "b",
+                4,
+                1,
+                true,
+                true,
+                Observations::same(Observation::before_collection()),
+                now() + Duration::minutes(11),
+            )
+            .unwrap();
+        b.commit(second, "b").unwrap();
+        assert_eq!(
+            b.prepare_checked(
+                &Limits::default(),
+                "s",
+                "b",
+                "a",
+                5,
+                2,
+                true,
+                true,
+                Observations::same(Observation::before_collection()),
+                now() + Duration::minutes(22)
+            )
+            .unwrap_err()
+            .reason,
+            Refusal::SessionHour
+        );
+        assert_eq!(b.sessions["s"].len(), 3);
+
+        let mut capped = Breaker::default();
+        move_at(&mut capped, "s", "a", "b", false, 0).unwrap();
+        let limits = Limits {
+            global_ten_minutes: 1,
+            ..Limits::default()
+        };
+        let denied = capped
+            .prepare_checked(
+                &limits,
+                "s",
+                "b",
+                "a",
+                2,
+                1,
+                true,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap_err();
+        assert_eq!(denied.reason, Refusal::GlobalTrip);
+        assert!(denied.newly_tripped);
+        assert_eq!(capped.sessions["s"].len(), 1);
     }
 }

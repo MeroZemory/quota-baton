@@ -849,7 +849,7 @@ The cost is that the session pauses until the reset.
    - A patch that moves a session without evidence does not compile. A static check in the gate refuses any other write to the field.
 2. **Run-time circuit breaker (last line, independent of the logic that decided).** `rebind` enforces budgets before it acts:
    - **Per session:** at most 1 move in 10 minutes and 3 in an hour, unless the current account is unusable with fresh evidence.
-   - **Ping-pong:** never back to an account the session left in the last 30 minutes, unless that account's evidence changed (for example a reset).
+   - **Ping-pong:** never back to an account the session left in the last 30 minutes, unless that account's evidence changed (for example a reset). R13.H adds a bounded recovery exception: if the current source became unusable after arrival and the prior account is the sole eligible destination, allow one emergency return in retained one-hour history, label it ping_pong_return_forced_by_unusable_source, and charge it. That first rescue may cross the soft session budget; subsequent moves must satisfy ordinary session limits. Never bypass the global incident breaker. If another eligible destination exists, choose it instead.
    - **Global:** more than N moves in 10 minutes (default 6; tuned from the ledger) trips the breaker. When it trips:
      - non-forced moves stop;
      - forced moves wait for the D26 hold path instead of moving;
