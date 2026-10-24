@@ -6,6 +6,9 @@ mod http_data;
 mod images;
 mod launch;
 mod ledger;
+#[cfg(test)]
+#[path = "relay/lineage_http_tests.rs"]
+mod lineage_http_tests;
 mod models;
 mod native_reset;
 pub(crate) mod notices;
