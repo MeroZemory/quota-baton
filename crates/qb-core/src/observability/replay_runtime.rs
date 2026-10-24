@@ -182,8 +182,12 @@ mod tests {
     use std::sync::Arc;
 
     fn directory() -> tempfile::TempDir {
-        let root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r142-runtime-fixtures");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r142-runtime-fixtures");
         std::fs::create_dir_all(&root).unwrap();
         tempfile::tempdir_in(root).unwrap()
     }

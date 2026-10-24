@@ -101,11 +101,15 @@ impl StoreUnavailableEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{AccountStore, import};
+    use crate::accounts::AccountStore;
 
     fn fixture() -> (tempfile::TempDir, AccountStore, std::path::PathBuf, Account) {
-        let base =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/n6t-store");
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/n6t-store");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let cpa = root.path().join("cpa");
@@ -121,7 +125,13 @@ mod tests {
         )
         .unwrap();
         let store = AccountStore::acquire(&root.path().join("home")).unwrap();
-        import::run(&store, &cpa, &["codex:sample@example.test".into()], false).unwrap();
+        crate::platform::seed_account_fixtures(
+            &store,
+            &cpa,
+            &["codex:sample@example.test".into()],
+            false,
+        )
+        .unwrap();
         let account = store.list().unwrap().remove(0);
         (root, store, cpa, account)
     }
@@ -230,7 +240,13 @@ mod tests {
             .expect("successful absent lookup");
         assert!(proof.applies_to(&account.id, None));
         assert!(!proof.applies_to(&account.id, Some(&account)));
-        import::run(&store, &cpa, &["codex:sample@example.test".into()], false).unwrap();
+        crate::platform::seed_account_fixtures(
+            &store,
+            &cpa,
+            &["codex:sample@example.test".into()],
+            false,
+        )
+        .unwrap();
         assert!(
             !proof.applies_to(&account.id, None),
             "replacement must revoke absence before publication"
@@ -308,8 +324,13 @@ mod tests {
                 None,
                 |_| {
                     if replace {
-                        import::run(&store, &cpa, &["codex:sample@example.test".into()], false)
-                            .unwrap();
+                        crate::platform::seed_account_fixtures(
+                            &store,
+                            &cpa,
+                            &["codex:sample@example.test".into()],
+                            false,
+                        )
+                        .unwrap();
                     }
                     Some(DispatchAdmission::ordinary().with_store_evidence(vec![proof]))
                 },

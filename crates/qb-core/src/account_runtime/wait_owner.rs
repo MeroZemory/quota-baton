@@ -1592,7 +1592,11 @@ mod tests {
 
         fn with_account(account: Account) -> Self {
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/r13-part-c/owner-fixtures");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/r13-part-c/owner-fixtures");
             std::fs::create_dir_all(&base).unwrap();
             let home = tempfile::tempdir_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());

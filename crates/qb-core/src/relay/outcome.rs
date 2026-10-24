@@ -336,8 +336,12 @@ mod failure_evidence_tests {
     #[test]
     fn n6t_actual_failed_attempt_context_veto_preserves_binding_policy_and_budget() {
         use crate::bindings::{BindingTable, Candidate, DispatchAdmission, MoveObservations};
-        let base =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/n6t-failure");
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/n6t-failure");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let table =

@@ -12,7 +12,12 @@ use reqwest::{Client, StatusCode};
 use tempfile::TempDir;
 
 fn home() -> TempDir {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".sandbox/tests");
     fs::create_dir_all(&root).unwrap();
     tempfile::Builder::new()
         .prefix("m0-")

@@ -1,10 +1,14 @@
-use std::{collections::BTreeMap, fs, path::Path};
+#[cfg(test)]
+use std::fs;
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(skip_serializing_if = "SecretsConfig::is_default")]
+    pub secrets: SecretsConfig,
     pub server: ServerConfig,
     pub upstream: UpstreamConfig,
     pub routing: RoutingConfig,
@@ -16,6 +20,26 @@ pub struct Config {
     pub ui: UiConfig,
     pub routing_replay: RoutingReplayConfig,
     pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+/// Linux secret storage is explicit; Windows retains its native DPAPI protector.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SecretsConfig {
+    pub linux_backend: LinuxSecretBackend,
+}
+impl SecretsConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinuxSecretBackend {
+    #[default]
+    SystemdCredential,
+    #[serde(rename = "file-0600")]
+    File0600,
 }
 
 /// Body-free owner metadata only; explicit operator opt-in, never enabled by a client.
@@ -467,9 +491,9 @@ impl Config {
     }
 
     pub fn load(home: &Path) -> anyhow::Result<Self> {
-        let text = match fs::read_to_string(home.join("config.toml")) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let text = match crate::platform::read_config(home) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
                 return Ok(Self::default());
             }
             Err(error) => return Err(error.into()),
@@ -503,7 +527,11 @@ impl Config {
             config.websocket.idle_close_secs < config.routing.rebalance_idle_secs,
             "websocket.idle_close_secs must be less than routing.rebalance_idle_secs"
         );
-        let known = toml::Value::try_from(Self::default())?;
+        let mut known = toml::Value::try_from(Self::default())?;
+        known.as_table_mut().expect("config table").insert(
+            "secrets".into(),
+            toml::Value::try_from(SecretsConfig::default())?,
+        );
         warn_unknown(&value, &known, "");
         if let Some(accounts) = value.get("accounts").and_then(toml::Value::as_table) {
             let known = toml::Value::try_from(AccountConfig {
@@ -539,7 +567,12 @@ mod r8_bounds_tests {
 
     #[test]
     fn startup_clamps_numeric_bounds_and_ignores_unknown_nested_keys_without_rewriting() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/config-clamp-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let text = r#"
@@ -624,7 +657,12 @@ future = true
     }
     #[test]
     fn account_thresholds_and_extreme_intervals_clamp_before_unsigned_deserialization() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/config-clamp-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let text = "[routing]\nactive_window_secs = 9223372036854775807\noverload_window_secs = 9223372036854775807\n[accounts.\"cl-a\"]\nspread_threshold = -1\n[accounts.\"cl-b\"]\nspread_threshold = 0\n[accounts.\"cl-c\"]\nspread_threshold = 7\n";
@@ -660,7 +698,12 @@ future = true
     }
     #[test]
     fn unsigned_schema_bounds_clamp_ports_guards_and_tray_without_rewriting() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/config-clamp-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let text = "[server]\ndata_port=-1\nadmin_port=99999\ndrain_timeout_secs=-1\n[guard]\nretain_max_per_request_mib=-1\ninflight_budget_mib=-1\nmemory_hard_limit_mib=-1\n[tray]\nburst_new_sessions=-1\n";
@@ -1036,7 +1079,11 @@ mod n6_replay_config_tests {
 
     fn synthetic_home() -> tempfile::TempDir {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r142/minimum-config-test-homes");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r142/minimum-config-test-homes");
         fs::create_dir_all(&root).unwrap();
         tempfile::tempdir_in(root).unwrap()
     }
@@ -1148,6 +1195,38 @@ mod n6_replay_config_tests {
         assert_eq!(
             Config::load(home.path()).unwrap_err().to_string(),
             "invalid config.toml"
+        );
+    }
+}
+
+#[cfg(test)]
+mod linux_secret_config_tests {
+    use super::*;
+    #[test]
+    fn linux_secret_backend_is_explicit_and_default_serialization_is_unchanged() {
+        let config = Config::default();
+        assert_eq!(
+            config.secrets.linux_backend,
+            LinuxSecretBackend::SystemdCredential
+        );
+        let value = toml::Value::try_from(&config).unwrap();
+        assert!(value.get("secrets").is_none());
+        let config: Config = toml::from_str(
+            r#"[secrets]
+linux_backend = "file-0600"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.secrets.linux_backend, LinuxSecretBackend::File0600);
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("file-0600"));
+        assert!(
+            toml::from_str::<Config>(
+                r#"[secrets]
+linux_backend = "unknown"
+"#
+            )
+            .is_err()
         );
     }
 }

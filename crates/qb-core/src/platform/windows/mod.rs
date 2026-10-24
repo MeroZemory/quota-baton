@@ -14,3 +14,8 @@ pub(crate) use lease::Lease;
 pub(crate) use memory::*;
 pub(crate) use process::*;
 pub(crate) use secrets::*;
+
+#[cfg(test)]
+mod account_fixtures;
+#[cfg(test)]
+pub(crate) use account_fixtures::seed_account_fixtures;

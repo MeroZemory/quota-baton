@@ -2548,7 +2548,12 @@ mod tests {
 
     #[test]
     fn r13_on_5h_limit_persists_root_and_frozen_project_inheritance() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -2613,7 +2618,12 @@ mod tests {
 
     #[test]
     fn r13_on_5h_limit_is_independent_of_strict_mode_and_wait_bounds() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         for policy in [On5hLimit::Wait, On5hLimit::Move] {
             let home = tempfile::tempdir_in(&root).unwrap();
@@ -2661,7 +2671,12 @@ mod tests {
 
     #[test]
     fn r13_urgent_toggle_preserves_strict_project_baseline_and_anchor() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -2708,7 +2723,12 @@ mod tests {
 
     #[test]
     fn r13_urgent_rejects_unobserved_id_and_accepts_matching_observed_root() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -2750,7 +2770,12 @@ mod tests {
 
     #[test]
     fn r13_urgency_only_uses_current_defaults_then_frozen_project_after_restart() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let key = "claude:12345678-1234-4321-abcd-123456789abc";
@@ -2802,7 +2827,12 @@ mod tests {
 
     #[test]
     fn r13_urgency_only_first_association_rechecks_concurrent_explicit_edit() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
@@ -2866,7 +2896,12 @@ mod tests {
 
     #[test]
     fn r13_urgency_only_does_not_authorize_anchored_or_different_project_reassociation() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -2908,7 +2943,12 @@ mod tests {
 
     #[test]
     fn r13_urgent_legacy_child_copies_intent_without_editing_parent() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -2939,7 +2979,12 @@ mod tests {
 
     #[test]
     fn r13_urgent_atomic_update_preserves_concurrent_mode_edit() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
@@ -2996,7 +3041,12 @@ mod tests {
     // Independent old-format fixture: digest the historical serializer's exact
     // field order, not the migration helper or a sorted serde_json::Value map.
     fn r13_prior_pair(mode: Mode) -> (tempfile::TempDir, std::path::PathBuf, String) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let path = home.path().join("routing-policies.json");
@@ -3092,7 +3142,12 @@ mod tests {
 
     #[test]
     fn r13_urgency_only_current_fence_detects_tamper_and_retains_strict_witness() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let key = "claude:12345678-1234-4321-abcd-123456789abc";
@@ -3196,7 +3251,12 @@ mod tests {
 
     #[test]
     fn r13_omitted_urgency_preserves_project_and_explicit_session_edits() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -3266,7 +3326,12 @@ mod tests {
 
     #[test]
     fn r13_legacy_edit_after_each_urgent_toggle_preserves_latest_policy_and_anchor() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -3320,7 +3385,12 @@ mod tests {
 
     #[test]
     fn r13_omitted_urgency_resolves_after_concurrent_toggle_under_writer_gate() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-policy-tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
@@ -4406,58 +4476,7 @@ mod tests {
         );
     }
     #[cfg(windows)]
-    mod windows_acl {
-        use super::*;
-
-        #[test]
-        fn policy_create_replace_and_load_have_one_protected_owner_ace() {
-            let home = home();
-            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
-            for n in 0..2 {
-                store
-                    .put_project(
-                        None,
-                        Project {
-                            name: format!("fixture-{n}"),
-                            settings: Settings::default(),
-                        },
-                    )
-                    .unwrap();
-                let saved = home.path().join("acl.txt");
-                let output = std::process::Command::new("icacls.exe")
-                    .arg(&store.path)
-                    .arg("/save")
-                    .arg(&saved)
-                    .arg("/q")
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "synthetic policy ACL inspection failed"
-                );
-                let bytes = fs::read(&saved).unwrap();
-                let text = if bytes.starts_with(&[255, 254]) || bytes.contains(&0) {
-                    let offset = usize::from(bytes.starts_with(&[255, 254])) * 2;
-                    String::from_utf16(
-                        &bytes[offset..]
-                            .chunks_exact(2)
-                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap()
-                } else {
-                    String::from_utf8(bytes).unwrap()
-                };
-                assert!(text.contains("D:P"), "policy ACL must be protected");
-                assert_eq!(
-                    text.matches("(A;").count(),
-                    1,
-                    "only the current owner may access intent"
-                );
-                assert!(PolicyStore::new(home.path(), Settings::default()).is_ok());
-            }
-        }
-    }
+    mod windows_acl;
     #[test]
     fn legacy_codex_agent_hash_keeps_strict_intent_through_schema_upgrade() {
         let home = home();
@@ -6240,7 +6259,11 @@ mod issue_operation_writer_tests {
     #[test]
     fn cancellation_behind_actual_policy_writer_prevents_cas() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r11-operation-tests");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
         let store = Arc::new(
@@ -6299,7 +6322,11 @@ mod issue_operation_writer_tests {
     #[test]
     fn admitted_operation_still_obeys_late_dispatch_recheck() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r11-operation-tests");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
         let store = PolicyStore::new(

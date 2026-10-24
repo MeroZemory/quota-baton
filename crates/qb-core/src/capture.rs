@@ -268,8 +268,12 @@ mod enabled {
         use std::fs;
 
         fn directory() -> tempfile::TempDir {
-            let root =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/capture-tests");
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/capture-tests");
             fs::create_dir_all(&root).unwrap();
             tempfile::tempdir_in(root).unwrap()
         }
@@ -298,8 +302,12 @@ mod enabled {
                 })
                 .is_err()
             );
-            let fake_component =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/..");
+            let fake_component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/..");
             assert!(
                 Capture::new(CaptureOptions {
                     dir: fake_component,

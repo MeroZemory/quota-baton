@@ -843,7 +843,6 @@ fn update_index(target: &Path, entries: &[String], remove: bool) -> Result<()> {
     guard::safe_path(target, &path)?;
     let mut options = OpenOptions::new();
     options.read(true).append(true).create(true);
-    #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(5);

@@ -1246,7 +1246,11 @@ mod publication_tests {
 
     async fn proven_relay() -> (tempfile::TempDir, RelayState, Inputs, CallerGuard) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r13-part-c/publication-unit-runs");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-part-c/publication-unit-runs");
         std::fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let store = Arc::new(crate::accounts::AccountStore::acquire(home.path()).unwrap());

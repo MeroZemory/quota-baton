@@ -12,7 +12,11 @@ const KEY: &str = "codex:r14-held";
 
 fn fixture() -> (tempfile::TempDir, Arc<BindingTable>, Vec<Candidate>) {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.sandbox/r14-selection-guard-tests");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".sandbox/r14-selection-guard-tests");
     std::fs::create_dir_all(&base).unwrap();
     let home = tempfile::tempdir_in(base).unwrap();
     let mut config = RoutingConfig::default();

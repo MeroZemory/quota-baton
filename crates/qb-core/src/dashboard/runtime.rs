@@ -1130,7 +1130,11 @@ pub fn request_outcome(outcome: &str) -> RequestOutcome {
 mod tests {
     fn n5c_ui_fixture() -> (tempfile::TempDir, Arc<BindingTable>, Arc<Runtime>) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r13-part-c/n5c-ui-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-part-c/n5c-ui-fixtures");
         std::fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let config = crate::config::Config::default();
@@ -1631,8 +1635,12 @@ mod tests {
     }
     #[test]
     fn r7_default_constructor_never_discovers_profile_and_filename_lookup_is_lazy_explicit() {
-        let base =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r7-filename-tests");
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r7-filename-tests");
         std::fs::create_dir_all(&base).unwrap();
         let temp = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
         let projects = temp.path().join("projects");

@@ -50,6 +50,7 @@ struct Record {
 
 pub struct AccountStore {
     dir: PathBuf,
+    protector: crypto::SecretProtector,
     gate: Mutex<()>,
     observer: Mutex<Option<AccountObserver>>,
     pre_mutation: Mutex<Option<PreMutationHook>>,
@@ -124,9 +125,9 @@ impl AccountStore {
     ) -> Result<(), StoreError> {
         self.path(id)?;
         let path = self.home().join("config.toml");
-        let mut value: toml_edit::DocumentMut = match fs::read_to_string(&path) {
-            Ok(text) => text.parse().map_err(|_| StoreError::InvalidData)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        let mut value: toml_edit::DocumentMut = match crate::platform::read_config(self.home()) {
+            Ok(Some(text)) => text.parse().map_err(|_| StoreError::InvalidData)?,
+            Ok(None) => toml_edit::DocumentMut::new(),
             Err(_) => return Err(StoreError::Io),
         };
         let accounts = value
@@ -163,11 +164,12 @@ impl AccountStore {
         Ok(accounts)
     }
     pub fn acquire(home: &Path) -> Result<Self, StoreError> {
-        let dir = home.join("accounts");
-        fs::create_dir_all(&dir).map_err(|_| StoreError::Io)?;
+        let dir = crate::platform::prepare_account_directory(home)?;
         let lease = Lease::acquire(&dir)?;
+        let protector = crypto::account_secret_protector(home)?;
         let store = Self {
             dir,
+            protector,
             gate: Mutex::new(()),
             observer: Mutex::new(None),
             pre_mutation: Mutex::new(None),
@@ -362,7 +364,9 @@ impl AccountStore {
         // Expire even when a stale token suppresses the requested transition.
         self.load_unlocked(id)?;
         let record = self.read(id)?;
-        let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
+        let tokens = self
+            .protector
+            .decrypt(&record.account.id, &record.secret_dpapi_b64)?;
         if tokens.access_token != failed {
             return Ok(record.account);
         }
@@ -493,7 +497,8 @@ impl AccountStore {
         if record.takeover_receipt.as_ref().is_some_and(|r| r.fenced()) {
             return Err(StoreError::InvalidData);
         }
-        crypto::decrypt(&record.secret_dpapi_b64)
+        self.protector
+            .decrypt(&record.account.id, &record.secret_dpapi_b64)
     }
 
     // None은 신규 생성, Some(N)은 N에서 읽은 메타데이터의 갱신이다.
@@ -594,7 +599,9 @@ impl AccountStore {
         ) {
             return Err(StoreError::InvalidData);
         }
-        let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
+        let tokens = self
+            .protector
+            .decrypt(&record.account.id, &record.secret_dpapi_b64)?;
         Ok(super::import::codex_user_id(&tokens, workspace))
     }
 
@@ -701,7 +708,9 @@ impl AccountStore {
             self.write_takeover_journal_unlocked(&journal)?;
         }
         if receipt.state == ReceiptState::Installed {
-            let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
+            let tokens = self
+                .protector
+                .decrypt(&record.account.id, &record.secret_dpapi_b64)?;
             let ready = Receipt {
                 operation: journal.operation.clone(),
                 state: ReceiptState::Ready,
@@ -852,7 +861,7 @@ impl AccountStore {
         }
         let record = Record {
             account: updated.clone(),
-            secret_dpapi_b64: crypto::encrypt(tokens)?,
+            secret_dpapi_b64: self.protector.encrypt(&updated.id, tokens)?,
             takeover_receipt: receipt,
         };
         let bytes = serde_json::to_vec_pretty(&record).map_err(|_| StoreError::InvalidData)?;
@@ -979,7 +988,10 @@ impl AccountStore {
         fs::remove_file(self.dir.join(".login-migration")).map_err(|_| StoreError::Io)
     }
     fn recover_login_migration(&self) -> Result<(), StoreError> {
-        let bytes = match fs::read(self.dir.join(".login-migration")) {
+        let bytes = match crate::platform::read_private_bytes(
+            &self.dir.join(".login-migration"),
+            4 * 1024 * 1024,
+        ) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => return Err(StoreError::Io),
@@ -1007,7 +1019,9 @@ impl AccountStore {
             Ok(new) if matches!(new.account.source, super::Source::Oauth) => {
                 // A metadata-valid replacement must also contain usable credentials
                 // before recovery removes the only old token record.
-                let _tokens = crypto::decrypt(&new.secret_dpapi_b64)?;
+                let _tokens = self
+                    .protector
+                    .decrypt(&new.account.id, &new.secret_dpapi_b64)?;
                 match self.read(&migration.old) {
                     Ok(mut old) => {
                         // The transaction authorized this replacement before journaling.
@@ -1082,13 +1096,14 @@ impl AccountStore {
     }
 
     fn read_path(path: &Path) -> Result<Record, StoreError> {
-        let bytes = fs::read(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                StoreError::NotFound
-            } else {
-                StoreError::Io
-            }
-        })?;
+        let bytes =
+            crate::platform::read_private_bytes(path, 4 * 1024 * 1024).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    StoreError::NotFound
+                } else {
+                    StoreError::Io
+                }
+            })?;
         let record: Record = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
         Self::validate(&record.account)?;
         if let Some(receipt) = &record.takeover_receipt {
@@ -1257,7 +1272,7 @@ macro_rules! takeover_store_api {
         let record = self.read(&account.id)?;
         Self::check_generation(Some(account.generation), Some(record.account.generation))?;
         if record.takeover_receipt.as_ref().is_none_or(|r| r.operation != operation || r.state == super::takeover::ReceiptState::Superseded) { return Err(StoreError::InvalidData); }
-        crypto::decrypt(&record.secret_dpapi_b64)
+        self.protector.decrypt(&record.account.id, &record.secret_dpapi_b64)
     }
 
     $visibility fn save_takeover_receipt(
@@ -1302,7 +1317,7 @@ macro_rules! takeover_store_api {
             // its account receipt. A failed tombstone write blocks publication.
             self.complete_takeover_journal_unlocked(&journal.account.id, before)?;
         }
-        let tokens = crypto::decrypt(journal.protected_tokens.as_deref().ok_or(StoreError::InvalidData)?)?;
+        let tokens = self.protector.decrypt(&journal.account.id, journal.protected_tokens.as_deref().ok_or(StoreError::InvalidData)?)?;
         // Keep identity/store CAS and intent publication in one short transaction.
         // The existing account gate excludes competing token-consuming work.
         self.write_takeover_journal_unlocked(journal)?;
@@ -1323,8 +1338,8 @@ macro_rules! takeover_store_api {
         if before.operation != operation || before.state != ReceiptState::Started {
             return Err(StoreError::InvalidData);
         }
+        let tokens = self.protector.decrypt(&record.account.id, &record.secret_dpapi_b64)?;
         let mut account = record.account;
-        let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
         account.token_meta.refresh_uncertain = false;
         if let Some(reason) = terminal {
             account.apply_health_signal(super::HealthSignal::TerminalRefresh { reason }, chrono::Utc::now());
@@ -1397,7 +1412,7 @@ macro_rules! takeover_store_api {
         crate::platform::read_takeover_bytes(path)
     }
 
-    $visibility fn protect_takeover_tokens(tokens: &Tokens) -> Result<String, StoreError> { crypto::encrypt(tokens) }
+    $visibility fn protect_takeover_tokens(&self, id: &str, tokens: &Tokens) -> Result<String, StoreError> { self.path(id)?; self.protector.encrypt(id, tokens) }
         }
     };
 }
@@ -1415,12 +1430,18 @@ mod tests {
     // No credentials or native secret operations are needed for these failed
     // store transitions. Runtime authority/persistence tests remain integration work.
     fn n5a_hook_store() -> (tempfile::TempDir, AccountStore, Arc<Mutex<Vec<String>>>) {
-        let sandbox =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/n5a-store-fixtures");
+        let sandbox = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/n5a-store-fixtures");
         fs::create_dir_all(&sandbox).unwrap();
         let root = tempfile::tempdir_in(sandbox).unwrap();
+        let dir = crate::platform::prepare_account_directory(root.path()).unwrap();
         let store = AccountStore {
-            dir: root.path().join("accounts"),
+            dir,
+            protector: crypto::account_secret_protector(root.path()).unwrap(),
             gate: Mutex::new(()),
             observer: Mutex::new(None),
             pre_mutation: Mutex::new(None),
@@ -1807,8 +1828,12 @@ mod tests {
 
     #[test]
     fn r1_metadata_and_token_guarded_transitions_expire_before_read() {
-        let sandbox =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/hardening-fixtures");
+        let sandbox = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/hardening-fixtures");
         fs::create_dir_all(&sandbox).unwrap();
         let root = tempfile::tempdir_in(sandbox).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);

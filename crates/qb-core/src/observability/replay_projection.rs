@@ -155,7 +155,11 @@ mod tests {
     use super::*;
     fn fixture() -> (tempfile::TempDir, Runtime, Account) {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r142-projection-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r142-projection-fixtures");
         std::fs::create_dir_all(&base).unwrap();
         let dir = tempfile::tempdir_in(base).unwrap();
         let runtime = Runtime::start(&dir.path().join("capture"), 16).unwrap();

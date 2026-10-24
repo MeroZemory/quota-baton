@@ -5,9 +5,8 @@ pub mod health;
 #[cfg(windows)]
 pub mod import;
 #[cfg(unix)]
-pub mod import {
-    pub(crate) use super::login::codex_user_id;
-}
+#[path = "import_unix.rs"]
+pub mod import;
 mod lease;
 pub mod linked;
 pub mod login;
@@ -21,9 +20,8 @@ pub mod takeover;
 #[cfg(windows)]
 pub(crate) mod takeover_native;
 #[cfg(unix)]
-pub(crate) mod takeover_native {
-    pub(crate) use crate::platform::takeover::*;
-}
+#[path = "takeover_native_unix.rs"]
+pub(crate) mod takeover_native;
 
 use chrono::{DateTime, Utc};
 pub use health::HealthSignal;

@@ -180,16 +180,16 @@ impl Scanner {
 }
 impl<'ast> Visit<'ast> for Scanner {
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
-        // This is the sole permitted common-code OS cfg site. A positively
-        // Windows-only module is a declared feature root; do not scan its body.
+        // Only out-of-line declarations may select an OS implementation or
+        // feature root. Inline modules remain common code, even on Windows.
         for attr in &module.attrs {
-            if !attr.path().is_ident("cfg") && !attr.path().is_ident("cfg_attr") {
+            if module.content.is_some()
+                || (!attr.path().is_ident("cfg") && !attr.path().is_ident("cfg_attr"))
+            {
                 self.visit_attribute(attr);
             }
         }
-        if !windows_module(&module.attrs)
-            && let Some((_, items)) = &module.content
-        {
+        if let Some((_, items)) = &module.content {
             for item in items {
                 self.visit_item(item);
             }
@@ -434,10 +434,29 @@ fn scanner_allows_feature_cfg_comments_strings_and_module_roots() {
         "fn f() { let _ = r#\"windows:: cfg!(windows)\"#; }",
         "#[cfg(windows)] mod feature;",
         "#[cfg(unix)] mod feature;",
-        "#[cfg(all(test, windows))] mod tests { use windows::Win32; }",
-        "#[cfg(target_os = \"windows\")] mod feature { fn f() { windows::foo(); } }",
+        "#[cfg(all(test, windows))] mod tests;",
+        "#[cfg(target_os = \"windows\")] mod feature;",
     ] {
         assert!(scan(source).is_empty(), "false positive: {source}");
+    }
+}
+
+#[test]
+fn scanner_rejects_inline_os_modules_including_windows_feature_roots() {
+    for source in [
+        "#[cfg(windows)] mod feature {}",
+        "#[cfg(unix)] pub mod feature {}",
+        "#[cfg(all(test, windows))] mod tests { #[test] fn t() {} }",
+        "#[cfg(target_os = \"linux\")] mod feature { fn f() {} }",
+        "#[cfg(target_os = \"windows\")] mod feature { fn f() {} }",
+        "#[cfg_attr(feature = \"x\", cfg(windows))] mod feature {}",
+        "mod common { #[cfg(windows)] mod feature {} }",
+        "#[cfg(windows)] mod feature { #[cfg(unix)] fn hidden() {} }",
+    ] {
+        assert!(
+            !scan(source).is_empty(),
+            "inline OS module escaped: {source}"
+        );
     }
 }
 

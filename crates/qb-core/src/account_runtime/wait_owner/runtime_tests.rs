@@ -50,7 +50,11 @@ impl Fixture {
 
     fn build(access: &str, expires_at: Option<DateTime<Utc>>, managed: bool) -> Self {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r13-part-c/wait-runtime-tests/fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-part-c/wait-runtime-tests/fixtures");
         std::fs::create_dir_all(&base).unwrap();
         let home = tempfile::Builder::new()
             .prefix("synthetic-runtime-")

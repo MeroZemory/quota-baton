@@ -122,7 +122,11 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/staging/r6-core/test-homes");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/staging/r6-core/test-homes");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
         let store = Arc::new(AccountStore::acquire(root.path()).unwrap());
@@ -1115,7 +1119,11 @@ async fn r6_failed_supersession_journal_compaction_preserves_replay_restart_dele
         };
         next.account.token_meta.expires_at = Some(f.source.now + chrono::Duration::hours(3));
         next.expected = Some(saved.generation);
-        next.protected_tokens = Some(AccountStore::protect_takeover_tokens(&tokens).unwrap());
+        next.protected_tokens = Some(
+            f.store
+                .protect_takeover_tokens(&next.account.id, &tokens)
+                .unwrap(),
+        );
         match action {
             "replay" => assert!(install(&f.store, &f.deps, plan.clone()).is_err()),
             "delete" => {

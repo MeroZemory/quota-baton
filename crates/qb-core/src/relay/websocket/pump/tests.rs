@@ -127,7 +127,12 @@ async fn pair_with_pump_timer_probe(
     rate: Option<(u64, u32)>,
     timer_probe: Option<Arc<PumpTimerProbe>>,
 ) -> Pair {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
     let obs = Arc::new(Observability::new(home.path(), None).unwrap());
@@ -1035,7 +1040,12 @@ async fn close_code_and_reason_are_mirrored_both_ways() {
 
 #[tokio::test]
 async fn c6_row_13a_only_response_events_commit_the_current_request() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
     let context = Context {
@@ -1345,7 +1355,12 @@ fn r1_ws_retry_advice_is_a_sidecopy() {
 async fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders() {
     for explicit_finish in [false, true] {
         for wait_dropped_first in [false, true] {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/pump-tests");
             std::fs::create_dir_all(&root).unwrap();
             let home = tempfile::tempdir_in(root).unwrap();
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());

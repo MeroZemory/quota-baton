@@ -254,7 +254,11 @@ mod release_probe_tests {
     impl PollFixture {
         fn new() -> Self {
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/r12.9/runtime-fixtures");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/r12.9/runtime-fixtures");
             std::fs::create_dir_all(&base).unwrap();
             let home = tempfile::tempdir_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -556,7 +560,11 @@ mod release_probe_tests {
     #[test]
     fn outage_release_probe_is_single_flight_and_cancellation_allows_retry() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r12.9/runtime-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r12.9/runtime-fixtures");
         std::fs::create_dir_all(&base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -585,7 +593,11 @@ mod release_probe_tests {
     #[tokio::test]
     async fn outage_release_partial_credit_update_does_not_refresh_inherited_limit() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r12.9/runtime-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r12.9/runtime-fixtures");
         std::fs::create_dir_all(&base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -680,7 +692,11 @@ mod selection_admission_tests {
     impl Fixture {
         fn new() -> Self {
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/r11-prep/selection-admission-fixtures");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/r11-prep/selection-admission-fixtures");
             std::fs::create_dir_all(&base).unwrap();
             let home = tempfile::tempdir_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -3248,7 +3264,11 @@ mod r1_rate_tests {
     impl Fixture {
         fn new() -> Self {
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/r1-rate-test-fixtures");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/r1-rate-test-fixtures");
             std::fs::create_dir_all(&base).unwrap();
             let home = tempfile::tempdir_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -3270,7 +3290,7 @@ mod r1_rate_tests {
             "access_token":"synthetic-access-pending","refresh_token":"synthetic-refresh-pending",
             "expired":"2099-01-01T00:00:00Z"
         })).unwrap()).unwrap();
-        crate::accounts::import::run(
+        crate::platform::seed_account_fixtures(
             &f.runtime.store,
             &cpa,
             &["codex:pending@example.invalid".into()],
@@ -4230,7 +4250,11 @@ mod r5_view_tests {
     #[tokio::test]
     async fn r5_view_preserves_pool_membership_limiting_window_and_observation_time() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r5-view-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r5-view-fixtures");
         std::fs::create_dir_all(&base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());

@@ -92,7 +92,11 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r13-part-c/n5d-native/control-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-part-c/n5d-native/control-fixtures");
         require(std::fs::create_dir_all(&base));
         let home = require(tempfile::tempdir_in(base));
         let store = Arc::new(require(AccountStore::acquire(home.path())));

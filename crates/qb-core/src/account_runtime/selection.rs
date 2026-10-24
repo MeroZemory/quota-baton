@@ -93,7 +93,11 @@ mod tests {
     // configuration or shared account fixtures are needed by these tests.
     fn synthetic_runtime() -> (Arc<AccountRuntime>, tempfile::TempDir, Account) {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/runtime-selection-tests");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/runtime-selection-tests");
         std::fs::create_dir_all(&base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());

@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::{
-    accounts::{Health, HealthReason, Provider, import},
+    accounts::{Health, HealthReason, Provider},
     config::Config,
     debug_pin::DebugPins,
     http::{self, RunningServers},
@@ -66,7 +66,11 @@ impl Drop for HttpFixture {
 impl HttpFixture {
     async fn new(body: impl FnOnce(i64) -> String) -> (Self, String) {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r13-part-c/http-owner-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-part-c/http-owner-fixtures");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let cpa = root.path().join("cpa");
@@ -85,7 +89,7 @@ impl HttpFixture {
         )
         .unwrap();
         let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
-        import::run(
+        crate::platform::seed_account_fixtures(
             &store,
             &cpa,
             &["codex:pending-http@example.invalid".into()],

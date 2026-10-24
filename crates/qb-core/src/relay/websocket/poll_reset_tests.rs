@@ -216,7 +216,11 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/n5d-ws-prep/poll-reset-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/n5d-ws-prep/poll-reset-fixtures");
         require(std::fs::create_dir_all(&base));
         let home = require(tempfile::tempdir_in(base));
         let store = Arc::new(require(AccountStore::acquire(home.path())));

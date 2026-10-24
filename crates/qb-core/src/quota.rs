@@ -720,7 +720,11 @@ mod tests {
     #[test]
     fn poll_capture_persists_only_keys_and_allowlisted_usage_values() {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/usage-capture-tests");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/usage-capture-tests");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let obs = Observability::new(
@@ -761,7 +765,11 @@ mod tests {
         }
         async fn with_provider(count: usize, provider: Provider) -> Self {
             let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/usage-unit-tests");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/usage-unit-tests");
             std::fs::create_dir_all(&base).unwrap();
             let root = tempfile::tempdir_in(base).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1281,5 +1289,9 @@ mod tests {
     mod ws_poll_receipt_tests {
         include!("quota/ws_poll_receipt_tests.rs");
     }
+    #[cfg(windows)]
+    #[path = "profile_linked_tests.rs"]
+    mod profile_linked_tests;
+
     include!("quota/profile_tests.rs");
 }

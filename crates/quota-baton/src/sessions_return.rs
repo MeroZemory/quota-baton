@@ -644,7 +644,7 @@ fn run_using(
     Ok(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;

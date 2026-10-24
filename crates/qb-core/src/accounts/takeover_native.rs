@@ -550,7 +550,12 @@ mod tests {
     }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, SourceSnapshot) {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r6-native-fixtures");
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r6-native-fixtures");
         fs::create_dir_all(&base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
         let path = home.path().join("auth.json");

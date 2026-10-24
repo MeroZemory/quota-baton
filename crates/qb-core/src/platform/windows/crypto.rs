@@ -69,3 +69,17 @@ pub(crate) fn decrypt_account(encoded: &str) -> Result<Tokens, StoreError> {
     let plaintext = transform(&mut encrypted, false)?;
     serde_json::from_slice(&plaintext).map_err(|_| StoreError::InvalidData)
 }
+
+/// Store-scoped facade; Windows keeps its existing DPAPI envelope and entropy.
+pub(crate) struct SecretProtector;
+impl SecretProtector {
+    pub(crate) fn encrypt(&self, _: &str, tokens: &Tokens) -> Result<String, StoreError> {
+        encrypt_account(tokens)
+    }
+    pub(crate) fn decrypt(&self, _: &str, encoded: &str) -> Result<Tokens, StoreError> {
+        decrypt_account(encoded)
+    }
+}
+pub(crate) fn account_secret_protector(_: &std::path::Path) -> Result<SecretProtector, StoreError> {
+    Ok(SecretProtector)
+}
