@@ -1,5 +1,5 @@
-//! Staged /state envelope. Account, warning and pool payloads remain migration
-//! debt; this type does not establish their nested contracts.
+//! Staged /state envelope. Account payload migration remains separate; pool and
+//! warning contracts live in admin_pool and admin_warning.
 use serde::{Deserialize, Serialize};
 
 // Field order matches the existing json! response with serde_json preserve_order.
@@ -49,8 +49,8 @@ pub struct StateBindings {
 
 /// Explicit legacy read boundary. The wire type itself keeps required fields.
 /// Reads raw fields so duplicate known keys cannot be hidden by a Value map.
-/// Pool defaults are unknown for the current Value specialization. Account,
-/// warning and pool payload contracts remain the caller's responsibility.
+/// Pool defaults are unknown with Option<ReadPools>. Nested contracts are
+/// selected by each transport; account migration remains separate.
 pub fn deserialize_compat<'de, D, A, W, P>(
     deserializer: D,
     require_accounts: bool,

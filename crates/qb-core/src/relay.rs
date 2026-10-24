@@ -286,7 +286,9 @@ impl RelayState {
             .await
     }
 
-    pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
+    pub(crate) fn recent_warnings(
+        &self,
+    ) -> Vec<qb_proto::admin_warning::AdminWarning<chrono::DateTime<chrono::Utc>>> {
         self.observability.recent_warnings()
     }
     pub fn move_cost_snapshot(&self) -> crate::observability::reread_accounting::Snapshot {

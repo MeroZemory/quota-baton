@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+pub mod admin_pool;
 pub mod admin_state;
+pub mod admin_warning;
 pub mod native_reset;
 pub use admin_state::{AdminState, StateBindings, StateCapabilities, StateInflight, StateMemory};
 

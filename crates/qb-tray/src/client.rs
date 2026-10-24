@@ -605,7 +605,7 @@ pub struct MovePair {
     pub from: String,
     pub to: String,
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TrayWarning {
     #[serde(default)]
     pub model_limited: bool,
@@ -631,6 +631,51 @@ pub struct TrayWarning {
     pub next_account: Option<String>,
     #[serde(default)]
     pub earliest_account: Option<String>,
+}
+
+/// Presentation adapter for /state only. The permissive flat SSE warning DTO
+/// remains separate; it cannot add variants to the typed state protocol.
+impl From<&StateWarning> for TrayWarning {
+    fn from(warning: &StateWarning) -> Self {
+        use qb_proto::admin_warning::AdminWarning;
+        match warning {
+            AdminWarning::Burst {
+                burst_new_sessions,
+                observed_at,
+            } => Self {
+                kind: "burst".into(),
+                burst_new_sessions: Some(*burst_new_sessions),
+                observed_at: Some(*observed_at),
+                ..Self::default()
+            },
+            AdminWarning::MoveReread {
+                observed_at,
+                reread_tokens,
+                ..
+            } => Self {
+                kind: "move_reread".into(),
+                reread_tokens: Some(*reread_tokens),
+                observed_at: Some(*observed_at),
+                ..Self::default()
+            },
+            AdminWarning::MoveBreaker {
+                observed_at,
+                move_list,
+                ..
+            } => Self {
+                kind: "move_breaker".into(),
+                observed_at: Some(*observed_at),
+                move_list: move_list
+                    .iter()
+                    .map(|pair| MovePair {
+                        from: pair.from.clone(),
+                        to: pair.to.clone(),
+                    })
+                    .collect(),
+                ..Self::default()
+            },
+        }
+    }
 }
 
 impl TrayWarning {
@@ -684,16 +729,18 @@ mod quota_wire_tests {
     }
 }
 
-/// Shared wire envelope plus an explicit legacy-read adapter. Nested account,
-/// warning and pool schemas remain staged debt; presentation decoding is unchanged.
+pub type StateWarning = qb_proto::admin_warning::AdminWarning<chrono::DateTime<chrono::Utc>>;
+pub type StatePools = Option<qb_proto::admin_pool::ReadPools>;
+type TrayState = qb_proto::admin_state::AdminState<TrayAccount, StateWarning, StatePools>;
+
+/// Typed transport envelope plus explicit legacy-read and presentation adapters.
+/// Nested account migration remains separate.
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
-pub struct TraySnapshot(
-    pub qb_proto::admin_state::AdminState<TrayAccount, TrayWarning, serde_json::Value>,
-);
+pub struct TraySnapshot(pub TrayState);
 
 impl std::ops::Deref for TraySnapshot {
-    type Target = qb_proto::admin_state::AdminState<TrayAccount, TrayWarning, serde_json::Value>;
+    type Target = TrayState;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -1675,7 +1722,7 @@ mod r15_envelope_transport_tests {
     #[test]
     fn r15_complete_state_envelope_survives_tray_and_lossless_cli_decode() {
         let wire = json!({
-            "pools":{"codex":{"eligible":1,"cooling":{},"unavailable":0}},
+            "pools":{"claude":{"eligible":0,"cooling":{},"unavailable":0},"codex":{"eligible":1,"cooling":{},"unavailable":0}},
             "warnings":[],
             "draining":false,
             "capabilities":{"account_adopt":true,"manual_refresh":true,"account_takeover":true},
@@ -1701,7 +1748,7 @@ mod r15_envelope_transport_tests {
         let tray: TraySnapshot = serde_json::from_value(old.clone()).unwrap();
         assert_eq!(tray.draining, None);
         assert_eq!(tray.capabilities, None);
-        assert!(tray.pools.is_null());
+        assert!(tray.pools.is_none());
         assert_eq!(tray.inflight.requests, 0);
         let cli: qb_proto::admin_state::AdminState<Value, Value, Value> =
             qb_proto::admin_state::deserialize_compat(old, true).unwrap();
@@ -1743,7 +1790,7 @@ mod r15_envelope_transport_tests {
         assert_eq!(legacy.inflight.bytes, 0);
         assert_eq!(legacy.memory.private_bytes, 0);
         assert_eq!(legacy.bindings.count, 0);
-        assert!(legacy.pools.is_null());
+        assert!(legacy.pools.is_none());
         assert_eq!(legacy.draining, None);
         assert_eq!(legacy.capabilities, None);
     }
@@ -1769,5 +1816,59 @@ mod r15_dependency_strictness_tests {
         assert!(serde_json::from_value::<State>(nested).is_err());
         let health = r#"{"ok":true,"version":"synthetic","pid":7,"started_at":"2030-01-01T00:00:00Z","unexpected":true}"#;
         assert!(serde_json::from_str::<qb_proto::HealthResponse>(health).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r15_pool_warning_transport_tests {
+    use super::*;
+
+    #[test]
+    fn raw_pool_and_state_warning_duplicates_never_collapse() {
+        for raw in [
+            r#"{"accounts":[],"pools":{"codex":{"eligible":1,"eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"eligible":"bad","eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"eligible":null,"eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":null,"codex":{"eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"unavailable":null,"unavailable":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"cooling":{"auth":1,"auth":2}}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"cooling":{"auth":null,"auth":2}}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"cooling":null,"cooling":{}}}}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":0,"unknown_count":1}]}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":null,"unknown_count":1}]}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":"bad","unknown_count":1}]}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_breaker","observed_at":"2030-01-01T00:00:00Z","move_list":[{"from":null,"from":"a","to":"b"}],"until":"2030-01-01T00:04:00Z","session":"0123456789ab","from":"a","to":"b","reason":"global_trip","forced":false}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<TraySnapshot>(raw).is_err(),
+                "accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_sparse_pools_remain_unknown_and_warning_payload_is_preserved() {
+        let raw = r#"{"accounts":[],"pools":{"codex":{"eligible":2}},"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":1}]}"#;
+        let state = serde_json::from_str::<TraySnapshot>(raw).unwrap();
+        let pools = state.pools.as_ref().unwrap();
+        assert!(pools.claude.is_none());
+        let codex = pools.codex.as_ref().unwrap();
+        assert_eq!(codex.eligible, Some(2));
+        assert!(codex.cooling.is_none());
+        assert!(codex.unavailable.is_none());
+        let wire = serde_json::to_value(&state.warnings[0]).unwrap();
+        assert_eq!(wire["known_count"], 2);
+        assert_eq!(wire["unknown_count"], 1);
+        for raw in [r#"{"accounts":[]}"#, r#"{"accounts":[],"pools":null}"#] {
+            assert!(
+                serde_json::from_str::<TraySnapshot>(raw)
+                    .unwrap()
+                    .pools
+                    .is_none()
+            );
+        }
+        // /state does not adopt the separate SSE quota_notice schema.
+        let raw = r#"{"accounts":[],"warnings":[{"kind":"quota_notice","account":"a"}]}"#;
+        assert!(serde_json::from_str::<TraySnapshot>(raw).is_err());
     }
 }

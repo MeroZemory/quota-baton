@@ -419,7 +419,7 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
         .await
     {
         Ok(accounts) => Json(qb_proto::AdminState {
-            pools: crate::account_runtime::pool_counts(&accounts),
+            pools: crate::account_runtime::typed_pool_counts(&accounts),
             warnings: state.relay.recent_warnings(),
             draining: Some(state.relay.is_draining()),
             capabilities: Some(qb_proto::StateCapabilities {

@@ -222,8 +222,6 @@ fn required_health(value: &Value) -> Result<(), SnapshotError> {
 const HEALTH: &[&str] = &["kind", "reason", "scope", "until", "since"];
 const CREDITS: &[&str] = &["has_credits", "unlimited", "balance", "serving"];
 const QUOTA_COOLING: &[&str] = &["window", "reset_at", "started_at"];
-const PROVIDERS: &[&str] = &["claude", "codex"];
-const POOL: &[&str] = &["eligible", "unavailable", "cooling"];
 const REASONS: &[&str] = &[
     "quota",
     "rate",
@@ -245,12 +243,10 @@ fn retain_fields(value: &mut Value, fields: &[&str]) -> Result<(), SnapshotError
 }
 
 fn allowlist_state(state: &mut TraySnapshot) -> Result<(), SnapshotError> {
-    retain_fields(&mut state.pools, PROVIDERS)?;
-    if let Some(pools) = state.pools.as_object_mut() {
-        for pool in pools.values_mut() {
-            retain_fields(pool, POOL)?;
-            if let Some(cooling) = pool.get_mut("cooling") {
-                retain_fields(cooling, REASONS)?;
+    if let Some(pools) = &mut state.pools {
+        for pool in pools.claude.iter_mut().chain(pools.codex.iter_mut()) {
+            if let Some(cooling) = &mut pool.cooling {
+                cooling.retain(|reason| REASONS.contains(&reason));
             }
         }
     }
@@ -290,20 +286,15 @@ fn text_fields(value: &Value, allowed: &[&str]) -> Result<(), SnapshotError> {
 }
 
 fn validate_state(state: &TraySnapshot) -> Result<(), SnapshotError> {
-    if let Some(pools) = object_fields(&state.pools, PROVIDERS)? {
-        for pool in pools.values() {
-            if let Some(pool) = object_fields(pool, POOL)? {
-                for (name, value) in pool {
-                    if name == "cooling" {
-                        if let Some(reasons) = object_fields(value, REASONS)?
-                            && reasons.values().any(|v| v.as_u64().is_none())
-                        {
-                            return Err(SnapshotError::Invalid);
-                        }
-                    } else if !value.is_null() && value.as_u64().is_none() {
-                        return Err(SnapshotError::Invalid);
-                    }
-                }
+    // Typed counters validate unsigned/null shapes during raw deserialization.
+    // Unknown reason names still require the capture allowlist, even though the
+    // transport preserves them for forward compatibility.
+    if let Some(pools) = &state.pools {
+        for pool in pools.claude.iter().chain(pools.codex.iter()) {
+            if let Some(cooling) = &pool.cooling
+                && cooling.iter().any(|(reason, _)| !REASONS.contains(&reason))
+            {
+                return Err(SnapshotError::DisallowedField);
             }
         }
     }
@@ -437,8 +428,8 @@ mod tests {
         }]});
         let state = json!({
             "version":"synthetic","refresh_token":"private-canary-root",
-            "pools":{"codex":{"eligible":1,"unavailable":0,"cooling":{"auth":1},
-                "access_token":"private-canary-pool"}},
+            "pools":{"codex":{"eligible":1,"unavailable":0,
+                "cooling":{"auth":1,"private-canary-pool":1}}},
             "accounts":[{"id":"one","provider":"codex","user_state":"active",
                 "label":"Synthetic account","plan":"plus",
                 "health":{"kind":"ready","access_token":"private-canary-health"},
@@ -645,5 +636,33 @@ mod tests {
             serialize_limited(&json!({"value":"x".repeat(100)}), 32, false),
             Err(SnapshotError::TooLarge)
         ));
+    }
+}
+
+#[cfg(test)]
+mod typed_pool_capture_tests {
+    use super::*;
+
+    #[test]
+    fn open_cooling_reasons_are_allowlisted_without_fabricating_counts() {
+        let mut state: TraySnapshot = serde_json::from_str(
+            r#"{"accounts":[],"pools":{"codex":{"cooling":{"rate":1,"future_private":2}}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_state(&state),
+            Err(SnapshotError::DisallowedField)
+        ));
+        allowlist_state(&mut state).unwrap();
+        let pools = state.pools.as_ref().unwrap();
+        assert!(pools.claude.is_none());
+        let codex = pools.codex.as_ref().unwrap();
+        assert_eq!(codex.eligible, None);
+        assert_eq!(codex.unavailable, None);
+        let cooling = codex.cooling.as_ref().unwrap();
+        assert_eq!(cooling.get("rate"), Some(1));
+        assert_eq!(cooling.get("future_private"), None);
+        let wire = serde_json::to_string(&state).unwrap();
+        assert!(!wire.contains("future_private"));
     }
 }

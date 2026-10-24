@@ -163,7 +163,8 @@ impl Controller {
         let mut found = Vec::new();
         let mut exhausted_providers = HashSet::new();
         let now = chrono::DateTime::<chrono::Utc>::from(wall);
-        for warning in &snapshot.warnings {
+        for state_warning in &snapshot.warnings {
+            let warning = crate::client::TrayWarning::from(state_warning);
             let Some(observed_at) = warning.observed_at else {
                 continue;
             };
@@ -300,7 +301,12 @@ impl Controller {
                 .count() as u64;
             if !exhausted_providers.contains(provider)
                 && !unresolved_quota
-                && let Some(eligible) = snapshot.pools[provider]["eligible"].as_u64()
+                && let Some(eligible) = snapshot
+                    .pools
+                    .as_ref()
+                    .and_then(|pools| pools.get(provider))
+                    .and_then(Option::as_ref)
+                    .and_then(|pool| pool.eligible)
                 && let Some(signal) = signals::pool_signal(&signals::Pool {
                     provider,
                     active,
@@ -464,7 +470,7 @@ mod tests {
             let mut s = quota_snapshot(action);
             // Keep generic exhaustion out of the first two fixture cases.
             if action != "exhausted" {
-                s.pools["codex"]["eligible"] = json!(1);
+                s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(1);
             }
             observe(&mut c, &s, t);
             let n = c.next(Duration::from_secs(t)).unwrap();
@@ -508,7 +514,7 @@ mod tests {
             assert_eq!(c.presentation().badge, Badge::Normal);
         }
         let mut s = quota_snapshot("credits");
-        s.pools["codex"]["eligible"] = json!(1);
+        s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(1);
         s.accounts[0].quota_notice.as_mut().unwrap().reset_at =
             Some(chrono::Utc::now() - chrono::Duration::seconds(1));
         let mut c = Controller::default();
@@ -543,7 +549,7 @@ mod tests {
         );
         s.accounts[0].email = Some("hello.sample-acct@example.test".into());
         s.accounts[0].provider = "claude".into();
-        s.pools = json!({"claude":{"eligible":0}});
+        s.pools = serde_json::from_value(json!({"claude":{"eligible":0}})).unwrap();
         let (title, body) = account_message(&s, &s.accounts[0], Kind::Billing, wall);
         assert_eq!(title, "hello.sample-acct · Claude 결제 거절");
         assert_eq!(
@@ -555,7 +561,7 @@ mod tests {
         );
         let (_, body) = account_message(&s, &s.accounts[0], Kind::Relogin, wall);
         assert!(body.contains("처리할 다른 계정이 없습니다"));
-        s.pools["claude"]["eligible"] = json!(1);
+        s.pools.as_mut().unwrap().claude.as_mut().unwrap().eligible = Some(1);
         // A pool can include self; the explicit core field decides alternatives.
         let (_, body) = account_message(&s, &s.accounts[0], Kind::Relogin, wall);
         assert!(body.contains("처리할 다른 계정이 없습니다"));
@@ -584,7 +590,7 @@ mod tests {
             let context = s.accounts[0].quota_notice.take().unwrap();
             s.accounts[0].health = json!({"kind":"cooling","reason":"quota","scope":"account",
                 "until":chrono::Utc::now()+chrono::Duration::seconds(remaining)});
-            s.pools["codex"]["eligible"] = json!(0);
+            s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(0);
             let mut c = Controller::default();
             observe(&mut c, &s, 0);
             assert!(
@@ -610,7 +616,7 @@ mod tests {
         ] {
             let mut s = quota_snapshot("failover");
             s.accounts[0].email = Some(format!("{local}@example.test"));
-            s.pools["codex"]["eligible"] = json!(1);
+            s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(1);
             let mut c = Controller::default();
             observe(&mut c, &s, 0);
             let notice = c.next(Duration::ZERO).unwrap();
@@ -627,7 +633,7 @@ mod tests {
         for action in ["failover", "exhausted"] {
             let mut s = quota_snapshot(action);
             if action == "failover" {
-                s.pools["codex"]["eligible"] = json!(1);
+                s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(1);
             }
             let mut successor = s.accounts[1].clone();
             successor.id = "c".into();
@@ -663,7 +669,7 @@ mod tests {
     #[test]
     fn older_context_is_suppressed_and_earliest_null_or_unknown_id_stays_truthful() {
         let mut s = quota_snapshot("exhausted");
-        s.pools["codex"]["eligible"] = json!(1);
+        s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(1);
         s.accounts[0].last_relevant_state_at = Some("2026-01-01T00:00:01Z".parse().unwrap());
         let mut c = Controller::default();
         observe(&mut c, &s, 0);
@@ -713,19 +719,9 @@ mod tests {
     fn hidden_tray_recovers_recent_burst_from_snapshot_once_without_badge_change() {
         let mut c = Controller::default();
         let mut s = snapshot(json!({"kind":"ready"}), "active", Some(1));
-        s.warnings = vec![crate::client::TrayWarning {
-            model_limited: false,
-            kind: "burst".into(),
-            burst_new_sessions: Some(31),
-            move_list: Vec::new(),
-            reread_tokens: None,
-            observed_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
-            account: None,
-            window: None,
-            reset_at: None,
-            action: None,
-            next_account: None,
-            earliest_account: None,
+        s.warnings = vec![crate::client::StateWarning::Burst {
+            burst_new_sessions: 31,
+            observed_at: chrono::Utc::now() - chrono::Duration::seconds(1),
         }];
         observe(&mut c, &s, 0);
         assert_eq!(c.presentation().badge, Badge::Normal);
@@ -733,7 +729,13 @@ mod tests {
         c.finish();
         observe(&mut c, &s, 10);
         assert!(c.next(Duration::from_secs(10)).is_none());
-        s.warnings[0].observed_at = Some(chrono::Utc::now() - chrono::Duration::minutes(11));
+        match &mut s.warnings[0] {
+            crate::client::StateWarning::Burst { observed_at, .. }
+            | crate::client::StateWarning::MoveReread { observed_at, .. }
+            | crate::client::StateWarning::MoveBreaker { observed_at, .. } => {
+                *observed_at = chrono::Utc::now() - chrono::Duration::minutes(11);
+            }
+        }
         let mut fresh = Controller::default();
         observe(&mut fresh, &s, 0);
         assert!(fresh.next(Duration::ZERO).is_none());
@@ -747,13 +749,28 @@ mod tests {
         ] {
             let mut s = snapshot(json!({"kind":"ready"}), "active", Some(1));
             s.accounts[0].label = Some("테스트 계정".into());
-            s.warnings = vec![
-                serde_json::from_value(json!({
-                    "kind":kind,"observed_at":chrono::Utc::now()-chrono::Duration::seconds(1),
-                    "move_list":[{"from":"cx-synthetic","to":"cx-other"}],"reread_tokens":1234
-                }))
-                .unwrap(),
-            ];
+            s.warnings = vec![if kind == "move_breaker" {
+                crate::client::StateWarning::MoveBreaker {
+                    observed_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+                    move_list: vec![qb_proto::admin_warning::AdminMovePair {
+                        from: "cx-synthetic".into(),
+                        to: "cx-other".into(),
+                    }],
+                    until: chrono::Utc::now() + chrono::Duration::minutes(4),
+                    session: "0123456789ab".into(),
+                    from: "cx-synthetic".into(),
+                    to: "cx-other".into(),
+                    reason: "global_trip".into(),
+                    forced: false,
+                }
+            } else {
+                crate::client::StateWarning::MoveReread {
+                    observed_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+                    reread_tokens: 1234,
+                    known_count: 2,
+                    unknown_count: 1,
+                }
+            }];
             let mut controller = Controller::default();
             observe(&mut controller, &s, 0);
             let notice = controller.next(Duration::ZERO).unwrap();
@@ -766,7 +783,13 @@ mod tests {
             controller.finish();
             observe(&mut controller, &s, 1);
             assert!(controller.next(Duration::from_secs(1)).is_none());
-            s.warnings[0].observed_at = Some(chrono::Utc::now() - chrono::Duration::minutes(11));
+            match &mut s.warnings[0] {
+                crate::client::StateWarning::Burst { observed_at, .. }
+                | crate::client::StateWarning::MoveReread { observed_at, .. }
+                | crate::client::StateWarning::MoveBreaker { observed_at, .. } => {
+                    *observed_at = chrono::Utc::now() - chrono::Duration::minutes(11);
+                }
+            }
             let mut fresh = Controller::default();
             observe(&mut fresh, &s, 0);
             assert!(fresh.next(Duration::ZERO).is_none());
@@ -886,7 +909,7 @@ mod tests {
     #[test]
     fn allow_off_prunes_unsent_paid_notice_and_preferences_alone_never_notify() {
         let mut s = quota_snapshot("credits");
-        s.pools["codex"]["eligible"] = json!(1);
+        s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(1);
         let mut c = Controller::default();
         observe(&mut c, &s, 0);
         assert_eq!(c.pending.len(), 1);
