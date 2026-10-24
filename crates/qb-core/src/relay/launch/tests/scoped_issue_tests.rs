@@ -204,7 +204,48 @@ async fn box_issue_revoke_behind_actual_mutations_gate_leaves_no_placement_or_to
     );
     let _caller = operation.caller_guard();
     assert_eq!(f.relay.launch_tokens.entry_count_for_test(), 0);
-    let held = f.relay.bindings.lock_launch_mutations_for_test();
+    // Own the real synchronous gate on a native thread, rather than retaining a
+    // MutexGuard on this async task across its actual issuance poll.
+    struct HeldMutations {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl HeldMutations {
+        fn release(mut self) {
+            self.release.take().unwrap().send(()).unwrap();
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+    impl Drop for HeldMutations {
+        fn drop(&mut self) {
+            // Disconnect/release on every failed assertion or cancelled await,
+            // then join before the fixture's store and temporary home drop.
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+    let (release, released) = std::sync::mpsc::channel();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let relay = f.relay.clone();
+    let worker = std::thread::spawn(move || {
+        let _held = relay.bindings.lock_launch_mutations_for_test();
+        let _ = entered.send(());
+        // Bounded independently of the async runtime; disconnection is also a
+        // release, so a failed test cannot retain the mutation gate.
+        let _ = released.recv_timeout(Duration::from_secs(15));
+    });
+    let held = HeldMutations {
+        release: Some(release),
+        worker: Some(worker),
+    };
+    tokio::time::timeout(Duration::from_secs(5), ready)
+        .await
+        .expect("native holder must acquire the actual mutation gate")
+        .unwrap();
     let issue = f.relay.issue_box_launch_for_operation(
         issue_request(Some("common")),
         10200,
@@ -231,7 +272,7 @@ async fn box_issue_revoke_behind_actual_mutations_gate_leaves_no_placement_or_to
     assert_eq!(f.relay.launch_tokens.entry_count_for_test(), 1);
     assert!(!operation.is_admitted());
     boxes.revoke(scope.name()).unwrap();
-    drop(held);
+    held.release();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), &mut issue)
             .await

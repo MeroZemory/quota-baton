@@ -127,10 +127,10 @@ async fn grant_close_is_observed_before_retained_writer_returns() {
                 result
             },
             |event| {
-                if matches!(event, WriteEvent::GrantClosed) {
-                    if let Some(closed) = closed.take() {
-                        let _ = closed.send(());
-                    }
+                if matches!(event, WriteEvent::GrantClosed)
+                    && let Some(closed) = closed.take()
+                {
+                    let _ = closed.send(());
                 }
             },
         )
@@ -196,10 +196,10 @@ async fn drain_is_observed_without_abandoning_blocking_writer() {
                 registry.revoke(scope.name())
             },
             |event| {
-                if matches!(event, WriteEvent::Drain) {
-                    if let Some(noticed) = noticed.take() {
-                        let _ = noticed.send(());
-                    }
+                if matches!(event, WriteEvent::Drain)
+                    && let Some(noticed) = noticed.take()
+                {
+                    let _ = noticed.send(());
                 }
             },
         )

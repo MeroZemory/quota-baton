@@ -58,11 +58,10 @@ async fn detached_spawn_blocking_and_nested_spawn_retain_exact_scope_after_calle
                 // alive after its requesting future and join handle disappear.
                 released.recv().unwrap();
                 assert!(!dispatch_allowed());
-                let nested = spawn(async move {
+                spawn(async move {
                     assert_eq!(current().unwrap().scope(), &expected);
                     assert!(!dispatch_allowed());
-                });
-                nested
+                })
             })
             .await
             .unwrap()

@@ -5,7 +5,12 @@ pub(crate) use tokio::{spawn, task::spawn_blocking};
 
 // These fixtures cannot construct a scoped admission; retain the production
 // optional-field shape without introducing a mock grant.
-pub(crate) type BoxRequest = std::convert::Infallible;
+pub(crate) struct BoxRequest(std::convert::Infallible);
+impl Clone for BoxRequest {
+    fn clone(&self) -> Self {
+        match self.0 {}
+    }
+}
 pub(crate) fn current_request() -> Option<BoxRequest> {
     None
 }
