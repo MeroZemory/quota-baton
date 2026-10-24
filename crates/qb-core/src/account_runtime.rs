@@ -2795,164 +2795,166 @@ impl AccountRuntime {
         let outside_inflight = self.inflight.clone();
         let probes = self.probes.clone();
         let volatile = self.volatile.clone();
-        let (account, snapshot, pending) = crate::boxes::spawn_blocking(move || -> Result<_, ()> {
-            let _guard = store.transaction().map_err(|_| ())?;
-            // Consume the pre-send ordinal before classification, even for a
-            // partial or nonqualifying raw report. Never capture on receipt.
-            let mut application = origin.and_then(|origin| wait_owner.accept(&account_id, origin));
-            let report_model = model.clone();
-            let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
-            let mut snapshot = snapshot;
-            let mut model = model;
-            if let Some(current) = obs.quota_snapshot(&account_id)
-                && let Some((new, incoming)) =
-                    time(&current["observed_at"]).zip(time(&snapshot["observed_at"]))
-                && new >= incoming
-            {
-                if new > incoming {
-                    model = None;
-                }
-                snapshot = current;
-            }
-            if let Ok(mut released) = released_quota.lock()
-                && let Some(release) = released.get_mut(&account_id)
-            {
-                release.observe(&reported, &snapshot);
-            }
-            let attributed = application.is_some();
-            let cause = match application.as_mut() {
-                Some(report) => crate::accounts::MetadataCause::UsageReport(report),
-                None => crate::accounts::MetadataCause::Mutation(
-                    crate::accounts::MetadataMutation::Ordinary,
-                ),
-            };
-            let mut ran = false;
-            let mut candidate = None;
-            let mut readiness = None;
-            let account = store
-                .update_metadata_with_cause_unlocked(&account_id, cause, |account| {
-                    ran = true;
-                    let before = attributed.then(|| account.clone());
-                    let mut health_snapshot = snapshot.clone();
-                    if let Ok(released) = released_quota.lock()
-                        && let Some(release) = released.get(&account_id)
-                    {
-                        filter_released_quota(account, &mut health_snapshot, release);
-                    }
-                    let applied_at = Utc::now();
-                    account.apply_health_signal(
-                        crate::accounts::HealthSignal::UsageSnapshot {
-                            snapshot: health_snapshot,
-                            model: model.clone(),
-                            projected_allowance: 0.0,
-                        },
-                        applied_at,
-                    );
-                    if let Some(before) = before {
-                        readiness = wait_owner::classify_readiness(
-                            &before,
-                            account,
-                            &reported,
-                            report_model.as_deref(),
-                            applied_at,
-                        );
-                        candidate = wait_owner::classify(
-                            &before,
-                            account,
-                            &reported,
-                            report_model.as_deref(),
-                            applied_at,
-                        );
-                    }
-                })
-                .map_err(|_| ())?;
-            // Stopped updates may return Ok without running the reducer. The
-            // registry also rejects an independently expired/released permit.
-            let pending = if ran
-                && !store.writes_stopped()
-                && let Some(application) = application
-            {
-                // No healthy ShortQuotaProof or new producer receipt. Readiness
-                // is only for existing suspended records and exact durable gen.
-                let readiness_guards = readiness.as_ref().and_then(|_| {
-                    // Hold native runtime vetoes THROUGH publication, in the
-                    // same order as existing registration/consumption gates.
-                    let released = released_quota.lock().ok()?;
-                    let probes = probes.lock().ok()?;
-                    let volatile = volatile.lock().ok()?;
-                    Some((released, probes, volatile))
-                });
-                let readiness = readiness.filter(|_| {
-                    readiness_guards
-                        .as_ref()
-                        .is_some_and(|(released, probes, volatile)| {
-                            !released
-                                .get(&account_id)
-                                .is_some_and(|release| release.pending)
-                                && !probes.contains(&account_id)
-                                && !volatile.contains_key(&account_id)
-                                && store
-                                    .tokens_unlocked(&account)
-                                    .is_ok_and(|tokens| !tokens.access_token.is_empty())
-                        })
-                });
-                if candidate.is_none()
-                    && matches!(
-                        publication,
-                        wait_owner::ReportPublication::Immediate
-                            | wait_owner::ReportPublication::ImmediatePollReceipt
-                    )
-                    && let Some(readiness) = readiness
+        let (account, snapshot, pending) =
+            crate::boxes::spawn_blocking(move || -> Result<_, ()> {
+                let _guard = store.transaction().map_err(|_| ())?;
+                // Consume the pre-send ordinal before classification, even for a
+                // partial or nonqualifying raw report. Never capture on receipt.
+                let mut application =
+                    origin.and_then(|origin| wait_owner.accept(&account_id, origin));
+                let report_model = model.clone();
+                let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
+                let mut snapshot = snapshot;
+                let mut model = model;
+                if let Some(current) = obs.quota_snapshot(&account_id)
+                    && let Some((new, incoming)) =
+                        time(&current["observed_at"]).zip(time(&snapshot["observed_at"]))
+                    && new >= incoming
                 {
-                    application.finish_readiness(readiness, &account);
-                    None
-                } else {
-                    match publication {
-                        wait_owner::ReportPublication::Immediate => {
-                            application.finish(candidate);
-                            None
-                        }
-                        wait_owner::ReportPublication::ImmediatePollReceipt => application
-                            .finish_poll(candidate)
-                            .map(wait_owner::ReportReceipt::Poll),
-                        wait_owner::ReportPublication::DeferredHttp429 => application
-                            .seal_http(candidate, &account)
-                            .map(wait_owner::ReportReceipt::Http),
+                    if new > incoming {
+                        model = None;
                     }
+                    snapshot = current;
                 }
-            } else {
-                None
-            };
-            apply_snapshot_notices(
-                &obs,
-                &notices,
-                &account_id,
-                &account,
-                &snapshot,
-                model.as_deref(),
-            );
-            let publish_outside = ran && !store.writes_stopped() && outside.is_some();
-            if publish_outside
-                && let Some(outside_owner::PollApplication {
-                    origin: Some(origin),
-                }) = outside
-            {
-                let active = outside_inflight
-                    .lock()
-                    .map(|counts| counts.get(&account_id).copied().unwrap_or(0) > 0)
-                    .unwrap_or(true);
-                outside_owner.observe(&account_id, &reported, origin, active);
-            }
-            // Native selection can take the inverse Store/bindings order.
-            // Finish persistence, release Store, then publish under mutations.
-            drop(_guard);
-            if publish_outside {
-                outside_owner.publish();
-            }
-            Ok((account, snapshot, pending))
-        })
-        .await
-        .map_err(|_| ())??;
+                if let Ok(mut released) = released_quota.lock()
+                    && let Some(release) = released.get_mut(&account_id)
+                {
+                    release.observe(&reported, &snapshot);
+                }
+                let attributed = application.is_some();
+                let cause = match application.as_mut() {
+                    Some(report) => crate::accounts::MetadataCause::UsageReport(report),
+                    None => crate::accounts::MetadataCause::Mutation(
+                        crate::accounts::MetadataMutation::Ordinary,
+                    ),
+                };
+                let mut ran = false;
+                let mut candidate = None;
+                let mut readiness = None;
+                let account = store
+                    .update_metadata_with_cause_unlocked(&account_id, cause, |account| {
+                        ran = true;
+                        let before = attributed.then(|| account.clone());
+                        let mut health_snapshot = snapshot.clone();
+                        if let Ok(released) = released_quota.lock()
+                            && let Some(release) = released.get(&account_id)
+                        {
+                            filter_released_quota(account, &mut health_snapshot, release);
+                        }
+                        let applied_at = Utc::now();
+                        account.apply_health_signal(
+                            crate::accounts::HealthSignal::UsageSnapshot {
+                                snapshot: health_snapshot,
+                                model: model.clone(),
+                                projected_allowance: 0.0,
+                            },
+                            applied_at,
+                        );
+                        if let Some(before) = before {
+                            readiness = wait_owner::classify_readiness(
+                                &before,
+                                account,
+                                &reported,
+                                report_model.as_deref(),
+                                applied_at,
+                            );
+                            candidate = wait_owner::classify(
+                                &before,
+                                account,
+                                &reported,
+                                report_model.as_deref(),
+                                applied_at,
+                            );
+                        }
+                    })
+                    .map_err(|_| ())?;
+                // Stopped updates may return Ok without running the reducer. The
+                // registry also rejects an independently expired/released permit.
+                let pending = if ran
+                    && !store.writes_stopped()
+                    && let Some(application) = application
+                {
+                    // No healthy ShortQuotaProof or new producer receipt. Readiness
+                    // is only for existing suspended records and exact durable gen.
+                    let readiness_guards = readiness.as_ref().and_then(|_| {
+                        // Hold native runtime vetoes THROUGH publication, in the
+                        // same order as existing registration/consumption gates.
+                        let released = released_quota.lock().ok()?;
+                        let probes = probes.lock().ok()?;
+                        let volatile = volatile.lock().ok()?;
+                        Some((released, probes, volatile))
+                    });
+                    let readiness = readiness.filter(|_| {
+                        readiness_guards
+                            .as_ref()
+                            .is_some_and(|(released, probes, volatile)| {
+                                !released
+                                    .get(&account_id)
+                                    .is_some_and(|release| release.pending)
+                                    && !probes.contains(&account_id)
+                                    && !volatile.contains_key(&account_id)
+                                    && store
+                                        .tokens_unlocked(&account)
+                                        .is_ok_and(|tokens| !tokens.access_token.is_empty())
+                            })
+                    });
+                    if candidate.is_none()
+                        && matches!(
+                            publication,
+                            wait_owner::ReportPublication::Immediate
+                                | wait_owner::ReportPublication::ImmediatePollReceipt
+                        )
+                        && let Some(readiness) = readiness
+                    {
+                        application.finish_readiness(readiness, &account);
+                        None
+                    } else {
+                        match publication {
+                            wait_owner::ReportPublication::Immediate => {
+                                application.finish(candidate);
+                                None
+                            }
+                            wait_owner::ReportPublication::ImmediatePollReceipt => application
+                                .finish_poll(candidate)
+                                .map(wait_owner::ReportReceipt::Poll),
+                            wait_owner::ReportPublication::DeferredHttp429 => application
+                                .seal_http(candidate, &account)
+                                .map(wait_owner::ReportReceipt::Http),
+                        }
+                    }
+                } else {
+                    None
+                };
+                apply_snapshot_notices(
+                    &obs,
+                    &notices,
+                    &account_id,
+                    &account,
+                    &snapshot,
+                    model.as_deref(),
+                );
+                let publish_outside = ran && !store.writes_stopped() && outside.is_some();
+                if publish_outside
+                    && let Some(outside_owner::PollApplication {
+                        origin: Some(origin),
+                    }) = outside
+                {
+                    let active = outside_inflight
+                        .lock()
+                        .map(|counts| counts.get(&account_id).copied().unwrap_or(0) > 0)
+                        .unwrap_or(true);
+                    outside_owner.observe(&account_id, &reported, origin, active);
+                }
+                // Native selection can take the inverse Store/bindings order.
+                // Finish persistence, release Store, then publish under mutations.
+                drop(_guard);
+                if publish_outside {
+                    outside_owner.publish();
+                }
+                Ok((account, snapshot, pending))
+            })
+            .await
+            .map_err(|_| ())??;
         let _ = self
             .events
             .send(json!({"event":"quota_updated","data":{"id":id,"snapshot":snapshot}}));
