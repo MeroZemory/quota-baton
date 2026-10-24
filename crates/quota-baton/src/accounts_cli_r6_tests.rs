@@ -417,12 +417,12 @@ fn parser_accepts_both_providers_and_optional_flags() {
         assert!(matches!(
             cli.command,
             crate::Command::Accounts {
-                command: AccountsCommand::Takeover {
+                command: AccountsCommand::Platform(AccountsPlatformCommand::Takeover {
                     replace: true,
                     keep_source: true,
                     yes: true,
                     ..
-                }
+                })
             }
         ));
     }

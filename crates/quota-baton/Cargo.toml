@@ -13,7 +13,6 @@ chrono.workspace = true
 qb-core.workspace = true
 qb-proto.workspace = true
 rand.workspace = true
-qb-tray = { path = "../qb-tray" }
 reqwest.workspace = true
 rusqlite = { version = "=0.33.0", features = ["bundled"] }
 serde_json.workspace = true
@@ -21,12 +20,15 @@ serde.workspace = true
 sha2.workspace = true
 toml_edit.workspace = true
 tokio.workspace = true
-windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_IO"] }
 zstd.workspace = true
 zeroize.workspace = true
 futures-util.workspace = true
 unicode-width = "=0.2.2"
 tokio-tungstenite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+qb-tray = { path = "../qb-tray" }
+windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_IO"] }
 
 [build-dependencies]
 cc = "=1.8.0"

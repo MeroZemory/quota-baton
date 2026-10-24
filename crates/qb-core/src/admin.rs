@@ -1,6 +1,6 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use crate::accounts::{AccountStore, StoreError, import};
+use crate::accounts::AccountStore;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -8,43 +8,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use qb_proto::{
-    CpaImportRequest, ImportMode,
-    admin_action::{
-        AccountActionReply, ClearedReply, ProjectReply, ReleaseHoldReply, RoutingMutationReply,
-        UpdatedReply,
-    },
+use qb_proto::admin_action::{
+    AccountActionReply, ClearedReply, ProjectReply, ReleaseHoldReply, RoutingMutationReply,
+    UpdatedReply,
 };
 
-#[derive(Clone)]
-struct AccountAdmin {
-    store: Arc<AccountStore>,
-    poller: Option<Arc<crate::quota::UsagePoller>>,
-}
-
-pub fn account_routes(store: Arc<AccountStore>) -> Router {
-    account_router(AccountAdmin {
-        store,
-        poller: None,
-    })
-}
-
-/// Live core imports queue profile work; store-only callers remain offline.
-pub fn account_routes_with_poller(
-    store: Arc<AccountStore>,
-    poller: Arc<crate::quota::UsagePoller>,
-) -> Router {
-    account_router(AccountAdmin {
-        store,
-        poller: Some(poller),
-    })
-}
-
-fn account_router(state: AccountAdmin) -> Router {
-    Router::new()
-        .route("/admin/v1/accounts/import", post(import_cpa))
-        .with_state(state)
-}
+pub use source_features::{account_routes, account_routes_with_poller};
 
 #[derive(serde::Deserialize)]
 pub struct LoginRequest {
@@ -114,63 +83,6 @@ fn login_error(error_value: crate::oauth::LoginError) -> Response {
     error(status, &error_value.to_string())
 }
 
-async fn import_cpa(
-    State(state): State<AccountAdmin>,
-    request: Result<Json<CpaImportRequest>, JsonRejection>,
-) -> Response {
-    let Json(request) = match request {
-        Ok(request) => request,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid import request"),
-    };
-    if request.source != "cpa" {
-        return error(StatusCode::BAD_REQUEST, "Unsupported account source");
-    }
-    if request.mode != ImportMode::Linked {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "소유권 이전은 계정별 adopt 명령을 사용해 주세요.",
-        );
-    }
-    let dir = match request.dir {
-        Some(dir) => dir,
-        None => match std::env::var_os("USERPROFILE") {
-            Some(profile) => PathBuf::from(profile).join(".cli-proxy-api/auths"),
-            None => return error(StatusCode::INTERNAL_SERVER_ERROR, "USERPROFILE is missing"),
-        },
-    };
-    match tokio::task::spawn_blocking(move || {
-        let store = state.store;
-        let rows = import::run(&store, &dir, &request.activate, request.dry_run)?;
-        if !request.dry_run
-            && let Some(poller) = state.poller
-        {
-            for row in &rows {
-                if matches!(
-                    row.action,
-                    import::ImportAction::Created | import::ImportAction::Updated
-                ) && let Some(id) = &row.id
-                    && let Ok(account) = store.load(id)
-                {
-                    poller.queue_profile(&account);
-                }
-            }
-        }
-        Ok::<_, StoreError>(rows)
-    })
-    .await
-    {
-        Ok(Ok(rows)) => Json(rows).into_response(),
-        Ok(Err(StoreError::GenerationConflict { .. } | StoreError::IdentityCollision)) => {
-            error(StatusCode::CONFLICT, "Account store conflict")
-        }
-        Ok(Err(_)) => error(StatusCode::BAD_REQUEST, "Account import failed"),
-        Err(_) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Account import task failed",
-        ),
-    }
-}
-
 fn error(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -188,7 +100,7 @@ struct RuntimeAdmin {
     relay: Arc<crate::relay::RelayState>,
     data_port: u16,
     #[cfg(feature = "testkit")]
-    adoption_probe: Option<fn() -> crate::accounts::adopt::ProbeState>,
+    adoption_probe: Option<fn() -> source_features::ProbeState>,
 }
 
 pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> Router {
@@ -204,7 +116,7 @@ pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> R
 pub fn runtime_routes_with_adoption_probe(
     relay: Arc<crate::relay::RelayState>,
     data_port: u16,
-    probe: fn() -> crate::accounts::adopt::ProbeState,
+    probe: fn() -> source_features::ProbeState,
 ) -> Router {
     runtime_router(RuntimeAdmin {
         relay,
@@ -214,39 +126,40 @@ pub fn runtime_routes_with_adoption_probe(
 }
 
 fn runtime_router(state: RuntimeAdmin) -> Router {
-    Router::new()
-        .route(
-            "/admin/v1/launches",
-            post(issue_launch)
-                .layer(axum::extract::DefaultBodyLimit::max(8192))
-                .layer(axum::middleware::from_fn(issue_operation_entry)),
-        )
-        .route(
-            "/admin/v1/routing",
-            axum::routing::get(routing_view).post(routing_update),
-        )
-        .route("/admin/v1/routing/move-guard/clear", post(clear_move_guard))
-        .route("/admin/v1/sessions", axum::routing::get(dashboard_sessions))
-        .route(
-            "/admin/v1/sessions/{id}",
-            axum::routing::get(dashboard_detail),
-        )
-        .route("/admin/v1/activity", axum::routing::get(dashboard_activity))
-        .route(
-            "/admin/v1/usage-history",
-            axum::routing::get(dashboard_usage),
-        )
-        .route("/admin/v1/state", axum::routing::get(runtime_state))
-        .route("/admin/v1/events", axum::routing::get(runtime_events))
-        .route("/admin/v1/accounts/takeover", post(takeover_account))
-        .route("/admin/v1/accounts/{id}/{action}", post(account_action))
-        .route(
-            "/admin/v1/accounts/{id}",
-            axum::routing::patch(account_patch),
-        )
-        .route("/admin/v1/lifecycle/drain", post(lifecycle_drain))
-        .route("/admin/v1/lifecycle/shutdown", post(lifecycle_shutdown))
-        .with_state(state)
+    source_features::runtime_routes(
+        Router::new()
+            .route(
+                "/admin/v1/launches",
+                post(issue_launch)
+                    .layer(axum::extract::DefaultBodyLimit::max(8192))
+                    .layer(axum::middleware::from_fn(issue_operation_entry)),
+            )
+            .route(
+                "/admin/v1/routing",
+                axum::routing::get(routing_view).post(routing_update),
+            )
+            .route("/admin/v1/routing/move-guard/clear", post(clear_move_guard))
+            .route("/admin/v1/sessions", axum::routing::get(dashboard_sessions))
+            .route(
+                "/admin/v1/sessions/{id}",
+                axum::routing::get(dashboard_detail),
+            )
+            .route("/admin/v1/activity", axum::routing::get(dashboard_activity))
+            .route(
+                "/admin/v1/usage-history",
+                axum::routing::get(dashboard_usage),
+            )
+            .route("/admin/v1/state", axum::routing::get(runtime_state))
+            .route("/admin/v1/events", axum::routing::get(runtime_events))
+            .route("/admin/v1/accounts/{id}/{action}", post(account_action))
+            .route(
+                "/admin/v1/accounts/{id}",
+                axum::routing::patch(account_patch),
+            )
+            .route("/admin/v1/lifecycle/drain", post(lifecycle_drain))
+            .route("/admin/v1/lifecycle/shutdown", post(lifecycle_shutdown)),
+    )
+    .with_state(state)
 }
 
 // Candidate admission/wait budget, not a filesystem completion deadline.
@@ -464,11 +377,7 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
                 pools,
                 warnings: state.relay.recent_warnings(),
                 draining: Some(state.relay.is_draining()),
-                capabilities: Some(qb_proto::StateCapabilities {
-                    account_adopt: true,
-                    manual_refresh: true,
-                    account_takeover: true,
-                }),
+                capabilities: Some(source_features::capabilities()),
                 accounts,
                 inflight: qb_proto::StateInflight {
                     requests: state
@@ -652,7 +561,7 @@ async fn account_action(
     let user_state = match action.as_str() {
         "release-hold" => return release_hold(state, id, request).await,
         "refresh-usage" => return refresh_usage(state, id).await,
-        "adopt" => return adopt_account(state, id, request).await,
+        "adopt" => return source_features::adopt_account(state, id, request).await,
         "refresh" => return refresh_account(state, id, request).await,
         "pause" => UserState::Paused,
         "resume" | "enable" => UserState::Active,
@@ -699,169 +608,6 @@ async fn release_hold(
         Err(()) => error(
             StatusCode::CONFLICT,
             "해제할 사용량 한도가 없거나 저장하지 못했습니다.",
-        ),
-    }
-}
-
-async fn takeover_account(
-    State(state): State<RuntimeAdmin>,
-    request: Result<Json<crate::accounts::takeover::TakeoverRequest>, JsonRejection>,
-) -> Response {
-    let Ok(Json(request)) = request else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "계정 가져오기 요청이 올바르지 않습니다.",
-        );
-    };
-    let phase = request.phase;
-    match state.relay.takeover_account(request).await {
-        Ok(value) => match phase {
-            crate::accounts::takeover::Phase::Inspect => {
-                match serde_json::from_value::<qb_proto::admin_takeover::TakeoverInspect>(value) {
-                    Ok(reply) => Json(reply).into_response(),
-                    Err(_) => error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Account response unavailable",
-                    ),
-                }
-            }
-            crate::accounts::takeover::Phase::Commit => {
-                match serde_json::from_value::<qb_proto::admin_takeover::TakeoverCommit>(value) {
-                    Ok(reply) => Json(reply).into_response(),
-                    Err(_) => error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Account response unavailable",
-                    ),
-                }
-            }
-        },
-        Err(problem) => {
-            use crate::accounts::takeover::TakeoverError;
-            let (status, code, message) = match problem {
-                TakeoverError::Conflict => (
-                    StatusCode::CONFLICT,
-                    "takeover_conflict",
-                    "원래 앱 실행 상태, 최근 파일 변경 또는 기존 계정 충돌을 확인하고 다시 검사하세요.",
-                ),
-                TakeoverError::ApiKey => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "api_key_auth",
-                    "API 키 계정은 가져올 수 없습니다. 구독 계정의 OAuth 로그인이 필요합니다.",
-                ),
-                TakeoverError::Invalid => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_takeover",
-                    "원본 계정 형식이나 사용자를 확인할 수 없습니다.",
-                ),
-                TakeoverError::Unavailable => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "takeover_unavailable",
-                    "가져오기에 필요한 파일이나 저장소를 사용할 수 없습니다. 계정 상태를 확인하세요.",
-                ),
-                TakeoverError::Uncertain => (
-                    StatusCode::CONFLICT,
-                    "takeover_uncertain",
-                    "앞선 토큰 갱신의 결과를 확인할 수 없어 다시 보내지 않았습니다. 계정에서 다시 로그인해 주세요.",
-                ),
-            };
-            (
-                status,
-                Json(qb_proto::admin_account_error::AccountErrorReply {
-                    error: qb_proto::admin_account_error::AccountErrorDetail::coded(code, message),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn adopt_account(
-    state: RuntimeAdmin,
-    id: String,
-    request: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Response {
-    let Ok(Json(value)) = request else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "소유권 이전 요청이 올바르지 않습니다.",
-        );
-    };
-    let Ok(request) = serde_json::from_value::<crate::accounts::adopt::AdoptRequest>(value) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "소유권 이전 요청이 올바르지 않습니다.",
-        );
-    };
-    let store = state.relay.accounts.store.clone();
-    let poller = state.relay.quota.clone();
-    #[cfg(feature = "testkit")]
-    let probe = state.adoption_probe;
-    let result = tokio::task::spawn_blocking(move || {
-        #[cfg(feature = "testkit")]
-        let result = match probe {
-            Some(probe) => crate::accounts::adopt::run_with_probe(&store, &id, request, probe),
-            None => crate::accounts::adopt::run(&store, &id, request),
-        }?;
-        #[cfg(not(feature = "testkit"))]
-        let result = crate::accounts::adopt::run(&store, &id, request)?;
-        if let Ok(account) = store.load(&result.id) {
-            poller.queue_profile(&account);
-        }
-        Ok::<_, crate::accounts::adopt::AdoptError>(result)
-    })
-    .await;
-    match result {
-        Ok(Ok(result)) => Json(result).into_response(),
-        Ok(Err(error_value)) => {
-            use crate::accounts::adopt::AdoptError;
-            let (status, code, message) = match error_value {
-                AdoptError::NotFound => (
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "계정을 찾을 수 없습니다.",
-                ),
-                AdoptError::NotLinked => (
-                    StatusCode::CONFLICT,
-                    "not_linked",
-                    "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
-                ),
-                AdoptError::Generation { .. } => (
-                    StatusCode::CONFLICT,
-                    "generation_conflict",
-                    "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
-                ),
-                AdoptError::IdentityMismatch | AdoptError::AmbiguousIdentity => (
-                    StatusCode::CONFLICT,
-                    "identity_conflict",
-                    "계정의 사용자를 확인할 수 없거나 서로 다른 사용자 파일이 겹칩니다.",
-                ),
-                AdoptError::CpaRunning => (
-                    StatusCode::CONFLICT,
-                    "cpa_running",
-                    "CPA가 아직 이 계정을 갱신할 수 있습니다.",
-                ),
-                AdoptError::ProbeUnavailable => (
-                    StatusCode::CONFLICT,
-                    "cpa_unknown",
-                    "CPA 실행 상태를 확인할 수 없습니다.",
-                ),
-                AdoptError::SourceIo | AdoptError::Store(_) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "store_unavailable",
-                    "소유권 이전에 필요한 계정 자료를 읽거나 저장할 수 없습니다.",
-                ),
-            };
-            (
-                status,
-                Json(qb_proto::admin_account_error::AccountErrorReply {
-                    error: qb_proto::admin_account_error::AccountErrorDetail::coded(code, message),
-                }),
-            )
-                .into_response()
-        }
-        Err(_) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "소유권 이전 작업을 마치지 못했습니다.",
         ),
     }
 }
@@ -1532,5 +1278,317 @@ mod r15_account_error_producer_tests {
                 serde_json::from_slice(&before).unwrap();
             assert_eq!(serde_json::to_vec(&decoded).unwrap(), before);
         }
+    }
+}
+
+// Whole account-source features are selected only at this module boundary.
+#[cfg(windows)]
+mod source_features {
+    use super::*;
+    #[cfg(feature = "testkit")]
+    pub(super) use crate::accounts::adopt::ProbeState;
+    use crate::accounts::{StoreError, import};
+    use qb_proto::{CpaImportRequest, ImportMode};
+    use std::path::PathBuf;
+
+    pub(super) fn runtime_routes(router: Router<RuntimeAdmin>) -> Router<RuntimeAdmin> {
+        router.route("/admin/v1/accounts/takeover", post(takeover_account))
+    }
+    pub(super) fn capabilities() -> qb_proto::StateCapabilities {
+        qb_proto::StateCapabilities {
+            account_adopt: true,
+            manual_refresh: true,
+            account_takeover: true,
+        }
+    }
+    #[derive(Clone)]
+    struct AccountAdmin {
+        store: Arc<AccountStore>,
+        poller: Option<Arc<crate::quota::UsagePoller>>,
+    }
+
+    pub fn account_routes(store: Arc<AccountStore>) -> Router {
+        account_router(AccountAdmin {
+            store,
+            poller: None,
+        })
+    }
+
+    /// Live core imports queue profile work; store-only callers remain offline.
+    pub fn account_routes_with_poller(
+        store: Arc<AccountStore>,
+        poller: Arc<crate::quota::UsagePoller>,
+    ) -> Router {
+        account_router(AccountAdmin {
+            store,
+            poller: Some(poller),
+        })
+    }
+
+    fn account_router(state: AccountAdmin) -> Router {
+        Router::new()
+            .route("/admin/v1/accounts/import", post(import_cpa))
+            .with_state(state)
+    }
+
+    async fn import_cpa(
+        State(state): State<AccountAdmin>,
+        request: Result<Json<CpaImportRequest>, JsonRejection>,
+    ) -> Response {
+        let Json(request) = match request {
+            Ok(request) => request,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid import request"),
+        };
+        if request.source != "cpa" {
+            return error(StatusCode::BAD_REQUEST, "Unsupported account source");
+        }
+        if request.mode != ImportMode::Linked {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "소유권 이전은 계정별 adopt 명령을 사용해 주세요.",
+            );
+        }
+        let dir = match request.dir {
+            Some(dir) => dir,
+            None => match std::env::var_os("USERPROFILE") {
+                Some(profile) => PathBuf::from(profile).join(".cli-proxy-api/auths"),
+                None => return error(StatusCode::INTERNAL_SERVER_ERROR, "USERPROFILE is missing"),
+            },
+        };
+        match tokio::task::spawn_blocking(move || {
+            let store = state.store;
+            let rows = import::run(&store, &dir, &request.activate, request.dry_run)?;
+            if !request.dry_run
+                && let Some(poller) = state.poller
+            {
+                for row in &rows {
+                    if matches!(
+                        row.action,
+                        import::ImportAction::Created | import::ImportAction::Updated
+                    ) && let Some(id) = &row.id
+                        && let Ok(account) = store.load(id)
+                    {
+                        poller.queue_profile(&account);
+                    }
+                }
+            }
+            Ok::<_, StoreError>(rows)
+        })
+        .await
+        {
+            Ok(Ok(rows)) => Json(rows).into_response(),
+            Ok(Err(StoreError::GenerationConflict { .. } | StoreError::IdentityCollision)) => {
+                error(StatusCode::CONFLICT, "Account store conflict")
+            }
+            Ok(Err(_)) => error(StatusCode::BAD_REQUEST, "Account import failed"),
+            Err(_) => error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Account import task failed",
+            ),
+        }
+    }
+
+    async fn takeover_account(
+        State(state): State<RuntimeAdmin>,
+        request: Result<Json<crate::accounts::takeover::TakeoverRequest>, JsonRejection>,
+    ) -> Response {
+        let Ok(Json(request)) = request else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "계정 가져오기 요청이 올바르지 않습니다.",
+            );
+        };
+        let phase = request.phase;
+        match state.relay.takeover_account(request).await {
+            Ok(value) => match phase {
+                crate::accounts::takeover::Phase::Inspect => {
+                    match serde_json::from_value::<qb_proto::admin_takeover::TakeoverInspect>(value)
+                    {
+                        Ok(reply) => Json(reply).into_response(),
+                        Err(_) => error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Account response unavailable",
+                        ),
+                    }
+                }
+                crate::accounts::takeover::Phase::Commit => {
+                    match serde_json::from_value::<qb_proto::admin_takeover::TakeoverCommit>(value)
+                    {
+                        Ok(reply) => Json(reply).into_response(),
+                        Err(_) => error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Account response unavailable",
+                        ),
+                    }
+                }
+            },
+            Err(problem) => {
+                use crate::accounts::takeover::TakeoverError;
+                let (status, code, message) = match problem {
+                    TakeoverError::Conflict => (
+                        StatusCode::CONFLICT,
+                        "takeover_conflict",
+                        "원래 앱 실행 상태, 최근 파일 변경 또는 기존 계정 충돌을 확인하고 다시 검사하세요.",
+                    ),
+                    TakeoverError::ApiKey => (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "api_key_auth",
+                        "API 키 계정은 가져올 수 없습니다. 구독 계정의 OAuth 로그인이 필요합니다.",
+                    ),
+                    TakeoverError::Invalid => (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid_takeover",
+                        "원본 계정 형식이나 사용자를 확인할 수 없습니다.",
+                    ),
+                    TakeoverError::Unavailable => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "takeover_unavailable",
+                        "가져오기에 필요한 파일이나 저장소를 사용할 수 없습니다. 계정 상태를 확인하세요.",
+                    ),
+                    TakeoverError::Uncertain => (
+                        StatusCode::CONFLICT,
+                        "takeover_uncertain",
+                        "앞선 토큰 갱신의 결과를 확인할 수 없어 다시 보내지 않았습니다. 계정에서 다시 로그인해 주세요.",
+                    ),
+                };
+                (
+                    status,
+                    Json(qb_proto::admin_account_error::AccountErrorReply {
+                        error: qb_proto::admin_account_error::AccountErrorDetail::coded(
+                            code, message,
+                        ),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    pub(super) async fn adopt_account(
+        state: RuntimeAdmin,
+        id: String,
+        request: Result<Json<serde_json::Value>, JsonRejection>,
+    ) -> Response {
+        let Ok(Json(value)) = request else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "소유권 이전 요청이 올바르지 않습니다.",
+            );
+        };
+        let Ok(request) = serde_json::from_value::<crate::accounts::adopt::AdoptRequest>(value)
+        else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "소유권 이전 요청이 올바르지 않습니다.",
+            );
+        };
+        let store = state.relay.accounts.store.clone();
+        let poller = state.relay.quota.clone();
+        #[cfg(feature = "testkit")]
+        let probe = state.adoption_probe;
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "testkit")]
+            let result = match probe {
+                Some(probe) => crate::accounts::adopt::run_with_probe(&store, &id, request, probe),
+                None => crate::accounts::adopt::run(&store, &id, request),
+            }?;
+            #[cfg(not(feature = "testkit"))]
+            let result = crate::accounts::adopt::run(&store, &id, request)?;
+            if let Ok(account) = store.load(&result.id) {
+                poller.queue_profile(&account);
+            }
+            Ok::<_, crate::accounts::adopt::AdoptError>(result)
+        })
+        .await;
+        match result {
+            Ok(Ok(result)) => Json(result).into_response(),
+            Ok(Err(error_value)) => {
+                use crate::accounts::adopt::AdoptError;
+                let (status, code, message) = match error_value {
+                    AdoptError::NotFound => (
+                        StatusCode::NOT_FOUND,
+                        "not_found",
+                        "계정을 찾을 수 없습니다.",
+                    ),
+                    AdoptError::NotLinked => (
+                        StatusCode::CONFLICT,
+                        "not_linked",
+                        "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
+                    ),
+                    AdoptError::Generation { .. } => (
+                        StatusCode::CONFLICT,
+                        "generation_conflict",
+                        "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
+                    ),
+                    AdoptError::IdentityMismatch | AdoptError::AmbiguousIdentity => (
+                        StatusCode::CONFLICT,
+                        "identity_conflict",
+                        "계정의 사용자를 확인할 수 없거나 서로 다른 사용자 파일이 겹칩니다.",
+                    ),
+                    AdoptError::CpaRunning => (
+                        StatusCode::CONFLICT,
+                        "cpa_running",
+                        "CPA가 아직 이 계정을 갱신할 수 있습니다.",
+                    ),
+                    AdoptError::ProbeUnavailable => (
+                        StatusCode::CONFLICT,
+                        "cpa_unknown",
+                        "CPA 실행 상태를 확인할 수 없습니다.",
+                    ),
+                    AdoptError::SourceIo | AdoptError::Store(_) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "store_unavailable",
+                        "소유권 이전에 필요한 계정 자료를 읽거나 저장할 수 없습니다.",
+                    ),
+                };
+                (
+                    status,
+                    Json(qb_proto::admin_account_error::AccountErrorReply {
+                        error: qb_proto::admin_account_error::AccountErrorDetail::coded(
+                            code, message,
+                        ),
+                    }),
+                )
+                    .into_response()
+            }
+            Err(_) => error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "소유권 이전 작업을 마치지 못했습니다.",
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+mod source_features {
+    use super::*;
+    #[cfg(feature = "testkit")]
+    pub(super) type ProbeState = ();
+
+    pub fn account_routes(_store: Arc<AccountStore>) -> Router {
+        Router::new()
+    }
+    pub fn account_routes_with_poller(
+        _store: Arc<AccountStore>,
+        _poller: Arc<crate::quota::UsagePoller>,
+    ) -> Router {
+        Router::new()
+    }
+    pub(super) fn runtime_routes(router: Router<RuntimeAdmin>) -> Router<RuntimeAdmin> {
+        router
+    }
+    pub(super) fn capabilities() -> qb_proto::StateCapabilities {
+        qb_proto::StateCapabilities {
+            account_adopt: false,
+            manual_refresh: true,
+            account_takeover: false,
+        }
+    }
+    pub(super) async fn adopt_account(
+        _state: RuntimeAdmin,
+        _id: String,
+        _request: Result<Json<serde_json::Value>, JsonRejection>,
+    ) -> Response {
+        error(StatusCode::NOT_FOUND, "Unknown account action")
     }
 }

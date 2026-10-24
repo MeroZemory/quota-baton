@@ -1,17 +1,29 @@
+#[cfg(windows)]
 pub mod adopt;
 mod crypto;
 pub mod health;
+#[cfg(windows)]
 pub mod import;
+#[cfg(unix)]
+pub mod import {
+    pub(crate) use super::login::codex_user_id;
+}
 mod lease;
 pub mod linked;
 pub mod login;
+pub(crate) mod shared_profile;
 mod store;
 #[cfg(not(feature = "testkit"))]
 pub(crate) mod takeover;
 #[cfg(feature = "testkit")]
 #[doc(hidden)]
 pub mod takeover;
+#[cfg(windows)]
 pub(crate) mod takeover_native;
+#[cfg(unix)]
+pub(crate) mod takeover_native {
+    pub(crate) use crate::platform::takeover::*;
+}
 
 use chrono::{DateTime, Utc};
 pub use health::HealthSignal;

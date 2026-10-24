@@ -1832,40 +1832,7 @@ fn prune(dir: &Path) {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temporary = path.with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            use windows::{
-                Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW},
-                core::PCWSTR,
-            };
-            let src: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-            let dst: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            unsafe {
-                MoveFileExW(
-                    PCWSTR(src.as_ptr()),
-                    PCWSTR(dst.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING,
-                )
-            }
-            .map_err(std::io::Error::other)
-        }
-        #[cfg(not(windows))]
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
+    crate::platform::atomic_write_observation(path, bytes)
 }
 fn retain(dir: &Path, today: NaiveDate, cap: u64) -> std::io::Result<()> {
     let mut files = Vec::new();
@@ -2634,43 +2601,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn transient_sync_and_quota_errors_retry_in_next_batch_without_sticky_failure() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = directory();
-        let mut writer = writer(dir.path());
-        let start = writer.last_sync;
-        writer.event(Command::Ledger(json!({"req": "synthetic"})));
-        writer.event(quota_command("42"));
-        let ledger = writer.dirty_files.iter().next().unwrap().clone();
-        let lock = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&ledger)
-            .unwrap();
-        fs::create_dir(dir.path().join("state/quota.json")).unwrap();
-        let log = warnings(|| writer.persist(start + SYNC_INTERVAL));
-        assert!(log.contains("Quota state write failed; next batch will retry"));
-        assert!(log.contains("Observability sync failed; next batch will retry"));
-        assert!(writer.quota_dirty);
-        assert!(writer.dirty_files.contains(&ledger));
-        drop(lock);
-        fs::remove_dir(dir.path().join("state/quota.json")).unwrap();
-        writer.persist(start + SYNC_INTERVAL * 2);
-        assert!(!writer.quota_dirty);
-        assert!(writer.dirty_files.is_empty());
-        writer.flush().unwrap();
-        let state: Value =
-            serde_json::from_slice(&fs::read(dir.path().join("state/quota.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            state["accounts"]["cx-synthetic"]["windows"][0]["used_pct"],
-            42.0
-        );
-        assert_eq!(fs::read_to_string(ledger).unwrap().lines().count(), 1);
-    }
-
     #[test]
     fn transient_ledger_and_quota_errors_recover_after_flush() {
         let dir = directory();
@@ -2746,38 +2676,6 @@ mod tests {
             assert!(log.contains("Corrupt quota state renamed; starting empty"));
             assert!(!log.contains("fake-access-marker"));
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn locked_expired_ledger_warns_starts_and_retries_next_prune() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = directory();
-        fs::create_dir(dir.path().join("ledger")).unwrap();
-        let expired = dir.path().join("ledger/2000-01-01.jsonl");
-        fs::write(&expired, "synthetic").unwrap();
-        let lock = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&expired)
-            .unwrap();
-        let log = warnings(|| {
-            let obs = Observability::new(dir.path(), None).unwrap();
-            obs.record_request(record());
-            obs.flush().unwrap();
-        });
-        assert!(log.contains("Ledger retention failed; next prune will retry"));
-        assert!(expired.exists());
-        let mut writer = writer(dir.path());
-        let start = writer.last_prune;
-        let log = warnings(|| writer.persist(start + WARN_INTERVAL));
-        assert!(log.contains("Ledger retention failed"));
-        drop(lock);
-        writer.persist(start + WARN_INTERVAL + StdDuration::from_secs(59));
-        assert!(expired.exists());
-        writer.persist(start + WARN_INTERVAL * 2);
-        assert!(!expired.exists());
-        assert!(!writer.error);
     }
 
     #[test]
@@ -2973,5 +2871,10 @@ mod tests {
             assert!(!text.contains(marker), "{marker}");
         }
         assert_eq!(body[0], b'{');
+    }
+    #[cfg(windows)]
+    mod windows_only {
+        use super::*;
+        include!("platform/windows/observability_tests.rs");
     }
 }

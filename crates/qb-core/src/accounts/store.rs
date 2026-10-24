@@ -3,25 +3,13 @@ mod selection;
 pub(crate) use selection::StoreUnavailableEvidence;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    os::windows::{ffi::OsStrExt, io::AsRawHandle},
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
 };
-use windows::{
-    Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{
-            FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        },
-    },
-    core::PCWSTR,
-};
-
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("credential lease is already held")]
@@ -1237,40 +1225,7 @@ impl AccountStore {
         if self.writes_stopped() {
             return Err(StoreError::LeaseUnavailable);
         }
-        let path = self
-            .dir
-            .join(format!(".write-{:032x}.tmp", rand::random::<u128>()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|_| StoreError::Io)?;
-        let result = (|| {
-            file.write_all(bytes).map_err(|_| StoreError::Io)?;
-            // 이동 전 파일 핸들을 명시적으로 flush한다.
-            unsafe {
-                FlushFileBuffers(HANDLE(file.as_raw_handle())).map_err(|_| StoreError::Io)?;
-            }
-            drop(file);
-            let source: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            let target: Vec<u16> = destination
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            unsafe {
-                MoveFileExW(
-                    PCWSTR(source.as_ptr()),
-                    PCWSTR(target.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-                .map_err(|_| StoreError::Io)
-            }
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&path);
-        }
-        result
+        crate::platform::atomic_write_account(&self.dir, destination, bytes)
     }
 }
 
@@ -1439,20 +1394,7 @@ macro_rules! takeover_store_api {
     }
 
     fn read_takeover_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
-        use std::{io::Read, os::windows::fs::{MetadataExt, OpenOptionsExt}};
-        let file = match OpenOptions::new().read(true).custom_flags(0x00200000).open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(StoreError::Io),
-        };
-        let meta = file.metadata().map_err(|_| StoreError::Io)?;
-        if !meta.is_file() || meta.file_attributes() & 0x410 != 0 || meta.len() > 4 * 1024 * 1024 {
-            return Err(StoreError::InvalidData);
-        }
-        let mut bytes = Vec::new();
-        file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| StoreError::Io)?;
-        if bytes.len() > 4 * 1024 * 1024 { return Err(StoreError::InvalidData); }
-        Ok(Some(bytes))
+        crate::platform::read_takeover_bytes(path)
     }
 
     $visibility fn protect_takeover_tokens(tokens: &Tokens) -> Result<String, StoreError> { crypto::encrypt(tokens) }

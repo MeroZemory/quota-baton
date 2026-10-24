@@ -6,7 +6,6 @@ use std::{
 
 use anyhow::Context;
 use clap::Subcommand;
-use qb_tray::client::{AdminClient, snapshot};
 
 #[derive(Subcommand)]
 pub enum DebugCommand {
@@ -23,9 +22,7 @@ pub enum DebugCommand {
 pub async fn run(home: &Path, command: DebugCommand) -> anyhow::Result<()> {
     match command {
         DebugCommand::Snapshot { out } => {
-            let client = AdminClient::from_home_path(home)
-                .map_err(|_| anyhow::anyhow!("Unable to read the local admin connection"))?;
-            let bytes = snapshot::encode(&snapshot::capture(&client).await?)?;
+            let bytes = crate::platform::capture_debug_snapshot(home).await?;
             write_new(&out, &bytes)
         }
     }

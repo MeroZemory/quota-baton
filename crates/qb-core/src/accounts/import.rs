@@ -2,7 +2,6 @@ use super::{
     Account, AccountStore, Health, Identity, ImportMode, Provider, Source, SourceMatch, StoreError,
     TokenMeta, Tokens, UserState,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::{
@@ -42,26 +41,7 @@ pub(crate) enum ReadError {
     UnknownType,
 }
 
-// Identity claims only: this does not authenticate or verify the JWT signature.
-pub(crate) fn codex_user_id(tokens: &Tokens, account_id: &str) -> Option<String> {
-    let mut parts = tokens.id_token.as_deref()?.split('.');
-    parts.next()?;
-    let payload = parts.next()?;
-    parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let payload = Zeroizing::new(URL_SAFE_NO_PAD.decode(payload).ok()?);
-    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    let auth = &claims["https://api.openai.com/auth"];
-    if auth["chatgpt_account_id"].as_str()? != account_id {
-        return None;
-    }
-    auth["chatgpt_user_id"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-}
+pub(crate) use super::login::codex_user_id;
 
 pub(crate) fn paths(dir: &Path) -> Result<Vec<PathBuf>, StoreError> {
     let mut paths = Vec::new();

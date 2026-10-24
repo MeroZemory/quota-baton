@@ -6,34 +6,19 @@ macro_rules! println_utf8 {
     };
 }
 
+#[allow(dead_code)] // Compatibility fields preserve the existing tray decoder.
+mod account_display;
 mod accounts_cli;
-mod catalog_snapshot;
-mod cutover;
+
 mod debug_snapshot;
-mod image_canary;
-mod image_launch;
-mod launch_client;
-mod launcher_label;
-mod launcher_script;
-#[cfg(windows)]
-mod native_resume;
-mod resume_selection;
+
+mod platform;
 mod routing_cli;
-mod sessions;
-mod sessions_admission;
-mod sessions_confirm;
-mod sessions_db;
-mod sessions_discovery;
-mod sessions_guard;
-mod sessions_map;
-mod sessions_plain_header;
-mod sessions_presentation;
-mod sessions_preview_title;
-mod sessions_progress;
-mod wire_readiness;
+#[allow(unused_imports)] // Windows feature roots retain their existing crate:: paths.
+use platform::*;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
-    use std::io::{IsTerminal, Write};
+    use std::io::IsTerminal;
     let stdout = std::io::stdout();
     if stdout.is_terminal() {
         // Keep the existing console path and its UTF-8 console setup.
@@ -41,15 +26,7 @@ fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
         return Ok(());
     }
     let line = format!("{args}\n");
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsHandle;
-        // A pipe/file receives the UTF-8 bytes directly, without console encoding.
-        let mut output = std::fs::File::from(stdout.as_handle().try_clone_to_owned()?);
-        output.write_all(line.as_bytes())
-    }
-    #[cfg(not(windows))]
-    stdout.lock().write_all(line.as_bytes())
+    platform::write_stdout(&stdout, line.as_bytes())
 }
 
 #[derive(Parser)]
@@ -61,38 +38,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(flatten)]
+    Platform(platform::PlatformCommand),
     #[command(about = "Export diagnostic display data")]
+    #[command(display_order = 0)]
     Debug {
         #[command(subcommand)]
         command: debug_snapshot::DebugCommand,
     },
-    #[command(about = "대화 이동 기록과 홈의 상태를 검사합니다")]
-    Doctor,
+
     #[command(about = "기존 Codex 대화를 가져오거나 되돌립니다")]
+    #[command(display_order = 2)]
     Sessions {
         #[command(subcommand)]
-        command: sessions::SessionsCommand,
+        command: platform::SessionsCommand,
     },
     #[command(about = "프로젝트·세션별 계정 전환을 설정합니다")]
+    #[command(display_order = 3)]
     Routing {
         #[command(subcommand)]
         command: routing_cli::RoutingCommand,
     },
-    /// Internal managed child launch; ordinary Codex uses authenticated issuance.
-    #[command(hide = true)]
-    LaunchClient {
-        #[arg(long, value_enum, default_value = "claude")]
-        client: launcher_label::Client,
-        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
-        command: Option<std::path::PathBuf>,
-        #[arg(long, help = "Codex 연결 기록만 읽어 검사하고 종료합니다")]
-        check: bool,
-        #[arg(long)]
-        settings: Option<std::path::PathBuf>,
-        #[arg(last = true, allow_hyphen_values = true)]
-        args: Vec<std::ffi::OsString>,
-    },
+
     #[command(about = "프록시를 시작합니다")]
+    #[command(display_order = 5)]
     Serve {
         #[cfg(feature = "shape-capture")]
         #[arg(long, help = "기존 .sandbox 폴더에 요청 구조를 기록합니다")]
@@ -118,51 +87,21 @@ enum Command {
         takeover: bool,
     },
     #[command(about = "상태를 확인합니다")]
+    #[command(display_order = 6)]
     Status {
-        #[arg(long, help = "M8 전환용 보고 전용 항목을 함께 표시합니다")]
-        cutover_report: bool,
+        #[command(flatten)]
+        options: platform::StatusOptions,
     },
     #[command(about = "계정을 관리합니다")]
+    #[command(display_order = 7)]
     Accounts {
         #[command(subcommand)]
         command: accounts_cli::AccountsCommand,
     },
-    #[command(about = "클라이언트 설정을 연결하거나 되돌립니다")]
-    Wire {
-        #[arg(
-            long,
-            value_parser = ["default", "dedicated", "none"],
-            help = "Codex 연결 모드를 선택합니다; 생략하면 자동 감지합니다"
-        )]
-        codex_mode: Option<String>,
-        #[arg(long, value_parser = ["default", "dedicated", "none"], help = "Claude 연결 모드를 선택합니다; 생략하면 별도 설정을 사용합니다")]
-        claude_mode: Option<String>,
-        #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
-        apply: bool,
-        #[arg(
-            long,
-            help = "같은 전용 파일의 내용 변경을 허용하여 제목 설정을 업그레이드합니다"
-        )]
-        force: bool,
-        #[arg(long, help = "현재 사용자 트레이 자동 시작을 연결합니다")]
-        autostart: bool,
-        #[arg(long, help = "CPA 예약 작업을 삭제하지 않고 비활성화합니다")]
-        disable_cpa_tasks: bool,
-        #[arg(
-            long,
-            help = "ChatGPT 인증 세션 홈을 session-homes.json에서 분리합니다"
-        )]
-        detach_chatgpt_session_homes: bool,
-    },
-    #[command(about = "클라이언트 설정 연결을 되돌립니다")]
-    Unwire {
-        #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
-        apply: bool,
-        #[arg(long, help = "사용자 변경 감지를 무시하고 되돌립니다")]
-        force: bool,
-    },
+
     #[cfg(feature = "phase0")]
     #[command(about = "디버그 캡처를 재생합니다")]
+    #[command(display_order = 10)]
     Phase0 {
         #[command(subcommand)]
         command: Phase0Command,
@@ -201,46 +140,13 @@ async fn main() {
         } else {
             eprintln!("실패했습니다: {message}");
         }
-        keep_launch_error_visible();
+        platform::keep_launch_error_visible();
         std::process::exit(1);
     }
 }
 
-fn keep_launch_error_visible() {
-    use std::io::IsTerminal;
-    // Automated exec/pipe callers must retain their noninteractive exit path.
-    // A terminal launched for the interactive wrapper must not disappear before
-    // the user can read an issuance/model/resume failure.
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("launch-client"))
-        && std::io::stdin().is_terminal()
-        && std::io::stderr().is_terminal()
-    {
-        eprintln!("실행하지 못했습니다. 위 오류를 확인한 뒤 Enter 키를 누르면 닫습니다.");
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-    }
-}
-
 fn friendly_error(error: &anyhow::Error) -> String {
-    if let Some(stage) = error.downcast_ref::<cutover::WireStage>() {
-        return stage.to_string();
-    }
-    if let Some(message) = launch_client::friendly_error(error) {
-        return message;
-    }
-    if let Some(message) = catalog_snapshot::friendly_error(error) {
-        return message;
-    }
-    if let Some(message) = image_canary::friendly_error(error) {
-        return message;
-    }
-    if let Some(message) = image_launch::friendly_error(error) {
-        return message;
-    }
-    if let Some(message) = sessions_admission::friendly_error(error) {
-        return message;
-    }
-    if let Some(message) = sessions::friendly_error(error) {
+    if let Some(message) = platform::friendly_error(error) {
         return message;
     }
     // Only exact fixed diagnostics may pass through; parser/transport chains
@@ -272,9 +178,6 @@ fn friendly_error(error: &anyhow::Error) -> String {
     let detail = error.to_string();
     if WIRE_DIAGNOSTICS.contains(&detail.as_str()) {
         return detail;
-    }
-    if error.to_string() == cutover::CPA_DEPENDENCY_REFUSAL {
-        return cutover::CPA_DEPENDENCY_REFUSAL.into();
     }
     if error.to_string().contains("로그인 시간이 만료되었습니다") {
         return "로그인 시간이 만료되었습니다. 다시 시작해 주세요.".into();
@@ -357,135 +260,16 @@ async fn request_takeover(
     Ok(response.json().await?)
 }
 
-async fn check_wire_preconditions(
-    home: &std::path::Path,
-    options: &cutover::WireOptions,
-    codex_mode: cutover::CodexMode,
-    claude_mode: cutover::ClaudeMode,
-) -> anyhow::Result<()> {
-    cutover::check_optional_preconditions(home, options)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let config = qb_core::config::Config::load(home)?;
-    let secrets = qb_core::local_secrets::load_existing(home).map_err(|_| {
-        anyhow::anyhow!("적용하려면 client.key와 admin.token이 먼저 있어야 합니다.")
-    })?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .tcp_nodelay(true)
-        .timeout(std::time::Duration::from_secs(3))
-        .build()?;
-    let port = config.server.admin_port;
-    let response = client
-        .get(format!("http://127.0.0.1:{port}/admin/v1/health"))
-        .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", secrets.admin_token),
-        )
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("적용하려면 정상 상태의 코어가 실행 중이어야 합니다."))?;
-    if !response.status().is_success() {
-        anyhow::bail!("적용하려면 정상 상태의 코어가 실행 중이어야 합니다.");
-    }
-    tokio::net::TcpStream::connect(("127.0.0.1", config.server.data_port))
-        .await
-        .map_err(|_| anyhow::anyhow!("설정된 데이터 포트에 연결할 수 없습니다."))?;
-    let accounts = qb_core::accounts::AccountStore::list_metadata(home)?;
-    for provider in [
-        qb_core::accounts::Provider::Codex,
-        qb_core::accounts::Provider::Claude,
-    ] {
-        if provider == qb_core::accounts::Provider::Codex
-            && matches!(codex_mode, cutover::CodexMode::None)
-            || provider == qb_core::accounts::Provider::Claude
-                && matches!(claude_mode, cutover::ClaudeMode::None)
-        {
-            continue;
-        }
-        let dedicated = match provider {
-            qb_core::accounts::Provider::Codex => codex_mode == cutover::CodexMode::Dedicated,
-            qb_core::accounts::Provider::Claude => claude_mode == cutover::ClaudeMode::Dedicated,
-        };
-        if let Some(warning) =
-            wire_readiness::check(&accounts, provider, dedicated, chrono::Utc::now())?
-        {
-            println_utf8!("경고: {warning}");
-        }
-    }
-    Ok(())
-}
-
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if let Command::LaunchClient {
-        client,
-        command,
-        check,
-        settings,
-        args,
-    } = &cli.command
-    {
-        if *check {
-            if settings.is_some() || !args.is_empty() {
-                anyhow::bail!("--check에는 실행 인자나 설정 경로를 함께 지정할 수 없습니다");
-            }
-            sessions_admission::check_wiring(&qb_core::home()?)?;
-            println_utf8!("Codex 실행 연결 검사가 통과했습니다. 변경하지 않았습니다.");
-            return Ok(());
-        }
-        let command = command
-            .as_deref()
-            .expect("clap requires --command without --check");
-        let (images, native_args) = image_launch::split(args);
-        if images {
-            anyhow::ensure!(
-                matches!(client, launcher_label::Client::Codex),
-                "--images는 codex-qb에서만 사용할 수 있습니다"
-            );
-            let home = qb_core::home()?;
-            image_launch::validate_args(native_args)?;
-            let image = image_launch::ImageLaunch::load(&home)?;
-            let id = sessions::resume_uuid(native_args)?;
-            sessions::admission_check(&home, id.as_deref())?;
-            sessions_admission::preflight_images(native_args, command, &image)?;
-            image_canary::check(command, &home).await?;
-            let (permit, child_args) =
-                sessions_admission::prepare_images(native_args, command, &image)?;
-            sessions::admission_check(&home, id.as_deref())?;
-            let status = launcher_label::run_with_environment(
-                *client,
-                command,
-                settings.as_deref(),
-                &child_args,
-                &image.environment(),
-            );
-            drop(permit);
-            std::process::exit(status?);
-        }
-        if matches!(client, launcher_label::Client::Codex) {
-            let status = launch_client::run_codex(command, settings.as_deref(), args).await;
-            // run_codex explicitly releases snapshot/admission on success and
-            // errors, after the existing contained runner's tree cleanup.
-            std::process::exit(status?);
-        }
-        let status = launch_client::run_claude(command, settings.as_deref(), args).await;
-        std::process::exit(status?);
+    if let Command::Platform(command) = cli.command {
+        return platform::run(command).await;
     }
     let home = qb_core::home()?;
     match cli.command {
         Command::Debug { command } => debug_snapshot::run(&home, command).await?,
-        Command::Doctor => sessions::doctor(&home)?,
-        Command::Sessions {
-            command: sessions::SessionsCommand::Urgent { id, state },
-        } => {
-            let config = qb_core::config::Config::load(&home)?;
-            routing_cli::urgent(id, state == "on", &home, &config).await?;
-        }
-        Command::Sessions { command } => sessions::run(&home, command)?,
-        Command::LaunchClient { .. } => {
-            unreachable!("launcher handled before core home resolution")
-        }
+        Command::Platform(_) => unreachable!("platform commands handled before home resolution"),
+        Command::Sessions { command } => platform::run_sessions(command, &home).await?,
         Command::Serve {
             #[cfg(feature = "shape-capture")]
             capture_dir,
@@ -734,21 +518,10 @@ async fn run() -> anyhow::Result<()> {
             })
             .await??;
         }
-        Command::Status { cutover_report } => {
+        Command::Status { options } => {
             let config = qb_core::config::Config::load(&home)?;
             accounts_cli::status(&home, &config).await?;
-            if cutover_report {
-                let report = cutover::report_only(&cutover::CutoverPaths::from_environment(home)?);
-                for line in report.summary {
-                    println_utf8!("{line}");
-                }
-                for warning in report.warnings {
-                    println_utf8!("경고: {warning}");
-                }
-                for item in report.report_only {
-                    println_utf8!("보고: {item}");
-                }
-            }
+            platform::status_extra(&home, options)?;
         }
         Command::Accounts { command } => {
             let config = qb_core::config::Config::load(&home)?;
@@ -757,77 +530,6 @@ async fn run() -> anyhow::Result<()> {
         Command::Routing { command } => {
             let config = qb_core::config::Config::load(&home)?;
             routing_cli::run(command, &home, &config).await?;
-        }
-        Command::Wire {
-            codex_mode,
-            claude_mode,
-            apply,
-            force,
-            autostart,
-            disable_cpa_tasks,
-            detach_chatgpt_session_homes,
-        } => {
-            let mut options = cutover::WireOptions {
-                codex_mode: codex_mode.map(|mode| mode.parse()).transpose()?,
-                claude_mode: claude_mode.map(|mode| mode.parse()).transpose()?,
-                data_port: qb_core::config::Config::load(&home)?.server.data_port,
-                force,
-                autostart,
-                disable_cpa_tasks,
-                detach_chatgpt_session_homes,
-            };
-            let paths = cutover::CutoverPaths::from_environment(home.clone())?;
-            let codex_mode = cutover::resolve_codex_mode(&paths, &options)?;
-            let claude_mode = cutover::resolve_claude_mode(&paths, &options)?;
-            if codex_mode == cutover::CodexMode::None && claude_mode == cutover::ClaudeMode::None {
-                anyhow::bail!("Codex와 Claude를 모두 연결 안 함으로 선택할 수 없습니다");
-            }
-            options.codex_mode = Some(codex_mode);
-            options.claude_mode = Some(claude_mode);
-            if apply {
-                check_wire_preconditions(&home, &options, codex_mode, claude_mode).await?;
-            }
-            let report = cutover::wire_with_options(&paths, apply, options)?;
-            for line in report.summary {
-                println_utf8!("{line}");
-            }
-            println_utf8!(
-                "{} {}",
-                if apply {
-                    "적용했습니다:"
-                } else {
-                    "미리보기:"
-                },
-                report.changed.join(", ")
-            );
-            for warning in report.warnings {
-                println_utf8!("경고: {warning}");
-            }
-            for line in report.diff {
-                println_utf8!("{line}");
-            }
-            for item in report.report_only {
-                println_utf8!("보고: {item}");
-            }
-        }
-        Command::Unwire { apply, force } => {
-            let paths = cutover::CutoverPaths::from_environment(home)?;
-            let report = cutover::unwire(&paths, apply, force)?;
-            for line in report.summary {
-                println_utf8!("{line}");
-            }
-            println_utf8!(
-                "{} {}",
-                if apply {
-                    "되돌렸습니다:"
-                } else {
-                    "미리보기:"
-                },
-                report.changed.join(", ")
-            );
-            for warning in report.warnings {
-                println_utf8!("경고: {warning}");
-            }
         }
         #[cfg(feature = "phase0")]
         Command::Phase0 {
@@ -885,46 +587,4 @@ async fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod r1_cpa_error_tests {
-    #[test]
-    fn r111_wire_stage_hides_paths_values_and_error_chain() {
-        let error = anyhow::anyhow!("synthetic-private-token C:/private/config")
-            .context(crate::cutover::WireStage("upgrade-shared-agents"));
-        let text = super::friendly_error(&error);
-        assert!(text.contains("wire:upgrade-shared-agents"));
-        assert!(!text.contains("synthetic-private"));
-        assert!(!text.contains("C:/private"));
-        // A textual lookalike cannot bypass the typed diagnostic boundary.
-        let forged = anyhow::anyhow!("wire:upgrade-shared-agents synthetic-private-token");
-        assert!(!super::friendly_error(&forged).contains("synthetic-private"));
-    }
-
-    #[test]
-    fn r3_wire_prerequisites_are_actionable_but_never_echo_appended_details() {
-        for message in [
-            "PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요",
-            "Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다",
-            "Codex와 Claude를 모두 연결 안 함으로 선택할 수 없습니다",
-            "적용하려면 정상 상태의 코어가 실행 중이어야 합니다.",
-            "각 프로바이더에 적용 가능한 활성 계정이 하나 이상 필요합니다.",
-            "npm 디렉터리 또는 codex.cmd가 없습니다. Codex 설치를 확인하세요",
-        ] {
-            assert_eq!(super::friendly_error(&anyhow::anyhow!(message)), message);
-            let untrusted = anyhow::anyhow!("{message} synthetic-private-detail");
-            assert!(!super::friendly_error(&untrusted).contains("synthetic-private-detail"));
-        }
-    }
-    #[test]
-    fn r1_cpa_refusal_survives_cli_error_sanitization() {
-        let error = anyhow::anyhow!(crate::cutover::CPA_DEPENDENCY_REFUSAL);
-        assert_eq!(
-            super::friendly_error(&error),
-            crate::cutover::CPA_DEPENDENCY_REFUSAL
-        );
-        let untrusted = anyhow::anyhow!(
-            "{} synthetic-private-detail",
-            crate::cutover::CPA_DEPENDENCY_REFUSAL
-        );
-        assert!(!super::friendly_error(&untrusted).contains("synthetic-private-detail"));
-    }
-}
+mod platform_structure_tests;

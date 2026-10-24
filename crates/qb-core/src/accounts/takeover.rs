@@ -703,7 +703,7 @@ fn finish_prepare(
     })))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 #[path = "takeover_tests.rs"]
 mod tests;
 
