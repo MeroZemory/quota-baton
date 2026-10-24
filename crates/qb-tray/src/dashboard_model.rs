@@ -1020,6 +1020,13 @@ fn session_row(
         .into_iter()
         .find(|a| a.raw.id == s.account);
     let mut notes = vec![];
+    if s.provider == "claude"
+        && s.routing.as_ref().is_some_and(|routing| {
+            routing.usable() && routing.mode != "strict" && !routing.urgent()
+        })
+    {
+        notes.push(crate::i18n::static_text("이동 (Claude는 자동 재개 미지원)").into());
+    }
     if let Some(p) = &s.pacing_wait
         && p.waiting.unwrap_or(0) > 0
     {
@@ -2759,5 +2766,55 @@ mod n5c_routing_dto_tests {
         assert!(!view.flat[0].urgency_enabled);
         assert!(view.flat[0].routing.is_none());
         assert!(!view.flat[0].quota_wait_known);
+    }
+}
+
+#[cfg(test)]
+mod native_claude_move_label_tests {
+    use super::*;
+    #[test]
+    fn claude_wait_policy_explains_permanent_far_move_without_relabeling_strict_or_codex() {
+        for (language, expected) in [
+            (
+                crate::i18n::UiLanguage::Ko,
+                "이동 (Claude는 자동 재개 미지원)",
+            ),
+            (
+                crate::i18n::UiLanguage::En,
+                "Move (Claude cannot resume automatically)",
+            ),
+        ] {
+            crate::i18n::with_language(language, || {
+                let mut snapshot = crate::dashboard_fixtures::snapshot();
+                snapshot.sessions.sessions.truncate(1);
+                let session = &mut snapshot.sessions.sessions[0];
+                session.provider = "claude".into();
+                session.routing = Some(SessionRouting {
+                    action_id: "a".repeat(64),
+                    on_5h_limit: "wait".into(),
+                    mode: "recover".into(),
+                });
+                let clock = crate::dashboard_fixtures::clock();
+                let mut state = DashboardState::default();
+                assert!(
+                    project(&snapshot, &mut state, &clock).flat[0]
+                        .memo
+                        .contains(expected)
+                );
+                snapshot.sessions.sessions[0].routing.as_mut().unwrap().mode = "strict".into();
+                assert!(
+                    !project(&snapshot, &mut state, &clock).flat[0]
+                        .memo
+                        .contains(expected)
+                );
+                snapshot.sessions.sessions[0].routing.as_mut().unwrap().mode = "recover".into();
+                snapshot.sessions.sessions[0].provider = "codex".into();
+                assert!(
+                    !project(&snapshot, &mut state, &clock).flat[0]
+                        .memo
+                        .contains(expected)
+                );
+            });
+        }
     }
 }

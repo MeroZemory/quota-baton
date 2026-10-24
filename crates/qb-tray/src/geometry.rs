@@ -1718,9 +1718,17 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         .flat
         .iter()
         .map(|row| {
-            session_control_layout(b, row, 0., &v.clock)
+            let controls = session_control_layout(b, row, 0., &v.clock)
                 .last()
-                .map_or(0., |(_, r, _)| r.right)
+                .map_or(0., |(_, r, _)| r.right);
+            if row
+                .memo
+                .starts_with(crate::i18n::static_text("이동 (Claude는 자동 재개 미지원)"))
+            {
+                controls + b.measured_width(crate::i18n::static_text("이동"), 12., false)
+            } else {
+                controls
+            }
         })
         .fold(0., f32::max);
     let columns = session_columns(width(card) - 50., !s.grouped, control_width);
@@ -3079,10 +3087,24 @@ fn session(
                 let used = session_control_layout(b, row, *cw, clock)
                     .last()
                     .map_or(0., |(_, r, _)| r.right + 8.);
-                if *cw - used >= 40. {
+                let compact = row
+                    .memo
+                    .starts_with(crate::i18n::static_text("이동 (Claude는 자동 재개 미지원)"));
+                let minimum_width = if compact {
+                    b.measured_width(crate::i18n::static_text("이동"), 12., false)
+                } else {
+                    40.
+                };
+                if *cw - used >= minimum_width {
+                    let bounds = rect(cr.left + used, cr.top, *cw - used, 20.);
+                    let text = if compact {
+                        crate::i18n::static_text("이동")
+                    } else {
+                        &row.memo
+                    };
                     b.text(
-                        rect(cr.left + used, cr.top, *cw - used, 20.),
-                        row.memo.clone(),
+                        bounds,
+                        text,
                         12.,
                         false,
                         if row.memo.contains(crate::i18n::static_text("크레딧")) {
@@ -3092,6 +3114,16 @@ fn session(
                         },
                         false,
                     );
+                    if !row.memo.is_empty() {
+                        b.semantic(
+                            format!("session:{}:memo", row.id),
+                            Some(format!("session:{}", row.id)),
+                            Role::Text,
+                            row.memo.clone(),
+                            bounds,
+                            None,
+                        );
+                    }
                 }
             }
             _ => {
@@ -3807,6 +3839,196 @@ mod n10_outside_usage_tests {
                     );
                     assert!(width(node.rect) > 200. && height(node.rect) == 16.);
                 }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod n5d_claude_note_tests {
+    use super::*;
+
+    #[test]
+    fn english_grouped_claude_note_fits_the_captured_862_dip_row() {
+        crate::i18n::with_language(crate::i18n::UiLanguage::En, || {
+            let clock = crate::dashboard_fixtures::clock();
+            let mut snapshot = crate::dashboard_fixtures::snapshot();
+            snapshot.accounts = v2::project(
+                &serde_json::json!({"accounts": [
+                    {"id":"cl-a", "provider":"claude", "label":"Synthetic A",
+                     "user_state":"active", "health":{"kind":"ready"}, "source":{"kind":"oauth"}},
+                    {"id":"cl-b", "provider":"claude", "label":"Synthetic B",
+                     "user_state":"active", "health":{"kind":"ready"}, "source":{"kind":"oauth"}}
+                ]})
+                .to_string(),
+                clock.utc().into(),
+            )
+            .unwrap();
+            snapshot.sessions.sessions.truncate(1);
+            let session = &mut snapshot.sessions.sessions[0];
+            session.routing = Some(m::SessionRouting {
+                action_id: "a".repeat(64),
+                on_5h_limit: "wait".into(),
+                mode: "recover".into(),
+            });
+            session.quota_wait = None;
+            session.quota_wait_known = true;
+            let id = session.id.clone();
+            let mut state = DashboardState {
+                grouped: true,
+                range: Range::All,
+                ..Default::default()
+            };
+            let view = m::project(&snapshot, &mut state, &clock);
+            let memo = &view.flat[0].memo;
+            assert!(memo.starts_with("Move (Claude cannot resume automatically)"));
+            let mut metrics = Metrics::default();
+            // Captured Urgent is 76 DIP: 40 measured text + 36 control padding.
+            for (text, size, measured) in [("Urgent", 13., 40.), ("Move", 12., 30.)] {
+                metrics.widths.insert(
+                    Measure {
+                        text: text.into(),
+                        size,
+                        line_height: 20.,
+                        width: 4096.,
+                        bold: false,
+                        wrap: false,
+                        face: Face::Text,
+                        align: TextAlign::Leading,
+                    }
+                    .key(),
+                    measured,
+                );
+            }
+            for (size, row_width) in [([1304., 889.], 862.), ([1320., 900.], 878.)] {
+                let scene = Scene::build(&view, &state, size, &metrics);
+                let row = scene.session_rows.iter().find(|row| row.id == id).unwrap();
+                assert_eq!(width(row.rect), row_width);
+                assert_eq!(height(row.rect), 35.);
+                let urgent = scene
+                    .targets
+                    .iter()
+                    .find(|hit| hit.target == Target::SessionUrgency(id.clone()))
+                    .unwrap();
+                assert_eq!(width(urgent.rect), 76.);
+                let node = scene
+                    .accessibility
+                    .iter()
+                    .find(|node| node.key == format!("session:{id}:memo"))
+                    .expect("visible compact Notes");
+                assert_eq!(node.name, *memo);
+                assert_eq!(node.role, Role::Text);
+                assert!(node.target.is_none());
+                assert!(width(node.rect) >= 30.);
+                assert!(scene.draw.iter().any(|draw| matches!(draw,
+                    Draw::Text { rect, measure, .. }
+                    if *rect == node.rect && measure.text == "Move" && !measure.wrap)));
+                assert!(
+                    scene.tooltips.iter().any(|tip| tip.text == *memo
+                        && contains(tip.rect, node.rect.left, node.rect.top))
+                );
+                if size[0] == 1320. {
+                    assert!(
+                        width(node.rect) < 40.,
+                        "measured copy fits below the old guard"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn claude_note_paints_compact_copy_with_full_read_only_semantics_and_tooltip() {
+        for (language, compact) in [
+            (crate::i18n::UiLanguage::Ko, "이동"),
+            (crate::i18n::UiLanguage::En, "Move"),
+        ] {
+            crate::i18n::with_language(language, || {
+                let clock = crate::dashboard_fixtures::clock();
+                let mut snapshot = crate::dashboard_fixtures::snapshot();
+                snapshot.sessions.sessions.truncate(1);
+                let session = &mut snapshot.sessions.sessions[0];
+                session.provider = "claude".into();
+                session.routing = Some(m::SessionRouting {
+                    action_id: "a".repeat(64),
+                    on_5h_limit: "wait".into(),
+                    mode: "recover".into(),
+                });
+                session.quota_wait = None;
+                session.quota_wait_known = true;
+                let id = session.id.clone();
+                let mut state = DashboardState {
+                    grouped: false,
+                    range: Range::All,
+                    ..Default::default()
+                };
+                let view = m::project(&snapshot, &mut state, &clock);
+                let memo = &view.flat[0].memo;
+                assert!(
+                    memo.starts_with(crate::i18n::static_text("이동 (Claude는 자동 재개 미지원)"))
+                );
+                let scene = Scene::build(&view, &state, [1320., 900.], &Metrics::default());
+                let key = format!("session:{id}:memo");
+                let nodes: Vec<_> = scene
+                    .accessibility
+                    .iter()
+                    .filter(|node| node.key == key)
+                    .collect();
+                assert_eq!(nodes.len(), 1);
+                let node = nodes[0];
+                assert_eq!(
+                    node.parent.as_deref(),
+                    Some(format!("session:{id}").as_str())
+                );
+                assert_eq!(node.role, Role::Text);
+                assert_eq!(&node.name, memo);
+                assert!(node.target.is_none() && !node.hidden);
+                assert!(width(node.rect) >= 40. && height(node.rect) == 20.);
+                assert!(scene.draw.iter().any(|draw| matches!(draw,
+                    Draw::Text { rect, measure, .. }
+                    if *rect == node.rect && measure.text == compact && !measure.wrap)));
+                assert!(!scene.draw.iter().any(|draw| matches!(draw,
+                    Draw::Text { rect, measure, .. }
+                    if *rect == node.rect && measure.text == *memo)));
+                assert!(scene.tooltips.iter().any(|tip| tip.text == *memo
+                    && contains(tip.rect, node.rect.left, node.rect.top)
+                    && node.rect.right <= tip.rect.right
+                    && node.rect.bottom <= tip.rect.bottom));
+                let row = scene.session_rows.iter().find(|row| row.id == id).unwrap();
+                assert_eq!(height(row.rect), 35.);
+
+                let mut ordinary = view.clone();
+                ordinary.flat[0].memo = "standard memo".into();
+                let baseline = Scene::build(&ordinary, &state, [1320., 900.], &Metrics::default());
+                assert!(baseline.draw.iter().any(|draw| matches!(draw,
+                    Draw::Text { rect, measure, .. }
+                    if *rect == node.rect && measure.text == "standard memo")));
+                assert_eq!(scene.focus_order(), baseline.focus_order());
+                let hits = |scene: &Scene| {
+                    scene
+                        .targets
+                        .iter()
+                        .map(|hit| {
+                            (
+                                hit.target.clone(),
+                                hit.rect,
+                                hit.enabled,
+                                hit.tooltip.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(hits(&scene), hits(&baseline));
+                let baseline_row = baseline
+                    .session_rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap();
+                assert_eq!(row.rect, baseline_row.rect);
+
+                ordinary.flat[0].memo.clear();
+                let empty = Scene::build(&ordinary, &state, [1320., 900.], &Metrics::default());
+                assert!(!empty.accessibility.iter().any(|node| node.key == key));
             });
         }
     }
