@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N8/R15 공유 계약 최종 관문 완료·설치 인계; 다음 N6r 초기 상태·재생 구현
-목표: 서버·CLI·트레이의 관리자 응답 계약을 공유하고 실제 전송과 화면에서 필드 손실을 검증하기
-핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 숫자 통합 예측·실제 재생은 미수용
+현재 마일스톤: L1 P0 컴파일·Windows 보존 관문 완료; 다음 P1 Linux 암호화·권한·lease
+목표: 공통 코드를 유지하며 홈 서버용 Linux 헤드리스 코어 P0–P2를 완성하기
+핵심 지표: Linux 서버 독립 단계 1/3 (P0 컴파일, P1 플랫폼, P2 systemd); 전체 L1 서버 수용 전
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 17:49 KST (R15 b492eda 동일 입력 전체 기능3899·코어1310·실제 HWND10/추가PNG2 검수)
+갱신: 2026-10-25 00:50 KST (P0 코드 798f8a8, 양쪽 check·Windows lint·회귀·읽기 전용 연결 검사)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -243,6 +243,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 13:31 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | 설계 세션 확인: N5d-native cc12102 12:10 설치·Part F 사실9fcc560 13:31 설치; 통합 숫자 예측은 보정·백테스트 미수용 |
 | 2026-10-24 16:11 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | 설계 세션의 N5d-native 12:10 설치 수용 반영; R13.H 집중 관문은 출시 수 변화 없음, pooled 숫자 미출시 |
 | 2026-10-24 17:49 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | R15 공유 응답 계약 최종 관문 완료; 원본 실패16 집중 복구·전체 기능3899/코어1310 통과·실제 화면 검수; 통합 숫자/실제 재생 미수용 |
+| 2026-10-25 00:50 | Linux 서버 독립 단계 (분모 3: P0 컴파일, P1 플랫폼, P2 systemd) | 1/3 | 사용자 L1 brief의 서버 불필요 단계로 구현 메인이 새 계열 선택. P0 798f8a8 관문 통과; P3–P5 전체 수용과 별도 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -488,14 +489,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 16:11 | R13.H WS 용량·제한된 복귀 | 앞선 core1160·최종 core6/WS5·원본 WS148/1의 실패 기대 집중 복구·기본/전체 strict core lint·fmt/diff 통과 | 3세션 같은 계정 HTTP·유일 복귀·대안 선택·중복 예외 및 전역 예산 거부 | R13.H-evidence/delivery-fingerprint.json; 미사용 테스트 재수출 제거·실패 원본 보존·명시적 lease 종료, 전체 workspace/설치 미주장 |
 | 2026-10-24 16:19 | R15 계정 오류 응답 공유 계약 | proto·core·tray·CLI·실제 HTTP 오류·strict lint·syn guard 집중 통과 | code/outcome/message/retry_after 순서·생략·기존 분류 보존; 정확한7허용 제거·선택3필드 검토 | 7f419f5; account-errors-fingerprint.json; 전체 관문 별도 |
 | 2026-10-24 17:49 | R15 최종 계약 관문 | 전체 기능3899/0/36제외·코어1310/0/1제외·실제 HWND10/추가PNG2 검수 | 전체 행렬·집중 복구·실제 DTO 경로 | delivery-fingerprint.json; 원본 기본3475/16/19제외 보존·집중 원인별 복구·strict lint/fmt/guard/build/check exit0; 검사 간 중복 합산 안 함 |
+| 2026-10-25 00:50 | L1 P0 Windows 보존·Linux 컴파일 | 코어1179·HTTP9·CLI605+수정1·help 기본2/전체2·경계5 통과 | 양쪽 check·strict lint·Windows smoke | 원래 CLI child-name 실패 보존 후 해당 fixture 수정 검증; P1 credential backend는 미구현 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| 실제 재생 초기 상태·복원 | recorder 최소 설치; 초기 producer/reader 후보 준비 | owner 전체 초기 cut·복원·실제 epoch별 대조 | N6r 후보 집중 통합·나머지 owner/clock 구현 |
-| 통합 숫자 예측 | 기본 사실 설치; 보정 export의 scoreable pair 0 | 실제24시간 보정·백테스트 수용 | 고정 기준 유지·입력 adapter 보완·관측 결손 명시 |
-| R15 설치 | 전체 관문·실제 화면 검수 완료 | 설계 세션 설치와 smoke | 최종 병합 해시·검사 지문 인계(S2) |
+| Linux P1 자격증명·저장 | P0 토큰 저장은 명시적 거절; 후보 독립 검수 중 | 암호화·권한·lease 회귀와 Linux core 테스트 통과 | systemd credential 기본·명시적 file-0600 구현 |
+| Linux P2 서비스 | systemd 단위 후보; foreground reload·listener 인계 미완료 | 실제 systemd 시작·재시작·25초 연결 거절0 | Linux 종료·reload 소유권·listener 인계 구현과 실제 검증 |
+| N6r·N7 보류 | 각 브랜치·준비 자료에 보존 | 사용자 작업 순서와 별도 실제 재생·보정 수용 | Linux 우선 작업 뒤 별도 재개; dev 병합 안 함 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
