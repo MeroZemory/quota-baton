@@ -8,7 +8,7 @@ use qb_core::{
     config::Config,
     http::{self, RunningServers},
     local_secrets::LocalSecrets,
-    oauth::{LoginService, LoginStart, LoginState, LoginStatus, LoginTestConfig},
+    oauth::{DeviceTestConfig, LoginService, LoginStart, LoginState, LoginStatus, LoginTestConfig},
     observability::Observability,
 };
 use qb_testkit::{ScriptedResponse, ScriptedUpstream};
@@ -92,6 +92,13 @@ impl Harness {
                 callback_port: callback.local_addr().unwrap().port(),
             },
         )
+        .unwrap()
+        .with_device_test_config(DeviceTestConfig {
+            usercode_url: format!("{}/device/usercode", fake.url),
+            poll_url: format!("{}/device/token", fake.url),
+            poll_interval: Duration::from_millis(25),
+            lifetime: Duration::from_secs(10),
+        })
         .unwrap();
         let mut config = Config::default();
         config.server.data_port = 0;
@@ -133,7 +140,10 @@ impl Harness {
             .client
             .post(self.url(""))
             .bearer_auth(ADMIN)
-            .json(&json!({"provider":provider,"replace_linked":false,"no_browser":true}))
+            .json(&json!({
+                "provider":provider,"replace_linked":false,"no_browser":true,
+                "paste_redirect":provider == Provider::Codex
+            }))
             .send()
             .await
             .unwrap();
@@ -264,6 +274,69 @@ fn assert_redacted(body: &str) {
 }
 
 #[tokio::test]
+async fn codex_no_browser_defaults_to_device_through_authenticated_admin() {
+    let h = Harness::new().await;
+    let verifier = "synthetic-device-verifier-with-enough-bounded-characters";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    for body in [
+        json!({
+            "device_auth_id":"synthetic-device-id","user_code":"ABCD-EFGH",
+            "interval":"1","expires_in":60
+        }),
+        json!({
+            "authorization_code":CODE,"code_challenge":challenge,"code_verifier":verifier
+        }),
+    ] {
+        h.fake.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            serde_json::to_vec(&body).unwrap(),
+        ));
+    }
+    h.replies(Provider::Codex);
+    let response = h
+        .client
+        .post(h.url(""))
+        .bearer_auth(ADMIN)
+        .json(&json!({"provider":"codex","no_browser":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let start: LoginStart = response.json().await.unwrap();
+    let prompt = start.device.as_ref().expect("device prompt is the default");
+    assert_eq!(
+        prompt.verification_url,
+        "https://auth.openai.com/codex/device"
+    );
+    assert_eq!(start.auth_url, prompt.verification_url);
+    assert_eq!(prompt.user_code, "ABCD-EFGH");
+    assert!(prompt.expires_in <= 10);
+    assert!(!format!("{start:?}").contains("ABCD-EFGH"));
+    let status = h.terminal(&start.login_id).await;
+    assert_eq!(status.status, LoginState::Completed);
+    assert_redacted(&serde_json::to_string(&status).unwrap());
+    let account = h.store.load(status.account_id.as_ref().unwrap()).unwrap();
+    assert_eq!(h.store.tokens(&account).unwrap().access_token, ACCESS);
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path_and_query, "/device/usercode");
+    assert_eq!(requests[1].path_and_query, "/device/token");
+    assert_eq!(requests[2].path_and_query, "/token");
+    let encoded = reqwest::Url::parse(&format!(
+        "http://127.0.0.1/?{}",
+        std::str::from_utf8(&requests[2].body).unwrap()
+    ))
+    .unwrap();
+    let form: std::collections::BTreeMap<_, _> = encoded.query_pairs().into_owned().collect();
+    assert_eq!(
+        form["redirect_uri"],
+        "https://auth.openai.com/deviceauth/callback"
+    );
+    assert_eq!(form["code_verifier"], verifier);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn manual_http_login_persists_both_providers_and_refuses_replay() {
     let h = Harness::new().await;
     let unauthorized = h
@@ -276,6 +349,21 @@ async fn manual_http_login_persists_both_providers_and_refuses_replay() {
         .await
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let before = h.fake.state.requests().len();
+    for (provider, no_browser) in [(Provider::Claude, true), (Provider::Codex, false)] {
+        let response = h
+            .client
+            .post(h.url(""))
+            .bearer_auth(ADMIN)
+            .json(&json!({
+                "provider":provider,"no_browser":no_browser,"paste_redirect":true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(h.fake.state.requests().len(), before);
     for provider in [Provider::Claude, Provider::Codex] {
         h.replies(provider);
         let start = h.start(provider).await;

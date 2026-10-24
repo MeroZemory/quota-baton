@@ -1136,6 +1136,58 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for LoginObject<T>
 }
 
 impl LoginBackend {
+    async fn start(
+        &self,
+        provider: qb_core::accounts::Provider,
+        replace_linked: bool,
+        no_browser: bool,
+        paste_redirect: bool,
+    ) -> Result<LoginStart, LoginStartFailure> {
+        match self {
+            Self::Admin {
+                client,
+                base,
+                token,
+            } => {
+                let mut body = serde_json::json!({
+                    "provider": provider, "replace_linked": replace_linked, "no_browser": no_browser,
+                });
+                if paste_redirect {
+                    body["paste_redirect"] = true.into();
+                }
+                let response = client
+                    .post(format!("{base}/accounts/login"))
+                    .bearer_auth(token.trim())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|_| login_start_failure(None))?;
+                let response = admin_route_response(response, client, base, token)
+                    .await
+                    .map_err(|_| login_start_failure(None))?;
+                if !response.status().is_success() {
+                    let payload: serde_json::Value = response.json().await.unwrap_or_default();
+                    return Err(login_start_failure(payload["error"]["message"].as_str()));
+                }
+                response
+                    .json::<LoginObject<LoginStart>>()
+                    .await
+                    .map(|value| value.0)
+                    .map_err(|_| login_start_failure(None))
+            }
+            Self::Local(service) => {
+                let result = if paste_redirect {
+                    service.start_paste_redirect(replace_linked).await
+                } else if no_browser {
+                    service.start_manual(provider, replace_linked).await
+                } else {
+                    service.start(provider, replace_linked).await
+                };
+                result.map_err(|error| login_start_failure(Some(&error.to_string())))
+            }
+        }
+    }
+
     async fn submit_manual(&self, id: &str, input: &str) -> anyhow::Result<()> {
         match self {
             Self::Admin {
@@ -1218,6 +1270,22 @@ impl LoginBackend {
     }
 }
 
+struct LoginStartFailure {
+    message: &'static str,
+    offer_paste: bool,
+}
+
+fn login_start_failure(error: Option<&str>) -> LoginStartFailure {
+    use qb_core::oauth::LoginError;
+    LoginStartFailure {
+        message: login_failure(error),
+        offer_paste: error.is_some_and(|error| {
+            error == LoginError::DeviceUnavailable.to_string()
+                || error == LoginError::DeviceRateLimited.to_string()
+        }),
+    }
+}
+
 pub(crate) async fn login(
     home: &Path,
     config: &Config,
@@ -1226,45 +1294,12 @@ pub(crate) async fn login(
     no_browser: bool,
 ) -> anyhow::Result<()> {
     let mut offline_obs = None;
-    let (backend, id, auth_url) = if let Some((client, base, token)) =
-        running_admin(home, config).await?
-    {
-        let response = admin_route_response(client
-            .post(format!("{base}/accounts/login"))
-            .bearer_auth(token.trim())
-            .json(&serde_json::json!({ "provider": provider, "replace_linked": replace_linked, "no_browser": no_browser }))
-            .send()
-            .await?, &client, &base, &token).await?;
-        if let Err(error) = response.error_for_status_ref() {
-            let payload: serde_json::Value = response.json().await.unwrap_or_default();
-            println_utf8!("{}", login_failure(payload["error"]["message"].as_str()));
-            return Err(error.into());
+    let backend = if let Some((client, base, token)) = running_admin(home, config).await? {
+        LoginBackend::Admin {
+            client,
+            base,
+            token,
         }
-        let start = response
-            .json::<LoginObject<LoginStart>>()
-            .await
-            .map_err(|_| anyhow::anyhow!("로그인 응답을 확인해 주세요."))?
-            .0;
-        let id = Some(start.login_id.as_str())
-            .filter(|id| {
-                !id.is_empty()
-                    && id.len() <= 100
-                    && id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-            })
-            .ok_or_else(|| anyhow::anyhow!("로그인 응답을 확인해 주세요."))?
-            .to_owned();
-        let url = start.auth_url;
-        (
-            LoginBackend::Admin {
-                client,
-                base,
-                token,
-            },
-            id,
-            url,
-        )
     } else {
         let home = home.to_owned();
         let (store, obs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1280,150 +1315,290 @@ pub(crate) async fn login(
             .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let service = qb_core::oauth::LoginService::new(store, client, obs.clone());
-        let started = if no_browser {
-            service.start_manual(provider, replace_linked).await
-        } else {
-            service.start(provider, replace_linked).await
-        };
-        let start = match started {
-            Ok(start) => start,
-            Err(error) => {
-                println_utf8!("{}", login_failure(Some(&error.to_string())));
-                finish_offline_login(service, obs).await?;
-                anyhow::bail!("로그인을 시작하지 못했습니다.");
-            }
-        };
         offline_obs = Some(obs);
-        (LoginBackend::Local(service), start.login_id, start.auth_url)
+        LoginBackend::Local(service)
     };
-
-    // Only provider authorization URLs may be printed or opened. Never expose a
-    // callback URL, arbitrary admin text, userinfo, or provider error payload.
-    let result = async {
-        let url = reqwest::Url::parse(&auth_url)?;
-        let host = match provider {
-            qb_core::accounts::Provider::Claude => "claude.ai",
-            qb_core::accounts::Provider::Codex => "auth.openai.com",
-        };
-        anyhow::ensure!(
-            url.scheme() == "https"
-                && url.host_str() == Some(host)
-                && url.path() == "/oauth/authorize"
-                && url.port().is_none()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.fragment().is_none()
-                && !url.query_pairs().any(|(key, value)| (key == "code"
-                    && !(provider == qb_core::accounts::Provider::Claude && value == "true"))
-                    || matches!(
-                        key.as_ref(),
-                        "code_verifier"
-                            | "client_secret"
-                            | "access_token"
-                            | "refresh_token"
-                            | "id_token"
-                            | "error"
-                            | "error_description"
-                    )),
-            "로그인 주소를 확인해 주세요."
-        );
-        println_utf8!("로그인 주소: {}", url.as_str());
-        if !no_browser && crate::platform::open_browser(url.as_str()).is_err() {
-            println_utf8!("브라우저를 열지 못했습니다. 위 주소를 직접 열어 주세요.");
-        }
-        println_utf8!("로그인 대기 중입니다. 취소하려면 Ctrl+C를 누르세요.");
-        let mut manual_input = if no_browser {
-            println_utf8!("{}", match provider {
-                qb_core::accounts::Provider::Claude => "인증 페이지의 코드를 붙여넣고 Enter를 누르세요.",
-                qb_core::accounts::Provider::Codex => "브라우저의 최종 localhost 리디렉션 주소를 붙여넣고 Enter를 누르세요.",
-            });
-            Some(manual_login_input())
-        } else {
-            None
-        };
-        let interrupt = tokio::signal::ctrl_c();
-        tokio::pin!(interrupt);
-        let deadline = tokio::time::sleep(Duration::from_secs(605));
-        tokio::pin!(deadline);
-        loop {
-            let status = tokio::select! {
-                input = async {
-                    match &mut manual_input {
-                        Some(input) => input.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    manual_input = None;
-                    let input = input.map_err(|_| anyhow::anyhow!("로그인 입력을 읽지 못했습니다."))??;
-                    tokio::select! {
-                        signal = &mut interrupt => {
-                            signal?;
-                            backend.cancel(&id).await?;
-                            println_utf8!("로그인을 취소했습니다.");
-                            return Ok(());
-                        }
-                        _ = &mut deadline => anyhow::bail!("로그인 시간이 만료되었습니다."),
-                        submitted = backend.submit_manual(&id, &input) => {
-                            submitted.map_err(|_| anyhow::anyhow!("로그인 코드 또는 리디렉션 주소를 확인하고 다시 시작해 주세요."))?;
-                        }
-                    }
-                    continue;
-                }
-                signal = &mut interrupt => {
-                    signal?;
-                    backend.cancel(&id).await?;
-                    println_utf8!("로그인을 취소했습니다.");
-                    return Ok(());
-                }
-                _ = &mut deadline => {
-                    println_utf8!("로그인 시간이 만료되었습니다. 다시 시작해 주세요.");
-                    anyhow::bail!("로그인 시간이 만료되었습니다.");
-                }
-                status = backend.status(&id) => status?,
-            };
-            match status.status {
-                LoginState::Pending => {}
-                LoginState::Completed => {
-                    println_utf8!("로그인을 완료했습니다.");
-                    return Ok(());
-                }
-                LoginState::Cancelled => {
-                    println_utf8!("로그인을 취소했습니다.");
-                    return Ok(());
-                }
-                LoginState::Expired => {
-                    println_utf8!("로그인 시간이 만료되었습니다. 다시 시작해 주세요.");
-                    anyhow::bail!("로그인 시간이 만료되었습니다.");
-                }
-                LoginState::Failed => {
-                    // Never print the returned error/code or any account fields.
-                    println_utf8!("{}", login_failure(status.error.as_deref()));
-                    anyhow::bail!("로그인에 실패했습니다.");
-                }
-            }
-            tokio::select! {
-                signal = &mut interrupt => {
-                    signal?;
-                    backend.cancel(&id).await?;
-                    println_utf8!("로그인을 취소했습니다.");
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-        }
-    }
+    let mut active_id = None;
+    let result = login_interaction(
+        &backend,
+        provider,
+        replace_linked,
+        no_browser,
+        &mut active_id,
+    )
     .await;
-    if result.is_err() {
-        let _ = backend.cancel(&id).await;
-    }
+    // Also covers interrupted starts of the explicit fallback and invalid UI
+    // metadata. Never let the stdin owner retain this backend or its lease.
+    let cancelled = if let Some(id) = active_id {
+        backend
+            .cancel(&id)
+            .await
+            .map_err(|_| anyhow::anyhow!("로그인 취소 상태를 확인해 주세요."))
+    } else {
+        Ok(())
+    };
     if let (LoginBackend::Local(service), Some(obs)) = (backend, offline_obs) {
         finish_offline_login(service, obs).await?;
     }
-    result
+    result.and(cancelled)
+}
+
+async fn login_interaction(
+    backend: &LoginBackend,
+    provider: qb_core::accounts::Provider,
+    replace_linked: bool,
+    no_browser: bool,
+    active_id: &mut Option<String>,
+) -> anyhow::Result<()> {
+    use qb_core::accounts::Provider;
+    let device_requested = no_browser && provider == Provider::Codex;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let deadline = tokio::time::sleep(Duration::from_secs(if device_requested {
+        900
+    } else {
+        605
+    }));
+    tokio::pin!(deadline);
+    let mut start_next = Some(false);
+    let mut device = false;
+    let mut offer_paste = false;
+    let mut input = None;
+    let mut poll_at = tokio::time::Instant::now();
+    loop {
+        if let Some(paste) = start_next.take() {
+            let started = tokio::select! {
+                biased;
+                signal = &mut interrupt => {
+                    signal?;
+                    println_utf8!("로그인을 취소했습니다.");
+                    return Ok(());
+                }
+                _ = &mut deadline => anyhow::bail!("로그인 시간이 만료되었습니다."),
+                started = backend.start(provider, replace_linked, no_browser, paste) => started,
+            };
+            match started {
+                Ok(start) => {
+                    anyhow::ensure!(
+                        !start.login_id.is_empty()
+                            && start.login_id.len() <= 100
+                            && start
+                                .login_id
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+                        "로그인 응답을 확인해 주세요."
+                    );
+                    *active_id = Some(start.login_id.clone());
+                    device = start.device.is_some();
+                    anyhow::ensure!(
+                        !device || device_requested && !paste,
+                        "로그인 응답을 확인해 주세요."
+                    );
+                    let lifetime = display_login_start(&start, provider, no_browser)?;
+                    if device {
+                        let remaining = tokio::time::Instant::now() + Duration::from_secs(lifetime);
+                        let bounded = remaining.min(deadline.deadline());
+                        deadline.as_mut().reset(bounded);
+                    } else {
+                        let manual = tokio::time::Instant::now() + Duration::from_secs(605);
+                        let bounded = manual.min(deadline.deadline());
+                        deadline.as_mut().reset(bounded);
+                    }
+                    offer_paste = false;
+                    poll_at = tokio::time::Instant::now();
+                }
+                Err(error) => {
+                    println_utf8!("{}", error.message);
+                    if !device_requested || paste || !error.offer_paste {
+                        anyhow::bail!("로그인을 시작하지 못했습니다.");
+                    }
+                    offer_paste = true;
+                    println_utf8!("붙여넣기 로그인으로 전환하려면 Enter를 누르세요. 취소: Ctrl+C");
+                }
+            }
+            if no_browser && input.is_none() {
+                input = Some(manual_login_input(device || offer_paste));
+            }
+        }
+
+        let status = tokio::select! {
+            biased;
+            signal = &mut interrupt => {
+                signal?;
+                println_utf8!("로그인을 취소했습니다.");
+                return Ok(());
+            }
+            _ = &mut deadline => anyhow::bail!("로그인 시간이 만료되었습니다. 다시 시작해 주세요."),
+            line = async {
+                match &mut input {
+                    Some(input) => input.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                input = None;
+                let line = line.map_err(|_| anyhow::anyhow!("로그인 입력을 읽지 못했습니다."))??;
+                if device || offer_paste {
+                    anyhow::ensure!(line.is_empty(), "붙여넣기 로그인으로 전환하려면 먼저 Enter를 누르세요.");
+                    if let Some(id) = active_id.as_deref() {
+                        let terminal = tokio::select! {
+                            biased;
+                            signal = &mut interrupt => {
+                                signal?;
+                                println_utf8!("로그인을 취소했습니다.");
+                                return Ok(());
+                            }
+                            _ = &mut deadline => anyhow::bail!("로그인 시간이 만료되었습니다."),
+                            terminal = async {
+                                backend.cancel(id).await?;
+                                backend.status(id).await
+                            } => terminal.map_err(|_| anyhow::anyhow!("로그인 취소 상태를 확인해 주세요."))?,
+                        };
+                        match terminal.status {
+                            LoginState::Completed => {
+                                *active_id = None;
+                                println_utf8!("로그인을 완료했습니다.");
+                                return Ok(());
+                            }
+                            LoginState::Cancelled | LoginState::Expired => *active_id = None,
+                            _ => anyhow::bail!("기존 로그인 종료를 확인하지 못했습니다. 다시 시작해 주세요."),
+                        }
+                    }
+                    device = false;
+                    offer_paste = false;
+                    start_next = Some(true); // Exactly one user-requested paste start.
+                    deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(605));
+                    continue;
+                }
+                anyhow::ensure!(!line.is_empty(), "로그인 입력을 확인해 주세요.");
+                let id = active_id.as_deref().ok_or_else(|| anyhow::anyhow!("로그인 요청을 확인해 주세요."))?;
+                tokio::select! {
+                    biased;
+                    signal = &mut interrupt => {
+                        signal?;
+                        println_utf8!("로그인을 취소했습니다.");
+                        return Ok(());
+                    }
+                    _ = &mut deadline => anyhow::bail!("로그인 시간이 만료되었습니다."),
+                    submitted = backend.submit_manual(id, &line) => {
+                        submitted.map_err(|_| anyhow::anyhow!("로그인 코드 또는 리디렉션 주소를 확인하고 다시 시작해 주세요."))?;
+                    }
+                }
+                poll_at = tokio::time::Instant::now();
+                continue;
+            }
+            status = async {
+                tokio::time::sleep_until(poll_at).await;
+                backend.status(active_id.as_deref().expect("active login")).await
+            }, if !offer_paste => status.map_err(|_| anyhow::anyhow!("로그인 상태를 확인해 주세요."))?,
+        };
+        match status.status {
+            LoginState::Pending => poll_at = tokio::time::Instant::now() + Duration::from_secs(1),
+            LoginState::Completed => {
+                *active_id = None;
+                println_utf8!("로그인을 완료했습니다.");
+                return Ok(());
+            }
+            LoginState::Cancelled => {
+                *active_id = None;
+                println_utf8!("로그인을 취소했습니다.");
+                return Ok(());
+            }
+            LoginState::Expired => {
+                anyhow::bail!("로그인 시간이 만료되었습니다. 다시 시작해 주세요.")
+            }
+            LoginState::Failed => {
+                println_utf8!("{}", login_failure(status.error.as_deref()));
+                anyhow::bail!("로그인에 실패했습니다.");
+            }
+        }
+    }
+}
+
+fn display_login_start(
+    start: &LoginStart,
+    provider: qb_core::accounts::Provider,
+    no_browser: bool,
+) -> anyhow::Result<u64> {
+    if let Some(device) = &start.device {
+        anyhow::ensure!(
+            start.auth_url == "https://auth.openai.com/codex/device"
+                && device.verification_url == start.auth_url
+                && (1..=900).contains(&device.expires_in)
+                && (1..=64).contains(&device.user_code.len())
+                && device
+                    .user_code
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "로그인 응답을 확인해 주세요."
+        );
+        println_utf8!("로그인 주소: {}", device.verification_url);
+        println_utf8!("기기 코드: {}", device.user_code);
+        println_utf8!(
+            "{}초 안에 인증해 주세요. 새 코드를 자동 요청하지 않습니다.",
+            device.expires_in
+        );
+        println_utf8!(
+            "개인 계정은 ChatGPT Security 설정에서 기기 코드 로그인을 켜거나, workspace admin에게 허용을 요청하세요."
+        );
+        println_utf8!("붙여넣기 로그인으로 전환하려면 Enter를 누르세요. 취소: Ctrl+C");
+        return Ok(device.expires_in);
+    }
+    let url = reqwest::Url::parse(&start.auth_url)
+        .map_err(|_| anyhow::anyhow!("로그인 주소를 확인해 주세요."))?;
+    let host = match provider {
+        qb_core::accounts::Provider::Claude => "claude.ai",
+        qb_core::accounts::Provider::Codex => "auth.openai.com",
+    };
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some(host)
+            && url.path() == "/oauth/authorize"
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && !url.query_pairs().any(|(key, value)| (key == "code"
+                && !(provider == qb_core::accounts::Provider::Claude && value == "true"))
+                || matches!(
+                    key.as_ref(),
+                    "code_verifier"
+                        | "client_secret"
+                        | "access_token"
+                        | "refresh_token"
+                        | "id_token"
+                        | "error"
+                        | "error_description"
+                )),
+        "로그인 주소를 확인해 주세요."
+    );
+    println_utf8!("로그인 주소: {}", url.as_str());
+    if !no_browser && crate::platform::open_browser(url.as_str()).is_err() {
+        println_utf8!("브라우저를 열지 못했습니다. 위 주소를 직접 열어 주세요.");
+    }
+    println_utf8!("로그인 대기 중입니다. 취소하려면 Ctrl+C를 누르세요.");
+    if no_browser {
+        println_utf8!(
+            "{}",
+            match provider {
+                qb_core::accounts::Provider::Claude =>
+                    "인증 페이지의 코드를 붙여넣고 Enter를 누르세요.",
+                qb_core::accounts::Provider::Codex =>
+                    "브라우저의 최종 localhost 리디렉션 주소를 붙여넣고 Enter를 누르세요.",
+            }
+        );
+    }
+    Ok(605)
 }
 
 fn read_manual_login_input(
     reader: impl std::io::BufRead,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    read_login_line(reader, false)
+}
+
+fn read_login_line(
+    reader: impl std::io::BufRead,
+    allow_empty: bool,
 ) -> anyhow::Result<zeroize::Zeroizing<String>> {
     use std::io::BufRead;
     let mut input = zeroize::Zeroizing::new(Vec::with_capacity(8193));
@@ -1435,18 +1610,26 @@ fn read_manual_login_input(
     let value =
         std::str::from_utf8(&input).map_err(|_| anyhow::anyhow!("로그인 입력을 확인해 주세요."))?;
     let value = zeroize::Zeroizing::new(value.trim_end_matches(['\r', '\n']).to_owned());
-    anyhow::ensure!(!value.is_empty(), "로그인 입력을 확인해 주세요.");
+    anyhow::ensure!(
+        allow_empty || !value.is_empty(),
+        "로그인 입력을 확인해 주세요."
+    );
     Ok(value)
 }
 
-fn manual_login_input() -> tokio::sync::oneshot::Receiver<anyhow::Result<zeroize::Zeroizing<String>>>
-{
+fn manual_login_input(
+    allow_empty: bool,
+) -> tokio::sync::oneshot::Receiver<anyhow::Result<zeroize::Zeroizing<String>>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     // Tokio's blocking pool waits for blocked stdin at runtime shutdown. A
     // detached ordinary thread owns no service/store handles and permits Ctrl+C
     // and timeout to finish login cleanup even while stdin is still open.
     std::thread::spawn(move || {
-        let result = read_manual_login_input(std::io::stdin().lock());
+        let result = if allow_empty {
+            read_login_line(std::io::stdin().lock(), true)
+        } else {
+            read_manual_login_input(std::io::stdin().lock())
+        };
         let _ = sender.send(result);
     });
     receiver
@@ -1482,6 +1665,12 @@ pub(crate) async fn finish_offline_login(
 pub(crate) fn login_failure(error: Option<&str>) -> &'static str {
     use qb_core::oauth::LoginError;
     match error {
+        Some(error) if error == LoginError::DeviceUnavailable.to_string() => {
+            "기기 코드 로그인을 사용할 수 없습니다. 개인 계정의 ChatGPT Security 설정에서 켜거나 workspace admin에게 허용을 요청하세요. Enter로 붙여넣기 로그인을 사용할 수 있습니다."
+        }
+        Some(error) if error == LoginError::DeviceRateLimited.to_string() => {
+            "기기 코드 요청이 제한되었습니다. 새 코드를 자동 요청하지 않습니다. Enter로 붙여넣기 로그인을 사용할 수 있습니다."
+        }
         Some(error)
             if error == "linked_conflict" || error == LoginError::LinkedConflict.to_string() =>
         {
