@@ -209,8 +209,13 @@ fn confirmed_ephemeral_lifetimes_are_bounded_and_duplicate_ids_fail_closed() {
             &mut c,
             json!({"id":999,"method":"thread/start","params":{"ephemeral":true}}),
         );
+        let extra_id = if duplicate {
+            "title-0"
+        } else {
+            "title-overflow"
+        };
         let result = c.native_frame(
-            json!({"id":999,"result":{"thread":{"id":"title-0"}}})
+            json!({"id":999,"result":{"thread":{"id":extra_id}}})
                 .to_string()
                 .as_bytes(),
         );
