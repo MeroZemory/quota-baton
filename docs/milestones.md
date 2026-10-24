@@ -5,7 +5,7 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N8/R15 직접 계정 생산자·CLI·현재 HTTP fixture 단위 완료
+현재 마일스톤: N8/R15 계정·실제 호환 엄격 검사 완료, launch/login 통합 중
 목표: CLI·tray·dashboard의 제공자 요약을 한 계산으로 맞추고 검증 없는 통합 잔여시간을 표시하지 않기
 핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); pooled 실제 보정·백테스트 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
@@ -478,7 +478,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R15 공유 계약 | 직접 계정 생산자·CLI·실제 전송·현재 fixture 통과 | 나머지 응답·호환 엄격성·정적/실제 경로·전체 관문 | 공유 나머지 응답·정적 guard 통합 |
+| R15 공유 계약 | 직접 계정 생산자·CLI·실제 전송·현재 fixture 통과 | 나머지 응답·정적/실제 경로·전체 관문 | 공유 나머지 응답·정적 guard 통합 |
 | 제공자 통합 예측 | 기본 사실 공통화 관문 완료·실제12PNG 수용; pooled 미출시 | 제공 export 보정·실제24시간 백테스트 | 기본 사실 설치 수용; 제공된 body-free export 분석·N8 공유 계약 진행 |
 | 실제24시간 라우팅 재생 | 최소 기록·typed rebind 설치, 복원 초기 상태/adapter 미완 | epoch별 실제 초기 상태·loss·동일 router 대조 | N6r 생산자·읽기·복원 adapter 구현, export 근거 구분 |
 <!-- gaps:end -->
