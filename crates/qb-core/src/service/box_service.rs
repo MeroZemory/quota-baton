@@ -15,6 +15,16 @@ fn unavailable() -> anyhow::Error {
     anyhow::anyhow!("box service lifecycle unavailable")
 }
 
+// Key identity declarations do not implicitly request a native listener.
+fn declared_listeners(config: &Config) -> Vec<String> {
+    config
+        .boxes
+        .iter()
+        .filter(|endpoint| endpoint.listen == Some(crate::config::BoxListen::Unix))
+        .map(|endpoint| endpoint.name.clone())
+        .collect()
+}
+
 /// Own outside RelayState. Keep this SAME handle across start errors, shutdown
 /// and cancelled borrowed waits; Drop is neither a terminal join nor cleanup.
 #[must_use = "retain and explicitly drain/join/freeze/check before P2 finish"]
@@ -36,10 +46,10 @@ impl BoxService {
             config
                 .boxes
                 .iter()
-                .all(|endpoint| endpoint.listen == crate::config::BoxListen::Unix),
+                .all(|endpoint| !matches!(endpoint.listen, Some(crate::config::BoxListen::Tcp(_)))),
             "TCP box listeners are not available in this build"
         );
-        let declared: Vec<_> = config.boxes.iter().map(|b| b.name.clone()).collect();
+        let declared = declared_listeners(config);
         let sockets = SocketSet::new();
         // Separate narrow native preparation query dependency; no OS cfg or
         // registry reads on the unsupported platform's empty/default path.

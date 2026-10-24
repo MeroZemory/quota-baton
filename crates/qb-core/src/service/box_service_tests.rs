@@ -63,3 +63,22 @@ fn listener_selection_uses_fresh_active_epoch_and_empty_declarations_bind_nothin
     assert_ne!(next, old);
     assert_eq!(service.listener_scopes().unwrap(), vec![next]);
 }
+
+#[test]
+fn name_only_configuration_keeps_identity_without_declaring_a_listener() {
+    let config: Config =
+        toml::from_str("[[boxes]]\nname='key-only'\n[[boxes]]\nname='bound'\nlisten='unix'\n")
+            .unwrap();
+    config.validate_boxes().unwrap();
+    let declared = declared_listeners(&config);
+    assert_eq!(declared, ["bound"]);
+    let names: Vec<_> = declared.iter().map(String::as_str).collect();
+    let (_home, registry, service) = fixture(&names);
+    let key_only = enroll(&registry, "key-only");
+    let bound = enroll(&registry, "bound");
+    assert_eq!(service.listener_scopes().unwrap(), vec![bound]);
+    assert!(service.active_scopes().unwrap().contains(&key_only));
+    assert!(declared_listeners(&Config::default()).is_empty());
+    let only: Config = toml::from_str("[[boxes]]\nname='key-only'\n").unwrap();
+    assert!(declared_listeners(&only).is_empty());
+}

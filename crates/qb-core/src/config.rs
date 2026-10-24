@@ -29,15 +29,14 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct BoxConfig {
     pub name: String,
-    #[serde(default)]
-    pub listen: BoxListen,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<BoxListen>,
 }
 
 /// Listener binding is additional to the per-box key's identity.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum BoxListen {
-    #[default]
     Unix,
     Tcp(u16),
 }
@@ -533,7 +532,7 @@ impl Config {
         for endpoint in &self.boxes {
             let name = crate::boxes::BoxName::parse(&endpoint.name)?;
             anyhow::ensure!(seen.insert(name), "duplicate box name");
-            if let BoxListen::Tcp(port) = endpoint.listen {
+            if let Some(BoxListen::Tcp(port)) = endpoint.listen {
                 anyhow::ensure!(port != 0, "invalid box listener port");
                 anyhow::ensure!(ports.insert(port), "duplicate box listener port");
                 anyhow::ensure!(
@@ -607,7 +606,7 @@ impl Config {
             "boxes".into(),
             toml::Value::try_from(vec![BoxConfig {
                 name: "sample-box".into(),
-                listen: BoxListen::Unix,
+                listen: Some(BoxListen::Unix),
             }])?,
         );
         warn_unknown(&value, &known, "");
@@ -1331,7 +1330,11 @@ mod box_config_tests {
         let config: Config =
             toml::from_str("[[boxes]]\nname='sample-box'\n[[boxes]]\nname='sample_2'\n").unwrap();
         config.validate_boxes().unwrap();
-        let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(config.boxes.iter().all(|item| item.listen.is_none()));
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(!encoded.contains("listen"));
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert!(decoded.boxes.iter().all(|item| item.listen.is_none()));
         assert_eq!(
             decoded
                 .boxes
@@ -1359,7 +1362,7 @@ mod box_config_tests {
             let mut config = Config::default();
             config.boxes.push(BoxConfig {
                 name: name.into(),
-                listen: BoxListen::Unix,
+                listen: Some(BoxListen::Unix),
             });
             assert!(config.validate_boxes().is_err(), "{name:?}");
         }
@@ -1367,7 +1370,7 @@ mod box_config_tests {
         config.boxes = vec![
             BoxConfig {
                 name: "sample-box".into(),
-                listen: BoxListen::Unix,
+                listen: Some(BoxListen::Unix),
             };
             2
         ];
@@ -1375,7 +1378,7 @@ mod box_config_tests {
         config.boxes = (0..257)
             .map(|index| BoxConfig {
                 name: format!("sample-{index}"),
-                listen: BoxListen::Unix,
+                listen: Some(BoxListen::Unix),
             })
             .collect();
         assert!(config.validate_boxes().is_err());
@@ -1391,9 +1394,9 @@ mod box_config_tests {
                 toml::from_str(&format!("[[boxes]]\nname='sample-box'\nlisten='{value}'\n"))
                     .unwrap();
             config.validate_boxes().unwrap();
-            assert_eq!(config.boxes[0].listen, expected);
+            assert_eq!(config.boxes[0].listen, Some(expected.clone()));
             let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-            assert_eq!(decoded.boxes[0].listen, expected);
+            assert_eq!(decoded.boxes[0].listen, Some(expected));
         }
         for value in [
             "tcp:0.0.0.0:10301",

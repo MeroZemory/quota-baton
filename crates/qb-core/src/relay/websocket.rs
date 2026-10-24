@@ -1404,3 +1404,7 @@ impl HandshakeError {
         response
     }
 }
+
+#[cfg(test)]
+#[path = "websocket/box_revocation_tests.rs"]
+mod box_revocation_tests;
