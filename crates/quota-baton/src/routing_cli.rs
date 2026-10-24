@@ -68,7 +68,7 @@ pub async fn run(
             )
             .into());
         }
-        let value: serde_json::Value = response.json().await?;
+        let value = routing_value(&response.bytes().await?)?;
         Some(
             current_wait(&value, id).ok_or(crate::accounts_cli::AccountCliError(
                 "현재 세션 대기 시간을 확인하지 못했습니다.",
@@ -165,6 +165,7 @@ async fn send_request(
     admin_token: &str,
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
+    let is_read = body.is_none();
     let response = if let Some(body) = body {
         client
             .post(url)
@@ -181,9 +182,22 @@ async fn send_request(
         )
         .into());
     }
-    let value: serde_json::Value = response.json().await?;
+    let bytes = response.bytes().await?;
+    let value: serde_json::Value = if is_read {
+        routing_value(&bytes)?
+    } else {
+        serde_json::from_slice(&bytes)?
+    };
     crate::print_stdout(format_args!("{}", serde_json::to_string_pretty(&value)?))?;
     Ok(())
+}
+
+// Validate the complete GET graph before existing Value-based presentation.
+// Retain original bytes for the presentation map, including future object keys.
+fn routing_value(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let _: qb_proto::admin_routing::RoutingGet = serde_json::from_slice(bytes)
+        .map_err(|_| crate::accounts_cli::AccountCliError("Invalid routing response contract"))?;
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 fn current_wait(value: &serde_json::Value, id: &str) -> Option<u64> {
@@ -277,9 +291,47 @@ mod tests {
             assert_eq!(explicit["reset_wait_secs"], omitted["reset_wait_secs"]);
         }
     }
+    fn routing_fixture() -> serde_json::Value {
+        let settings = |wait| serde_json::json!({"mode":"recover","reset_wait_secs":wait,"on_5h_limit":"wait"});
+        let plan = |wait| serde_json::json!({"settings":settings(wait),"anchor":null,"project":null,"source":"session","revision":1});
+        serde_json::json!({"revision":1,"defaults":settings(13),"projects":{},"sessions":{"synthetic":plan(7)},"observed_sessions":[{"id":"observed","account":"synthetic-account","policy":plan(0)}],"forecast_shadow":[]})
+    }
+
+    #[test]
+    fn routing_get_decode_precedes_existing_presentation() {
+        let fixture = routing_fixture();
+        let value = routing_value(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+        assert_eq!(value, fixture);
+        assert_eq!(current_wait(&value, "synthetic"), Some(7));
+        assert_eq!(current_wait(&value, "observed"), Some(0));
+        assert_eq!(current_wait(&value, "new"), Some(13));
+    }
+
+    #[test]
+    fn routing_get_refuses_sparse_nested_settings_and_raw_duplicates() {
+        for pointer in [
+            "/defaults",
+            "/sessions/synthetic/settings",
+            "/observed_sessions/0/policy/settings",
+        ] {
+            let mut fixture = routing_fixture();
+            fixture
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("on_5h_limit");
+            assert!(routing_value(&serde_json::to_vec(&fixture).unwrap()).is_err());
+        }
+        let fixture = routing_fixture();
+        let raw = serde_json::to_string(&fixture).unwrap();
+        let duplicate = format!("{},\"revision\":2}}", &raw[..raw.len() - 1]);
+        assert!(routing_value(duplicate.as_bytes()).is_err());
+    }
+
     #[test]
     fn mode_edit_uses_running_root_wait_then_observed_policy_then_running_default() {
-        let mut view = serde_json::json!({"defaults":{"reset_wait_secs":13},"sessions":{"synthetic":{"settings":{"reset_wait_secs":7}}},"observed_sessions":[{"id":"observed","policy":{"settings":{"reset_wait_secs":0}}}]});
+        let mut view = routing_fixture();
         assert_eq!(current_wait(&view, "synthetic"), Some(7));
         assert_eq!(current_wait(&view, "observed"), Some(0));
         assert_eq!(current_wait(&view, "new"), Some(13));

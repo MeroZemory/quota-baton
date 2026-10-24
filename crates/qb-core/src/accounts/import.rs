@@ -4,7 +4,7 @@ use super::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs,
@@ -12,36 +12,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImportAction {
-    Created,
-    Updated,
-    Skipped,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SkipReason {
-    UnknownType,
-    InvalidData,
-    OlderToken,
-    OwnedAccount,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ImportRow {
-    pub id: Option<String>,
-    pub provider: Option<Provider>,
-    pub email: Option<String>,
-    pub plan: Option<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub user_state: Option<UserState>,
-    pub action: ImportAction,
-    pub reason: Option<SkipReason>,
-    pub stored_timestamp: Option<DateTime<Utc>>,
-    pub file_timestamp: Option<DateTime<Utc>>,
-}
+pub use qb_proto::admin_import::{ImportAction, SkipReason};
+pub type ImportRow = qb_proto::admin_import::ImportRow<Provider, UserState, DateTime<Utc>>;
 
 #[derive(Deserialize)]
 struct CpaFile {

@@ -347,6 +347,7 @@ impl Harness {
     }
 
     async fn admin(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Value {
+        let routing_get = method == reqwest::Method::GET && path == "/admin/v1/routing";
         let is_post = method == reqwest::Method::POST;
         let is_patch = method == reqwest::Method::PATCH;
         let mut request = self
@@ -359,6 +360,9 @@ impl Harness {
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), 200);
         let bytes = response.bytes().await.unwrap();
+        if routing_get {
+            routing_get_roundtrip(&bytes);
+        }
         if is_post && path == "/admin/v1/routing" {
             action_roundtrip::<qb_proto::admin_action::RoutingMutationReply>(&bytes);
         } else if is_post && path == "/admin/v1/routing/move-guard/clear" {
@@ -631,6 +635,158 @@ async fn r15_action_ack_routes_keep_shapes_and_auth() {
     assert_eq!(reply["drain"], true);
     assert_eq!(reply["allow_credits"], true);
     assert!(h.fake.state.requests().is_empty());
+}
+
+fn routing_get_roundtrip(body: &[u8]) {
+    let reply: qb_proto::admin_routing::RoutingGet = serde_json::from_slice(body)
+        .unwrap_or_else(|_| panic!("routing GET violates shared contract"));
+    let encoded = serde_json::to_vec(&reply).unwrap();
+    assert!(
+        encoded.as_slice() == body,
+        "routing GET roundtrip changed bytes"
+    );
+}
+
+// Dedicated to the new contract case; existing Harness drop semantics stay unchanged.
+async fn routing_contract_cleanup(h: Harness) -> Result<(), String> {
+    let Harness {
+        mut servers,
+        state,
+        store,
+        obs,
+        fake,
+        client,
+        home,
+        _root,
+        _serial,
+    } = h;
+    let limit = Duration::from_secs(10);
+    let mut errors = Vec::new();
+    servers.shutdown();
+    drop(client);
+    for task in [&mut servers.data_task, &mut servers.admin_task] {
+        match tokio::time::timeout(limit, &mut *task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(_) => errors.push("server task failed"),
+            Err(_) => {
+                errors.push("server shutdown timed out");
+                task.abort();
+                // Reap after abort too: dropping a JoinHandle is not completion.
+                let _ = task.await;
+            }
+        }
+    }
+    drop(servers);
+    // Retain on any teardown failure (including a panicking cleanup thread).
+    // No TempDir destructor may race outstanding owners.
+    let root = _root.keep();
+    let cleanup = std::thread::spawn(move || {
+        drop(state);
+        drop(fake);
+        if Arc::strong_count(&store) != 1 {
+            errors.push("fixture store owners remain after server join");
+        }
+        // AccountRuntime installs a store observer that owns an obs clone.
+        // Release that callback before checking the remaining writer owner.
+        drop(store);
+        if Arc::strong_count(&obs) != 1 {
+            errors.push("fixture observability owners remain after store drop");
+        }
+        if obs.flush().is_err() {
+            errors.push("observability flush failed");
+        }
+        // Outside Tokio, Observability::drop stops and joins its writer inline.
+        drop(obs);
+        drop(home);
+        if !errors.is_empty() {
+            return Err(format!(
+                "{}; retained {}",
+                errors.join("; "),
+                root.display()
+            ));
+        }
+        std::fs::remove_dir_all(&root)
+            .map_err(|error| format!("synthetic home removal failed: {error}"))?;
+        if root.exists() {
+            return Err("synthetic home remains after removal".into());
+        }
+        Ok(())
+    })
+    .join()
+    .unwrap_or_else(|_| Err("ordinary cleanup thread panicked; synthetic home retained".into()));
+    drop(_serial);
+    cleanup
+}
+
+#[tokio::test]
+async fn r15_routing_get_real_body_keeps_graph_and_forecast_variants() {
+    use futures_util::FutureExt;
+    for enabled in [false, true] {
+        let h = Harness::with_limits_and_config(Provider::Codex, 60, 300, 60, |config| {
+            config.routing.forecast_shadow = enabled;
+        })
+        .await;
+        let body = std::panic::AssertUnwindSafe(async {
+        let url = format!("http://{}/admin/v1/routing", h.servers.admin_addr);
+        let denied = h.client.get(&url).send().await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        denied.bytes().await.unwrap();
+        let id = h
+            .turn(
+                "/v1/responses",
+                &[("session-id", "synthetic-routing-contract")],
+                RAW,
+            )
+            .await;
+        let project = h.admin(reqwest::Method::POST, "/admin/v1/routing", Some(json!({"kind":"project", "name":"synthetic routing", "settings":{"mode":"strict", "reset_wait_secs":7}}))).await;
+        let session = qb_core::routing::session_id("codex:synthetic-routing-contract");
+        h.admin(
+            reqwest::Method::POST,
+            "/admin/v1/routing",
+            Some(json!({"kind":"session", "id":session, "project":project["id"]})),
+        )
+        .await;
+        let view = h
+            .admin(reqwest::Method::GET, "/admin/v1/routing", None)
+            .await;
+        assert!(!view["projects"].as_object().unwrap().is_empty());
+        assert!(!view["sessions"].as_object().unwrap().is_empty());
+        assert!(
+            view["observed_sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == session && s["account"] == id)
+        );
+        let forecasts = view["forecast_shadow"].as_array().unwrap();
+        assert_eq!(forecasts.len(), h.ids().len());
+        for forecast in forecasts {
+            let forecast = &forecast["forecast"];
+            assert_eq!(forecast["enabled"], enabled);
+            assert_eq!(forecast["placement_effect"], false);
+            if enabled {
+                assert_eq!(forecast.as_object().unwrap().len(), 6);
+                let windows = forecast["windows"].as_array().unwrap();
+                assert!(!windows.is_empty());
+                assert!(
+                    windows
+                        .iter()
+                        .all(|w| w["status"] == "fallback" && w.as_object().unwrap().len() == 3)
+                );
+            } else {
+                assert_eq!(forecast.as_object().unwrap().len(), 2);
+            }
+        }
+        }).catch_unwind().await;
+        let cleanup = routing_contract_cleanup(h).await;
+        if let Err(panic) = body {
+            if let Err(error) = cleanup {
+                eprintln!("{error}");
+            }
+            std::panic::resume_unwind(panic);
+        }
+        cleanup.unwrap_or_else(|error| panic!("{error}"));
+    }
 }
 
 fn usage(provider: Provider, percent: u32) -> HeaderMap {

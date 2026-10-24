@@ -283,6 +283,15 @@ mod tests {
     fn snapshot(at: DateTime<Utc>, reset: DateTime<Utc>, used: f64) -> Value {
         json!({"windows":[{"name":"5h","used_pct":used,"observed_at":at,"reset_at":reset}]})
     }
+    fn shared_forecast_roundtrip(value: &Value) {
+        let raw = serde_json::to_vec(value).unwrap();
+        let decoded: qb_proto::admin_routing::Forecast = serde_json::from_slice(&raw)
+            .unwrap_or_else(|_| panic!("actual shadow producer violates shared wire schema"));
+        assert!(
+            serde_json::to_vec(&decoded).unwrap() == raw,
+            "shadow producer roundtrip changed bytes"
+        );
+    }
     #[test]
     fn opt_in_shadow_is_bounded_and_never_claims_placement_or_probability() {
         let now = Utc::now();
@@ -291,7 +300,9 @@ mod tests {
         let v = snapshot(now, reset, 80.0);
         s.observe("cl-fixture", &v, now);
         assert!(s.series.is_empty());
-        assert_eq!(s.view("cl-fixture", &v, 2, 0, now)["enabled"], false);
+        let disabled = s.view("cl-fixture", &v, 2, 0, now);
+        shared_forecast_roundtrip(&disabled);
+        assert_eq!(disabled["enabled"], false);
         s.enable(true);
         s.regime("cl-fixture", Some(2), None);
         for i in 0..9 {
@@ -303,11 +314,14 @@ mod tests {
             );
         }
         let view = s.view("cl-fixture", &snapshot(now, reset, 79.0), 2, 0, now);
+        shared_forecast_roundtrip(&view);
         assert_eq!(view["placement_effect"], false);
         assert_eq!(view["windows"][0]["status"], "shadow");
         assert_eq!(view["windows"][0]["calibration"], "uncalibrated");
+        let fallback = s.view("cl-fixture", &v, 2, 1, now);
+        shared_forecast_roundtrip(&fallback);
         assert_eq!(
-            s.view("cl-fixture", &v, 2, 1, now)["windows"][0]["reason"],
+            fallback["windows"][0]["reason"],
             "unobserved_inflight_consumption"
         );
     }
