@@ -1,7 +1,7 @@
 //! Real loopback upgrades and genuine physical qualification, with synthetic
 //! credentials only. Never format scoped URLs, frames, or transport errors.
 
-use super::{PendingPublication, next_reset_wake};
+use super::{PendingPublication, due_is_new, next_reset_wake};
 use crate::{
     account_runtime::{AccountRuntime, DeferredResetId, DeferredResetStatus, HealthSignal},
     accounts::{AccountStore, HealthReason, Provider, Tokens},
@@ -514,10 +514,20 @@ async fn actual_replayed_id_and_thread_switch_close_without_payload_echo() {
 #[tokio::test]
 async fn actual_malformed_unknown_fields_and_invalid_shape_close_without_echo() {
     for wire in [
-        "synthetic-private-invalid-json",
-        r#"{"version":1,"request_id":1,"command":{"type":"observe","thread_id":"11111111-2222-4333-8444-555555555555"},"private":"must-not-echo"}"#,
-        r#"{"version":1,"request_id":0,"command":{"type":"cancel","episode":1}}"#,
-        r#"{"version":1,"request_id":1,"command":{"type":"observe","thread_id":"synthetic-not-a-native-uuid"}}"#,
+        "synthetic-private-invalid-json".to_owned(),
+        serde_json::json!({"version":VERSION,"request_id":1,"command":{
+            "type":"observe","thread_id":THREAD},"private":"must-not-echo"})
+        .to_string(),
+        serde_json::json!({"version":VERSION,"request_id":0,"command":{
+            "type":"cancel","episode":1}})
+        .to_string(),
+        serde_json::json!({"version":VERSION,"request_id":1,"command":{
+            "type":"observe","thread_id":"synthetic-not-a-native-uuid"}})
+        .to_string(),
+        // Separate old-version case; shape cases above exercise the current version.
+        serde_json::json!({"version":1,"request_id":1,"command":{
+            "type":"observe","thread_id":THREAD}})
+        .to_string(),
     ] {
         let fixture = Fixture::new().await;
         let mut socket = fixture.connect().await;
@@ -886,4 +896,176 @@ fn reset_wake_after_wall_clock_rollback_is_bounded_and_never_busy_due() {
     );
     assert!(next_reset_wake(wake, reset, reached, reset).is_none());
     assert!(next_reset_wake(wake, reset, reached, reset + chrono::Duration::seconds(1)).is_none());
+}
+
+#[test]
+fn due_cursor_ignores_cuts_spurious_notifications_and_unchanged_revision() {
+    let id = DeferredResetId::from_u64(1);
+    assert!(due_is_new(None, id, None));
+    assert!(!due_is_new(Some((id, 0)), id, None));
+    assert!(!due_is_new(Some((id, 0)), id, Some(0)));
+    assert!(due_is_new(Some((id, 0)), id, Some(1)));
+    assert!(!due_is_new(Some((id, 1)), id, Some(1)));
+    assert!(!due_is_new(Some((id, 1)), id, None));
+    assert!(!due_is_new(Some((id, 2)), id, Some(1)));
+    assert!(due_is_new(Some((id, 1)), id, Some(2)));
+    assert!(due_is_new(
+        Some((id, 2)),
+        DeferredResetId::from_u64(2),
+        Some(0)
+    ));
+}
+
+// Actual origin/application API, no readiness setter or fabricated record.
+async fn report_readiness(fixture: &Fixture, complete: bool) {
+    let at = Utc::now();
+    let mut raw = serde_json::json!({"observed_at":at,"windows":[
+        {"name":"5h","used_pct":10.0,"observed_at":at,
+         "reset_at":at+chrono::Duration::hours(5)},
+        {"name":"7d","used_pct":20.0,"observed_at":at,
+         "reset_at":at+chrono::Duration::days(1)}
+    ]});
+    if !complete {
+        raw["windows"].as_array_mut().unwrap().pop();
+    }
+    let origin = require(
+        fixture
+            .state
+            .accounts
+            .capture_poll_origin(&fixture.account)
+            .await
+            .ok_or(()),
+    );
+    require(
+        fixture
+            .state
+            .accounts
+            .apply_quota_snapshot_reported_origin(
+                &fixture.account,
+                raw.clone(),
+                &raw,
+                None,
+                Some(origin),
+            )
+            .await,
+    );
+}
+
+async fn next_due(socket: &mut Socket, id: DeferredResetId) {
+    let wire = match bounded(socket.next()).await {
+        Some(Ok(Message::Text(wire))) => wire,
+        _ => panic!("missing original episode Due"),
+    };
+    let event: Reply = require(serde_json::from_str(&wire));
+    assert!(event.valid_shape() && event.request_id.is_none());
+    assert!(matches!(event.event, Event::Due { episode } if episode == id.as_u64()));
+}
+
+#[tokio::test]
+async fn actual_pending_wait_preserves_owner_and_rearms_due_only_on_positive_recovery() {
+    let fixture = Fixture::new().await;
+    let mut socket = fixture.connect().await;
+    ping(&mut socket).await;
+    let (id, scope) = fixture.register_after(3).await;
+    let original = match fixture.state.accounts.deferred_reset_status(&scope, THREAD) {
+        DeferredResetStatus::Waiting { reset_at, wake, .. } => (reset_at, wake),
+        _ => panic!("original episode missing"),
+    };
+    PendingPublication::new(fixture.state.accounts.clone(), scope.clone(), id).keep();
+    report_readiness(&fixture, false).await;
+    send_command(
+        &mut socket,
+        1,
+        Command::Observe {
+            thread_id: THREAD.into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply(&mut socket, 1).await.event, Event::Waiting { episode, .. }
+        if episode == id.as_u64())
+    );
+    next_due(&mut socket, id).await;
+    assert!(Utc::now() >= original.0 && Instant::now() >= original.1);
+    send_command(
+        &mut socket,
+        2,
+        Command::Inspect {
+            episode: id.as_u64(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply(&mut socket, 2).await.event, Event::Pending { episode }
+        if episode == id.as_u64())
+    );
+    // A real Pong barrier fails if cuts or repeated Observe enqueue another Due.
+    ping(&mut socket).await;
+    send_command(
+        &mut socket,
+        3,
+        Command::Observe {
+            thread_id: THREAD.into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply(&mut socket, 3).await.event, Event::Waiting { episode, .. }
+        if episode == id.as_u64())
+    );
+    ping(&mut socket).await;
+    report_readiness(&fixture, false).await;
+    ping(&mut socket).await;
+    assert!(scope.live());
+    report_readiness(&fixture, true).await;
+    next_due(&mut socket, id).await;
+    ping(&mut socket).await;
+    send_command(
+        &mut socket,
+        4,
+        Command::Inspect {
+            episode: id.as_u64(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply(&mut socket, 4).await.event, Event::Ready { episode }
+        if episode == id.as_u64())
+    );
+    report_readiness(&fixture, false).await;
+    ping(&mut socket).await;
+    send_command(
+        &mut socket,
+        5,
+        Command::Inspect {
+            episode: id.as_u64(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply(&mut socket, 5).await.event, Event::Pending { episode }
+        if episode == id.as_u64())
+    );
+    report_readiness(&fixture, true).await;
+    next_due(&mut socket, id).await;
+    match fixture.state.accounts.deferred_reset_status(&scope, THREAD) {
+        DeferredResetStatus::Waiting {
+            id: same,
+            reset_at,
+            wake,
+        } if same == id => assert_eq!((reset_at, wake), original),
+        _ => panic!("recovery replaced original episode"),
+    }
+    send_command(
+        &mut socket,
+        6,
+        Command::Consume {
+            episode: id.as_u64(),
+        },
+    )
+    .await;
+    assert!(reply(&mut socket, 6).await.grants(6, id.as_u64()));
+    ping(&mut socket).await;
+    close_owner(&mut socket, &scope).await;
+    fixture.finish().await;
 }
