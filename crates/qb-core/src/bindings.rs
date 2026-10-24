@@ -42,6 +42,9 @@ pub(crate) use move_guard::{Observation as MoveObservation, Observations as Move
 #[path = "bindings/move_guard_tests.rs"]
 mod move_guard_tests;
 #[cfg(test)]
+#[path = "bindings/r15_properties.rs"]
+mod r15_properties;
+#[cfg(test)]
 #[path = "bindings/routing_safety_tests.rs"]
 mod routing_safety_tests;
 
