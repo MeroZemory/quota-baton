@@ -6220,3 +6220,52 @@ mod n5d_initial_poll_producer {
         assert_eq!(usage.state.requests().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn r15_real_core_state_shared_envelope_reserializes_without_top_level_loss() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/admin/v1/state", h.servers.admin_addr))
+        .bearer_auth("synthetic-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    let original: Value = serde_json::from_slice(&body).unwrap();
+    type Envelope = qb_proto::AdminState<Value, Value, Value>;
+    let shared: Envelope = serde_json::from_slice(&body).unwrap();
+    let serialized = serde_json::to_vec(&shared).unwrap();
+    let decoded: Value = serde_json::from_slice(&serialized).unwrap();
+    let keys: Vec<_> = original
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "pools",
+            "warnings",
+            "draining",
+            "capabilities",
+            "accounts",
+            "inflight",
+            "memory",
+            "bindings",
+            "data_port",
+            "version"
+        ]
+    );
+    assert_eq!(original, decoded);
+    assert_eq!(
+        &body[..],
+        serialized.as_slice(),
+        "changed current response bytes/order"
+    );
+    assert!(shared.capabilities.as_ref().unwrap().account_adopt);
+    assert_eq!(shared.draining, Some(false));
+    // Generic Value payloads preserve nested bytes structurally, but do not
+    // establish the future typed Account/Warning/Pool contract.
+}

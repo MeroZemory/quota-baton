@@ -565,13 +565,7 @@ pub fn short_error(error: &ClientError) -> &'static str {
     })
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct HealthResponse {
-    pub ok: bool,
-    pub version: String,
-    pub pid: u32,
-    pub started_at: String,
-}
+pub use qb_proto::HealthResponse;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreHealth {
@@ -690,24 +684,29 @@ mod quota_wire_tests {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TraySnapshot {
-    #[serde(default)]
-    pub warnings: Vec<TrayWarning>,
-    #[serde(default)]
-    pub pools: serde_json::Value,
-    #[serde(default)]
-    pub accounts: Vec<TrayAccount>,
-    #[serde(default)]
-    pub inflight: Inflight,
-    #[serde(default)]
-    pub memory: Memory,
-    #[serde(default)]
-    pub bindings: Bindings,
-    #[serde(default)]
-    pub data_port: u16,
-    #[serde(default)]
-    pub version: String,
+/// Shared wire envelope plus an explicit legacy-read adapter. Nested account,
+/// warning and pool schemas remain staged debt; presentation decoding is unchanged.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct TraySnapshot(
+    pub qb_proto::admin_state::AdminState<TrayAccount, TrayWarning, serde_json::Value>,
+);
+
+impl std::ops::Deref for TraySnapshot {
+    type Target = qb_proto::admin_state::AdminState<TrayAccount, TrayWarning, serde_json::Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TraySnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl<'de> Deserialize<'de> for TraySnapshot {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        qb_proto::admin_state::deserialize_compat(deserializer, false).map(Self)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -825,20 +824,6 @@ pub struct QuotaWindow {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Inflight {
-    #[serde(default)]
-    pub requests: u64,
-    #[serde(default)]
-    pub bytes: u64,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Memory {
-    #[serde(default)]
-    pub private_bytes: u64,
-}
-
 #[cfg(test)]
 mod n10_outside_usage_transport_tests {
     use super::*;
@@ -934,12 +919,6 @@ mod r5_transport_tests {
         assert!(codex.rows[0].raw.source.owned_or_adopted());
         assert_eq!(view.summaries[1].verdict, qb_tray::v2::Verdict::Credits);
     }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Bindings {
-    #[serde(default)]
-    pub count: u64,
 }
 
 /// Render a compact Korean tooltip line without exposing any secret fields.
@@ -1685,5 +1664,110 @@ mod n5c_urgency_client_tests {
             exchange(chunked, true).await,
             Err(ClientError::AccountAction(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod r15_envelope_transport_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn r15_complete_state_envelope_survives_tray_and_lossless_cli_decode() {
+        let wire = json!({
+            "pools":{"codex":{"eligible":1,"cooling":{},"unavailable":0}},
+            "warnings":[],
+            "draining":false,
+            "capabilities":{"account_adopt":true,"manual_refresh":true,"account_takeover":true},
+            "accounts":[],
+            "inflight":{"requests":2,"bytes":17},
+            "memory":{"private_bytes":23},
+            "bindings":{"count":1},
+            "data_port":12345,
+            "version":"synthetic"
+        });
+        let tray: TraySnapshot = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&tray).unwrap(), wire);
+        let cli: qb_proto::admin_state::AdminState<Value, Value, Value> =
+            qb_proto::admin_state::deserialize_compat(wire.clone(), true).unwrap();
+        assert_eq!(serde_json::to_value(cli).unwrap(), wire);
+        assert_eq!(tray.draining, Some(false));
+        assert!(tray.capabilities.as_ref().unwrap().manual_refresh);
+    }
+
+    #[test]
+    fn r15_legacy_decoder_keeps_unknown_and_requires_cli_account_array() {
+        let old = json!({"accounts":[]});
+        let tray: TraySnapshot = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(tray.draining, None);
+        assert_eq!(tray.capabilities, None);
+        assert!(tray.pools.is_null());
+        assert_eq!(tray.inflight.requests, 0);
+        let cli: qb_proto::admin_state::AdminState<Value, Value, Value> =
+            qb_proto::admin_state::deserialize_compat(old, true).unwrap();
+        assert!(cli.pools.is_null());
+        assert!(
+            qb_proto::admin_state::deserialize_compat::<_, Value, Value, Value>(json!({}), true)
+                .is_err()
+        );
+        assert!(serde_json::from_value::<TraySnapshot>(json!({"accounts":null})).is_err());
+        assert!(serde_json::from_value::<TraySnapshot>(json!({"inflight":null})).is_err());
+    }
+
+    #[test]
+    fn r15_raw_tray_state_rejects_duplicate_envelope_and_metric_keys() {
+        for wire in [
+            r#"{"accounts":[],"accounts":[]}"#,
+            r#"{"accounts":null,"accounts":[]}"#,
+            r#"{"version":"old","version":"new"}"#,
+            r#"{"inflight":{"requests":1,"requests":2}}"#,
+            r#"{"inflight":{"requests":null,"requests":2}}"#,
+            r#"{"inflight":{"bytes":1,"bytes":2}}"#,
+            r#"{"inflight":{"bytes":null,"bytes":2}}"#,
+            r#"{"memory":{"private_bytes":1,"private_bytes":2}}"#,
+            r#"{"memory":{"private_bytes":null,"private_bytes":2}}"#,
+            r#"{"bindings":{"count":1,"count":2}}"#,
+            r#"{"bindings":{"count":null,"count":2}}"#,
+            r#"{"capabilities":{"account_adopt":true,"account_adopt":false,"manual_refresh":true,"account_takeover":true}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<TraySnapshot>(wire).is_err(),
+                "{wire}"
+            );
+        }
+        let legacy: TraySnapshot = serde_json::from_str(
+            r#"{"accounts":[],"inflight":{"requests":4},"memory":{},"bindings":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.inflight.requests, 4);
+        assert_eq!(legacy.inflight.bytes, 0);
+        assert_eq!(legacy.memory.private_bytes, 0);
+        assert_eq!(legacy.bindings.count, 0);
+        assert!(legacy.pools.is_null());
+        assert_eq!(legacy.draining, None);
+        assert_eq!(legacy.capabilities, None);
+    }
+}
+
+#[cfg(test)]
+mod r15_dependency_strictness_tests {
+    #[test]
+    fn shared_state_and_health_reject_unknown_keys_in_a_consumer_test() {
+        type State = qb_proto::AdminState<serde_json::Value, serde_json::Value, serde_json::Value>;
+        let current = serde_json::json!({
+            "pools":null,"warnings":[],"draining":false,"capabilities":null,
+            "accounts":[],"inflight":{"requests":0,"bytes":0},
+            "memory":{"private_bytes":0},"bindings":{"count":0},
+            "data_port":12345,"version":"synthetic"
+        });
+        serde_json::from_value::<State>(current.clone()).unwrap();
+        let mut unknown = current.clone();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<State>(unknown).is_err());
+        let mut nested = current;
+        nested["inflight"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<State>(nested).is_err());
+        let health = r#"{"ok":true,"version":"synthetic","pid":7,"started_at":"2030-01-01T00:00:00Z","unexpected":true}"#;
+        assert!(serde_json::from_str::<qb_proto::HealthResponse>(health).is_err());
     }
 }
