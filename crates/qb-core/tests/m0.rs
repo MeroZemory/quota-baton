@@ -519,3 +519,102 @@ async fn r1_n5_jwt_hint_is_data_bearer_only_and_never_echoes_credentials() {
         }
     }
 }
+
+#[tokio::test]
+async fn r15_http_error_real_protected_bytes_keep_path_specific_shape_and_order() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut config = Config::default();
+        config.server.data_port = 0;
+        config.server.admin_port = 0;
+        let servers = http::spawn(&config, secrets()).await.unwrap();
+        let client = client();
+        for (admin, path, authenticated, status, kind, message, messages) in [
+            (
+                true,
+                "/admin/v1/health",
+                false,
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Invalid local credential",
+                false,
+            ),
+            (
+                false,
+                "/v1/messages",
+                false,
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Invalid local credential",
+                true,
+            ),
+            (
+                false,
+                "/v1/messages/missing",
+                true,
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "Route not found",
+                true,
+            ),
+            (
+                false,
+                "/v1/responses",
+                true,
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "Route not found",
+                false,
+            ),
+            (
+                false,
+                "/v1/messages-other",
+                true,
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "Route not found",
+                false,
+            ),
+        ] {
+            let addr = if admin {
+                servers.admin_addr
+            } else {
+                servers.data_addr
+            };
+            let mut request = client.get(format!("http://{addr}{path}"));
+            if authenticated {
+                request = request.bearer_auth(if admin {
+                    "fake-admin-token"
+                } else {
+                    "fake-client-key"
+                });
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let body = response.bytes().await.unwrap();
+            let decoded: qb_proto::admin_error::HttpErrorReply =
+                serde_json::from_slice(&body).unwrap();
+            assert_eq!(decoded.error.kind, kind);
+            assert_eq!(decoded.error.message, message);
+            assert_eq!(decoded.kind.as_deref(), messages.then_some("error"));
+            let suffix = if messages { ",\"type\":\"error\"" } else { "" };
+            let expected = format!(
+                "{{\"error\":{{\"type\":{kind},\"message\":{message}}}{suffix}}}",
+                kind = serde_json::to_string(kind).unwrap(),
+                message = serde_json::to_string(message).unwrap(),
+            );
+            assert!(
+                body.as_ref() == expected.as_bytes(),
+                "HTTP error shape/order changed"
+            );
+            assert!(
+                serde_json::to_vec(&decoded).unwrap().as_slice() == body.as_ref(),
+                "same protected HTTP response did not roundtrip"
+            );
+        }
+        servers.shutdown();
+        servers.wait_for_listener_close().await;
+    })
+    .await
+    .expect("synthetic HTTP error contract deadline");
+}

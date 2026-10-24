@@ -657,3 +657,40 @@ async fn completed_admin_login_reaches_owned_refresh_through_public_http_relay()
     h.closed(&start).await;
     h.service.cancel_all().await;
 }
+
+#[tokio::test]
+async fn r15_admin_error_real_protected_bytes_keep_message_only_shape_and_order() {
+    let h = Harness::new(0).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let response = h
+            .request(reqwest::Method::GET, "/accounts/login/missing")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = response.bytes().await.unwrap();
+        secret_free(std::str::from_utf8(&body).unwrap());
+        let decoded: qb_proto::admin_error::AdminErrorReply =
+            serde_json::from_slice(&body).unwrap();
+        let message = qb_core::oauth::LoginError::NotFound.to_string();
+        assert_eq!(decoded.error.message, message);
+        let expected = format!(
+            "{{\"error\":{{\"message\":{}}}}}",
+            serde_json::to_string(&message).unwrap()
+        );
+        assert!(
+            body.as_ref() == expected.as_bytes(),
+            "admin error shape/order changed"
+        );
+        assert!(
+            serde_json::to_vec(&decoded).unwrap().as_slice() == body.as_ref(),
+            "same protected admin response did not roundtrip"
+        );
+        assert!(h.oauth.state.requests().is_empty());
+        assert!(h.store.list().unwrap().is_empty());
+        h.service.cancel_all().await;
+    })
+    .await
+    .expect("synthetic admin error contract deadline");
+}
