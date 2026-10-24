@@ -69,7 +69,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.1 | merged and INSTALLED (c6a304e, 10-21 23:14): image canary stage diagnostics and retry, user `-c` passthrough |
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
-| R13 | 진행 중: B+B2+D·A·A1 및 C+E 주 경로 설치 수용. N5a-c·N10·N5i 관문 보존; N5d-native 일반 release0.164 지원 새 실행 실제7/7 관문 완료·설치 인계(별도 행). Part F 기본 사실 공유 계산 bc2a34a 집중503·실제 한영10HWND/2PNG 수용, 전체 관문·실패 집중 보완 완료(5f6d5f6), 원본 행렬 실패 보존·설치 인계. pooled runway는 실제24시간 보정/백테스트 전 계속 미표시; brief `R13-burn-icon-hold.md` |
+| R13 | 진행 중: B+B2+D·A·A1 및 C+E 주 경로 설치 수용. N5a-c·N10·N5i 관문 보존; N5d-native 일반 release0.164 지원 새 실행 실제7/7 관문·12:10 설치 수용(별도 행). Part F 기본 사실 공유 계산 bc2a34a 집중503·실제 한영10HWND/2PNG 수용, 전체 관문·실패 집중 보완 완료(5f6d5f6), 원본 행렬 실패 보존·설치 인계. pooled runway는 실제24시간 보정/백테스트 전 계속 미표시; brief `R13-burn-icon-hold.md` |
 | R14 | 진행 중: R14.1 실행 보호·R14.2 최소 기록기 설치 수용. N6t 계정 봉인·승인 영수증·정적 검사와 health·WS 용량·C7 재분산·실패/재연결·명시적 모델 동의·저장소·자격증명·핀 증거 전달 단위 검증 완료; owner 증거형 MoveReason·단일 이동 경로 집중 검증 완료(정적 반례67·semantic red4·private compile2 포함); dev 결합 실제 모델 컨텍스트 보완·Strict/런처 fixture 정리 후 N6t 관문 완료(ed2cb87, 입력별 전체 검사·집중 보완 지문). 단일 근거형 이동 경로 self-merge; 실제24시간 재생 N6r은 별도 미완료 |
 | R14.1 | 설치 수용: dev249a14c (01:12 KST). guard21·R1419·HTTP12·WS123, strict lint 통과. takeover 연결 거절0/1,717·일반/이미지 exec·실제 dashboard 지표 확인 |
 | R12.11 | merged: df5bf72·집중58통과/1명시제외·strict CLI lint·real launch check·두 반례101→복원0. version15초·한 번 재시도·24시간 pass fallback, 잘못된 출력은 즉시 거절. 설치는 설계 세션 |
@@ -78,7 +78,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.2 | 완료·설치 수용: dev ddf8d87, 04:34 KST; 실제 dashboard 확인·takeover 연결 거절0/1,959 |
 | N10 | merged·설치 수용(dev ef75624, 16:52; takeover 연결 거절0/1,278): D30 자동 외부 사용 감지(설정 없음)와 WS spill anti-herding. 외부 사용 표시는 현재·다음 window 동안 기존 세션 이동 대상에서 제외, 새 배정은 최후 수단. own-slot 대기 뒤 spill D20 charge/약한 근거 cap·새 사용량 관측 전 대상별1개. 4세션 reset 회귀·외부 상승/자체 트래픽/clean window 해제·Daybreak 소스 연구. N5c 바로 뒤·N5d 앞 |
 | R13.G | 완료·설치 인계: 먼 5h 한도 이동·WS 426 fallback·launch 활동 보존·사용 불가 계정 재개·오류 표시. 코어11·R11 HTTP10·native-owner HTTP2·실제 WS4·콘솔1·인접 회귀·기본/testkit strict lint·제품 build/read-only check 통과; Sol 지적 보완. v0.4.0 설치·공개는 설계 세션 |
-| N5d-native | 관문 완료·설치 인계: f154b6a·일반 release native0.164 지원 새 실행 실제7/7(HTTP/WS 재개·pause/input veto·정상 종료). ownership39·entry13·strict lint·read-only check·fmt0. 임시 대화 수명 정리 전 봉인 보류; 모든 봉인 뒤 UI 취소 보존. Claude TUI 영구 이동, 미지원 argv/버전은 이동 유지. 이전 전체 검사 실패·집중 복구 입력별 지문 유지, 실제24시간 N6r 별도. 보고서 `.sandbox/reports/R13.N5d-native.md` |
+| N5d-native | 관문·설치 완료: f154b6a·일반 release native0.164 지원 새 실행 실제7/7(HTTP/WS 재개·pause/input veto·정상 종료). ownership39·entry13·strict lint·read-only check·fmt0. 임시 대화 수명 정리 전 봉인 보류; 모든 봉인 뒤 UI 취소 보존. Claude TUI 영구 이동, 미지원 argv/버전은 이동 유지. 이전 전체 검사 실패·집중 복구 입력별 지문 유지, 실제24시간 N6r 별도. 보고서 `.sandbox/reports/R13.N5d-native.md` |
 | R13.UI | 완료: 세션 행35 DIP·메모 열 앞 긴급 토글. 한영 1024/1320 geometry·tray345·strict lint·실제 core/AdminClient/tray4HWND 관문 통과. 보고서 `.sandbox/reports/R13.UI.md`; 설치는 설계 세션 |
 | N11 | 완료: dev 기존 tray6실패는 모두 오래된 fixture. 제품 변경 없이 compact summary/tooltip·측정 geometry·normal startup logging fixture 복구. 대상·인접36검사·strict tray lint·fmt 통과; 보고서 `.sandbox/reports/N11.md` |
 | R9.5 | 완료(N3): 즉시 안내·5초 heartbeat·단계별 안전 취소·명시적 복구·한영 읽기 쉬운 확인. 합성 실제 CLI 집중 관문·read-only launch check 통과, 설치 인계. 보고서 `.sandbox/reports/R9.5.md` |
@@ -87,7 +87,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |
 | R16.5 | 완료: 7cab418 잔여량 이력 유지·소진0·리셋100·한영 결과 문구. 집중466·strict lint·실제 core/AdminClient/tray10HWND·export2PNG 확인. 19353ac 설치 수용(06:58)·takeover 거절0/1,920; 다음 N5a |
 | R14.2 | 완료(N6 최소): 기본 꺼짐·schema3·bounded 7일 보존·off switch·실제 합성 HTTP/종료 집중 관문. 초기 cut/전체 owner/실제24시간 replay는 N6t/N6r 별도; 128 MiB 기록 활성화. 설치 동결 해제: 여러 epoch의 24시간 export 허용, epoch별 초기 상태·loss manifest로 각각 재생한 뒤 합산; 단일 epoch를 기다리지 않음 |
-| R15 | 진행(N8): N7 기본 사실 관문 완료 후 공유 admin 응답형·계약 왕복·라우팅 속성 검사(D27). 실제 보정 데이터 대기와 독립; state-envelope 첫 단위 준비. brief `R15-contract.md` |
+| R15 | 진행(N8): 공통 상태/health 응답형 첫 단위 792559a 집중·실제HTTP·strict lint 통과. 계정/경고/pool 내부 계약·정적/라우팅 속성·전체 관문 남음. 실제 보정 분석과 독립; brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
