@@ -249,11 +249,17 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
                         .json(&request)
                         .send()
                         .await?;
-                    admin_route_response(response, &client, &base, token.as_deref().unwrap_or(""))
-                        .await?
-                        .error_for_status()?
-                        .json::<serde_json::Value>()
-                        .await?
+                    let bytes = admin_route_response(
+                        response,
+                        &client,
+                        &base,
+                        token.as_deref().unwrap_or(""),
+                    )
+                    .await?
+                    .error_for_status()?
+                    .bytes()
+                    .await?;
+                    decode_account_subset(&bytes, AccountSubset::Import)?
                 }
                 Err(error) if error.is_connect() => {
                     if args.dry_run {
@@ -623,6 +629,58 @@ fn valid_account_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Select the response contract at the request call site, never by trying
+// permissive DTO alternatives against a normalized Value.
+#[derive(Clone, Copy)]
+enum AccountSubset {
+    Import,
+    Action,
+    Released,
+}
+
+fn decode_account_subset(
+    bytes: &[u8],
+    expected: AccountSubset,
+) -> anyhow::Result<serde_json::Value> {
+    use qb_proto::admin_account::{AdminHealth, AdminProvider, AdminUserState};
+    type Imported = qb_proto::admin_import::ImportRow<
+        AdminProvider,
+        AdminUserState,
+        chrono::DateTime<chrono::Utc>,
+    >;
+    type Action =
+        qb_proto::admin_action::AccountActionReply<AdminProvider, AdminUserState, AdminHealth>;
+    type Released =
+        qb_proto::admin_action::ReleaseHoldReply<AdminProvider, AdminUserState, AdminHealth>;
+    let invalid = || account_error("계정 응답 형식이 올바르지 않습니다.");
+    // Reuse the existing map-only raw adapter. Import has an array root, but
+    // each row must still be an object. Its diagnostic text is never rendered.
+    match expected {
+        AccountSubset::Import => {
+            let _: Vec<LoginObject<Imported>> =
+                serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        }
+        AccountSubset::Action => {
+            let _: LoginObject<Action> = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        }
+        AccountSubset::Released => {
+            let _: LoginObject<Released> = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        }
+    }
+    // Present the original payload, preserving its key order and timestamp
+    // spelling rather than reserializing the validation DTO.
+    serde_json::from_slice(bytes).map_err(|_| invalid())
+}
+
+async fn release_hold_response(response: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+    if !response.status().is_success() {
+        // Keep the existing allowlisted status/code classifier unchanged.
+        return account_response(response).await;
+    }
+    let bytes = response.bytes().await?;
+    decode_account_subset(&bytes, AccountSubset::Released)
+}
+
 async fn account_response(response: reqwest::Response) -> anyhow::Result<serde_json::Value> {
     let status = response.status();
     let value: serde_json::Value = response.json().await.unwrap_or_default();
@@ -923,7 +981,7 @@ async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow:
         "계정 ID를 확인해 주세요."
     );
     if let Some((client, base, token)) = running_admin(home, config).await? {
-        admin_route_response(
+        let bytes = admin_route_response(
             client
                 .post(format!("{base}/accounts/{id}/{action}"))
                 .bearer_auth(token.trim())
@@ -934,7 +992,10 @@ async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow:
             &token,
         )
         .await?
-        .error_for_status()?;
+        .error_for_status()?
+        .bytes()
+        .await?;
+        decode_account_subset(&bytes, AccountSubset::Action)?;
     } else {
         let home = home.to_owned();
         let id = id.to_owned();
@@ -975,7 +1036,7 @@ async fn release_hold(home: &Path, config: &Config, id: &str) -> anyhow::Result<
     let (client, base, token) = running_admin(home, config)
         .await?
         .ok_or_else(|| account_error("한도를 해제하려면 코어를 먼저 실행해 주세요."))?;
-    account_response(
+    release_hold_response(
         admin_route_response(
             client
                 .post(format!("{base}/accounts/{id}/release-hold"))
@@ -2541,5 +2602,197 @@ mod r15_adoption_contract_tests {
         let reply = super::adoption_response(response).await.unwrap();
         server.await.unwrap();
         assert_eq!(serde_json::to_vec(&reply).unwrap(), raw);
+    }
+}
+
+#[cfg(test)]
+mod r15_account_subset_raw_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn action(released: bool) -> Value {
+        let mut value = json!({"id":"synthetic-account"});
+        if released {
+            value["released"] = json!(true);
+        }
+        for (key, field) in json!({"provider":"codex","label":"synthetic-label",
+            "email":"synthetic@example.invalid","plan":null,"user_state":"active",
+            "health":{"kind":"ready"},"drain":false,"allow_credits":false})
+        .as_object()
+        .unwrap()
+        {
+            value[key] = field.clone();
+        }
+        value
+    }
+    fn row() -> Value {
+        json!({"id":"synthetic-account","provider":"codex",
+            "email":"synthetic@example.invalid","plan":null,
+            "expires_at":"2030-01-01T00:00:00+00:00","user_state":"active",
+            "action":"updated","reason":null,
+            "stored_timestamp":null,"file_timestamp":null})
+    }
+    fn fixture(kind: AccountSubset) -> Value {
+        match kind {
+            AccountSubset::Import => json!([row()]),
+            AccountSubset::Action => action(false),
+            AccountSubset::Released => action(true),
+        }
+    }
+    fn rejected(bytes: &[u8], kind: AccountSubset) {
+        let error = decode_account_subset(bytes, kind).unwrap_err();
+        assert_eq!(error.to_string(), "계정 응답 형식이 올바르지 않습니다.");
+    }
+    #[test]
+    fn original_presentation_bytes_and_timestamp_spelling_survive_validation() {
+        for kind in [
+            AccountSubset::Import,
+            AccountSubset::Action,
+            AccountSubset::Released,
+        ] {
+            let raw = fixture(kind).to_string();
+            let value = decode_account_subset(raw.as_bytes(), kind).unwrap();
+            assert_eq!(serde_json::to_vec(&value).unwrap(), raw.as_bytes());
+            let padded = format!(" \n{raw}\t");
+            assert_eq!(
+                decode_account_subset(padded.as_bytes(), kind).unwrap(),
+                value
+            );
+        }
+        assert_eq!(
+            decode_account_subset(b"[]", AccountSubset::Import).unwrap(),
+            json!([])
+        );
+        let skipped = br#"[{"id":null,"provider":null,"email":null,"plan":null,"expires_at":null,"user_state":null,"action":"skipped","reason":"invalid_data","stored_timestamp":null,"file_timestamp":null}]"#;
+        let value = decode_account_subset(skipped, AccountSubset::Import).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&value).unwrap().as_slice(),
+            skipped.as_slice()
+        );
+    }
+    #[test]
+    fn every_current_subset_field_is_required_and_raw_duplicates_are_visible() {
+        for kind in [
+            AccountSubset::Import,
+            AccountSubset::Action,
+            AccountSubset::Released,
+        ] {
+            let value = fixture(kind);
+            let object = if matches!(kind, AccountSubset::Import) {
+                &value[0]
+            } else {
+                &value
+            };
+            for (key, field) in object.as_object().unwrap() {
+                let mut missing = object.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                let missing = if matches!(kind, AccountSubset::Import) {
+                    json!([missing])
+                } else {
+                    missing
+                };
+                rejected(missing.to_string().as_bytes(), kind);
+                let raw = object.to_string();
+                let duplicate = format!(
+                    "{{{}:{},{}",
+                    serde_json::to_string(key).unwrap(),
+                    field,
+                    &raw[1..]
+                );
+                let duplicate = if matches!(kind, AccountSubset::Import) {
+                    format!("[{duplicate}]")
+                } else {
+                    duplicate
+                };
+                rejected(duplicate.as_bytes(), kind);
+            }
+        }
+    }
+    #[test]
+    fn caller_selects_array_or_object_contract_without_permissive_branch_guessing() {
+        for kind in [
+            AccountSubset::Import,
+            AccountSubset::Action,
+            AccountSubset::Released,
+        ] {
+            for bad in [
+                "null",
+                "true",
+                "17",
+                "\"synthetic\"",
+                "{}",
+                "[true]",
+                "not-json",
+            ] {
+                rejected(bad.as_bytes(), kind);
+            }
+            let raw = fixture(kind).to_string();
+            rejected(format!("{raw} {{}}").as_bytes(), kind);
+            let object = if matches!(kind, AccountSubset::Import) {
+                row()
+            } else {
+                fixture(kind)
+            };
+            let positional = Value::Array(object.as_object().unwrap().values().cloned().collect());
+            let bad = if matches!(kind, AccountSubset::Import) {
+                json!([positional])
+            } else {
+                positional
+            };
+            rejected(bad.to_string().as_bytes(), kind);
+        }
+        rejected(row().to_string().as_bytes(), AccountSubset::Import);
+        rejected(
+            fixture(AccountSubset::Import).to_string().as_bytes(),
+            AccountSubset::Action,
+        );
+        rejected(
+            action(false).to_string().as_bytes(),
+            AccountSubset::Released,
+        );
+        for kind in [AccountSubset::Action, AccountSubset::Released] {
+            rejected(b"[]", kind);
+        }
+    }
+    #[test]
+    fn malformed_domain_leaves_never_reach_value_presentation() {
+        for kind in [
+            AccountSubset::Import,
+            AccountSubset::Action,
+            AccountSubset::Released,
+        ] {
+            let object = if matches!(kind, AccountSubset::Import) {
+                row()
+            } else {
+                fixture(kind)
+            };
+            let mut bad = object.clone();
+            bad["provider"] = json!("synthetic-secret-provider");
+            let bad = if matches!(kind, AccountSubset::Import) {
+                json!([bad])
+            } else {
+                bad
+            };
+            rejected(bad.to_string().as_bytes(), kind);
+            let mut bad = object;
+            bad["user_state"] = json!(17);
+            let bad = if matches!(kind, AccountSubset::Import) {
+                json!([bad])
+            } else {
+                bad
+            };
+            rejected(bad.to_string().as_bytes(), kind);
+        }
+        let mut bad = row();
+        bad["expires_at"] = json!("not-a-timestamp");
+        rejected(json!([bad]).to_string().as_bytes(), AccountSubset::Import);
+        let raw = action(false).to_string().replace(
+            "\"kind\":\"ready\"",
+            "\"kind\":\"ready\",\"kind\":\"ready\"",
+        );
+        rejected(raw.as_bytes(), AccountSubset::Action);
+        let mut bad = action(true);
+        bad["released"] = json!("true");
+        rejected(bad.to_string().as_bytes(), AccountSubset::Released);
     }
 }
