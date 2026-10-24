@@ -43,11 +43,6 @@ pub(crate) async fn try_run(
     client_key: &str,
     account_short: Option<&str>,
 ) -> Result<Option<i32>, LaunchError> {
-    // N5d-native remains a separate acceptance follow-up. Keep the established
-    // launcher in ordinary builds until the owned native path passes its smoke.
-    if !cfg!(all(feature = "testkit", debug_assertions)) {
-        return Ok(None);
-    }
     diagnostic("plan");
     let remote = plan::from_issued_args(args);
     if matches!(remote, plan::Plan::ExistingPath) {
@@ -61,7 +56,7 @@ pub(crate) async fn try_run(
     let version = crate::launcher_label::version_output(program)
         .ok()
         .and_then(|bytes| crate::launcher_label::parse_version_output(&bytes));
-    if !matches!(version.as_deref(), Some("0.163.0" | "0.164.0")) {
+    if !supports_owned_native(version.as_deref()) {
         return Ok(None);
     }
     // Explicit non-content harness observation only. No release-build reader,
@@ -179,4 +174,29 @@ pub(crate) async fn try_run(
         eprintln!("qb-native-observer-finished");
     }
     outcome
+}
+
+// The release-source serialization prerequisite covers more versions than the
+// actual product-entry TUI acceptance. Unsupported versions keep ordinary launch.
+fn supports_owned_native(version: Option<&str>) -> bool {
+    matches!(version, Some("0.164.0"))
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::supports_owned_native;
+
+    #[test]
+    fn only_runtime_accepted_native_version_enables_owned_continuation() {
+        assert!(supports_owned_native(Some("0.164.0")));
+        for version in [
+            None,
+            Some(""),
+            Some("0.163.0"),
+            Some("0.164.1"),
+            Some("0.165.0"),
+        ] {
+            assert!(!supports_owned_native(version));
+        }
+    }
 }
