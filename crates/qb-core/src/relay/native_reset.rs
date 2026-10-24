@@ -7,7 +7,7 @@
 mod tests;
 
 use crate::{
-    account_runtime::{AccountRuntime, DeferredResetId},
+    account_runtime::{AccountRuntime, DeferredResetId, deferred_reset::DeferredResetInspection},
     launch_tokens::LaunchOwnerScope,
 };
 use std::sync::Arc;
@@ -50,6 +50,19 @@ fn next_reset_wake(
         return None;
     }
     mono_now.checked_add(remaining.min(Duration::from_secs(1)))
+}
+
+/// Initial Due is emitted once. Only a successful recovery/restoration cursor
+/// newer than the last emitted one can rearm this same episode; cuts are hints.
+fn due_is_new(
+    announced: Option<(DeferredResetId, u64)>,
+    id: DeferredResetId,
+    revision: Option<u64>,
+) -> bool {
+    match announced {
+        None => true,
+        Some((previous, last)) => previous != id || revision.is_some_and(|next| next > last),
+    }
 }
 
 /// Authentication has already run on the local data listener. Only an issued
@@ -113,7 +126,7 @@ async fn control(
     let mut thread: Option<String> = None;
     let mut observed = false;
     let mut last_request = 0;
-    let mut due_announced = false;
+    let mut announced_due: Option<(DeferredResetId, u64)> = None;
     let mut grant_issued = false;
     loop {
         // Poll once to arm notifications BEFORE status inspection. A future
@@ -139,6 +152,9 @@ async fn control(
         let status = status_thread
             .filter(|_| !grant_issued)
             .map(|thread| state.accounts.deferred_reset_status(&scope, thread));
+        if !scope.live() || state.is_draining() {
+            break;
+        }
         let mut wake = None;
         if let Some(status) = status {
             match status {
@@ -155,7 +171,8 @@ async fn control(
                     let mono_now = Instant::now();
                     let wall_now = chrono::Utc::now();
                     if mono_now >= at && wall_now >= reset_at {
-                        if observed && !due_announced {
+                        let revision = state.accounts.deferred_reset_readiness_revision(&scope, id);
+                        if observed && due_is_new(announced_due, id, revision) {
                             if send(
                                 &mut socket,
                                 None,
@@ -168,7 +185,7 @@ async fn control(
                             {
                                 break;
                             }
-                            due_announced = true;
+                            announced_due = Some((id, revision.unwrap_or(0)));
                         }
                     } else {
                         wake = next_reset_wake(at, reset_at, mono_now, wall_now);
@@ -196,7 +213,7 @@ async fn control(
         let message = tokio::select! {
             biased;
             _ = state.wait_for_drain_start() => break,
-            _ = &mut changed, if !changed_ready => { due_announced = false; continue; },
+            _ = &mut changed, if !changed_ready => continue,
             _ = timer => continue,
             message = socket.next() => message,
         };
@@ -292,12 +309,12 @@ async fn control(
                         _ = socket.next() => break,
                         result = &mut task => result,
                     };
-                    if !operation.can_reply() || !scope.live() {
+                    if !operation.can_reply() || !scope.live() || state.is_draining() {
                         break;
                     }
                     if matches!(result, Ok(Ok(true))) {
                         grant_issued = false;
-                        due_announced = false;
+                        announced_due = None;
                         observed = false;
                         // Keep thread and last_request: this is the same owner,
                         // and the next Observe may only repeat its identity.
@@ -333,9 +350,15 @@ async fn control(
                                 DeferredResetId::from_u64(episode),
                                 &work_operation,
                             )
-                            .map(|permit| permit.is_some())
+                            .map(|permit| {
+                                if permit.is_some() {
+                                    DeferredResetInspection::Ready
+                                } else {
+                                    DeferredResetInspection::Refused
+                                }
+                            })
                     } else {
-                        accounts.inspect_deferred_reset(
+                        accounts.inspect_deferred_reset_state(
                             &bindings,
                             &work_scope,
                             DeferredResetId::from_u64(episode),
@@ -352,26 +375,28 @@ async fn control(
                     _ = socket.next() => break,
                     result = &mut task => result,
                 };
-                if !operation.can_reply() || !scope.live() {
+                if !operation.can_reply() || !scope.live() || state.is_draining() {
                     break;
                 }
-                if matches!(result, Ok(Ok(true))) {
-                    if consume {
-                        // A single-use receipt must remain usable at the parent
-                        // write boundary. Keep this same owner live until peer
-                        // close/drain; terminal core state still denies repeats.
+                match result {
+                    Ok(Ok(DeferredResetInspection::Ready)) if consume => {
+                        // Keep the owner live until parent progress/close/drain.
                         grant_issued = true;
                         Event::Granted { episode }
-                    } else {
-                        Event::Ready { episode }
                     }
-                } else {
-                    Event::Refused {
+                    Ok(Ok(DeferredResetInspection::Ready)) => Event::Ready { episode },
+                    Ok(Ok(DeferredResetInspection::Pending)) if !consume => {
+                        Event::Pending { episode }
+                    }
+                    _ => Event::Refused {
                         reason: Refusal::Unavailable,
-                    }
+                    },
                 }
             }
         };
+        if !scope.live() || state.is_draining() {
+            break;
+        }
         if send(&mut socket, Some(last_request), event).await.is_err() {
             break;
         }
