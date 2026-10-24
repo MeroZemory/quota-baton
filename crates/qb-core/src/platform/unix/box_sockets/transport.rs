@@ -166,6 +166,7 @@ impl SocketNode {
         Ok(stat)
     }
     /// Caller has closed the bank original and joined all IO. No Drop unlink.
+    #[cfg(test)]
     pub fn unlink_owned(&self) -> io::Result<()> {
         self.unlink_owned_with(File::sync_all)
     }
