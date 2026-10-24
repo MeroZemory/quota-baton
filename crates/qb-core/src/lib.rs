@@ -19,6 +19,7 @@ pub mod oauth;
 pub mod observability;
 #[cfg(all(feature = "phase0", debug_assertions))]
 pub mod phase0;
+pub mod provider_forecast;
 pub mod quota;
 pub mod relay;
 pub mod routing;
