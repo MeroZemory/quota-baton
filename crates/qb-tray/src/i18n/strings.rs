@@ -3,6 +3,11 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("qb 밖에서도 사용 중", "also used outside qb"),
     ("5시간 대기 상태 확인 전", "5h wait status unavailable"),
     ("긴급", "Urgent"),
+    ("이동", "Move"),
+    (
+        "이동 (Claude는 자동 재개 미지원)",
+        "Move (Claude cannot resume automatically)",
+    ),
     ("지금 옮기기", "Move now"),
     ("초기화 {0}까지 대기", "Waiting until reset {0}"),
     ("긴급 설정 확인 전", "Urgency unavailable"),
