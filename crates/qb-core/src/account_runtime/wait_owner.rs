@@ -2789,13 +2789,14 @@ mod tests {
             reset_at: until,
             started_at: until - Duration::minutes(5),
         });
-        // Seed after constructor baseline (which normally persists expiry).
-        // Capture reads current metadata without performing that publication.
+        // Capture before the independent expiry becomes visible. UsagePoll
+        // capture now settles an already expired hold before issuing its origin;
+        // this test instead exercises expiry during this report's later reducer.
+        let origin = f.runtime.capture_poll_origin(&f.id).await.unwrap();
         {
             let _gate = f.runtime.store.transaction().unwrap();
             Fixture::write(f.home.path(), &account);
         }
-        let origin = f.runtime.capture_poll_origin(&f.id).await.unwrap();
         let held = f.apply(Fixture::raw(), Some(origin)).await;
         assert!(held.quota_cooling.is_some());
         assert!(
