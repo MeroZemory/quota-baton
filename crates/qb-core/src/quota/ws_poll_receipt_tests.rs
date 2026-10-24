@@ -1,4 +1,4 @@
-// Synthetic C9 GET coverage for the proposed poll_ws_quota API.
+// Synthetic C9 GET coverage for the poll_ws_quota API.
 // Receipt presence only: no native ticket access, registration, WS or resume.
 use super::*;
 
@@ -137,4 +137,33 @@ async fn c9_ws_malformed_unrecognized_or_failed_response_preserves_error() {
         ));
         assert_gets(&f, 1);
     }
+}
+
+#[tokio::test]
+async fn c9_ws_cancelled_inflight_poll_keeps_budget_and_publishes_no_receipt() {
+    let f = Fixture::new(1).await;
+    let reset = (Utc::now() + chrono::Duration::hours(1)).timestamp();
+    let mut delayed =
+        ScriptedResponse::json(reqwest::StatusCode::OK, body(100, 20, reset).to_string());
+    delayed.chunks[0].0 = Duration::from_secs(30);
+    f.fake.state.push(delayed);
+    let poller = f.relay.quota.clone();
+    let id = f.ids[0].clone();
+    let task = tokio::spawn(async move { poller.poll_ws_quota(&id).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f.fake.state.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("synthetic usage GET starts before cancellation");
+    task.abort();
+    assert!(task.await.is_err_and(|error| error.is_cancelled()));
+    assert!(f.relay.quota.obs.quota_snapshot(&f.ids[0]).is_none());
+    assert!(matches!(f.account(0).health, Health::Ready));
+    assert!(matches!(
+        f.relay.quota.poll_ws_quota(&f.ids[0]).await,
+        Err(PollError::TooSoon { .. })
+    ));
+    assert_gets(&f, 1);
 }

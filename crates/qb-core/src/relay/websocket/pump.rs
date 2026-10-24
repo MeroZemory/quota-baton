@@ -158,6 +158,7 @@ pub(in crate::relay) struct CurrentCompletion {
     model: Option<String>,
     response_id: Option<String>,
     physical_key: Option<String>,
+    physical_deadline: Option<Instant>,
     last_create: Option<(Message, Reservation)>,
     rate: Arc<RateBudget>,
 }
@@ -209,6 +210,7 @@ impl CurrentCompletion {
             model: None,
             response_id: None,
             physical_key: session.key.clone(),
+            physical_deadline: None,
             last_create: None,
             rate,
         })
@@ -914,6 +916,7 @@ struct PendingRateResend {
     rate: Arc<RateBudget>,
     model: Option<String>,
     key: Option<String>,
+    deadline: Option<Instant>,
 }
 
 // The create's caller/deadline owner is separate from metadata operations.
@@ -1485,6 +1488,7 @@ pub(super) struct DispatchSnapshot {
     pub(super) model: Option<String>,
     pub(super) pin: Option<Arc<crate::launch_tokens::LaunchPin>>,
     pub(super) owner: Option<crate::launch_tokens::LaunchOwnerScope>,
+    pub(super) deadline: Option<Instant>,
 }
 pub(super) struct QuotaCandidateSnapshot {
     pub(super) candidate: Candidate,
@@ -1497,12 +1501,17 @@ impl DispatchSnapshot {
             account: context.account.clone(),
             key,
             model,
+            deadline: None,
             pin: context.launch_pin.clone(),
             owner: context
                 .launch_pin
                 .as_ref()
                 .and_then(|pin| pin.deferred_owner_scope()),
         }
+    }
+    fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
     fn copy(&self) -> Self {
         Self {
@@ -1511,6 +1520,7 @@ impl DispatchSnapshot {
             model: self.model.clone(),
             pin: self.pin.clone(),
             owner: self.owner.clone(),
+            deadline: self.deadline,
         }
     }
 }
@@ -1732,6 +1742,50 @@ where
     })
 }
 
+// One retained original error, never an unbounded upstream queue. The future
+// owns registration rollback; the pump owns its original wire reservation.
+struct PendingQuotaError {
+    error: QuotaErrorReplay,
+    poll: BoxFuture<'static, Option<super::poll_reset::PendingWsPublication>>,
+}
+struct QuotaErrorReplay {
+    message: Message,
+    reservation: Reservation,
+    request: u64,
+    deadline: Instant,
+    publication: Option<super::poll_reset::PendingWsPublication>,
+}
+
+fn quota_poll_deadline(snapshot: &QuotaCandidateSnapshot, now: Instant) -> Option<Instant> {
+    // A logical ledger request may corroborate identity, never supply it.
+    snapshot.request?;
+    snapshot.dispatch.key.as_ref()?;
+    snapshot.dispatch.model.as_ref()?;
+    snapshot.dispatch.pin.as_ref()?;
+    snapshot.dispatch.owner.as_ref()?;
+    let deadline = snapshot.dispatch.deadline?;
+    (deadline > now).then_some(deadline.min(now + Duration::from_secs(30)))
+}
+
+// start_send has already happened synchronously beside publication.keep.
+// Retain the original error's reservation through flush, including failure.
+fn flush_handed_off<S>(
+    mut sink: S,
+    reservation: Reservation,
+    delivered: Delivered,
+    accepted: bool,
+) -> Write<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+    S::Error: Send,
+{
+    Box::pin(async move {
+        let success = accepted && sink.flush().await.is_ok();
+        drop(reservation);
+        (sink, success, delivered)
+    })
+}
+
 type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
 
 fn write_initial<S>(
@@ -1741,12 +1795,13 @@ fn write_initial<S>(
     delivered: Delivered,
     create: Arc<CreateLifetime>,
     physical: Arc<PhysicalLeg>,
-    dispatch: DispatchSnapshot,
+    mut dispatch: DispatchSnapshot,
 ) -> Write<S>
 where
     S: Sink<Message> + Send + Unpin + 'static,
     S::Error: Send,
 {
+    dispatch.deadline = Some(create.operation.deadline());
     Box::pin(async move {
         #[cfg(test)]
         let (sink, success, delivered) = write_physical(
@@ -2125,7 +2180,10 @@ fn redial_rate(
                     completed: false,
                 },
                 write_physical_leg,
-                Some(DispatchSnapshot::new(&context, pending.key, pending.model)),
+                Some(
+                    DispatchSnapshot::new(&context, pending.key, pending.model)
+                        .with_deadline(pending.deadline),
+                ),
             )
             .await
         }) as Write<SplitSink<UpstreamSocket, Message>>;
@@ -2150,6 +2208,8 @@ async fn run_with_read_timeout(
     let mut upstream_sink = Some(upstream_sink);
     let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
     let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
+    let mut pending_quota: Option<PendingQuotaError> = None;
+    let mut quota_replay: Option<QuotaErrorReplay> = None;
     let mut pending_rate_redial: Option<PendingRateResend> = None;
     let mut rate_redial: Option<RateRedial> = None;
     let mut deferred_client: Option<(Message, Reservation)> = None;
@@ -2229,6 +2289,14 @@ async fn run_with_read_timeout(
             .is_some_and(|relay| relay.is_draining());
         if draining {
             physical.witness.close();
+            if let Some(pending) = pending_quota.take() {
+                // Cancel C9 but deliver this original error via ordinary drain
+                // behavior once, without claiming a second quota candidate.
+                quota_replay = Some(pending.error);
+            }
+            if let Some(replay) = quota_replay.as_mut() {
+                replay.publication = None;
+            }
         }
         // Keep an admitted payload here until the write arm is polled, so
         // drain can cancel it without losing the upstream sink or older turns.
@@ -2259,6 +2327,8 @@ async fn run_with_read_timeout(
             end_deadline = Instant::now() + CLOSE_TIMEOUT;
         }
         if ending.is_some() {
+            pending_quota = None;
+            quota_replay = None;
             physical.witness.close();
             launch_preparation = None;
             pending_launch_create = None;
@@ -2321,8 +2391,33 @@ async fn run_with_read_timeout(
             || pending_initial.is_some()
             || to_upstream.is_some()
             || pending_rate_redial.is_some()
-            || rate_redial.is_some();
+            || rate_redial.is_some()
+            || pending_quota.is_some()
+            || quota_replay.is_some();
+        let quota_handoff_deadline = quota_replay
+            .as_ref()
+            .filter(|error| error.publication.is_some())
+            .map(|error| error.deadline);
         tokio::select! {
+            result = async {
+                let pending = pending_quota.as_mut().unwrap();
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(pending.error.deadline) => None,
+                    result = &mut pending.poll => result,
+                }
+            }, if pending_quota.is_some() && ending.is_none() && !draining => {
+                let mut error = pending_quota.take().expect("quota poll owns original error").error;
+                error.publication = result;
+                quota_replay = Some(error);
+            }
+            _ = async {
+                tokio::time::sleep_until(quota_handoff_deadline.unwrap()).await;
+            }, if quota_handoff_deadline.is_some() && ending.is_none() => {
+                // Readiness can remain Pending after registration. Expiry must
+                // still cancel the publication and release ordinary fallback.
+                quota_replay.as_mut().unwrap().publication = None;
+            }
             _ = async {
                 match pending_create_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2600,6 +2695,7 @@ async fn run_with_read_timeout(
                     }
                     if let Some(active) = current.get_mut(&pending.request) {
                         active.physical_key = dispatch_key.clone();
+                        active.physical_deadline = Some(pending.create.operation.deadline());
                         active.completion.accounting_attempt(&context.account);
                         if let Some(binding) = &active.completion.binding {
                             binding.dispatched();
@@ -2696,6 +2792,8 @@ async fn run_with_read_timeout(
                             }
                         }
                     }
+                    pending_quota = None;
+                    quota_replay = None;
                     physical.witness.close();
                     to_upstream = None;
                     launch_preparation = None;
@@ -2783,7 +2881,67 @@ async fn run_with_read_timeout(
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
                 }
             }
-            message = upstream_read.next(), if to_client.is_none() && rate_redial.is_none() && ending.is_none() => {
+            ready = async {
+                futures_util::future::poll_fn(|cx| {
+                    std::pin::Pin::new(client_sink.as_mut().unwrap()).poll_ready(cx)
+                }).await
+            },
+                if quota_replay.as_ref().is_some_and(|error| error.publication.is_some())
+                    && to_client.is_none() && ending.is_none() && !draining => {
+                let mut error = quota_replay.take().expect("ready quota error");
+                if ready.is_err() {
+                    // Nothing handed off: dropping publication rolls back.
+                    ending = Some((None, "client_write_error"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    continue;
+                }
+                let publication = error.publication.take().expect("registered quota error");
+                if Instant::now() >= error.deadline
+                    || context.relay.as_ref().is_some_and(|relay| relay.is_draining())
+                    || !current.contains_key(&error.request) {
+                    drop(publication);
+                    quota_replay = Some(error);
+                    continue;
+                }
+                let bytes = error.message.len();
+                let event = if let Message::Text(text) = &error.message { parsed(text.as_str()) } else { None };
+                if !publication.keep_if_current() {
+                    quota_replay = Some(error);
+                    continue;
+                }
+                // No await between the final keep and actual start_send. Even
+                // a failed start is uncertain physical delivery; retain the
+                // native obligation and let the existing write error close.
+                let mut sink = client_sink.take().expect("ready client sink");
+                let accepted = std::pin::Pin::new(&mut sink).start_send(error.message).is_ok();
+                if let Some(event) = event.as_ref() {
+                    physical.terminal(event, &current);
+                    count_type(&mut counts, event);
+                }
+                // Only the ORIGINAL snapshot request attributes this error.
+                // Do not observe raw quota or apply_error after its full poll.
+                let request = Some(error.request);
+                let terminal = current.get_mut(&error.request).and_then(|active| {
+                    let terminal = active.upstream(event.as_ref());
+                    active.last_create = None;
+                    active.rate.commit();
+                    terminal
+                });
+                terminal_pending = terminal.is_some();
+                let completed = event.as_ref().is_some_and(|event| event["type"] == "response.completed");
+                to_client = Some(flush_handed_off(sink, error.reservation,
+                    Delivered { bytes, request, terminal, completed }, accepted));
+            }
+            incoming = async {
+                if let Some(error) = quota_replay.take() {
+                    (Some(Ok(error.message)), Some((error.reservation, error.request)))
+                } else {
+                    (upstream_read.next().await, None)
+                }
+            }, if to_client.is_none() && rate_redial.is_none() && ending.is_none()
+                && pending_quota.is_none()
+                && quota_replay.as_ref().is_none_or(|error| error.publication.is_none()) => {
+                let (message, replayed) = incoming;
                 last_activity = Instant::now();
                 upstream_activity = last_activity;
                 match message {
@@ -2793,18 +2951,29 @@ async fn run_with_read_timeout(
                             to_upstream = Some(flush(upstream_sink.take().unwrap()));
                         }
                         let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
-                        // poll_reset.rs integration point: move this exact snapshot
-                        // and original budgeted error into its pending future slot,
-                        // BEFORE response_completion/apply_error/reconnect_available.
-                        // This source-only slice deliberately does not start C9.
-                        let _quota_candidate = event.as_ref().and_then(|event| physical.quota_candidate(event, &current));
-                        // Keep a captured candidate live for the sibling's pending
-                        // operation. In this standalone draft it is dropped unused;
-                        // no registration or wait is authorized by this hook alone.
-                        if _quota_candidate.is_none() {
-                            if let Some(event) = event.as_ref() { physical.terminal(event, &current); }
+                        // Intercept before ledger fallback or raw quota observation.
+                        // Replay cannot recapture or run a second C9 operation.
+                        if replayed.is_none() && !draining
+                            && to_upstream.is_none() && pending_initial.is_none()
+                            && pending_launch_create.is_none() && pending_inspection.is_none()
+                            && pending_rate_redial.is_none()
+                            && let Some(relay) = context.relay.as_ref()
+                            && let Some(snapshot) = event.as_ref().and_then(|event| physical.quota_candidate(event, &current))
+                            && let Some(deadline) = quota_poll_deadline(&snapshot, Instant::now())
+                            && let Some(request) = snapshot.request.filter(|request| current.contains_key(request))
+                        {
+                            let error = QuotaErrorReplay { message,
+                                reservation: context.budget.reserve_message(bytes), request, deadline, publication: None };
+                            pending_quota = Some(PendingQuotaError { error,
+                                poll: Box::pin(super::poll_reset::register(relay.clone(), snapshot, deadline)) });
+                            continue;
                         }
-                        let request = response_completion(&mut current, event.as_ref());
+                        if let Some(event) = event.as_ref() { physical.terminal(event, &current); }
+                        let (reservation, request) = if let Some((reservation, request)) = replayed {
+                            (reservation, Some(request))
+                        } else {
+                            (context.budget.reserve_message(bytes), response_completion(&mut current, event.as_ref()))
+                        };
                         if let Some(event) = event.as_ref() { physical.observe_created(event, &current); }
                         if request.is_none() && connection_errors < 16
                             && let Some(error) = event.as_ref().filter(|event| {
@@ -2919,6 +3088,7 @@ async fn run_with_read_timeout(
                                             rate: rate.clone(),
                                             model: current[&request.expect("active rate request")].model.clone(),
                                             key: current[&request.expect("active rate request")].physical_key.clone(),
+                                            deadline: current[&request.expect("active rate request")].physical_deadline,
                                         });
                                         let runtime = context.runtime.clone();
                                         let relay = context.relay.clone();
@@ -2929,6 +3099,7 @@ async fn run_with_read_timeout(
                                         let retry_context = context.clone();
                                         let retry_physical = physical.clone();
                                         let retry_key = current[&request.expect("active rate request")].physical_key.clone();
+                                        let retry_deadline = current[&request.expect("active rate request")].physical_deadline;
                                         to_upstream = Some(Box::pin(async move {
                                             if !rate.admit(runtime.as_ref(), &account).await {
                                                 if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
@@ -2956,7 +3127,7 @@ async fn run_with_read_timeout(
                                                 reservation,
                                                 Delivered { bytes, request, terminal: None, completed: false },
                                                 retry_physical,
-                                                Some(DispatchSnapshot::new(&retry_context, retry_key, retry_model)),
+                                                Some(DispatchSnapshot::new(&retry_context, retry_key, retry_model).with_deadline(retry_deadline)),
                                             )
                                             .await
                                         }));
@@ -3007,7 +3178,7 @@ async fn run_with_read_timeout(
                             ending = Some((frame.clone(), "upstream_close"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        to_client = Some(write(client_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, request, terminal, completed }));
+                        to_client = Some(write(client_sink.take().unwrap(), message, reservation, Delivered { bytes, request, terminal, completed }));
                     }
                     _ => {
                         if let Some(pending) = pending_rate_redial.take()
@@ -3045,7 +3216,7 @@ async fn run_with_read_timeout(
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 }
             }
-            _ = tokio::time::sleep_until(last_activity + context.idle_close), if ending.is_none() && !draining && to_client.is_none() && to_upstream.is_none() => {
+            _ = tokio::time::sleep_until(last_activity + context.idle_close), if ending.is_none() && !draining && to_client.is_none() && to_upstream.is_none() && pending_quota.is_none() && quota_replay.is_none() => {
                 ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "idle_close"));
                 end_deadline = Instant::now() + CLOSE_TIMEOUT;
             }
@@ -3057,6 +3228,8 @@ async fn run_with_read_timeout(
             _ = tokio::time::sleep_until(end_deadline), if ending.is_some() => { break; }
         }
     }
+    drop(pending_quota);
+    drop(quota_replay);
     physical.witness.close();
     // End waits and release retained slots before the close handshake and the
     // completion snapshot. Direct cancellation still uses the Drop fallback.
@@ -3120,3 +3293,94 @@ async fn note_client_rate(context: &Context) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod quota_handoff_tests {
+    use super::*;
+    use futures_util::task::noop_waker;
+    use std::{
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+    };
+
+    struct FlushSink {
+        pending: bool,
+        fail: bool,
+    }
+    impl Sink<Message> for FlushSink {
+        type Error = ();
+        fn poll_ready(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            panic!("already handed off: flush must not poll another send")
+        }
+        fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), ()> {
+            panic!("original quota error must never be sent twice")
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            if self.pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(if self.fail { Err(()) } else { Ok(()) })
+            }
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            panic!("flush helper must not close the client")
+        }
+    }
+    fn delivered() -> Delivered {
+        Delivered {
+            bytes: 7,
+            request: Some(42),
+            terminal: Some("upstream_error"),
+            completed: false,
+        }
+    }
+
+    #[test]
+    fn successful_or_uncertain_handoff_flushes_without_resending_and_releases_budget() {
+        for (accepted, fail) in [(true, false), (true, true), (false, false)] {
+            let budget = InflightBudget::new(16);
+            let mut write = flush_handed_off(
+                FlushSink {
+                    pending: false,
+                    fail,
+                },
+                budget.reserve_message(7),
+                delivered(),
+                accepted,
+            );
+            assert_eq!(budget.used(), 7);
+            let waker = noop_waker();
+            let result = write.as_mut().poll(&mut TaskContext::from_waker(&waker));
+            let Poll::Ready((_, success, receipt)) = result else {
+                panic!("ready flush")
+            };
+            assert_eq!(success, accepted && !fail);
+            assert_eq!((receipt.request, receipt.bytes), (Some(42), 7));
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn pending_handoff_flush_keeps_original_budget_until_cancellation() {
+        let budget = InflightBudget::new(16);
+        let mut write = flush_handed_off(
+            FlushSink {
+                pending: true,
+                fail: false,
+            },
+            budget.reserve_message(7),
+            delivered(),
+            true,
+        );
+        let waker = noop_waker();
+        assert!(
+            write
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(budget.used(), 7);
+        drop(write);
+        assert_eq!(budget.used(), 0);
+    }
+}

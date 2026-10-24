@@ -379,12 +379,13 @@ impl AccountRuntime {
         request: HttpWaitRequest<'_>,
         observed: &super::wait_owner::ObservedUsagePoll,
         pin: &LaunchPin,
+        original_owner: &LaunchOwnerScope,
         candidate: crate::relay::WsQuotaCandidate,
     ) -> Result<Option<(DeferredResetId, LaunchOwnerScope)>, ()> {
         let Some(scope) = pin.deferred_owner_scope() else {
             return Ok(None);
         };
-        if !scope.matches_pin(pin) {
+        if !scope.same_owner(original_owner) || !original_owner.live() || !scope.matches_pin(pin) {
             return Ok(None);
         }
         let _transaction = self.store.transaction().map_err(|_| ())?;

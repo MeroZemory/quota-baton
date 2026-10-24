@@ -1622,6 +1622,7 @@ async fn n5b_initial_write_keeps_caller_through_backpressure_then_drop() {
             model: None,
             pin: None,
             owner: None,
+            deadline: None,
         },
     );
     tokio::time::timeout(Duration::from_secs(1), async {
