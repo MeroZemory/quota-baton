@@ -14,6 +14,8 @@ use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::boxes::BoxScope;
+
 pub const CAPACITY: usize = 4096;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MAX_ANCHOR_BYTES: usize = 256;
@@ -99,6 +101,8 @@ pub enum LaunchTokenError {
     InvalidMetadata,
     #[error("launch token missing")]
     Missing,
+    #[error("launch token scope mismatch")]
+    ScopeMismatch,
     #[error("launch token expired")]
     Expired,
     #[error("launch token registry at capacity")]
@@ -111,6 +115,7 @@ pub enum LaunchTokenError {
 
 struct Entry {
     metadata: LaunchMetadata,
+    box_scope: Option<BoxScope>,
     last_activity: Instant,
     pins: usize,
     deferred_owner: Weak<DeferredOwner>,
@@ -156,6 +161,11 @@ impl Default for LaunchTokenRegistry {
 }
 
 impl LaunchTokenRegistry {
+    #[cfg(test)]
+    pub(crate) fn entry_count_for_test(&self) -> usize {
+        self.0.lock().len()
+    }
+
     fn with_clock(clock: Arc<Clock>) -> Self {
         Self(Arc::new(Inner {
             entries: Mutex::new(HashMap::new()),
@@ -164,7 +174,24 @@ impl LaunchTokenRegistry {
     }
 
     pub fn issue(&self, metadata: LaunchMetadata) -> Result<LaunchToken, LaunchTokenError> {
-        self.issue_with(metadata, || {
+        self.issue_optional_scope(metadata, None)
+    }
+
+    /// Allocation only: the caller still owns publication and revocation checks.
+    pub(crate) fn issue_scoped(
+        &self,
+        metadata: LaunchMetadata,
+        scope: BoxScope,
+    ) -> Result<LaunchToken, LaunchTokenError> {
+        self.issue_optional_scope(metadata, Some(scope))
+    }
+
+    fn issue_optional_scope(
+        &self,
+        metadata: LaunchMetadata,
+        box_scope: Option<BoxScope>,
+    ) -> Result<LaunchToken, LaunchTokenError> {
+        self.issue_with_scope(metadata, box_scope, || {
             let mut bytes = Zeroizing::new([0u8; 32]);
             rand::rngs::OsRng
                 .try_fill_bytes(&mut *bytes)
@@ -173,10 +200,21 @@ impl LaunchTokenRegistry {
         })
     }
 
-    // The entropy seam is private: deterministic entropy can never be selected by callers.
+    // Preserve the existing deterministic unscoped test seam.
+    #[cfg(test)]
     fn issue_with(
         &self,
         metadata: LaunchMetadata,
+        entropy: impl FnMut() -> Result<Zeroizing<[u8; 32]>, LaunchTokenError>,
+    ) -> Result<LaunchToken, LaunchTokenError> {
+        self.issue_with_scope(metadata, None, entropy)
+    }
+
+    // The entropy seam is private: deterministic entropy can never be selected by callers.
+    fn issue_with_scope(
+        &self,
+        metadata: LaunchMetadata,
+        box_scope: Option<BoxScope>,
         mut entropy: impl FnMut() -> Result<Zeroizing<[u8; 32]>, LaunchTokenError>,
     ) -> Result<LaunchToken, LaunchTokenError> {
         validate_anchor(&metadata.binding_anchor_key)?;
@@ -208,6 +246,7 @@ impl LaunchTokenRegistry {
             if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(digest) {
                 slot.insert(Entry {
                     metadata,
+                    box_scope,
                     last_activity: now,
                     pins: 0,
                     deferred_owner: Weak::new(),
@@ -253,8 +292,25 @@ impl LaunchTokenRegistry {
     /// Atomically validate and pin. Each request obtains its own non-cloneable guard.
     /// Missing/expired failures are for the caller to apply only when a token is needed.
     pub fn get_or_pin(&self, token: &str) -> Result<LaunchPin, LaunchTokenError> {
+        self.get_or_pin_scoped(token, None)
+    }
+
+    /// Expected scope must come from the authenticated serving transport.
+    /// Callers must map lookup errors to fixed responses, never disclose scope
+    /// or distinguish a foreign known token from an unknown token remotely.
+    pub(crate) fn get_or_pin_scoped(
+        &self,
+        token: &str,
+        expected: Option<&BoxScope>,
+    ) -> Result<LaunchPin, LaunchTokenError> {
         let digest = incoming_digest(token)?;
         let mut entries = self.0.lock();
+        let entry = entries.get(&digest).ok_or(LaunchTokenError::Missing)?;
+        // Check before clock/expiry evaluation or any pin/activity mutation.
+        // Even an expired foreign entry has no authority on this transport.
+        if entry.box_scope.as_ref() != expected {
+            return Err(LaunchTokenError::ScopeMismatch);
+        }
         let now = (self.0.clock)();
         let entry = live_entry(&mut entries, &digest, now)?;
         entry.pins = entry
@@ -655,6 +711,192 @@ mod tests {
             binding_anchor_key: "binding-anchor".into(),
             advertised_models: BTreeSet::from(["model-a".into()]),
         }
+    }
+
+    // Insert inside the existing launch_tokens::tests module: reuse Fixture,
+    // metadata and the registry's real identity construction APIs.
+    fn box_scopes() -> (tempfile::TempDir, BoxScope, BoxScope, BoxScope) {
+        use crate::boxes::{BoxName, BoxRegistry};
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/tests/launch-token-scope");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let registry = BoxRegistry::open(home.path()).unwrap();
+        let name_a = BoxName::parse("box-a").unwrap();
+        let (a, _) = registry.add(name_a.clone()).unwrap().into_parts();
+        let (b, _) = registry
+            .add(BoxName::parse("box-b").unwrap())
+            .unwrap()
+            .into_parts();
+        registry.revoke(&name_a).unwrap();
+        let (next_a, _) = registry.add(name_a).unwrap().into_parts();
+        assert_eq!(a.name(), next_a.name());
+        assert_ne!(a.epoch(), next_a.epoch());
+        (home, a, b, next_a)
+    }
+
+    #[test]
+    fn scoped_tokens_reject_other_box_epoch_and_tcp_in_both_directions() {
+        let (_home, a, b, next_a) = box_scopes();
+        let f = Fixture::new();
+        let token = f.registry.issue_scoped(metadata(), a.clone()).unwrap();
+        for expected in [None, Some(&b), Some(&next_a)] {
+            assert_eq!(
+                f.registry
+                    .get_or_pin_scoped(token.expose_secret(), expected)
+                    .unwrap_err(),
+                LaunchTokenError::ScopeMismatch
+            );
+        }
+        assert_eq!(
+            f.registry.get_or_pin(token.expose_secret()).unwrap_err(),
+            LaunchTokenError::ScopeMismatch
+        );
+        let pin = f
+            .registry
+            .get_or_pin_scoped(token.expose_secret(), Some(&a))
+            .unwrap();
+        assert_eq!(pin.metadata(), metadata());
+        drop(pin);
+        for other in [b, next_a] {
+            let other_token = f.registry.issue_scoped(metadata(), other).unwrap();
+            assert_eq!(
+                f.registry
+                    .get_or_pin_scoped(other_token.expose_secret(), Some(&a))
+                    .unwrap_err(),
+                LaunchTokenError::ScopeMismatch
+            );
+        }
+        let tcp = f.issue();
+        assert_eq!(
+            f.registry
+                .get_or_pin_scoped(tcp.expose_secret(), Some(&a))
+                .unwrap_err(),
+            LaunchTokenError::ScopeMismatch
+        );
+        assert!(f.registry.get_or_pin(tcp.expose_secret()).is_ok());
+    }
+
+    #[test]
+    fn scope_mismatch_preserves_activity_pins_and_foreign_expired_entries() {
+        let (_home, a, b, next_a) = box_scopes();
+        let f = Fixture::new();
+        let token = f.registry.issue_scoped(metadata(), a.clone()).unwrap();
+        let digest = token_digest(token.expose_secret());
+        let original_idle = f.registry.0.lock()[&digest].last_activity;
+        // A sentinel makes an accidental fetch_max observable without sleeping.
+        f.registry.0.lock()[&digest]
+            .binding_activity
+            .store(-1, Ordering::Release);
+        for pins in [0, 1, usize::MAX] {
+            f.registry.0.lock().get_mut(&digest).unwrap().pins = pins;
+            for expected in [None, Some(&b), Some(&next_a)] {
+                assert_eq!(
+                    f.registry
+                        .get_or_pin_scoped(token.expose_secret(), expected)
+                        .unwrap_err(),
+                    LaunchTokenError::ScopeMismatch
+                );
+                let entries = f.registry.0.lock();
+                let entry = &entries[&digest];
+                assert_eq!(entry.pins, pins);
+                assert_eq!(entry.last_activity, original_idle);
+                assert_eq!(entry.binding_activity.load(Ordering::Acquire), -1);
+                assert_eq!(entry.metadata, metadata());
+                assert_eq!(entry.box_scope.as_ref(), Some(&a));
+                assert!(entry.deferred_owner.upgrade().is_none());
+            }
+        }
+        f.registry.0.lock().get_mut(&digest).unwrap().pins = 0;
+        f.advance(IDLE_TIMEOUT.as_secs());
+        for expected in [None, Some(&b), Some(&next_a)] {
+            assert_eq!(
+                f.registry
+                    .get_or_pin_scoped(token.expose_secret(), expected)
+                    .unwrap_err(),
+                LaunchTokenError::ScopeMismatch
+            );
+        }
+        {
+            let entries = f.registry.0.lock();
+            let entry = &entries[&digest];
+            assert_eq!(entry.pins, 0);
+            assert_eq!(entry.last_activity, original_idle);
+            assert_eq!(entry.binding_activity.load(Ordering::Acquire), -1);
+        }
+        assert_eq!(
+            f.registry
+                .get_or_pin_scoped(token.expose_secret(), Some(&a))
+                .unwrap_err(),
+            LaunchTokenError::Expired
+        );
+        let tcp = f.issue();
+        let tcp_digest = token_digest(tcp.expose_secret());
+        let tcp_idle = f.registry.0.lock()[&tcp_digest].last_activity;
+        f.registry.0.lock()[&tcp_digest]
+            .binding_activity
+            .store(-1, Ordering::Release);
+        f.advance(IDLE_TIMEOUT.as_secs());
+        assert_eq!(
+            f.registry
+                .get_or_pin_scoped(tcp.expose_secret(), Some(&a))
+                .unwrap_err(),
+            LaunchTokenError::ScopeMismatch
+        );
+        {
+            let entries = f.registry.0.lock();
+            let entry = &entries[&tcp_digest];
+            assert_eq!(entry.pins, 0);
+            assert_eq!(entry.last_activity, tcp_idle);
+            assert_eq!(entry.binding_activity.load(Ordering::Acquire), -1);
+        }
+        assert_eq!(
+            f.registry.get_or_pin(tcp.expose_secret()).unwrap_err(),
+            LaunchTokenError::Expired
+        );
+    }
+
+    #[test]
+    fn scoped_lookup_keeps_missing_results_fixed_and_scope_check_precedes_clock() {
+        let (_home, a, b, _) = box_scopes();
+        let f = Fixture::new();
+        for missing in ["malformed".to_owned(), "x".repeat(43)] {
+            for expected in [None, Some(&a), Some(&b)] {
+                assert_eq!(
+                    f.registry
+                        .get_or_pin_scoped(&missing, expected)
+                        .unwrap_err(),
+                    LaunchTokenError::Missing
+                );
+            }
+        }
+        let clock_allowed = Arc::new(AtomicBool::new(true));
+        let allowed = clock_allowed.clone();
+        let origin = Instant::now();
+        let registry = LaunchTokenRegistry::with_clock(Arc::new(move || {
+            assert!(allowed.load(Ordering::Acquire), "foreign lookup read clock");
+            origin
+        }));
+        let token = registry.issue_scoped(metadata(), a).unwrap();
+        clock_allowed.store(false, Ordering::Release);
+        assert_eq!(
+            registry
+                .get_or_pin_scoped(token.expose_secret(), Some(&b))
+                .unwrap_err(),
+            LaunchTokenError::ScopeMismatch
+        );
+        assert_eq!(
+            registry.get_or_pin(token.expose_secret()).unwrap_err(),
+            LaunchTokenError::ScopeMismatch
+        );
+        assert_eq!(
+            LaunchTokenError::ScopeMismatch.to_string(),
+            "launch token scope mismatch"
+        );
     }
 
     #[test]

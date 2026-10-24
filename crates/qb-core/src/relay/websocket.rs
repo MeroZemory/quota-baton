@@ -216,12 +216,13 @@ async fn redial_same_account(
 }
 
 pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Response {
-    let mut completion = Completion::new(
+    let mut completion = Completion::new_for_request(
         state.observability.clone(),
         &Method::GET,
         "/v1/responses",
         Provider::Codex,
         request.headers(),
+        request.extensions(),
     );
     completion.dashboard_enabled = false;
     completion.record.transport = "ws".into();
@@ -301,6 +302,24 @@ async fn upgrade_inner(
         );
     }
     let client_accept = derive_accept_key(key.expect("validated key").as_bytes());
+    let box_authority = request
+        .extensions()
+        .get::<crate::boxes::BoxAuthority>()
+        .cloned();
+    // Only the ingress-admitted grant may own an upgraded connection.
+    if let Some(admitted) = crate::boxes::current_request() {
+        if box_authority
+            .as_ref()
+            .is_none_or(|authority| authority.scope() != admitted.scope() || authority.is_revoked())
+        {
+            return native_error(
+                StatusCode::UNAUTHORIZED,
+                Provider::Codex,
+                "authentication_error",
+                "Invalid box credential",
+            );
+        }
+    }
     let client_upgrade = hyper::upgrade::on(&mut request);
     let launcher_label = request
         .extensions_mut()
@@ -406,7 +425,7 @@ async fn upgrade_inner(
         let binding_hint = {
             let table = state.bindings.clone();
             let key = session.key.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::boxes::spawn_blocking(move || {
                 let policy = table.routing_plan(key.as_deref());
                 if policy.settings.mode == crate::routing::Mode::Strict
                     && (table.policies.strict_dispatch_blocked()
@@ -1181,7 +1200,7 @@ async fn upgrade_inner(
         .key
         .as_deref()
         .and_then(|key| state.observability.dashboard().socket(key));
-    tokio::spawn(async move {
+    crate::boxes::spawn(async move {
         let _launch_pin = launch_pin;
         // The slot survives the HTTP 101 and is released on client-upgrade
         // cancellation, pump termination or task abort. Same-account redials
@@ -1190,14 +1209,30 @@ async fn upgrade_inner(
         let _activity = activity;
         let _dashboard_socket = dashboard_socket;
         let _socket_pin = socket_pin;
-        if let Ok(client) = client_upgrade.await {
-            let client = WebSocketStream::from_raw_socket(
-                hyper_util::rt::TokioIo::new(client),
-                Role::Server,
-                Some(config),
-            )
-            .await;
-            pump::run(client, upstream, context).await;
+        let revoked = async move {
+            match box_authority {
+                Some(authority) => authority.watch_revocation().revoked().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        // Hard revocation differs from graceful service drain: dropping this
+        // one pump closes its client/upstream IO even during an idle read or
+        // pending upgrade. Pump cancellation uses its existing Drop cleanup;
+        // admitted durable descendants retain their own scoped task permits.
+        tokio::select! {
+            biased;
+            _ = revoked => {}
+            _ = async move {
+                if let Ok(client) = client_upgrade.await {
+                    let client = WebSocketStream::from_raw_socket(
+                        hyper_util::rt::TokioIo::new(client),
+                        Role::Server,
+                        Some(config),
+                    )
+                    .await;
+                    pump::run(client, upstream, context).await;
+                }
+            } => {}
         }
     });
     let mut response = Response::new(axum::body::Body::empty());

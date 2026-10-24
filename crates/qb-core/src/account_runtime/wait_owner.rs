@@ -1350,7 +1350,7 @@ impl AccountRuntime {
         let owner = self.wait_owner.clone();
         let id = id.to_owned();
         let has_signal = signal.is_some();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::boxes::spawn_blocking(move || {
             let _gate = match store.transaction() {
                 Ok(gate) => gate,
                 Err(_) => {
@@ -1502,7 +1502,7 @@ impl AccountRuntime {
         let id = id.to_owned();
         let store = self.store.clone();
         let owner = self.wait_owner.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             let _gate = store.transaction().ok()?;
             if store.writes_stopped() {
                 return None;
@@ -1535,7 +1535,7 @@ impl AccountRuntime {
         let id = id.to_owned();
         let store = self.store.clone();
         let owner = self.wait_owner.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = crate::boxes::spawn_blocking(move || {
             let Ok(_gate) = store.transaction() else {
                 owner.close();
                 return;
@@ -1562,7 +1562,7 @@ impl AccountRuntime {
         let id = id.to_owned();
         let store = self.store.clone();
         let owner = self.wait_owner.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = crate::boxes::spawn_blocking(move || {
             let Ok(_gate) = store.transaction() else {
                 owner.close();
                 return;

@@ -21,6 +21,7 @@ pub(super) fn filtered(headers: &HeaderMap, request: bool) -> HeaderMap {
     for (name, value) in headers {
         if name.as_str() == crate::dashboard::labels::LABEL_HEADER
             || name.as_str() == crate::routing::PROJECT_HEADER
+            || name.as_str() == "x-qb-root-session"
             || name
                 .as_str()
                 .eq_ignore_ascii_case("x-openai-actor-authorization")
@@ -128,6 +129,31 @@ mod tests {
             quota_credit_releasable: false,
             generation: 1,
             token_meta: TokenMeta::default(),
+        }
+    }
+
+    #[test]
+    fn box_lineage_hint_never_reaches_upstream_or_response() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-qb-root-session",
+            HeaderValue::from_static("codex:sample-root"),
+        );
+        headers.append(
+            "x-qb-root-session",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        headers.insert("user-agent", HeaderValue::from_static("sample-client/1"));
+        for request in [false, true] {
+            let filtered = filtered(&headers, request);
+            assert!(!filtered.contains_key("x-qb-root-session"));
+            assert_eq!(filtered["user-agent"], "sample-client/1");
+        }
+        for provider in [Provider::Claude, Provider::Codex] {
+            let forwarded =
+                upstream(&headers, &account(provider), "sample-upstream-token").unwrap();
+            assert!(!forwarded.contains_key("x-qb-root-session"));
+            assert_eq!(forwarded["user-agent"], "sample-client/1");
         }
     }
 

@@ -542,6 +542,11 @@ fn room(weight: usize) -> std::result::Result<(), LaunchError> {
 }
 
 impl BindingTable {
+    /// Isolated pipeline regression: hold the actual placement mutation gate.
+    #[cfg(test)]
+    pub(crate) fn lock_launch_mutations_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mutations.lock().unwrap()
+    }
     /// Issue-worker-only registration of a bounded, process-local activity stamp.
     /// A stamp can retain existing identity, never create or authorize one.
     pub(crate) fn bind_launch_activity(
@@ -759,6 +764,14 @@ impl BindingTable {
             return Err(LaunchError::Retired);
         }
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        // Refuse revoked, unadmitted placement before even pruning shared data.
+        // This observation is not admission; the actual admit seams below and
+        // in routing serialize fresh admission with the grant's revoke gate.
+        if !operation.is_some_and(crate::issue_operation::IssueOperation::is_admitted)
+            && !crate::boxes::dispatch_allowed()
+        {
+            return Err(LaunchError::PolicyBlocked);
+        }
         // Both binding gates are held; this remains a precommit check.
         if let Some(operation) = operation {
             operation.check().map_err(|_| LaunchError::PolicyBlocked)?;
@@ -781,7 +794,7 @@ impl BindingTable {
                 return Err(LaunchError::NoEligibleAccount);
             }
             if let Some(operation) = operation {
-                operation.admit().map_err(|_| LaunchError::PolicyBlocked)?;
+                crate::boxes::admit_operation(operation).map_err(|_| LaunchError::PolicyBlocked)?;
             }
             let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
             touch(&mut d, &key, now);
@@ -1150,7 +1163,7 @@ impl BindingTable {
         // Admission checks cancellation/deadline atomically, before even pruning.
         // Once it wins, caller cancellation cannot revoke the required mutation.
         if let Some(operation) = operation {
-            operation.admit().map_err(|_| LaunchError::PolicyBlocked)?;
+            crate::boxes::admit_operation(operation).map_err(|_| LaunchError::PolicyBlocked)?;
         }
         self.prune(&mut d, now);
         if let Some(key) = request_key
@@ -1464,7 +1477,7 @@ impl BindingTable {
             return Err(LaunchError::PolicyBlocked);
         }
         if let Some(operation) = operation {
-            operation.admit().map_err(|_| LaunchError::PolicyBlocked)?;
+            crate::boxes::admit_operation(operation).map_err(|_| LaunchError::PolicyBlocked)?;
         }
         self.prune(&mut d, now);
         let before = info(&d, key)?;

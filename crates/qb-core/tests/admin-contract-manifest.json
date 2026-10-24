@@ -2,6 +2,18 @@
   "version": 1,
   "sources": [
     {
+      "file": "crates/qb-core/src/admin/boxes.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production box admin producer; shared qb-proto reply contracts, no local reply shapes."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_boxes.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire shared box admin wire contract file; strict contract-test decoding, no reply defaults."
+    },
+    {
       "file": "crates/qb-core/src/account_runtime.rs",
       "json": true,
       "defaults": false,
@@ -690,7 +702,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/bindings.rs",
-        "line": 1227,
+        "line": 1230,
         "rule": "admin-json",
         "snippet": "json!({\"id\":crate::routing::session_id(key),\"account\":g.account,\"policy\":self.policies.plan(launch::policy_key(&d, Some(key)))})",
         "field": "",
@@ -1180,7 +1192,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 205,
+        "line": 206,
         "rule": "admin-json",
         "snippet": "json!({\"account\":a.id,\"forecast\":self.observability.forecast_view(&a.id,\r\n                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})",
         "field": "",
@@ -1194,7 +1206,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 1943,
+        "line": 1958,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\"type\": kind, \"message\": message}})",
         "field": "",
@@ -1208,7 +1220,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/routing.rs",
-        "line": 1717,
+        "line": 1716,
         "rule": "admin-json",
         "snippet": "json!({\"revision\":state.revision,\"defaults\":self.defaults,\"projects\":state.projects,\"sessions\":state.sessions.keys().map(|id| (id.clone(), self.resolve(&state,id))).collect::<BTreeMap<_,_>>()})",
         "field": "",
@@ -1306,7 +1318,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 38,
+        "line": 39,
         "rule": "serde-default",
         "snippet": "default",
         "field": "session_key",
@@ -1320,7 +1332,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 54,
+        "line": 55,
         "rule": "serde-default",
         "snippet": "default",
         "field": "dir",
@@ -1334,7 +1346,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 56,
+        "line": 57,
         "rule": "serde-default",
         "snippet": "default",
         "field": "activate",
@@ -1348,7 +1360,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 58,
+        "line": 59,
         "rule": "serde-default",
         "snippet": "default",
         "field": "dry_run",

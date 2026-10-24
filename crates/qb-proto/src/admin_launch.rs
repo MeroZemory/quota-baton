@@ -10,10 +10,47 @@ pub struct LaunchReply {
     pub model: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(any(test, feature = "contract-tests"), serde(deny_unknown_fields))]
+pub struct LaunchErrorReply {
+    pub error: LaunchErrorDetail,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(any(test, feature = "contract-tests"), serde(deny_unknown_fields))]
+pub struct LaunchErrorDetail {
+    pub code: String,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::LaunchReply;
+    use super::{LaunchErrorDetail, LaunchErrorReply, LaunchReply};
     use serde_json::{Value, json};
+
+    #[test]
+    fn launch_error_exact_shape_and_required_fields() {
+        let raw = r#"{"error":{"code":"launch_unavailable","message":"synthetic message"}}"#;
+        let reply = LaunchErrorReply {
+            error: LaunchErrorDetail {
+                code: "launch_unavailable".into(),
+                message: "synthetic message".into(),
+            },
+        };
+        assert_eq!(serde_json::to_string(&reply).unwrap(), raw);
+        let decoded: LaunchErrorReply = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), raw);
+        for bad in [
+            r#"{}"#,
+            r#"{"error":{"message":"synthetic"}}"#,
+            r#"{"error":{"code":"synthetic"}}"#,
+            r#"{"error":{"code":null,"message":"synthetic"}}"#,
+            r#"{"error":{"code":"first","code":"second","message":"synthetic"}}"#,
+            r#"{"error":{"code":"synthetic","message":"synthetic","extra":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<LaunchErrorReply>(bad).is_err());
+        }
+    }
 
     fn wire(model: Value) -> Value {
         json!({"base_url":"http://127.0.0.1:1234/l/synthetic/v1",

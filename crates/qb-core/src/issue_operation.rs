@@ -49,6 +49,11 @@ impl IssueOperation {
         CallerGuard(Some(self.clone()))
     }
 
+    /// Admitted writes must complete even if their request is later revoked.
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|e| e.into_inner()).phase == Phase::Admitted
+    }
+
     /// Call after queue/gate acquisition; this is not commit admission.
     pub(crate) fn check(&self) -> Result<(), ()> {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());

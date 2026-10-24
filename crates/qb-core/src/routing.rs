@@ -1220,8 +1220,7 @@ impl PolicyStore {
         // Writer gate is held, f only changed a private clone. Cancellation
         // competes here before durable writes/publication; never after them.
         if let Some(operation) = operation {
-            operation
-                .admit()
+            crate::boxes::admit_operation(operation)
                 .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
         }
         let before = durable_state(&state, &self.defaults);
@@ -2173,8 +2172,7 @@ impl PolicyStore {
                 if self.snapshot().frozen {
                     bail!("routing policy writer retired");
                 }
-                operation
-                    .admit()
+                crate::boxes::admit_operation(operation)
                     .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
             }
             return Ok(());
@@ -2200,8 +2198,7 @@ impl PolicyStore {
                     || state.sessions.get(&id).is_some_and(|s| s.anchor.is_some()))
             {
                 if let Some(operation) = operation {
-                    operation
-                        .admit()
+                    crate::boxes::admit_operation(operation)
                         .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
                 }
                 return Ok(());
@@ -2211,8 +2208,7 @@ impl PolicyStore {
                 && !state.sessions.contains_key(&id)
             {
                 if let Some(operation) = operation {
-                    operation
-                        .admit()
+                    crate::boxes::admit_operation(operation)
                         .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
                 }
                 return Ok(());
@@ -2232,8 +2228,7 @@ impl PolicyStore {
                     bail!("routing policy recovery incomplete");
                 }
                 if let Some(operation) = operation {
-                    operation
-                        .admit()
+                    crate::boxes::admit_operation(operation)
                         .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
                 }
                 let mut next = (*state).clone();
@@ -2408,6 +2403,31 @@ impl PolicyStore {
             }
             Ok(())
         })
+    }
+
+    /// Coherent native plan/row-presence view for advisory new placement only.
+    /// Presence includes recovery witnesses even when their settings are global.
+    pub(crate) fn placement_plan(&self, key: Option<&str>) -> (Plan, bool) {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
+        let state = self.snapshot();
+        let witness = self
+            .recovery_intent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current = key.map(|key| state.policy_id(key)).unwrap_or_default();
+        let guarded = key.map(|key| witness.policy_id(key)).unwrap_or_default();
+        let recovering = self.recovery_blocked.load(Ordering::Acquire);
+        let id = if recovering && witness.sessions.contains_key(&guarded) {
+            &guarded
+        } else {
+            &current
+        };
+        let exists = key.is_none()
+            || state.frozen
+            || recovering
+            || state.sessions.contains_key(&current)
+            || witness.sessions.contains_key(&guarded);
+        (self.resolve_with_witness(&state, &witness, id), exists)
     }
 }
 

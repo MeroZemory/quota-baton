@@ -1329,6 +1329,7 @@ mod r15_account_error_producer_tests {
 }
 
 // Whole account-source features are selected only at this module boundary.
+pub(crate) mod boxes;
 #[cfg(windows)]
 #[path = "admin/source_features_windows.rs"]
 mod source_features;
