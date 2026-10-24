@@ -73,6 +73,158 @@ fn stopped_notice() -> Controller {
     c
 }
 
+#[test]
+fn confirmed_ephemeral_cleanup_must_finish_before_stop_read_seals() {
+    let mut c = user_active();
+    ui(
+        &mut c,
+        json!({"id":90,"method":"thread/start","params":{"ephemeral":true}}),
+    );
+    forwarded(
+        &mut c,
+        json!({"id":90,"result":{"thread":{"id":"title-thread"}}}),
+    );
+    forwarded(&mut c, updated(snapshot("usageLimited")));
+    assert!(
+        c.begin_stop_read().unwrap().is_none(),
+        "confirmed title cleanup must precede sealing"
+    );
+    ui(
+        &mut c,
+        json!({"id":91,"method":"thread/unsubscribe","params":{"threadId":"title-thread"}}),
+    );
+    assert!(
+        c.begin_stop_read().unwrap().is_none(),
+        "cleanup RPC still pending"
+    );
+    forwarded(&mut c, json!({"id":91,"result":{"status":"unsubscribed"}}));
+    issue(&mut c, PREFIX);
+    suppressed(&mut c, reply(PREFIX, 3, snapshot("usageLimited")));
+    assert!(
+        c.stopped_ticket().is_some(),
+        "original stopped goal remains eligible after cleanup"
+    );
+}
+
+#[test]
+fn failed_ephemeral_cleanup_cannot_unblock_sealing() {
+    let mut c = user_active();
+    ui(
+        &mut c,
+        json!({"id":90,"method":"thread/start","params":{"ephemeral":true}}),
+    );
+    forwarded(
+        &mut c,
+        json!({"id":90,"result":{"thread":{"id":"title-thread"}}}),
+    );
+    forwarded(&mut c, updated(snapshot("usageLimited")));
+    ui(
+        &mut c,
+        json!({"id":91,"method":"thread/unsubscribe","params":{"threadId":"title-thread"}}),
+    );
+    forwarded(
+        &mut c,
+        json!({"id":91,"error":{"code":-1,"message":"synthetic"}}),
+    );
+    assert!(
+        c.begin_stop_read().unwrap().is_none(),
+        "error is not completed cleanup"
+    );
+    assert!(c.stopped_ticket().is_none());
+}
+
+#[test]
+fn ephemeral_cleanup_survives_goal_generation_and_blocks_user_read_shortcut() {
+    let mut c = selected();
+    ui(
+        &mut c,
+        json!({"id":90,"method":"thread/start","params":{"ephemeral":true}}),
+    );
+    ui(
+        &mut c,
+        json!({"id":2,"method":"thread/goal/set","params":{
+        "threadId":"thread-a","objective":"user objective","origin":"user","status":"active"}}),
+    );
+    // The start belongs to an older goal generation, but its native lifetime
+    // still needs cleanup. It cannot supply any foreground-goal authority.
+    forwarded(
+        &mut c,
+        json!({"id":90,"result":{"thread":{"id":"title-thread"}}}),
+    );
+    forwarded(&mut c, json!({"id":2,"result":{"goal":snapshot("active")}}));
+    forwarded(&mut c, updated(snapshot("usageLimited")));
+    user_read(&mut c);
+    assert!(
+        c.stopped_ticket().is_none(),
+        "ordinary read must not bypass cleanup"
+    );
+    assert!(c.begin_stop_read().unwrap().is_none());
+    ui(
+        &mut c,
+        json!({"id":91,"method":"thread/unsubscribe","params":{"threadId":"foreign-thread"}}),
+    );
+    forwarded(&mut c, json!({"id":91,"result":{"status":"unsubscribed"}}));
+    assert!(
+        c.begin_stop_read().unwrap().is_none(),
+        "foreign cleanup is not evidence"
+    );
+    ui(
+        &mut c,
+        json!({"id":92,"method":"thread/unsubscribe","params":{"threadId":"title-thread"}}),
+    );
+    forwarded(
+        &mut c,
+        json!({"id":92,"result":{"status":"synthetic-unknown"}}),
+    );
+    assert!(
+        c.begin_stop_read().unwrap().is_none(),
+        "unknown result is not evidence"
+    );
+    ui(
+        &mut c,
+        json!({"id":93,"method":"thread/unsubscribe","params":{"threadId":"title-thread"}}),
+    );
+    forwarded(&mut c, json!({"id":93,"result":{"status":"notSubscribed"}}));
+    issue(&mut c, PREFIX);
+    suppressed(&mut c, reply(PREFIX, 3, snapshot("usageLimited")));
+    assert!(c.stopped_ticket().is_some());
+}
+
+#[test]
+fn confirmed_ephemeral_lifetimes_are_bounded_and_duplicate_ids_fail_closed() {
+    for duplicate in [false, true] {
+        let mut c = user_active();
+        let count = if duplicate { 1 } else { goal::MAX_PENDING };
+        for index in 0..count {
+            ui(
+                &mut c,
+                json!({"id":100+index,"method":"thread/start","params":{"ephemeral":true}}),
+            );
+            forwarded(
+                &mut c,
+                json!({"id":100+index,"result":{"thread":{"id":format!("title-{index}")}}}),
+            );
+        }
+        ui(
+            &mut c,
+            json!({"id":999,"method":"thread/start","params":{"ephemeral":true}}),
+        );
+        let result = c.native_frame(
+            json!({"id":999,"result":{"thread":{"id":"title-0"}}})
+                .to_string()
+                .as_bytes(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::InvalidFrame | Error::PendingBound)
+        ));
+        assert!(
+            c.begin_stop_read().is_err(),
+            "ambiguous or over-bound lifecycle closes the connection"
+        );
+    }
+}
+
 fn issue(c: &mut Controller, prefix: &str) {
     let action = c.begin_stop_read().unwrap().expect("one stopped preflight");
     let Action::ToNative(raw) = action else {

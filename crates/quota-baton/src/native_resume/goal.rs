@@ -150,6 +150,9 @@ pub(crate) struct Controller {
     sealed: bool,
     ticket_taken: bool,
     pending: BTreeMap<String, Pending>,
+    // Confirmed native housekeeping lifetimes, not foreground authority. These
+    // survive user-goal generations until their correlated cleanup completes.
+    ephemeral_threads: BTreeSet<String>,
     delivery: Delivery,
 }
 
@@ -185,6 +188,7 @@ impl Controller {
             sealed: false,
             ticket_taken: false,
             pending: BTreeMap::new(),
+            ephemeral_threads: BTreeSet::new(),
             delivery: Delivery::NotSent,
         })
     }
@@ -377,6 +381,7 @@ impl Controller {
                         || self.delivery != Delivery::NotSent
                         || !self.quota_observed
                         || !self.pending.is_empty()
+                        || !self.ephemeral_threads.is_empty()
                         || goal["threadId"].as_str() != self.current.as_deref()
                         || !self.active.as_ref().is_some_and(|active| {
                             active["status"] == "active" && same_identity(active, goal)
@@ -453,9 +458,11 @@ impl Controller {
             let key = id_key(&value["id"])?;
             if let Some(pending) = self.pending.remove(&key)
                 && value.get("error").is_none()
-                && pending.generation == self.generation
             {
-                self.observe_response(pending, &value["result"])?;
+                self.observe_cleanup(&pending, &value["result"])?;
+                if pending.generation == self.generation {
+                    self.observe_response(pending, &value["result"])?;
+                }
             }
         } else {
             let method = value["method"].as_str().ok_or(Error::InvalidFrame)?;
@@ -699,6 +706,31 @@ impl Controller {
         Ok(())
     }
 
+    fn observe_cleanup(&mut self, pending: &Pending, result: &Value) -> Result<(), Error> {
+        if pending.method == "thread/start" && pending.params["ephemeral"] == true {
+            let id = result["thread"]["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or(Error::InvalidFrame)?;
+            if self.ephemeral_threads.len() >= MAX_PENDING {
+                return Err(Error::PendingBound);
+            }
+            if self.current.as_deref() == Some(id) || !self.ephemeral_threads.insert(id.to_owned())
+            {
+                return Err(Error::InvalidFrame);
+            }
+        } else if pending.method == "thread/unsubscribe"
+            && matches!(
+                result["status"].as_str(),
+                Some("unsubscribed" | "notLoaded" | "notSubscribed")
+            )
+            && let Some(id) = pending.params["threadId"].as_str()
+        {
+            self.ephemeral_threads.remove(id);
+        }
+        Ok(())
+    }
+
     fn observe_response(&mut self, pending: Pending, result: &Value) -> Result<(), Error> {
         if matches!(
             pending.method.as_str(),
@@ -739,6 +771,7 @@ impl Controller {
                 && pending.quota_before_request
                 && !self.sealed
                 && self.pending.is_empty()
+                && self.ephemeral_threads.is_empty()
             {
                 self.stopped = Some(goal.clone());
                 self.stop_candidate = None;
@@ -769,6 +802,7 @@ impl Controller {
             || self.delivery != Delivery::NotSent
             || !self.quota_observed
             || !self.pending.is_empty()
+            || !self.ephemeral_threads.is_empty()
         {
             return Ok(None);
         }
@@ -832,6 +866,7 @@ impl Controller {
             && self.stopped.is_some()
             && self.quota_observed
             && self.pending.is_empty()
+            && self.ephemeral_threads.is_empty()
     }
 
     fn inject(&self, serial: u8, method: &str, params: Value) -> Action {
