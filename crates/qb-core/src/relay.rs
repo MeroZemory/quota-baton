@@ -319,11 +319,21 @@ impl RelayState {
         .map(|service| service.with_runtime(self.accounts.clone()))
     }
     /// Manual refresh uses the same lease owner, gate and write-ahead as relay 401s.
+    /// Compatibility wrapper for existing engine/local callers.
     pub async fn refresh_account(
         &self,
         id: String,
         force: bool,
     ) -> Result<serde_json::Value, ManualRefreshError> {
+        serde_json::to_value(self.refresh_account_typed(id, force).await?)
+            .map_err(|_| ManualRefreshError::Unavailable)
+    }
+
+    pub async fn refresh_account_typed(
+        &self,
+        id: String,
+        force: bool,
+    ) -> Result<qb_proto::admin_refresh::ManualRefreshReply, ManualRefreshError> {
         if self.is_draining() {
             return Err(ManualRefreshError::Unavailable);
         }
@@ -337,20 +347,31 @@ impl RelayState {
             )
             .await
         {
-            Ok(summary) => {
-                serde_json::to_value(summary).map_err(|_| ManualRefreshError::Unavailable)
-            }
+            Ok(summary) => Ok(qb_proto::admin_refresh::ManualRefreshReply {
+                outcome: qb_proto::admin_refresh::RefreshOutcome::Success,
+                token_expires_at: summary.token_expires_at,
+                last_refresh_at: summary.last_refresh_at,
+            }),
             Err(ManualRefreshError::Terminal { outcome }) => {
                 let store = self.store.clone();
                 let account = tokio::task::spawn_blocking(move || store.load(&id))
                     .await
                     .map_err(|_| ManualRefreshError::Unavailable)?
                     .map_err(|_| ManualRefreshError::Unavailable)?;
-                Ok(serde_json::json!({
-                    "outcome":outcome,
-                    "token_expires_at":account.token_meta.expires_at,
-                    "last_refresh_at":account.token_meta.last_refresh_at
-                }))
+                use qb_proto::admin_refresh::RefreshOutcome as Wire;
+                let outcome = match outcome {
+                    ManualRefreshTerminal::RefreshTokenInvalidated => Wire::RefreshTokenInvalidated,
+                    ManualRefreshTerminal::RefreshTokenReused => Wire::RefreshTokenReused,
+                    ManualRefreshTerminal::RefreshTokenExpired => Wire::RefreshTokenExpired,
+                    ManualRefreshTerminal::RefreshTokenRevoked => Wire::RefreshTokenRevoked,
+                    ManualRefreshTerminal::InvalidGrant => Wire::InvalidGrant,
+                    ManualRefreshTerminal::TokenEndpoint401 => Wire::TokenEndpoint401,
+                };
+                Ok(qb_proto::admin_refresh::ManualRefreshReply {
+                    outcome,
+                    token_expires_at: account.token_meta.expires_at,
+                    last_refresh_at: account.token_meta.last_refresh_at,
+                })
             }
             Err(error) => Err(error),
         }
@@ -1877,6 +1898,9 @@ async fn replay_capture(
                 summary[key] = value.clone();
             }
         }
+        // Validate only the completed, already-redacted response graph. Keep the
+        // observer and diagnostics construction as the sole policy producers.
+        let summary: qb_proto::admin_phase0::ReplaySummary = serde_json::from_value(summary)?;
         Ok::<_, anyhow::Error>(summary)
     }
     .await;

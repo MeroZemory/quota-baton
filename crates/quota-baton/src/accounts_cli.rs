@@ -524,6 +524,24 @@ fn takeover_result_line(value: &serde_json::Value) -> String {
     )
 }
 
+// Original live bytes -> phase-specific shared DTO -> existing display reader.
+async fn takeover_response<T: serde::de::DeserializeOwned + serde::Serialize>(
+    response: reqwest::Response,
+) -> anyhow::Result<serde_json::Value> {
+    if !response.status().is_success() {
+        return account_response(response).await;
+    }
+    let bytes = response.bytes().await?;
+    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(account_error(
+            "계정 가져오기 응답 형식이 올바르지 않습니다.",
+        ));
+    }
+    let wire: T = serde_json::from_slice(&bytes)
+        .map_err(|_| account_error("계정 가져오기 응답 형식이 올바르지 않습니다."))?;
+    Ok(serde_json::to_value(wire)?)
+}
+
 async fn takeover(
     home: &Path,
     config: &Config,
@@ -546,7 +564,7 @@ async fn takeover(
         "provider": qb_core::accounts::Provider::from(provider), "path": path,
         "phase": "inspect", "replace": replace, "keep_source": keep_source,
     });
-    let inspect = account_response(
+    let inspect = takeover_response::<qb_proto::admin_takeover::TakeoverInspect>(
         admin_route_response(
             client
                 .post(format!("{base}/accounts/takeover"))
@@ -573,7 +591,7 @@ async fn takeover(
         .ok_or_else(|| account_error("확인 다이제스트가 없습니다. 코어 응답을 확인해 주세요."))?;
     request["phase"] = serde_json::json!("commit");
     request["inspect_digest"] = serde_json::json!(digest);
-    let result = account_response(
+    let result = takeover_response::<qb_proto::admin_takeover::TakeoverCommit>(
         admin_route_response(
             client
                 .post(format!("{base}/accounts/takeover"))
@@ -795,6 +813,22 @@ async fn adopt_accounts(
     Ok(())
 }
 
+async fn manual_refresh_response(
+    response: reqwest::Response,
+) -> anyhow::Result<qb_proto::admin_refresh::ManualRefreshReply> {
+    if !response.status().is_success() {
+        account_response(response).await?;
+        return Err(account_error(
+            "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요.",
+        ));
+    }
+    let bytes = response.bytes().await?;
+    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(account_error("갱신 응답 형식이 올바르지 않습니다."));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| account_error("갱신 응답 형식이 올바르지 않습니다."))
+}
+
 async fn refresh_tokens(
     home: &Path,
     config: &Config,
@@ -803,7 +837,7 @@ async fn refresh_tokens(
 ) -> anyhow::Result<()> {
     valid_account_id(&id)?;
     let summary = if let Some((client, base, token)) = running_admin(home, config).await? {
-        account_response(
+        manual_refresh_response(
             admin_route_response(
                 client
                     .post(format!("{base}/accounts/{id}/refresh"))
@@ -847,7 +881,7 @@ async fn refresh_tokens(
             }
             relay
         };
-        let result = relay.refresh_account(id.clone(), force).await;
+        let result = relay.refresh_account_typed(id.clone(), force).await;
         let mut warned = false;
         // Never drop a lease while detached consumption or an unsaved rotation survives.
         while relay.shutdown_refreshes().await.is_err() {
@@ -862,12 +896,12 @@ async fn refresh_tokens(
         obs.flush()?;
         result?
     };
-    if summary["outcome"] == "success" {
+    if summary.outcome == qb_proto::admin_refresh::RefreshOutcome::Success {
         println_utf8!(
             "계정 {}: 갱신 완료 · 만료 {} · 최근 갱신 {}",
             id,
-            cell(&summary["token_expires_at"]),
-            cell(&summary["last_refresh_at"])
+            cell(&serde_json::to_value(summary.token_expires_at)?),
+            cell(&serde_json::to_value(summary.last_refresh_at)?)
         );
         Ok(())
     } else {
@@ -986,7 +1020,12 @@ async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(UsageCliError::TooSoon.into());
     }
-    response.error_for_status()?;
+    let body = response.error_for_status()?.bytes().await?;
+    if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(account_error("계정 응답 형식이 올바르지 않습니다."));
+    }
+    let _: qb_proto::AdminAccount = serde_json::from_slice(&body)
+        .map_err(|_| account_error("계정 응답 형식이 올바르지 않습니다."))?;
     println_utf8!("계정 {}의 사용량을 갱신했습니다.", id);
     Ok(())
 }

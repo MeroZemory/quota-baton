@@ -494,16 +494,7 @@ enum EventKind {
     Sessions,
     Activity,
 }
-#[derive(serde::Deserialize)]
-enum WarningKind {
-    #[serde(rename = "burst")]
-    Burst,
-}
-#[derive(serde::Deserialize)]
-struct BurstWarning {
-    kind: WarningKind,
-    burst_new_sessions: u32,
-}
+use qb_proto::admin_sse::{BurstWarning, WarningKind};
 #[derive(serde::Deserialize)]
 struct SessionChangeSignal {
     #[serde(default)]
@@ -1010,5 +1001,30 @@ mod tests {
             b"event: login_progress\n\nevent: account_changed\n\n",
             |_| panic!("refresh only")
         ));
+    }
+}
+
+#[cfg(test)]
+mod r15_shared_burst_projection_tests {
+    use super::*;
+
+    #[test]
+    fn r15_sse_shared_body_projects_positive_count_only() {
+        for count in [0, 7, u32::MAX] {
+            let data = serde_json::to_string(&BurstWarning {
+                kind: WarningKind::Burst,
+                burst_new_sessions: count,
+            })
+            .unwrap();
+            assert_eq!(
+                data,
+                format!(r#"{{"kind":"burst","burst_new_sessions":{count}}}"#)
+            );
+            let frame = format!("event: core_warning\ndata: {data}\n\n");
+            let mut parser = EventParser::default();
+            let mut counts = Vec::new();
+            assert!(parser.feed(frame.as_bytes(), |n| counts.push(n)));
+            assert_eq!(counts, if count > 0 { vec![count] } else { vec![] });
+        }
     }
 }

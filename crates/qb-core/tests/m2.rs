@@ -842,7 +842,22 @@ async fn phase0_authenticated_replay_uses_forced_account_and_linked_401_path() {
         }
     );
     assert_eq!(response.status(), 200);
-    let summary: Value = response.json().await.unwrap();
+    let summary_bytes = response.bytes().await.unwrap();
+    let shared: qb_proto::admin_phase0::ReplaySummary =
+        serde_json::from_slice(&summary_bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&shared).unwrap(), summary_bytes.to_vec());
+    let summary: Value = serde_json::from_slice(&summary_bytes).unwrap();
+    assert_eq!(summary.as_object().unwrap().len(), 7);
+    assert_eq!(summary["error"], Value::Null);
+    assert_eq!(
+        summary["usage"],
+        json!({"input_tokens":42,"input_tokens_details":{"cached_tokens":12}})
+    );
+    assert_eq!(
+        summary["removed_counts"],
+        json!({"reasoning":0,"compaction":0,"message":0,"other":0})
+    );
+    assert_eq!(summary["tampered_type"], Value::Null);
     assert_eq!(summary["status"], 200);
     assert_eq!(summary["account"], account.id);
     assert_eq!(summary["strip_encrypted"], "none");

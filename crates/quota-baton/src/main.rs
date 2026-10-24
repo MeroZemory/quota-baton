@@ -861,7 +861,7 @@ async fn run() -> anyhow::Result<()> {
             println_utf8!("{}", serde_json::to_string(&prepared.presence)?);
             drop(prepared);
             let token = std::fs::read_to_string(home.join("admin.token"))?;
-            let summary: serde_json::Value = reqwest::Client::builder()
+            let summary_bytes = reqwest::Client::builder()
                 .no_proxy()
                 .timeout(std::time::Duration::from_secs(150))
                 .build()?
@@ -874,8 +874,10 @@ async fn run() -> anyhow::Result<()> {
                 .send()
                 .await?
                 .error_for_status()?
-                .json()
+                .bytes()
                 .await?;
+            let summary: qb_proto::admin_phase0::ReplaySummary =
+                serde_json::from_slice(&summary_bytes)?;
             println_utf8!("{}", serde_json::to_string(&summary)?);
         }
     }

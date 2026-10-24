@@ -713,8 +713,28 @@ async fn takeover_account(
             "계정 가져오기 요청이 올바르지 않습니다.",
         );
     };
+    let phase = request.phase;
     match state.relay.takeover_account(request).await {
-        Ok(value) => Json(value).into_response(),
+        Ok(value) => match phase {
+            crate::accounts::takeover::Phase::Inspect => {
+                match serde_json::from_value::<qb_proto::admin_takeover::TakeoverInspect>(value) {
+                    Ok(reply) => Json(reply).into_response(),
+                    Err(_) => error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Account response unavailable",
+                    ),
+                }
+            }
+            crate::accounts::takeover::Phase::Commit => {
+                match serde_json::from_value::<qb_proto::admin_takeover::TakeoverCommit>(value) {
+                    Ok(reply) => Json(reply).into_response(),
+                    Err(_) => error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Account response unavailable",
+                    ),
+                }
+            }
+        },
         Err(problem) => {
             use crate::accounts::takeover::TakeoverError;
             let (status, code, message) = match problem {
@@ -860,7 +880,7 @@ async fn refresh_account(
     let Ok(request) = serde_json::from_value::<RefreshRequest>(value) else {
         return error(StatusCode::BAD_REQUEST, "갱신 요청이 올바르지 않습니다.");
     };
-    match state.relay.refresh_account(id, request.force).await {
+    match state.relay.refresh_account_typed(id, request.force).await {
         Ok(summary) => Json(summary).into_response(),
         Err(error_value) => {
             use crate::relay::ManualRefreshError;
@@ -883,10 +903,10 @@ async fn refresh_usage(state: RuntimeAdmin, id: String) -> Response {
         Ok(_) => match state
             .relay
             .accounts
-            .views_with_bindings(&state.relay.bindings)
+            .typed_views_with_bindings(&state.relay.bindings)
             .await
         {
-            Ok(views) => match views.into_iter().find(|view| view["id"] == id) {
+            Ok(views) => match views.into_iter().find(|view| view.id == id) {
                 Some(view) => Json(view).into_response(),
                 None => error(StatusCode::NOT_FOUND, "Account not found"),
             },
@@ -1095,5 +1115,311 @@ mod n5c_routing_dto_tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod r15_sse_boundary_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    async fn body(receiver: tokio::sync::broadcast::Receiver<serde_json::Value>) -> String {
+        let response = axum::response::sse::Sse::new(account_events(receiver)).into_response();
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), 8192),
+        )
+        .await
+        .expect("closed adapter must terminate")
+        .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn r15_sse_six_names_missing_data_and_closed_channel() {
+        let names = [
+            "account_changed",
+            "quota_updated",
+            "login_progress",
+            "core_warning",
+            "sessions_changed",
+            "activity",
+        ];
+        let (sender, receiver) = tokio::sync::broadcast::channel(32);
+        for event in [
+            serde_json::json!({"event":"unknown","data":"discarded"}),
+            serde_json::json!({"event":"activity\ninjected","data":1}),
+            serde_json::json!({"event":null,"data":1}),
+        ] {
+            sender.send(event).unwrap();
+        }
+        let mut expected = String::new();
+        for name in names {
+            sender
+                .send(serde_json::json!({"event":name,"data":{"receipt":name}}))
+                .unwrap();
+            expected.push_str(&format!(
+                "event: {name}\ndata: {{\"receipt\":\"{name}\"}}\n\n"
+            ));
+        }
+        sender
+            .send(serde_json::json!({"event":"core_warning"}))
+            .unwrap();
+        expected.push_str("event: core_warning\ndata: null\n\n");
+        drop(sender);
+        assert_eq!(body(receiver).await, expected);
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        assert_eq!(body(receiver).await, "");
+    }
+
+    #[tokio::test]
+    async fn r15_sse_lag_exact_resync_then_retained_frame_then_closure() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        sender
+            .send(serde_json::json!({"event":"activity","data":"lost"}))
+            .unwrap();
+        sender
+            .send(serde_json::json!({"event":"quota_updated","data":{"id":"retained"}}))
+            .unwrap();
+        drop(sender);
+        assert_eq!(
+            body(receiver).await,
+            concat!(
+                "event: sessions_changed\ndata: {\"changed\":[],\"removed\":[],\"resync\":true}\n\n",
+                "event: quota_updated\ndata: {\"id\":\"retained\"}\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn r15_sse_actual_observability_burst_body_shared_roundtrip() {
+        // Drop the actual writer outside Tokio and before removing its home,
+        // including when the test body panics. No extra public producer seam.
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r15-sse-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let obs = crate::observability::Observability::new(home.path(), None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let (sender, receiver) = tokio::sync::broadcast::channel(32);
+                obs.set_events(sender);
+                let stream = account_events(receiver);
+                futures_util::pin_mut!(stream);
+                // Also covers zero without promoting it to an actionable UI count.
+                for count in [0, 7, u32::MAX] {
+                    obs.burst_warning(count);
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            loop {
+                                let event =
+                                    stream.next().await.expect("producer channel open").unwrap();
+                                let response =
+                                    axum::response::sse::Sse::new(futures_util::stream::iter([
+                                        Ok::<_, std::convert::Infallible>(event),
+                                    ]))
+                                    .into_response();
+                                let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                                    .await
+                                    .unwrap();
+                                let frame = String::from_utf8(bytes.to_vec()).unwrap();
+                                if frame.starts_with("event: core_warning\n") {
+                                    break frame;
+                                }
+                                // burst_warning also emits a separate history activity signal.
+                                assert!(frame.starts_with("event: activity\n"));
+                            }
+                        })
+                        .await
+                        .expect("actual burst producer must reach SSE body");
+                    let raw = format!(r#"{{"kind":"burst","burst_new_sessions":{count}}}"#);
+                    assert_eq!(event, format!("event: core_warning\ndata: {raw}\n\n"));
+                    let data = event
+                        .strip_prefix("event: core_warning\ndata: ")
+                        .unwrap()
+                        .strip_suffix("\n\n")
+                        .unwrap();
+                    let decoded: qb_proto::admin_sse::BurstWarning =
+                        serde_json::from_str(data).unwrap();
+                    assert_eq!(decoded.burst_new_sessions, count);
+                    assert_eq!(serde_json::to_string(&decoded).unwrap(), data);
+                }
+            })
+        }));
+        drop(runtime);
+        drop(obs); // synchronous writer stop + join on this ordinary test thread
+        home.close().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[cfg(test)]
+mod r15_protected_sse_tests {
+    use super::*;
+    use futures_util::{FutureExt, StreamExt};
+
+    #[test]
+    fn r15_sse_protected_actual_burst_complete_frame_roundtrip() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r15-sse-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+        let obs = Arc::new(crate::observability::Observability::new(home.path(), None).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut relay = None;
+        let mut servers: Option<crate::http::RunningServers> = None;
+        let (result, joined) = runtime.block_on(async {
+            let result = std::panic::AssertUnwindSafe(async {
+                let mut config = crate::config::Config::default();
+                config.server.data_port = 0;
+                config.server.admin_port = 0;
+                // No schedulers/accounts/upstream requests: only the protected events route.
+                relay = Some(Arc::new(
+                    crate::relay::RelayState::new(
+                        store.clone(),
+                        &config,
+                        obs.clone(),
+                        Arc::new(crate::debug_pin::DebugPins::default()),
+                    )
+                    .unwrap(),
+                ));
+                servers = Some(
+                    crate::http::spawn_with_routes(
+                        &config,
+                        crate::local_secrets::LocalSecrets {
+                            client_key: "synthetic-sse-client".into(),
+                            admin_token: "synthetic-sse-admin".into(),
+                        },
+                        Router::new(),
+                        runtime_routes(relay.as_ref().unwrap().clone(), 0),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build()
+                    .unwrap();
+                let url = format!(
+                    "http://{}/admin/v1/events",
+                    servers.as_ref().unwrap().admin_addr
+                );
+                assert_eq!(
+                    client.get(&url).send().await.unwrap().status(),
+                    StatusCode::UNAUTHORIZED
+                );
+                let response = client
+                    .get(&url)
+                    .bearer_auth("synthetic-sse-admin")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(
+                    response.headers()["content-type"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("text/event-stream")
+                );
+                let mut stream = response.bytes_stream();
+                obs.burst_warning(23);
+                let raw = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let mut buffer = Vec::new();
+                    loop {
+                        let chunk = stream
+                            .next()
+                            .await
+                            .expect("SSE closed before burst")
+                            .unwrap();
+                        buffer.extend_from_slice(&chunk);
+                        assert!(buffer.len() <= 8192, "SSE fixture body bound");
+                        while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
+                            let frame: Vec<_> = buffer.drain(..end + 2).collect();
+                            if frame.starts_with(b"event: core_warning\n") {
+                                return String::from_utf8(frame).unwrap();
+                            }
+                            assert!(
+                                frame.starts_with(b"event: activity\n") || frame.starts_with(b":")
+                            );
+                        }
+                    }
+                })
+                .await
+                .expect("complete protected burst frame required");
+                assert_eq!(
+                    raw,
+                    "event: core_warning\ndata: {\"kind\":\"burst\",\"burst_new_sessions\":23}\n\n"
+                );
+                let data = raw
+                    .strip_prefix("event: core_warning\ndata: ")
+                    .unwrap()
+                    .strip_suffix("\n\n")
+                    .unwrap();
+                let shared: qb_proto::admin_sse::BurstWarning = serde_json::from_str(data).unwrap();
+                assert_eq!(shared.burst_new_sessions, 23);
+                assert_eq!(serde_json::to_string(&shared).unwrap(), data);
+                drop(stream);
+            })
+            .catch_unwind()
+            .await;
+            // The body future owns the HTTP stream, so success or unwind drops it
+            // before shutdown. Join both server tasks before dropping their owners.
+            let mut joined = true;
+            if let Some(servers) = servers.as_mut() {
+                servers.shutdown();
+                for task in [&mut servers.data_task, &mut servers.admin_task] {
+                    match tokio::time::timeout(std::time::Duration::from_secs(3), &mut *task).await
+                    {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(_) => joined = false,
+                        Err(_) => {
+                            joined = false;
+                            task.abort();
+                            let _ = task.await;
+                        }
+                    }
+                }
+            }
+            (result, joined)
+        });
+        let root = home.keep(); // retain on teardown failure; no racing TempDir drop
+        drop(servers);
+        drop(runtime);
+        drop(relay);
+        let store_exclusive = Arc::strong_count(&store) == 1;
+        // AccountRuntime installs an observer owned by the store. Release that
+        // observer before checking the writer's remaining owners.
+        drop(store);
+        let exclusive = store_exclusive && Arc::strong_count(&obs) == 1;
+        let flushed = obs.flush().is_ok();
+        drop(obs); // ordinary thread joins writer before owned home removal
+        if joined && exclusive && flushed {
+            std::fs::remove_dir_all(&root).expect("owned SSE home removal failed");
+            assert!(!root.exists());
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(
+            exclusive && flushed,
+            "SSE fixture owners or writer remain; home retained"
+        );
+        assert!(
+            joined,
+            "SSE servers must stop and join within fixture deadline"
+        );
     }
 }
