@@ -308,3 +308,20 @@ fn typed_warning_pool_facts_survive_raw_to_presentation_without_invented_counts(
         );
     }
 }
+
+#[test]
+fn live_transport_rejects_unknown_envelope_metrics_but_archives_are_explicitly_compatible() {
+    for field in [None, Some("inflight"), Some("memory"), Some("bindings")] {
+        let mut payload = wire(json!({"kind":"oauth"}));
+        if let Some(field) = field {
+            payload[field]["unknown_wire_field"] = json!(1);
+        } else {
+            payload["unknown_wire_field"] = json!(1);
+        }
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let error = serde_json::from_slice::<qb_tray::client::TraySnapshot>(&bytes).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+        let legacy: qb_tray::client::PresentationSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.accounts.len(), 1);
+    }
+}
