@@ -469,6 +469,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 12:42 | R13 F 제공자 기본 사실 집중 관문 | core9·CLI6·tray477·DTO/layout11 = 503 통과; strict 세 범위·build/fmt/diff0, 실제 한영10HWND/2PNG | 공유 계산·사용 가능 수와 측정 비율 구분·크레딧 잔여시간 대상 명시 | bc2a34a; R13.F-evidence/focused-fingerprint.json. 독립 표시 결함2개 정확 red2→수정, Python 사전도구32통과는 합성만; 전체 행렬·숫자 예측 미수용 |
 | 2026-10-24 13:26 | R13 F 기본 사실 전체 관문·집중 복구 | 기본3310/1/19·전체3707/10/36 원본 보존; 단독 core1276/0/1·양 strict lint/build0 | launcher 기본·전체 각1, R9 단위2·복구20 통과 | bc2a34a·5f6d5f6; delivery-fingerprint.json. R9 dev 소스 동일, 병렬 실패 원인 미확정; 새 전체 green 합계 아님 |
 | 2026-10-24 13:35 | R15 공통 상태·health 첫 단위 | proto13·tray4·strict consumer1·CLI1·실제HTTP1·기존 forecast 전송27 통과; workspace strict lint·fmt0 | 원래 상태10키/직렬화 순서·중복키 거절·호환 해석 유지 | 792559a; state-unit-fingerprint.json. 명령 testkit 누락·미사용 alias 수정, 계정/경고/pool 내부 계약·전체 R15 관문 별도 |
+| 2026-10-24 13:38 | R15 유한 라우팅 속성 단위 | 7검사·독립 fixture1580·retry122, strict core lint·fmt/diff0 | 실제 binding transaction·C7 fallback/관측 소진·이동 예산/왕복 억제 | 8a2019e; routing-properties-fingerprint.json. 실제 소켓/24시간 replay 아님; 테스트 import2와 module 순서 보완 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
