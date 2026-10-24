@@ -85,7 +85,7 @@ impl Fake {
                     );
                     let path = request.split_whitespace().nth(1).unwrap();
                     let mut account = admin_fixture::account(
-                        "synthetic-account",
+                        "cl-000001",
                         "claude",
                         admin_fixture::measuring_forecast(),
                     );
@@ -103,18 +103,21 @@ impl Fake {
                         if path.ends_with("range=all") {
                             (
                                 200,
-                                r#"{"sessions":[{"id":"abcdef123456","provider":"claude","account":"synthetic-account"}]}"#,
+                                r#"{"move_cost":null,"now":"2026-10-24T00:00:00Z","active_window_secs":60,"sessions":[{"id":"abcdef123456","provider":"claude","client":{"kind":"claude_cli","product":null,"version":null},"label":null,"account":"cl-000001","first_seen_at":null,"bound_since":null,"last_used_at":"2026-10-24T00:00:00Z","active":true,"inflight":{"requests":0,"oldest_started_at":null,"ws_open":0,"ws_response_in_flight":false},"inflight_known":true,"pacing_wait":null,"routing":null,"quota_wait":null,"quota_wait_known":true,"model":null,"subagents_today":0,"requests_today":0,"failures_today":0,"rate_wait_today":{"count":0,"total_ms":0},"moves_today":[],"first_account_today":null,"marked_for_move":false,"counters_complete":true,"truncated":false,"subagents_known":true,"moves_known":true,"metadata_truncated":false}],"truncated":false}"#,
                             )
                         } else {
-                            (200, r#"{"sessions":[]}"#)
+                            (
+                                200,
+                                r#"{"move_cost":null,"now":"2026-10-24T00:00:00Z","active_window_secs":60,"sessions":[],"truncated":false}"#,
+                            )
                         }
                     } else if path.starts_with("/admin/v1/activity?") {
                         (
                             200,
                             if partial.load(Ordering::SeqCst) {
-                                r#"{"truncated":true,"events":[{"seq":7,"kind":"token_refresh","provider":"claude","account":"synthetic-account"}]}"#
+                                r#"{"truncated":true,"events":[{"seq":7,"ts":"2026-10-24T00:00:00Z","kind":"token_refresh","provider":"claude","account":"cl-000001","account_to":null,"notable":true,"data":{"count":0,"max_wait_ms":0,"relayed":0,"moved_groups":0,"sessions_truncated":false,"recovered":false}}],"next_seq":7}"#
                             } else {
-                                r#"{"truncated":false,"events":[{"seq":7,"kind":"token_refresh","provider":"claude","account":"synthetic-account"}]}"#
+                                r#"{"truncated":false,"events":[{"seq":7,"ts":"2026-10-24T00:00:00Z","kind":"token_refresh","provider":"claude","account":"cl-000001","account_to":null,"notable":true,"data":{"count":0,"max_wait_ms":0,"relayed":0,"moved_groups":0,"sessions_truncated":false,"recovered":false}}],"next_seq":7}"#
                             },
                         )
                     } else if path.starts_with("/admin/v1/usage-history?") {
@@ -123,7 +126,7 @@ impl Fake {
                         } else {
                             (
                                 200,
-                                r#"{"accounts":[{"id":"synthetic-account","windows":[] }]}"#,
+                                r#"{"accounts":[{"id":"cl-000001","windows":[],"credits_spans":[],"truncated":false}],"truncated":false}"#,
                             )
                         }
                     } else {

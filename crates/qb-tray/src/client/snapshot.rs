@@ -447,9 +447,11 @@ mod tests {
             }]
         });
         let sessions: Value = serde_json::from_str(r#"{"move_cost":{"hour":{"tokens":90,"known_count":1,"unknown_count":1,"observed_since":"2026-10-24T00:00:00Z","recording_complete":false,"tokens_saturated":false},"rolling24h":{"tokens":90,"known_count":1,"unknown_count":1,"observed_since":"2026-10-24T00:00:00Z","recording_complete":false,"tokens_saturated":false},"clock_adjusted":true},"now":"2026-10-24T00:00:00Z","active_window_secs":60,"sessions":[{"id":"123456abcdef","provider":"codex","client":{"kind":"codex_cli","product":"synthetic","version":"1"},"label":{"text":"synthetic-folder","source":"claude_project","best_effort":true},"account":"cx-000001","first_seen_at":"2026-10-24T00:00:00Z","bound_since":"2026-10-24T00:00:00Z","last_used_at":"2026-10-24T00:00:00Z","active":true,"inflight":{"requests":2,"oldest_started_at":"2026-10-24T00:00:00Z","ws_open":1,"ws_response_in_flight":true},"inflight_known":false,"pacing_wait":{"waiting":2,"since":"2026-10-24T00:00:00Z"},"routing":{"action_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","on_5h_limit":"move","mode":"recover"},"quota_wait":{"waiting":1,"reset_at":"2026-10-24T00:00:00Z"},"quota_wait_known":true,"model":"synthetic","subagents_today":1,"requests_today":5,"failures_today":2,"rate_wait_today":{"count":1,"total_ms":9},"moves_today":[{"at":"2026-10-24T00:00:00Z","from":"cl-000002","to":"cx-000001","reason":"reset_hold_timeout","next_turn_cache":"miss"}],"first_account_today":"cl-000002","marked_for_move":true,"counters_complete":false,"truncated":true,"subagents_known":false,"moves_known":false,"metadata_truncated":true}],"truncated":true}"#).unwrap();
-        let activity = json!({"events":[{"seq":4,"ts":at,"kind":"request_failed",
-                "provider":"codex","account":"cx-000001","data":{"active":2,"recovered":true,
-                    "label":"presentation-injection"}}],"next_seq":4,"truncated":true});
+        let activity = json!({"events":[{"seq":4,"ts":at,"kind":"burst",
+                "provider":"codex","account":"cx-000001","account_to":null,"notable":true,
+                "data":{"count":0,"max_wait_ms":0,"relayed":0,"moved_groups":0,
+                    "sessions_truncated":false,"active":2,"recovered":true}}],
+                "next_seq":4,"truncated":true});
         let usage_history = json!({"accounts":[{"id":"cx-000001","windows":[{"name":"5h",
                 "points":[[at,70.0]],"resets":["2026-10-23T16:00:00Z"],"truncated":true}],
                 "credits_spans":[[at,null]],"truncated":true}],"truncated":true});
@@ -580,6 +582,19 @@ mod tests {
         assert_eq!(projected.data_at, Some(decoded.capture_completed_at));
         assert_eq!(projected.activity.len(), 1);
         assert!(projected.activity_truncated);
+    }
+
+    // Historical snapshot input is intentionally separate from live HTTP.
+    #[test]
+    fn r16_archive_only_activity_presentation_injection_is_discarded() {
+        let mut archived: Value = serde_json::from_slice(&encode(&bundle()).unwrap()).unwrap();
+        archived["activity"]["events"][0]["kind"] = json!("request_failed");
+        archived["activity"]["events"][0]["data"]["label"] = json!("presentation-injection");
+        let decoded = decode(&serde_json::to_vec(&archived).unwrap()).unwrap();
+        assert!(decoded.activity.events[0].data.label.is_none());
+        assert_eq!(decoded.activity.events[0].kind, "request_failed");
+        let encoded = String::from_utf8(encode(&decoded).unwrap()).unwrap();
+        assert!(!encoded.contains("presentation-injection"));
     }
 
     #[test]

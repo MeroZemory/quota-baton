@@ -11,6 +11,7 @@ pub mod admin_sessions;
 pub mod admin_state;
 pub use admin_account::AdminAccount;
 pub mod admin_warning;
+pub mod history_response;
 pub mod native_reset;
 pub use admin_state::{AdminState, StateBindings, StateCapabilities, StateInflight, StateMemory};
 

@@ -24,21 +24,13 @@ fn bundle() -> Value {
     let mut accounts = vec![];
     let mut history = vec![];
     for (id, provider, plan, state, drain, used, hours) in [
-        ("sample-a", "codex", "plus", "active", false, 20., 60),
-        ("sample-b", "codex", "pro", "active", false, 40., 96),
-        ("sample-free", "codex", "free", "active", false, 60., 360),
-        ("sample-paused", "codex", "plus", "paused", false, 90., 60),
-        (
-            "sample-disabled",
-            "codex",
-            "plus",
-            "disabled",
-            false,
-            90.,
-            60,
-        ),
-        ("sample-drain", "codex", "plus", "active", true, 90., 60),
-        ("sample-claude", "claude", "pro", "active", false, 30., 36),
+        ("cx-000001", "codex", "plus", "active", false, 20., 60),
+        ("cx-000002", "codex", "pro", "active", false, 40., 96),
+        ("cx-000003", "codex", "free", "active", false, 60., 360),
+        ("cx-000004", "codex", "plus", "paused", false, 90., 60),
+        ("cx-000005", "codex", "plus", "disabled", false, 90., 60),
+        ("cx-000006", "codex", "plus", "active", true, 90., 60),
+        ("cl-000001", "claude", "pro", "active", false, 30., 36),
     ] {
         let name = if plan == "free" { "43200m" } else { "7d" };
         let reset = now() + Duration::hours(hours);
@@ -48,13 +40,13 @@ fn bundle() -> Value {
         accounts.push(json!({"id":id,"provider":provider,"email":format!("{id}@example.test"),"plan":plan,"user_state":state,"drain":drain,"health":{"kind":"ready"},"source":"oauth","pool_eligible":state=="active"&&!drain,
             "windows":[{"name":name,"used_pct":used,"reset_at":reset,"observed_at":observed}],
             "usage_forecast":forecasts.view(id,now(),None)}));
-        history.push(json!({"id":id,"windows":[{"name":name,"points":[[now()-Duration::minutes(3),used-2.],[observed,used]],"resets":[]}]}));
+        history.push(json!({"id":id,"windows":[{"name":name,"points":[[now()-Duration::minutes(3),used-2.],[observed,used]],"resets":[],"truncated":false}],"credits_spans":[],"truncated":false}));
     }
     json!({"schema_version":1,"capture_started_at":AT,"capture_completed_at":AT,"utc_offset_seconds":32400,"consistency":"independent_reads","session_details":"not_captured",
         "query":{"sessions_range":"all","activity_days":7,"activity_limit":2000,"usage_hours":48},
         "health":{"ok":true,"version":"synthetic-r163","pid":7,"started_at":AT},
         "state":{"version":"synthetic-r163","accounts":accounts,"pools":{"codex":{"eligible":3},"claude":{"eligible":1}}},
-        "sessions":{"now":AT,"sessions":[]},"activity":{"events":[],"next_seq":0},"usage_history":{"accounts":history}})
+        "sessions":{"move_cost":null,"now":AT,"active_window_secs":60,"sessions":[],"truncated":false},"activity":{"events":[],"next_seq":0,"truncated":false},"usage_history":{"accounts":history,"truncated":false}})
 }
 
 async fn transport(wire: &Value) -> snapshot::SnapshotBundleV1 {
@@ -217,7 +209,7 @@ fn r164_measured_bundle(with_normal_history: bool) -> Value {
         .retain(|a| {
             matches!(
                 a["id"].as_str().unwrap(),
-                "sample-a" | "sample-b" | "sample-free" | "sample-paused"
+                "cx-000001" | "cx-000002" | "cx-000003" | "cx-000004"
             )
         });
     for account in wire["state"]["accounts"].as_array_mut().unwrap() {
@@ -225,17 +217,17 @@ fn r164_measured_bundle(with_normal_history: bool) -> Value {
         for window in account["windows"].as_array_mut().unwrap() {
             window.as_object_mut().unwrap().remove("observed_at");
         }
-        if account["id"] == "sample-a" {
+        if account["id"] == "cx-000001" {
             account["windows"][0]["used_pct"] = json!(100.);
         }
-        if !with_normal_history || account["id"] != "sample-free" {
+        if !with_normal_history || account["id"] != "cx-000003" {
             account.as_object_mut().unwrap().remove("usage_forecast");
         }
     }
     wire["usage_history"]["accounts"]
         .as_array_mut()
         .unwrap()
-        .retain(|a| with_normal_history && a["id"] == "sample-free");
+        .retain(|a| with_normal_history && a["id"] == "cx-000003");
     wire["state"]["pools"] = json!({"codex":{"eligible":3}});
     wire
 }
@@ -320,7 +312,7 @@ async fn r164_exhausted_snapshot_without_forecast_or_history_is_zero_until_reset
     wire["state"]["accounts"]
         .as_array_mut()
         .unwrap()
-        .retain(|a| a["id"] == "sample-a");
+        .retain(|a| a["id"] == "cx-000001");
     wire["state"]["pools"] = json!({"codex":{"eligible":1}});
     let captured = transport(&wire).await;
     let reset = now() + Duration::hours(60);
@@ -355,10 +347,10 @@ async fn r165_real_dto_exhausted_and_sparse_accounts_span_the_full_history() {
     wire["state"]["accounts"]
         .as_array_mut()
         .unwrap()
-        .retain(|a| a["id"] == "sample-a" || a["id"] == "sample-b");
+        .retain(|a| a["id"] == "cx-000001" || a["id"] == "cx-000002");
     for account in wire["state"]["accounts"].as_array_mut().unwrap() {
         account.as_object_mut().unwrap().remove("usage_forecast");
-        if account["id"] == "sample-a" {
+        if account["id"] == "cx-000001" {
             account["windows"][0]["used_pct"] = json!(100.);
             // A fresh poll's receipt time is not an exhaustion-onset time.
             // With no earlier history/onset, the current window bounds zero.
@@ -366,10 +358,10 @@ async fn r165_real_dto_exhausted_and_sparse_accounts_span_the_full_history() {
         }
     }
     wire["usage_history"]["accounts"] = json!([{
-        "id":"sample-b", "windows":[{"name":"7d", "resets":[], "points":[
+        "id":"cx-000002", "windows":[{"name":"7d", "resets":[], "points":[
             [now()-Duration::hours(20),20.],
             [now()-Duration::hours(12),40.]
-        ]}]
+        ], "truncated":false}], "credits_spans":[], "truncated":false
     }]);
     wire["state"]["pools"] = json!({"codex":{"eligible":1}});
     let captured = transport(&wire).await;
