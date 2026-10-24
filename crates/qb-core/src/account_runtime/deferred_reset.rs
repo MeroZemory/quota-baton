@@ -89,6 +89,14 @@ pub(super) struct PhysicalQualification {
     pub(super) allow_credits: bool,
     pub(super) quota_credit_releasable: bool,
 }
+// Finite current evidence for this original registered episode only.
+struct ReadinessStamp {
+    generation: u64,
+    observed_at: DateTime<Utc>,
+    fresh_until: DateTime<Utc>,
+    mono_until: Instant,
+    revision: u64,
+}
 struct Record {
     id: DeferredResetId,
     owner: LaunchOwnerScope,
@@ -106,8 +114,28 @@ struct Record {
     phase: AtomicU8,
     recovery: AtomicU8,
     expiry_generation: AtomicU64,
+    readiness: Mutex<Option<ReadinessStamp>>,
+    readiness_revision: AtomicU64,
 }
 impl Record {
+    fn readiness_current(
+        &self,
+        account: &Account,
+        wall: DateTime<Utc>,
+        mono: Instant,
+    ) -> Option<bool> {
+        let Ok(stamp) = self.readiness.lock() else {
+            return Some(false);
+        };
+        stamp.as_ref().map(|stamp| {
+            stamp.generation == account.generation
+                && stamp.observed_at <= wall
+                && stamp.observed_at >= self.qualification.reset_at
+                && wall < stamp.fresh_until
+                && mono < stamp.mono_until
+                && stamp.revision == self.readiness_revision.load(Ordering::Acquire)
+        })
+    }
     fn live(&self) -> bool {
         self.owner.live()
             && self.binding.live()
@@ -213,6 +241,8 @@ impl DeferredResets {
             phase: AtomicU8::new(WAITING),
             recovery: AtomicU8::new(0),
             expiry_generation: AtomicU64::new(0),
+            readiness: Mutex::new(None),
+            readiness_revision: AtomicU64::new(0),
         });
         let _owner_live = owner.live_guard()?;
         if !intent.caller_current()
@@ -245,6 +275,95 @@ impl DeferredResets {
         (record.owner.same_owner(owner) && owner.episode_id().ok()? == Some(id.0) && record.live())
             .then(|| record.clone())
     }
+    // Caller holds Store, after exact accepted raw UsagePoll persistence and
+    // runtime/probe/credential gates. No registration, reset or wake is changed.
+    pub(super) fn requalify_readiness(
+        &self,
+        account: &Account,
+        readiness: &super::wait_owner::AppliedReadiness,
+    ) {
+        let wall = Utc::now();
+        let mono = Instant::now();
+        if !super::wait_owner::readiness_native_current(account, wall)
+            || readiness.observed_at > wall
+            || readiness.fresh_until <= wall
+        {
+            return;
+        }
+        let Some(mono_until) = readiness
+            .fresh_until
+            .signed_duration_since(wall)
+            .to_std()
+            .ok()
+            .and_then(|remaining| mono.checked_add(remaining))
+        else {
+            return;
+        };
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        if state.closed {
+            return;
+        }
+        let mut changed = false;
+        for record in state.records.values().filter(|r| r.account == account.id) {
+            if !record.live()
+                || record.phase.load(Ordering::Acquire) != SUSPENDED
+                || !record.same_identity(account)
+                || wall < record.qualification.reset_at
+                || mono < record.wake
+                || readiness.observed_at < record.qualification.reset_at
+                || !account.eligible_at(Some(&record.model), wall)
+                || !record
+                    .owner
+                    .matches_thread(record.root.strip_prefix("codex:").unwrap_or(""))
+                || record.owner.episode_id().ok().flatten() != Some(record.id.0)
+                || !(record.qualification.scope == "account"
+                    || (record.qualification.scope == format!("model:{}", record.model)
+                        && readiness.model.as_deref() == Some(record.model.as_str())))
+                || readiness
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| model != record.model)
+            {
+                continue;
+            }
+            let Some(revision) = record
+                .readiness_revision
+                .load(Ordering::Acquire)
+                .checked_add(1)
+            else {
+                continue;
+            };
+            let Ok(mut stamp) = record.readiness.lock() else {
+                continue;
+            };
+            // Leaf gate serializes cancellation/consumption; a dead episode is
+            // never revived. Owner is rechecked with the existing leaf guard.
+            let Some(_owner_live) = record.owner.live_guard() else {
+                continue;
+            };
+            if !record.live() || record.phase.load(Ordering::Acquire) != SUSPENDED {
+                continue;
+            }
+            *stamp = Some(ReadinessStamp {
+                generation: account.generation,
+                observed_at: readiness.observed_at,
+                fresh_until: readiness.fresh_until,
+                mono_until,
+                revision,
+            });
+            record.readiness_revision.store(revision, Ordering::Release);
+            record.recovery.store(0, Ordering::Release);
+            record.phase.store(READY, Ordering::Release);
+            changed = true;
+        }
+        drop(state);
+        if changed {
+            self.changed.notify_waiters();
+        }
+    }
+
     pub(super) fn requalify_account(
         &self,
         id: &str,
@@ -272,6 +391,16 @@ impl DeferredResets {
             if !same {
                 record.phase.store(CANCELLED, Ordering::Release);
             } else {
+                if record.phase.load(Ordering::Acquire) == SUSPENDED {
+                    let Some(revision) = record
+                        .readiness_revision
+                        .load(Ordering::Acquire)
+                        .checked_add(1)
+                    else {
+                        continue;
+                    };
+                    record.readiness_revision.store(revision, Ordering::Release);
+                }
                 record.recovery.store(0, Ordering::Release);
                 let _ = record.phase.compare_exchange(
                     SUSPENDED,
@@ -303,6 +432,18 @@ impl DeferredResets {
         for record in state.records.values().filter(|record| record.account == id) {
             let old = record.phase.load(Ordering::Acquire);
             if old < CANCELLED && !(keep_expiring && old == EXPIRING) {
+                // Once fresh readiness is cut, no leftover native-expiry
+                // generation may substitute for another accepted raw poll.
+                match record.readiness.lock() {
+                    Ok(mut stamp) => {
+                        if stamp.take().is_some() {
+                            record.recovery.fetch_or(BLOCK_REPORT, Ordering::AcqRel);
+                        }
+                    }
+                    Err(_) => {
+                        record.recovery.fetch_or(BLOCK_REPORT, Ordering::AcqRel);
+                    }
+                }
                 record.recovery.fetch_or(recovery, Ordering::AcqRel);
                 record.phase.store(phase, Ordering::Release);
             }
@@ -789,6 +930,25 @@ impl AccountRuntime {
         if !record.same_identity(&account) || !self.deferred_credentials_current(&account) {
             return Ok(false);
         }
+        let readiness = record.readiness_current(&account, wall, Instant::now());
+        if readiness == Some(false) {
+            // Exact generation/freshness mismatch never falls through to the
+            // original native expiry lineage, even after evidence is cleared.
+            let state = self.wait_owner.deferred.state.lock().map_err(|_| ())?;
+            if let Ok(mut stamp) = record.readiness.lock() {
+                *stamp = None;
+            }
+            record.recovery.fetch_or(BLOCK_REPORT, Ordering::AcqRel);
+            let _ = record.phase.compare_exchange(
+                READY,
+                SUSPENDED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            drop(state);
+            self.wait_owner.deferred.changed.notify_waiters();
+            return Ok(false);
+        }
         if record.phase.load(Ordering::Acquire) == SUSPENDED {
             // Only credential-only saves and the native expiry boundary preserve
             // the original hold's lineage. Store's restricted save compares all
@@ -866,7 +1026,9 @@ impl AccountRuntime {
                 }
             }
             READY => {
-                if record.expiry_generation.load(Ordering::Acquire) != account.generation {
+                if readiness != Some(true)
+                    && record.expiry_generation.load(Ordering::Acquire) != account.generation
+                {
                     return Ok(false);
                 }
             }
@@ -911,7 +1073,23 @@ impl AccountRuntime {
                 {
                     return None;
                 }
+                // The owner gate may block; freshness must be checked after it.
                 let _owner_live = scope.live_guard()?;
+                if readiness == Some(true)
+                    && record.readiness_current(&account, Utc::now(), Instant::now()) != Some(true)
+                {
+                    if let Ok(mut stamp) = record.readiness.lock() {
+                        *stamp = None;
+                    }
+                    record.recovery.fetch_or(BLOCK_REPORT, Ordering::AcqRel);
+                    let _ = record.phase.compare_exchange(
+                        READY,
+                        SUSPENDED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    return None;
+                }
                 if consume {
                     operation.admit().ok()?;
                     record
@@ -1607,5 +1785,297 @@ mod tests {
             f.runtime.deferred_reset_status(&scope, THREAD),
             DeferredResetStatus::Cancelled
         );
+    }
+
+    // Existing Fixture only; no readiness setter or replacement registry.
+    async fn readiness_raw(f: &Fixture, complete: bool) {
+        readiness_raw_extra(f, complete, serde_json::json!({})).await;
+    }
+
+    async fn readiness_raw_extra(f: &Fixture, complete: bool, extra: serde_json::Value) {
+        let at = Utc::now();
+        let mut raw = serde_json::json!({"observed_at":at,"windows":[
+            {"name":"5h","used_pct":10.0,"observed_at":at,
+             "reset_at":at+Duration::hours(5)},
+            {"name":"7d","used_pct":20.0,"observed_at":at,
+             "reset_at":at+Duration::days(1)}
+        ]});
+        raw.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        if !complete {
+            raw["windows"].as_array_mut().unwrap().pop();
+        }
+        let origin = f.runtime.capture_poll_origin(&f.id).await.unwrap();
+        // Deliberately complete merged snapshot even when raw is partial.
+        let mut merged = raw.clone();
+        if !complete {
+            merged["windows"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name":"7d","used_pct":20.0,"observed_at":at,
+                    "reset_at":at+Duration::days(1)
+                }));
+        }
+        f.runtime
+            .apply_quota_snapshot_reported_origin(&f.id, merged, &raw, None, Some(origin))
+            .await
+            .unwrap();
+    }
+
+    async fn original_due(f: &Fixture, scope: &LaunchOwnerScope) -> (Instant, DateTime<Utc>) {
+        let (wake, reset_at) = match f.runtime.deferred_reset_status(scope, THREAD) {
+            DeferredResetStatus::Waiting { wake, reset_at, .. }
+            | DeferredResetStatus::Suspended { wake, reset_at, .. } => (wake, reset_at),
+            _ => panic!("original obligation missing"),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            tokio::time::sleep_until(wake),
+        )
+        .await
+        .unwrap();
+        assert!(Utc::now() >= reset_at);
+        (wake, reset_at)
+    }
+
+    fn assert_original_episode(
+        f: &Fixture,
+        scope: &LaunchOwnerScope,
+        id: DeferredResetId,
+        original: (Instant, DateTime<Utc>),
+    ) {
+        match f.runtime.deferred_reset_status(scope, THREAD) {
+            DeferredResetStatus::Waiting {
+                id: actual,
+                wake,
+                reset_at,
+            }
+            | DeferredResetStatus::Suspended {
+                id: actual,
+                wake,
+                reset_at,
+            } => {
+                assert_eq!(actual, id);
+                assert_eq!((wake, reset_at), original);
+            }
+            _ => panic!("recovery replaced or lost original episode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn n5d_registered_partial_through_reset_late_full_readiness_consumes_once() {
+        let f = Fixture::new();
+        let (observed, reset) = f.physical(2).await;
+        let (id, scope) = f.register(&observed);
+        f.poll(reset, false).await;
+        let original = original_due(&f, &scope).await;
+        assert!(
+            !f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap(),
+            "original reset alone cannot clear BLOCK_REPORT"
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+                .is_none()
+        );
+        assert_original_episode(&f, &scope, id, original);
+        readiness_raw(&f, true).await;
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap(),
+            "fresh accepted full native readiness repairs registered wait"
+        );
+        assert_original_episode(&f, &scope, id, original);
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!f.runtime.cancel_deferred_reset(&scope, id));
+    }
+
+    #[tokio::test]
+    async fn n5d_registered_healthy_available_credits_without_permission_recovers() {
+        let f = Fixture::new();
+        assert!(!f.runtime.store.load(&f.id).unwrap().allow_credits);
+        let (observed, reset) = f.physical(2).await;
+        let (id, scope) = f.register(&observed);
+        f.poll(reset, false).await;
+        let original = original_due(&f, &scope).await;
+        let extra = serde_json::json!({"credits":{"has_credits":true,"balance":5.0}});
+        assert!(crate::credits::entitled(&extra));
+        readiness_raw_extra(&f, true, extra).await;
+        let account = f.runtime.store.load(&f.id).unwrap();
+        assert!(!account.allow_credits);
+        assert!(!account.quota_credit_releasable);
+        assert!(matches!(account.health, Health::Ready));
+        assert!(account.quota_cooling.is_none());
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+        );
+        assert_original_episode(&f, &scope, id, original);
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn n5d_registered_available_credits_do_not_excuse_paid_serving() {
+        for paid in [
+            serde_json::json!({"signals":{"serving_from_credits":true}}),
+            serde_json::json!({"serving_from_credits":true}),
+            serde_json::json!({"signals":{"active_limit":"credits"}}),
+            serde_json::json!({"paid_serving_observed_at":Utc::now()}),
+        ] {
+            let f = Fixture::new();
+            assert!(!f.runtime.store.load(&f.id).unwrap().allow_credits);
+            let (observed, reset) = f.physical(2).await;
+            let (id, scope) = f.register(&observed);
+            f.poll(reset, false).await;
+            original_due(&f, &scope).await;
+            let mut extra = paid;
+            extra["credits"] = serde_json::json!({"has_credits":true,"balance":5.0});
+            readiness_raw_extra(&f, true, extra).await;
+            assert!(
+                !f.runtime
+                    .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                    .unwrap()
+            );
+            assert!(
+                f.runtime
+                    .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn n5d_registered_ready_account_partial_raw_cannot_borrow_merged_window() {
+        let f = Fixture::new();
+        let (observed, reset) = f.physical(2).await;
+        let (id, scope) = f.register(&observed);
+        f.poll(reset, false).await;
+        let original = original_due(&f, &scope).await;
+        // Native account expiry may run independently before the poll.
+        assert!(matches!(
+            f.runtime.store.load(&f.id).unwrap().health,
+            Health::Ready
+        ));
+        readiness_raw(&f, false).await;
+        assert!(
+            !f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+                .is_none(),
+            "durable Ready plus merged complete is insufficient"
+        );
+        assert_original_episode(&f, &scope, id, original);
+    }
+
+    #[tokio::test]
+    async fn n5d_registered_new_partial_revokes_readiness_then_full_recovers_same_id() {
+        let f = Fixture::new();
+        let (observed, reset) = f.physical(2).await;
+        let (id, scope) = f.register(&observed);
+        f.poll(reset, false).await;
+        let original = original_due(&f, &scope).await;
+        readiness_raw(&f, true).await;
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+        );
+        readiness_raw(&f, false).await;
+        assert!(
+            !f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+                .is_none()
+        );
+        readiness_raw(&f, true).await;
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+        );
+        assert_original_episode(&f, &scope, id, original);
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn n5d_registered_cancel_or_account_pause_cannot_be_recovered_by_full_poll() {
+        for pause in [false, true] {
+            let f = Fixture::new();
+            let (observed, reset) = f.physical(2).await;
+            let (id, scope) = f.register(&observed);
+            f.poll(reset, false).await;
+            original_due(&f, &scope).await;
+            if pause {
+                f.runtime
+                    .store
+                    .update_metadata(&f.id, |account| {
+                        account.user_state = crate::accounts::UserState::Paused;
+                    })
+                    .unwrap();
+            } else {
+                assert!(f.runtime.cancel_deferred_reset(&scope, id));
+            }
+            readiness_raw(&f, true).await;
+            assert_eq!(
+                f.runtime.deferred_reset_status(&scope, THREAD),
+                DeferredResetStatus::Cancelled
+            );
+            assert!(
+                !f.runtime
+                    .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                    .unwrap()
+            );
+            assert!(
+                f.runtime
+                    .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation(),)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

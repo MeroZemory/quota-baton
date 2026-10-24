@@ -313,6 +313,22 @@ impl<E> WaitProofs<E> {
         result
     }
 
+    /// Consume only this exact own-applied UsagePoll after durable native
+    /// application. No ShortQuotaProof is minted for healthy readiness.
+    pub(super) fn finish_applied_poll(&self, permit: AcceptPermit) -> Result<(), FenceError> {
+        let mut state = self.open()?;
+        let entry = state
+            .entries
+            .get_mut(&permit.origin.id)
+            .ok_or(FenceError::Missing)?;
+        self.check_permit(&permit, entry)?;
+        if permit.phase != Phase::Applied || permit.origin.source != ReportSource::UsagePoll {
+            return Err(FenceError::Rejected);
+        }
+        entry.active = None;
+        Ok(())
+    }
+
     /// Call only after the header's native persistence/closure succeeded. The
     /// registry checks provenance and phase, not persistence or raw classification.
     pub(crate) fn seal_http(&self, permit: AcceptPermit) -> Result<SealedHttpReport, FenceError> {
