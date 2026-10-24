@@ -8,7 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use qb_proto::{CpaImportRequest, ImportMode};
+use qb_proto::{
+    CpaImportRequest, ImportMode,
+    admin_action::{
+        AccountActionReply, ClearedReply, ProjectReply, ReleaseHoldReply, RoutingMutationReply,
+        UpdatedReply,
+    },
+};
 
 #[derive(Clone)]
 struct AccountAdmin {
@@ -168,7 +174,11 @@ async fn import_cpa(
 fn error(status: StatusCode, message: &str) -> Response {
     (
         status,
-        Json(serde_json::json!({"error": {"message": message}})),
+        Json(qb_proto::admin_error::AdminErrorReply {
+            error: qb_proto::admin_error::AdminErrorDetail {
+                message: message.to_owned(),
+            },
+        }),
     )
         .into_response()
 }
@@ -346,14 +356,41 @@ async fn routing_update(
         return error(StatusCode::BAD_REQUEST, "정책 요청이 올바르지 않습니다.");
     };
     let table = state.relay.bindings.clone();
-    let result=tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<RoutingMutationReply> {
         match request {
-            RoutingUpdate::ClaudeUrgentLaunch{session_id}=>{table.register_claude_urgent(&session_id)?;Ok(serde_json::json!({"updated":true}))},
-            RoutingUpdate::Urgent{id,on_5h_limit}=>{table.set_routing_session_urgent(&id,on_5h_limit)?;Ok(serde_json::json!({"updated":true}))},
-            RoutingUpdate::Project{id,name,settings}=>Ok(serde_json::json!({"id":table.policies.put_project_patch(id.as_deref(),name,settings)?})),
-            RoutingUpdate::Session{id,settings,project,inherit}=>{table.set_routing_session_patch(&id,settings,project.as_deref(),inherit)?;Ok(serde_json::json!({"updated":true}))},
+            RoutingUpdate::ClaudeUrgentLaunch { session_id } => {
+                table.register_claude_urgent(&session_id)?;
+                Ok(RoutingMutationReply::Updated(UpdatedReply {
+                    updated: true,
+                }))
+            }
+            RoutingUpdate::Urgent { id, on_5h_limit } => {
+                table.set_routing_session_urgent(&id, on_5h_limit)?;
+                Ok(RoutingMutationReply::Updated(UpdatedReply {
+                    updated: true,
+                }))
+            }
+            RoutingUpdate::Project { id, name, settings } => {
+                Ok(RoutingMutationReply::Project(ProjectReply {
+                    id: table
+                        .policies
+                        .put_project_patch(id.as_deref(), name, settings)?,
+                }))
+            }
+            RoutingUpdate::Session {
+                id,
+                settings,
+                project,
+                inherit,
+            } => {
+                table.set_routing_session_patch(&id, settings, project.as_deref(), inherit)?;
+                Ok(RoutingMutationReply::Updated(UpdatedReply {
+                    updated: true,
+                }))
+            }
         }
-    }).await;
+    })
+    .await;
     match result {
         Ok(Ok(value)) => Json(value).into_response(),
         _ => error(
@@ -472,7 +509,7 @@ fn dashboard_invalid() -> Response {
 async fn clear_move_guard(State(state): State<RuntimeAdmin>) -> Response {
     let bindings = state.relay.bindings.clone();
     match tokio::task::spawn_blocking(move || bindings.clear_move_guard()).await {
-        Ok(()) => Json(serde_json::json!({"cleared":true})).into_response(),
+        Ok(()) => Json(ClearedReply { cleared: true }).into_response(),
         Err(_) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "이동 안전장치를 해제하지 못했습니다.",
@@ -640,12 +677,18 @@ async fn release_hold(
         return error(StatusCode::BAD_REQUEST, "계정 ID 확인이 일치하지 않습니다.");
     }
     match state.relay.accounts.release_quota_hold(&id).await {
-        Ok(account) => Json(serde_json::json!({
-            "id":account.id,"released":true,"provider":account.provider,
-            "label":account.label,"email":account.email,"plan":account.plan,
-            "user_state":account.user_state,"health":account.health,"drain":account.drain,
-            "allow_credits":account.allow_credits
-        }))
+        Ok(account) => Json(ReleaseHoldReply {
+            id: account.id,
+            released: true,
+            provider: account.provider,
+            label: account.label,
+            email: account.email,
+            plan: account.plan,
+            user_state: account.user_state,
+            health: account.health,
+            drain: account.drain,
+            allow_credits: account.allow_credits,
+        })
         .into_response(),
         Err(()) => error(
             StatusCode::CONFLICT,
@@ -915,12 +958,18 @@ async fn change_account(
                     return error(StatusCode::INTERNAL_SERVER_ERROR, "Binding flush failed");
                 }
             }
-            Json(serde_json::json!({
-            "id": account.id, "provider": account.provider, "label": account.label,
-            "email": account.email, "plan": account.plan, "user_state": account.user_state,
-            "health": account.health, "drain": account.drain, "allow_credits": account.allow_credits
-        }))
-        .into_response()
+            Json(AccountActionReply {
+                id: account.id,
+                provider: account.provider,
+                label: account.label,
+                email: account.email,
+                plan: account.plan,
+                user_state: account.user_state,
+                health: account.health,
+                drain: account.drain,
+                allow_credits: account.allow_credits,
+            })
+            .into_response()
         }
         Err(()) => error(StatusCode::INTERNAL_SERVER_ERROR, "Account update failed"),
     }

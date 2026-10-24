@@ -319,9 +319,13 @@ async fn not_found(request: Request) -> Response {
 }
 
 fn error(status: StatusCode, kind: &str, message: &str, path: &str) -> Response {
-    let mut body = serde_json::json!({"error": {"type": kind, "message": message}});
-    if path == "/v1/messages" || path.starts_with("/v1/messages/") {
-        body["type"] = "error".into();
-    }
+    let body = qb_proto::admin_error::HttpErrorReply {
+        error: qb_proto::admin_error::HttpErrorDetail {
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+        },
+        kind: (path == "/v1/messages" || path.starts_with("/v1/messages/"))
+            .then(|| "error".to_owned()),
+    };
     (status, Json(body)).into_response()
 }

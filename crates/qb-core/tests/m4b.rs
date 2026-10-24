@@ -347,6 +347,8 @@ impl Harness {
     }
 
     async fn admin(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Value {
+        let is_post = method == reqwest::Method::POST;
+        let is_patch = method == reqwest::Method::PATCH;
         let mut request = self
             .client
             .request(method, format!("http://{}{path}", self.servers.admin_addr))
@@ -356,7 +358,35 @@ impl Harness {
         }
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), 200);
-        response.json().await.unwrap()
+        let bytes = response.bytes().await.unwrap();
+        if is_post && path == "/admin/v1/routing" {
+            action_roundtrip::<qb_proto::admin_action::RoutingMutationReply>(&bytes);
+        } else if is_post && path == "/admin/v1/routing/move-guard/clear" {
+            action_roundtrip::<qb_proto::admin_action::ClearedReply>(&bytes);
+        } else if let Some(tail) = path.strip_prefix("/admin/v1/accounts/") {
+            type AccountReply = qb_proto::admin_action::AccountActionReply<
+                Provider,
+                qb_core::accounts::UserState,
+                Health,
+            >;
+            type ReleasedReply = qb_proto::admin_action::ReleaseHoldReply<
+                Provider,
+                qb_core::accounts::UserState,
+                Health,
+            >;
+            if is_patch && !tail.contains('/') {
+                action_roundtrip::<AccountReply>(&bytes);
+            } else if is_post && let Some((_, action)) = tail.split_once('/') {
+                match action {
+                    "pause" | "resume" | "enable" | "disable" => {
+                        action_roundtrip::<AccountReply>(&bytes)
+                    }
+                    "release-hold" => action_roundtrip::<ReleasedReply>(&bytes),
+                    _ => {}
+                }
+            }
+        }
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     async fn drain(&self, id: &str) {
@@ -500,6 +530,107 @@ async fn r15_launch_route_shared_response_exact_roundtrip() {
     })
     .await
     .expect("synthetic launch response contract deadline");
+}
+
+fn action_roundtrip<T: serde::de::DeserializeOwned + serde::Serialize>(body: &[u8]) {
+    let reply: T = serde_json::from_slice(body)
+        .unwrap_or_else(|_| panic!("admin action body violates shared contract"));
+    let encoded =
+        serde_json::to_vec(&reply).unwrap_or_else(|_| panic!("admin action body encoding failed"));
+    assert!(
+        encoded.as_slice() == body,
+        "admin action body changed on roundtrip"
+    );
+}
+
+#[tokio::test]
+async fn r15_action_ack_routes_keep_shapes_and_auth() {
+    let h = Harness::new(Provider::Codex).await;
+    let id = h.ids()[0].clone();
+    let policies_before = h.state.bindings.policies.list();
+    let state_before = h.store.load(&id).unwrap().user_state;
+    for path in [
+        "/admin/v1/routing".to_owned(),
+        "/admin/v1/routing/move-guard/clear".to_owned(),
+        format!("/admin/v1/accounts/{id}/pause"),
+    ] {
+        let denied = h
+            .client
+            .post(format!("http://{}{path}", h.servers.admin_addr))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        denied.bytes().await.unwrap();
+    }
+    assert_eq!(h.state.bindings.policies.list(), policies_before);
+    assert_eq!(h.store.load(&id).unwrap().user_state, state_before);
+    let native = "12345678-1234-4234-8234-123456789abc";
+    let updated = h
+        .admin(
+            reqwest::Method::POST,
+            "/admin/v1/routing",
+            Some(json!({"kind":"claude_urgent_launch", "session_id":native})),
+        )
+        .await;
+    assert_eq!(updated, json!({"updated":true}));
+    let project = h.admin(reqwest::Method::POST, "/admin/v1/routing", Some(json!({"kind":"project", "name":"synthetic action project", "settings":{"mode":"strict", "reset_wait_secs":0}}))).await;
+    assert_eq!(project.as_object().unwrap().len(), 1);
+    assert!(!project["id"].as_str().unwrap().is_empty());
+    let session_id = qb_core::routing::session_id(&format!("claude:{native}"));
+    for request in [
+        json!({"kind":"urgent", "id":session_id, "on_5h_limit":"wait"}),
+        json!({"kind":"session", "id":session_id, "project":project["id"]}),
+    ] {
+        assert_eq!(
+            h.admin(reqwest::Method::POST, "/admin/v1/routing", Some(request))
+                .await,
+            json!({"updated":true})
+        );
+    }
+    assert_eq!(
+        h.admin(
+            reqwest::Method::POST,
+            "/admin/v1/routing/move-guard/clear",
+            None
+        )
+        .await,
+        json!({"cleared":true})
+    );
+    for (action, expected_state) in [
+        ("pause", qb_core::accounts::UserState::Paused),
+        ("resume", qb_core::accounts::UserState::Active),
+        ("disable", qb_core::accounts::UserState::Disabled),
+        ("enable", qb_core::accounts::UserState::Active),
+    ] {
+        let reply = h
+            .admin(
+                reqwest::Method::POST,
+                &format!("/admin/v1/accounts/{id}/{action}"),
+                None,
+            )
+            .await;
+        let account = h.store.load(&id).unwrap();
+        assert_eq!(account.user_state, expected_state);
+        // Original producer expression is the legacy wire oracle; values come
+        // from the persisted mutation, never a preconstructed shared DTO.
+        assert_eq!(
+            reply,
+            json!({"id":account.id,"provider":account.provider,"label":account.label,"email":account.email,"plan":account.plan,"user_state":account.user_state,"health":account.health,"drain":account.drain,"allow_credits":account.allow_credits})
+        );
+    }
+    let reply = h
+        .admin(
+            reqwest::Method::PATCH,
+            &format!("/admin/v1/accounts/{id}"),
+            Some(json!({"label":"synthetic patched", "drain":true, "allow_credits":true})),
+        )
+        .await;
+    assert_eq!(reply["label"], "synthetic patched");
+    assert_eq!(reply["drain"], true);
+    assert_eq!(reply["allow_credits"], true);
+    assert!(h.fake.state.requests().is_empty());
 }
 
 fn usage(provider: Provider, percent: u32) -> HeaderMap {
