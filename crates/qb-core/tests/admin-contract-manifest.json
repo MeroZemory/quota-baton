@@ -1,0 +1,1623 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "file": "crates/qb-core/src/account_runtime.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/account_runtime/admin_view.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/accounts/adopt.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/accounts/import.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/accounts/takeover.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/admin.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/bindings.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/bindings/affinity.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/dashboard.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/dashboard/history.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/dashboard/labels.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/dashboard/runtime.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/debug_pin.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/http.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/oauth.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/observability.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/observability/reread_accounting.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/relay.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/relay/credentials.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/relay/launch.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/routing.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/routing/forecast.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_account.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_action.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit newly applied shared admin DTO module; entire production file checked for JSON/defaults; direct cfg(test) items excluded. No occurrence approval implied."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_adopt.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Reviewed full production schema; direct cfg(test) items excluded. Zero JSON/default allowances; later findings must fail."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_control.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Reviewed full production schema; direct cfg(test) items excluded. Zero JSON/default allowances; later findings must fail."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_error.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit newly applied shared admin DTO module; entire production file checked for JSON/defaults; direct cfg(test) items excluded. No occurrence approval implied."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_import.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit reviewed zero-debt current shared schema; full production JSON/default checks, direct cfg(test) exclusions only; no occurrence allowances."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_launch.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit newly applied shared admin DTO module; entire production file checked for JSON/defaults; direct cfg(test) items excluded. No occurrence approval implied."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_login.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit newly applied shared admin DTO module; entire production file checked for JSON/defaults; direct cfg(test) items excluded. No occurrence approval implied."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_phase0.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit reviewed zero-debt current shared schema; full production JSON/default checks, direct cfg(test) exclusions only; no occurrence allowances."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_pool.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_refresh.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit reviewed zero-debt current shared schema; full production JSON/default checks, direct cfg(test) exclusions only; no occurrence allowances."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_routing.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit reviewed zero-debt current shared schema; full production JSON/default checks, direct cfg(test) exclusions only; no occurrence allowances."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_session_detail.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit newly applied shared admin DTO module; entire production file checked for JSON/defaults; direct cfg(test) items excluded. No occurrence approval implied."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_sessions.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit newly applied shared admin DTO module; entire production file checked for JSON/defaults; direct cfg(test) items excluded. No occurrence approval implied."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_sse.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit reviewed zero-debt current shared schema; full production JSON/default checks, direct cfg(test) exclusions only; no occurrence allowances."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_state.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_takeover.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit reviewed zero-debt current shared schema; full production JSON/default checks, direct cfg(test) exclusions only; no occurrence allowances."
+    },
+    {
+      "file": "crates/qb-proto/src/admin_warning.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
+    },
+    {
+      "file": "crates/qb-proto/src/history_response.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Explicit newly applied shared admin DTO module; entire production file checked for JSON/defaults; direct cfg(test) items excluded. No occurrence approval implied."
+    },
+    {
+      "file": "crates/qb-proto/src/lib.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
+    },
+    {
+      "file": "crates/qb-proto/src/native_reset.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
+    }
+  ],
+  "baseline": [
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 1153,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state,\"plan\":account.plan,\"generation\":account.generation}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in new."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 1344,
+        "rule": "admin-json",
+        "snippet": "json!({\"action\":\"credits\",\"window\":window,\r\n                \"reset_at\":reset_at,\"next_account\":null,\"earliest_account\":null,\"observed_at\":Utc::now(),\"model_limited\":false})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in credit_notice."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 1694,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":id,\"refresh_attention\":attention}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in set_refresh_attention."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 1758,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in clear_memory_health_if."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 1830,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in emit_account."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2277,
+        "rule": "admin-json",
+        "snippet": "json!(earliest.as_ref().map(|(_, reset)| *reset))",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in typed_views."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2278,
+        "rule": "admin-json",
+        "snippet": "json!(earliest.map(|(id, _)| id))",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in typed_views."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2279,
+        "rule": "admin-json",
+        "snippet": "json!(accounts.iter().any(|other| other.provider\r\n                    == a.provider\r\n                    && other.user_state == UserState::Active\r\n                    && !other.drain\r\n                    && crate::relay::notices::model_quota_applies(other, model)))",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in typed_views."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2291,
+        "rule": "admin-json",
+        "snippet": "json!(now)",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in typed_views."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2941,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"quota_updated\",\"data\":{\"id\":id,\"snapshot\":snapshot}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in apply_quota_snapshot_reported_inner."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3063,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: bound account is cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in strict_quota_response."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3065,
+        "rule": "admin-json",
+        "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: bound account is cooling\"}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in strict_quota_response."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3131,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: all accounts are cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in unavailable_known."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3133,
+        "rule": "admin-json",
+        "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: all accounts are cooling\"}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in unavailable_known."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3143,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"type\":\"invalid_request_error\",\"message\":format!(\"quota-baton: no usable {} account — open the tray\",provider.as_str())}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in unavailable_known."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3997,
+        "rule": "admin-json",
+        "snippet": "json!(\"quota_notice\")",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in publish_quota_notice."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3998,
+        "rule": "admin-json",
+        "snippet": "json!(account.id)",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in publish_quota_notice."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3999,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"core_warning\",\"data\":data})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in publish_quota_notice."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 4036,
+        "rule": "admin-json",
+        "snippet": "json!([\r\n        account.health,\r\n        account.user_state,\r\n        account.drain,\r\n        account.allow_credits,\r\n        account.quota_cooling,\r\n        account.payment_until\r\n    ])",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing account snapshot/notice/event assembly and internal ledger data in the state helper file; current typed state seam remains separate; reviewed occurrence in notice_state."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/accounts/takeover.rs",
+        "line": 525,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"email\":journal.account.email,\"plan\":journal.account.plan,\"provider_account_id\":provider_account_id,\r\n            \"source_path\":proof.path,\"source_last_refresh\":journal.account.token_meta.last_refresh_at,\r\n            \"source_mtime\":proof.modified,\"owner_alive\":deps.source.owner(request.provider, proof) != Owner::Stopped,\r\n            \"existing_id\":exists.then_some(&journal.account.id),\"inspect_digest\":journal.inspect_digest,\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing inspect/commit result with origin metadata; preserve nullable refresh and path fields; reviewed occurrence in terminal_snapshot."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/accounts/takeover.rs",
+        "line": 598,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"email\":profile.email,\"plan\":profile.plan,\"provider_account_id\":provider_account_id,\r\n            \"source_path\":snapshot.proof.path,\"source_last_refresh\":meta.last_refresh_at,\r\n            \"source_mtime\":snapshot.proof.modified,\r\n            \"owner_alive\":deps.source.owner(request.provider, &snapshot.proof) != Owner::Stopped,\r\n            \"existing_id\":existing.as_ref().map(|a| &a.id),\"inspect_digest\":inspect_digest,\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing inspect/commit result with origin metadata; preserve nullable refresh and path fields; reviewed occurrence in finish_prepare."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/accounts/takeover.rs",
+        "line": 794,
+        "rule": "admin-json",
+        "snippet": "json!({\"id\":journal.account.id,\r\n        \"renamed_to\":(journal.retired && !journal.keep_source).then_some(&journal.destination),\"refresh\":journal.result})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing inspect/commit result with origin metadata; preserve nullable refresh and path fields; reviewed occurrence in result_value."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 52,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "replace_linked",
+        "field_type": "bool",
+        "owner": "struct:LoginRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Login request may omit explicit linked-account replacement consent, defaulting false; do not change consent behavior."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 271,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\": {\r\n                    \"code\": error.code(), \"message\": error.message()\r\n                }})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in issue_operation_entry."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 303,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\r\n                \"code\":error.code(),\"message\":error.message(),\r\n            }})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in issue_launch."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 330,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "inherit",
+        "field_type": "bool",
+        "owner": "enum:RoutingUpdate/variant:Session",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Routing session update may omit inheritance reset, preserving existing false behavior."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 405,
+        "rule": "serde-default",
+        "snippet": "default = \"default_drain_timeout\"",
+        "field": "drain_timeout_secs",
+        "field_type": "u64",
+        "owner": "struct:DrainRequest",
+        "attribute": "#[serde(default = \"default_drain_timeout\")]"
+      },
+      "count": 1,
+      "reason": "Drain request may omit timeout and use existing default_drain_timeout; preserve bounded shutdown contract."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 625,
+        "rule": "admin-json",
+        "snippet": "json!({\"changed\":[],\"removed\":[],\"resync\":true})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in account_events."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 769,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"code\":code,\"message\":message}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in takeover_account."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 854,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"code\":code,\"message\":message}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in adopt_account."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 868,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "force",
+        "field_type": "bool",
+        "owner": "struct:RefreshRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Refresh request may omit force, defaulting false; no manufactured account eligibility."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 894,
+        "rule": "admin-json",
+        "snippet": "json!(message)",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_account."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 895,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":value})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_account."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 916,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"code\":\"poll_too_soon\",\"message\":\"Usage poll interval has not elapsed\",\"retry_after\":retry_after}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_usage."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 921,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"code\":\"poll_excluded\",\"message\":\"Account cannot be polled\"}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_usage."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 922,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"code\":\"poll_unavailable\",\"message\":\"Usage poll unavailable\"}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_usage."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/bindings.rs",
+        "line": 1251,
+        "rule": "admin-json",
+        "snippet": "json!({\"id\":crate::routing::session_id(key),\"account\":g.account,\"policy\":self.policies.plan(launch::policy_key(&d, Some(key)))})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing routing/session and persistence helper data; preserve the lifecycle filtered export boundary; reviewed occurrence in routing_view."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/dashboard/runtime.rs",
+        "line": 286,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":name,\"data\":data})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing dashboard runtime SSE event envelopes and activity projections; actual sessions/detail/activity/usage producer helper; reviewed occurrence in emit."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/dashboard/runtime.rs",
+        "line": 546,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":event})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing dashboard runtime SSE event envelopes and activity projections; actual sessions/detail/activity/usage producer helper; reviewed occurrence in activity."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/dashboard/runtime.rs",
+        "line": 767,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":event})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing dashboard runtime SSE event envelopes and activity projections; actual sessions/detail/activity/usage producer helper; reviewed occurrence in rate_hold."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/debug_pin.rs",
+        "line": 145,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"message\":\"잘못된 계정 고정 요청입니다.\"}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered debug-pin success/error wire body; reviewed occurrence in set_pin."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/debug_pin.rs",
+        "line": 157,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\":{\"message\":\"계정을 찾을 수 없습니다.\"}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing registered debug-pin success/error wire body; reviewed occurrence in set_pin."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 343,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":at, \"event\":\"binding_move_cost\",\r\n            \"move_id\":id, \"session\":session, \"provider\":provider, \"reread_tokens\":null,\r\n            \"measurement\":\"pending\"})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in committed_move."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 390,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":at, \"event\":\"binding_move_cost\",\r\n                \"move_id\":id, \"reread_tokens\":reread_tokens,\r\n                \"measurement\":if reread_tokens.is_some() { \"known\" } else { \"unknown\" }})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in accounting_end."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 419,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":Utc::now(), \"event\":\"binding_move_refused\",\r\n            \"session\":session, \"from\":event.from, \"to\":event.to, \"reason\":event.reason,\r\n            \"proposed_reason\":event.proposed_reason,\r\n            \"until\":event.until, \"newly_tripped\":event.newly_tripped, \"forced\":event.forced})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_move_guard."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 461,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":Utc::now(), \"event\":\"core_warning\", \"data\":value})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in move_warning."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 463,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"core_warning\", \"data\":value})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in move_warning."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 493,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"takeover\",\r\n            \"phase\": phase, \"pid\": std::process::id()\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_takeover."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 528,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"login\",\"provider\":provider,\"login_id\":login_id,\"outcome\":status,\"account\":account_id})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_login."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 529,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"login_progress\",\"data\":{\"login_id\":login_id,\"status\":status,\"account_id\":account_id}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_login."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 545,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"token_refresh\",\"account\":account,\"trigger\":trigger,\"outcome\":outcome,\"expires_at\":expires_at})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_refresh."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 587,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"core_warning\",\r\n            \"kind\": \"burst\", \"burst_new_sessions\": observed_count,\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in burst_warning."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 591,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"event\": \"core_warning\",\r\n            \"data\": qb_proto::admin_sse::BurstWarning {\r\n                kind: qb_proto::admin_sse::WarningKind::Burst,\r\n                burst_new_sessions: observed_count,\r\n            },\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in burst_warning."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 600,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"core_warning\",\"account\":account,\"code\":code})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in core_warning."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 602,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"core_warning\",\"data\":{\"account\":account,\"code\":code}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in core_warning."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 606,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(),\r\n            \"event\": phase,\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_guard."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 610,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\": phase, \"data\": {}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_guard."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 737,
+        "rule": "admin-json",
+        "snippet": "json!(provider)",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in capture_poll."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 826,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\":Utc::now().to_rfc3339(), \"event\":\"placement\", \"session\":session,\r\n            \"account\":event.to, \"evidence\":event.evidence, \"capped\":event.capped,\r\n            \"placed_since_obs\":event.placed_since_obs, \"charge\":event.placement_charge_pct\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_placement."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 834,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n                \"ts\":Utc::now().to_rfc3339(), \"event\":\"victim_skipped_unknown_cost\",\r\n                \"count\":count\r\n            })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_unknown_cost_skips."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 841,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\":Utc::now().to_rfc3339(), \"event\":\"poll\", \"account\":account,\r\n            \"reason\":\"placement_evidence\"\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_placement_poll."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 855,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":event,\"transport\":\"ws\",\"connection\":connection,\"account\":account,\"close_code\":code,\"reason\":reason})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_ws_connection."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 875,
+        "rule": "admin-json",
+        "snippet": "json!({\"destination\":destination,\"shape\":{\"response_header_names\":headers.keys().map(|n|n.as_str()).filter(|name|crate::dashboard::labels::capture_header_allowed(name)).collect::<Vec<_>>(),\"response_header_values\":values}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in capture_ws_response."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 885,
+        "rule": "admin-json",
+        "snippet": "json!({\"destination\":destination,\"shape\":{\"message_types\":counts}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in capture_ws_types."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 948,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(),\r\n            \"event\": \"overload_detected\",\r\n            \"account\": account,\r\n            \"active\": active,\r\n            \"threshold\": threshold,\r\n            \"groups_hit\": groups_hit,\r\n            \"marked\": marked,\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_overload."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 975,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"binding_move\",\r\n            \"session\": session, \"from\": from, \"to\": to, \"reason\": reason,\r\n            \"bytes_in\": bytes, \"keys\": keys, \"debug_pin\": debug_pin\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_group_move."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 1125,
+        "rule": "admin-json",
+        "snippet": "json!(Utc::now())",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in paid_serving_proof."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 1152,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"account_changed\",\r\n            \"account\": account.id, \"provider\": account.provider,\r\n            \"generation\": account.generation, \"plan\": plan,\r\n            \"health\": account.health, \"user_state\": account.user_state,\r\n        })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_account."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 1187,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"health_changed\",\"account\":id,\"from\":from,\"to\":to,\"reason\":value[\"reason\"],\"until\":value[\"until\"]})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_health_ledger."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 1204,
+        "rule": "admin-json",
+        "snippet": "json!({\"ts\": Utc::now().to_rfc3339(), \"event\": \"linked_reload\", \"account\": account_id, \"trigger\": trigger, \"outcome\": outcome, \"expires_at\": expires_at})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in record_reload."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/observability.rs",
+        "line": 1228,
+        "rule": "admin-json",
+        "snippet": "json!({\r\n                \"destination\": destination,\r\n                \"shape\": crate::capture::response_shape(headers)\r\n            })",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing quota/telemetry/ledger/SSE data in the warning/history producer file; typed state warnings remain separately constructed; reviewed occurrence in capture_response."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/relay.rs",
+        "line": 205,
+        "rule": "admin-json",
+        "snippet": "json!({\"account\":a.id,\"forecast\":self.observability.forecast_view(&a.id,\r\n                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing routing/SSE/replay helper output; preserve bounded diagnostic and event payloads; reviewed occurrence in routing_view."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/relay.rs",
+        "line": 1943,
+        "rule": "admin-json",
+        "snippet": "json!({\"error\": {\"type\": kind, \"message\": message}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing routing/SSE/replay helper output; preserve bounded diagnostic and event payloads; reviewed occurrence in native_error."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/routing.rs",
+        "line": 1753,
+        "rule": "admin-json",
+        "snippet": "json!({\"revision\":state.revision,\"defaults\":self.defaults,\"projects\":state.projects,\"sessions\":state.sessions.keys().map(|id| (id.clone(), self.resolve(&state,id))).collect::<BTreeMap<_,_>>()})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing routing policy view; preserve nullable plans and keyed project/session objects; reviewed occurrence in list."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/routing/forecast.rs",
+        "line": 165,
+        "rule": "admin-json",
+        "snippet": "json!({\"enabled\":false,\"placement_effect\":false})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing disabled/fallback/shadow diagnostic variants; no paid or pooled forecast activation; reviewed occurrence in view."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/routing/forecast.rs",
+        "line": 173,
+        "rule": "admin-json",
+        "snippet": "json!({\"window\":name,\"status\":\"fallback\",\"reason\":reason})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing disabled/fallback/shadow diagnostic variants; no paid or pooled forecast activation; reviewed occurrence in view."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/routing/forecast.rs",
+        "line": 248,
+        "rule": "admin-json",
+        "snippet": "json!({\"window\":name,\"status\":\"shadow\",\"calibration\":\"uncalibrated\",\r\n                \"classification\":classification,\"remaining_pp\":remaining,\"demand_lower_pp\":low,\r\n                \"demand_upper_pp\":high,\"margin_pp\":3,\"horizon_secs\":horizon,\r\n                \"samples\":s.samples.len(),\"evaluated\":s.evaluated,\"covered\":s.covered})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing disabled/fallback/shadow diagnostic variants; no paid or pooled forecast activation; reviewed occurrence in view."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/routing/forecast.rs",
+        "line": 254,
+        "rule": "admin-json",
+        "snippet": "json!({\"enabled\":true,\"placement_effect\":false,\"active_groups\":active,\r\n            \"external_traffic\":\"not_attributed\",\"new_demand_reservation\":\"unknown\",\"windows\":windows})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Existing disabled/fallback/shadow diagnostic variants; no paid or pooled forecast activation; reviewed occurrence in view."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_account.rs",
+        "line": 107,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "organization_uuid",
+        "field_type": "Option<String>",
+        "owner": "enum:AdminSourceMatch/variant:Claude",
+        "attribute": "#[serde(\r\n            default,\r\n            skip_serializing_if = \"Option::is_none\",\r\n            deserialize_with = \"present_string\"\r\n        )]"
+      },
+      "count": 1,
+      "reason": "Claude source match emits this member only when known; absence stays None and explicit null is rejected by present_string."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_account.rs",
+        "line": 142,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "probe_pending",
+        "field_type": "Option<bool>",
+        "owner": "enum:AdminHealth/variant:Cooling",
+        "attribute": "#[serde(\r\n            default,\r\n            skip_serializing_if = \"Option::is_none\",\r\n            deserialize_with = \"present_bool\"\r\n        )]"
+      },
+      "count": 1,
+      "reason": "Health cooling overlay emits pending only when present; absence stays None, explicit false is retained, explicit null is rejected."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/lib.rs",
+        "line": 37,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "session_key",
+        "field_type": "Option<String>",
+        "owner": "struct:DebugPinRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Debug pin request may omit the session key to retain existing request behavior; account_id remains required."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/lib.rs",
+        "line": 53,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "dir",
+        "field_type": "Option<std::path::PathBuf>",
+        "owner": "struct:CpaImportRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Import request may omit the optional source directory override."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/lib.rs",
+        "line": 55,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "activate",
+        "field_type": "Vec<String>",
+        "owner": "struct:CpaImportRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Import request omitted activation selection means an empty list, retaining current command semantics."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/lib.rs",
+        "line": 57,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "dry_run",
+        "field_type": "bool",
+        "owner": "struct:CpaImportRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Import request omitted preview flag preserves existing false default; not an inferred account state."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 55,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "session",
+        "field_type": "Option<Session>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent session identity is None; producer omits None and never fabricates a session ID. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 60,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "sessions",
+        "field_type": "Vec<Session>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(default, skip_serializing_if = \"Vec::is_empty\")]"
+      },
+      "count": 1,
+      "reason": "Producer omits an empty session list; omitted input restores only the empty vector, not a missing required counter. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 63,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "window",
+        "field_type": "Option<Window>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "An event without a quota-window attribution omits None; no synthetic window is selected. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 69,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "reset_at",
+        "field_type": "Option<Time>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent reset timestamp remains None and is omitted, not replaced with a current or zero timestamp. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 75,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "expires_at",
+        "field_type": "Option<Time>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent expiry timestamp remains None and is omitted, not fabricated from reset or wall time. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 81,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "reason",
+        "field_type": "Option<Reason>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Events without a move reason omit None; no default reason enum is introduced. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 87,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "attention",
+        "field_type": "Option<Attention>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent attention code remains None; omission must not invent an attention state. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 93,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "outcome",
+        "field_type": "Option<Outcome>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Events without a request outcome omit None; no success/failure classification is fabricated. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 99,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "action",
+        "field_type": "Option<Action>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Events without a setting action omit None; no action is inferred from other event fields. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 105,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "credits_used",
+        "field_type": "Option<f64>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent credit measurement remains None and omitted; measured zero remains present, distinct from unknown. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 117,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "active",
+        "field_type": "Option<u32>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent active count remains None and omitted; an actual zero remains explicitly present. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 123,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "threshold",
+        "field_type": "Option<u32>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent threshold remains None and omitted; no threshold zero is fabricated. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/history_response.rs",
+        "line": 129,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "groups_hit",
+        "field_type": "Option<u32>",
+        "owner": "struct:ActivityData",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Absent affected-group count remains None and omitted; actual zero remains present. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    }
+  ]
+}
