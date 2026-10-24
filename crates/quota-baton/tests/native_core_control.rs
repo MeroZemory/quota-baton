@@ -161,6 +161,7 @@ async fn actual_loopback_keeps_due_during_inspection_and_consumes_exact_once() {
 async fn ready_wrong_episode_wrong_request_and_unsolicited_grant_never_authorize() {
     for (id, event) in [
         (Some(2), Event::Ready { episode: EPISODE }),
+        (Some(2), Event::Pending { episode: EPISODE }),
         (Some(1), Event::Granted { episode: EPISODE }),
         (
             Some(2),
@@ -619,4 +620,24 @@ async fn cancelled_hint_is_terminal_even_while_readiness_reply_is_pending() {
     assert!(matches!(result, Err(Error::Cancelled)));
     assert!(client.is_closed());
     no_more_requests(&mut server).await;
+}
+
+#[tokio::test]
+async fn pending_inspection_rejects_wrong_request_episode_or_unsolicited_reply() {
+    for (id, episode) in [(Some(1), EPISODE), (Some(2), EPISODE + 1), (None, EPISODE)] {
+        let (mut client, mut server) = pair().await;
+        waiting(&mut client, &mut server).await;
+        let peer = async {
+            let inspect = request(&mut server).await;
+            assert!(matches!(
+                inspect.command,
+                Command::Inspect { episode: EPISODE }
+            ));
+            reply(&mut server, id, Event::Pending { episode }).await;
+        };
+        let (result, ()) = tokio::join!(client.inspect(EPISODE, deadline()), peer);
+        assert!(matches!(result, Err(Error::Protocol | Error::Replay)));
+        assert!(client.is_closed());
+        no_more_requests(&mut server).await;
+    }
 }

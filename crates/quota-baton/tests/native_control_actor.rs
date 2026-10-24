@@ -644,3 +644,98 @@ async fn advance_before_a_grant_is_local_terminal_denial() {
         bounded(async { tokio::join!(run_until_cancelled(control, io), work, peer) }).await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn pending_retains_episode_and_early_recovery_due_until_single_consume() {
+    let (control, mut server) = pair().await;
+    let (mut parent, io) = channels();
+    let mut due = parent.take_due().expect("owned Due receiver");
+    let work = async {
+        require(parent.observe("thread-a", deadline()).await);
+        assert_eq!(due.recv().await.expect("first Due").episode(), EPISODE);
+        assert!(matches!(
+            parent.inspect(EPISODE, deadline()).await,
+            Ok(Inspection::Pending)
+        ));
+        assert_eq!(due.recv().await.expect("recovery Due").episode(), EPISODE);
+        assert!(matches!(
+            parent.inspect(EPISODE, deadline()).await,
+            Ok(Inspection::Ready)
+        ));
+        let Consumption::Granted(grant) = require(parent.consume(EPISODE, deadline()).await) else {
+            panic!("one final grant expected");
+        };
+        assert!(grant.is_current(EPISODE));
+        assert_eq!(grant.request_id(), 4);
+        require(parent.close(deadline()).await);
+        assert!(!grant.is_current(EPISODE));
+    };
+    let peer = async {
+        observed(&mut server, true).await;
+        let first = request(&mut server).await;
+        assert!(matches!(
+            first.command,
+            Command::Inspect { episode: EPISODE }
+        ));
+        // Recovery can arrive while the first Inspect is awaiting its correlated
+        // answer. Pending must not discard that already coalesced Due hint.
+        reply(&mut server, None, Event::Due { episode: EPISODE }).await;
+        reply(
+            &mut server,
+            Some(first.request_id),
+            Event::Pending { episode: EPISODE },
+        )
+        .await;
+        inspected(&mut server, true).await;
+        let consume = request(&mut server).await;
+        assert!(matches!(
+            consume.command,
+            Command::Consume { episode: EPISODE }
+        ));
+        reply(
+            &mut server,
+            Some(consume.request_id),
+            Event::Granted { episode: EPISODE },
+        )
+        .await;
+        closed(&mut server).await;
+    };
+    let (result, (), ()) =
+        bounded(async { tokio::join!(run_until_cancelled(control, io), work, peer) }).await;
+    require(result);
+}
+
+#[tokio::test]
+async fn pending_without_recovery_sends_no_retry_and_owner_close_is_responsive() {
+    let (control, mut server) = pair().await;
+    let (mut parent, io) = channels();
+    let mut due = parent.take_due().expect("owned Due receiver");
+    let work = async {
+        require(parent.observe("thread-a", deadline()).await);
+        due.recv().await.expect("first Due");
+        assert!(matches!(
+            parent.inspect(EPISODE, deadline()).await,
+            Ok(Inspection::Pending)
+        ));
+        require(parent.close(deadline()).await);
+    };
+    let peer = async {
+        observed(&mut server, true).await;
+        let inspect = request(&mut server).await;
+        assert!(matches!(
+            inspect.command,
+            Command::Inspect { episode: EPISODE }
+        ));
+        reply(
+            &mut server,
+            Some(inspect.request_id),
+            Event::Pending { episode: EPISODE },
+        )
+        .await;
+        // A retry, re-Observe or Consume would be a text frame and fails closed().
+        closed(&mut server).await;
+    };
+    let (result, (), ()) =
+        bounded(async { tokio::join!(run_until_cancelled(control, io), work, peer) }).await;
+    require(result);
+}
