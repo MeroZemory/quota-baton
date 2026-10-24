@@ -115,6 +115,7 @@ pub struct Client {
 pub struct Label {
     pub text: String,
     pub source: String,
+    pub best_effort: bool,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -2818,3 +2819,5 @@ mod native_claude_move_label_tests {
         }
     }
 }
+
+mod sessions_wire;

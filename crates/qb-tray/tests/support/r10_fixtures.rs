@@ -437,6 +437,7 @@ fn sessions() -> Vec<Session> {
                     ..Default::default()
                 },
                 label: label.map(|text| Label {
+                    best_effort: false,
                     text: text.into(),
                     source: if account.starts_with("cl-") {
                         "claude_project"
@@ -674,6 +675,7 @@ pub fn snapshot(state: u8) -> DashboardSnapshot {
         blog.account = "cx-hello".into();
         blog.client.kind = "codex_vscode".into();
         blog.label = Some(Label {
+            best_effort: false,
             text: "blog".into(),
             source: "codex_workspace".into(),
         });
@@ -688,6 +690,7 @@ pub fn snapshot(state: u8) -> DashboardSnapshot {
         sample.account = "cx-use".into();
         sample.client.kind = "codex_cli".into();
         sample.label = Some(Label {
+            best_effort: false,
             text: "상태 확인".into(),
             source: "codex_workspace".into(),
         });

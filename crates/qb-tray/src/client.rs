@@ -77,11 +77,12 @@ impl AdminClient {
         &self,
         range: qb_tray::state::Range,
     ) -> Result<qb_tray::dashboard_model::SessionsResponse, ClientError> {
-        self.dashboard_get(
-            &format!("/admin/v1/sessions?range={}", range.query()),
-            "sessions",
-        )
-        .await
+        let bytes = self
+            .dashboard_bytes(&format!("/admin/v1/sessions?range={}", range.query()))
+            .await?;
+        let wire: qb_proto::admin_sessions::SessionsView = serde_json::from_slice(&bytes)
+            .map_err(|_| ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다"))?;
+        Ok(wire.into())
     }
 
     /// Set the desired policy once. The acknowledgement does not assert movement.
@@ -198,6 +199,12 @@ impl AdminClient {
         &self,
         path: &str,
     ) -> Result<serde_json::Value, ClientError> {
+        let bytes = self.dashboard_bytes(path).await?;
+        let invalid = || ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다");
+        serde_json::from_slice(&bytes).map_err(|_| invalid())
+    }
+
+    async fn dashboard_bytes(&self, path: &str) -> Result<Vec<u8>, ClientError> {
         const MAX: usize = 8 * 1024 * 1024;
         test_response_delay().await;
         let response = self
@@ -217,8 +224,7 @@ impl AdminClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let invalid = || ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다");
-        serde_json::from_slice(&bytes).map_err(|_| invalid())
+        Ok(bytes)
     }
 
     pub async fn snapshot(&self) -> Result<TraySnapshot, ClientError> {
@@ -1423,24 +1429,22 @@ mod r7_dashboard_client_tests {
     }
     #[tokio::test]
     async fn dashboard_empty_container_is_valid_but_missing_schema_never_becomes_no_sessions() {
-        for body in [
-            r#"{"sessions":[]}"#,
-            r#"{"sessions":[],"future":{"opaque":"ignored"}}"#,
-        ] {
-            let (client, task) = fake(body, None).await;
-            assert!(
-                client
-                    .dashboard_sessions(qb_tray::state::Range::Hour)
-                    .await
-                    .unwrap()
-                    .sessions
-                    .is_empty()
-            );
-            task.await.unwrap();
-        }
+        let body = r#"{"now":"2026-10-24T00:00:00Z","active_window_secs":60,"sessions":[],"truncated":false,"move_cost":null}"#;
+        let (client, task) = fake(body, None).await;
+        assert!(
+            client
+                .dashboard_sessions(qb_tray::state::Range::Hour)
+                .await
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+        task.await.unwrap();
         for body in [
             r#"{"error":"synthetic-secret-must-not-echo"}"#,
             r#"{"sessions":null}"#,
+            r#"{"sessions":[]}"#,
+            r#"{"now":"2026-10-24T00:00:00Z","active_window_secs":60,"sessions":[],"sessions":[],"truncated":false,"move_cost":null}"#,
             "[]",
         ] {
             let (client, task) = fake(body, None).await;

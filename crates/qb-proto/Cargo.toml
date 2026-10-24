@@ -10,6 +10,7 @@ default = []
 contract-tests = []
 
 [dependencies]
+chrono.workspace = true
 serde.workspace = true
 
 [dev-dependencies]

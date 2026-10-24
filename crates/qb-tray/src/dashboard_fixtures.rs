@@ -54,6 +54,7 @@ pub fn snapshot() -> DashboardSnapshot {
                 version: Some("synthetic".into()),
             },
             label: Some(Label {
+                best_effort: provider == "claude",
                 text: format!("project-{i}"),
                 source: if provider == "claude" {
                     "claude_project"
