@@ -1205,6 +1205,10 @@ mod tests {
     const ROOT: &str = "codex:11111111-2222-4333-8444-555555555555";
     const ANCHOR: &str = "launch:synthetic-deferred";
     const MODEL: &str = "synthetic-model";
+    // These tests exercise readiness after the original reset, not a race
+    // between real Store writes and a one-second setup window. Keep the reset
+    // beyond the registration deadline without changing the production gates.
+    const NEAR_RESET_LEAD: i64 = 10;
     struct Fixture {
         runtime: Arc<AccountRuntime>,
         table: Arc<BindingTable>,
@@ -1298,9 +1302,13 @@ mod tests {
             }
         }
         async fn physical(&self, seconds: i64) -> (ObservedHttp429, DateTime<Utc>) {
-            let reset =
-                DateTime::from_timestamp((Utc::now() + Duration::seconds(seconds)).timestamp(), 0)
-                    .unwrap();
+            let phase_started = std::time::Instant::now();
+            let desired = Utc::now() + Duration::seconds(seconds);
+            let reset = DateTime::from_timestamp(
+                desired.timestamp() + i64::from(desired.timestamp_subsec_nanos() != 0),
+                0,
+            )
+            .unwrap();
             let mut headers = axum::http::HeaderMap::new();
             for (name, value) in [
                 ("x-codex-primary-used-percent", "100".into()),
@@ -1348,7 +1356,13 @@ mod tests {
                 )
                 .await
                 .unwrap()
-                .expect("actual complete physical header/body adapter must qualify");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "actual complete physical header/body adapter must qualify: reset={reset}, completed={}, elapsed={:?}",
+                        Utc::now(),
+                        phase_started.elapsed()
+                    )
+                });
             (observed, reset)
         }
         async fn poll(&self, reset: DateTime<Utc>, complete: bool) {
@@ -1395,7 +1409,12 @@ mod tests {
                     &self.pin,
                 )
                 .unwrap()
-                .expect("native existing managed physical fallback must register")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "native existing managed physical fallback must register: completed={}",
+                        Utc::now()
+                    )
+                })
         }
         fn operation() -> IssueOperation {
             IssueOperation::new(Instant::now() + std::time::Duration::from_secs(5))
@@ -2026,12 +2045,11 @@ mod tests {
             | DeferredResetStatus::Suspended { wake, reset_at, .. } => (wake, reset_at),
             _ => panic!("original obligation missing"),
         };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(6),
-            tokio::time::sleep_until(wake),
-        )
-        .await
-        .unwrap();
+        let wait_bound =
+            wake.saturating_duration_since(Instant::now()) + std::time::Duration::from_secs(5);
+        tokio::time::timeout(wait_bound, tokio::time::sleep_until(wake))
+            .await
+            .unwrap();
         assert!(Utc::now() >= reset_at);
         (wake, reset_at)
     }
@@ -2063,7 +2081,7 @@ mod tests {
     #[tokio::test]
     async fn n5d_typed_inspection_pending_ready_and_positive_revision_are_same_episode() {
         let f = Fixture::new();
-        let (observed, reset) = f.physical(2).await;
+        let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
         let (id, scope) = f.register(&observed);
         assert_eq!(
             f.runtime
@@ -2158,7 +2176,7 @@ mod tests {
     async fn n5d_typed_pending_does_not_bypass_terminal_native_binding_or_policy_gates() {
         for veto in 0..6 {
             let f = Fixture::new();
-            let (observed, reset) = f.physical(2).await;
+            let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
             let (id, scope) = f.register(&observed);
             f.poll(reset, false).await;
             original_due(&f, &scope).await;
@@ -2219,7 +2237,7 @@ mod tests {
     #[tokio::test]
     async fn n5d_pending_inspection_revalidates_binding_table_before_returning_pending() {
         let f = Fixture::new();
-        let (observed, reset) = f.physical(2).await;
+        let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
         let (id, scope) = f.register(&observed);
         f.poll(reset, false).await;
         original_due(&f, &scope).await;
@@ -2304,7 +2322,7 @@ mod tests {
     #[tokio::test]
     async fn n5d_registered_partial_through_reset_late_full_readiness_consumes_once() {
         let f = Fixture::new();
-        let (observed, reset) = f.physical(2).await;
+        let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
         let (id, scope) = f.register(&observed);
         f.poll(reset, false).await;
         let original = original_due(&f, &scope).await;
@@ -2348,7 +2366,7 @@ mod tests {
     async fn n5d_registered_healthy_available_credits_without_permission_recovers() {
         let f = Fixture::new();
         assert!(!f.runtime.store.load(&f.id).unwrap().allow_credits);
-        let (observed, reset) = f.physical(2).await;
+        let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
         let (id, scope) = f.register(&observed);
         f.poll(reset, false).await;
         let original = original_due(&f, &scope).await;
@@ -2390,7 +2408,7 @@ mod tests {
         ] {
             let f = Fixture::new();
             assert!(!f.runtime.store.load(&f.id).unwrap().allow_credits);
-            let (observed, reset) = f.physical(2).await;
+            let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
             let (id, scope) = f.register(&observed);
             f.poll(reset, false).await;
             original_due(&f, &scope).await;
@@ -2414,7 +2432,7 @@ mod tests {
     #[tokio::test]
     async fn n5d_registered_ready_account_partial_raw_cannot_borrow_merged_window() {
         let f = Fixture::new();
-        let (observed, reset) = f.physical(2).await;
+        let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
         let (id, scope) = f.register(&observed);
         f.poll(reset, false).await;
         let original = original_due(&f, &scope).await;
@@ -2442,7 +2460,7 @@ mod tests {
     #[tokio::test]
     async fn n5d_registered_new_partial_revokes_readiness_then_full_recovers_same_id() {
         let f = Fixture::new();
-        let (observed, reset) = f.physical(2).await;
+        let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
         let (id, scope) = f.register(&observed);
         f.poll(reset, false).await;
         let original = original_due(&f, &scope).await;
@@ -2483,7 +2501,7 @@ mod tests {
     async fn n5d_registered_cancel_or_account_pause_cannot_be_recovered_by_full_poll() {
         for pause in [false, true] {
             let f = Fixture::new();
-            let (observed, reset) = f.physical(2).await;
+            let (observed, reset) = f.physical(NEAR_RESET_LEAD).await;
             let (id, scope) = f.register(&observed);
             f.poll(reset, false).await;
             original_due(&f, &scope).await;
