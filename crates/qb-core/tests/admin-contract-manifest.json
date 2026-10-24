@@ -270,7 +270,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1153,
+        "line": 1169,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state,\"plan\":account.plan,\"generation\":account.generation}})",
         "field": "",
@@ -284,7 +284,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1344,
+        "line": 1360,
         "rule": "admin-json",
         "snippet": "json!({\"action\":\"credits\",\"window\":window,\r\n                \"reset_at\":reset_at,\"next_account\":null,\"earliest_account\":null,\"observed_at\":Utc::now(),\"model_limited\":false})",
         "field": "",
@@ -298,7 +298,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1694,
+        "line": 1710,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":id,\"refresh_attention\":attention}})",
         "field": "",
@@ -312,7 +312,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1758,
+        "line": 1774,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state}})",
         "field": "",
@@ -326,7 +326,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1830,
+        "line": 1846,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state}})",
         "field": "",
@@ -340,7 +340,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2277,
+        "line": 2293,
         "rule": "admin-json",
         "snippet": "json!(earliest.as_ref().map(|(_, reset)| *reset))",
         "field": "",
@@ -354,7 +354,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2278,
+        "line": 2294,
         "rule": "admin-json",
         "snippet": "json!(earliest.map(|(id, _)| id))",
         "field": "",
@@ -368,7 +368,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2279,
+        "line": 2295,
         "rule": "admin-json",
         "snippet": "json!(accounts.iter().any(|other| other.provider\r\n                    == a.provider\r\n                    && other.user_state == UserState::Active\r\n                    && !other.drain\r\n                    && crate::relay::notices::model_quota_applies(other, model)))",
         "field": "",
@@ -382,7 +382,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2291,
+        "line": 2307,
         "rule": "admin-json",
         "snippet": "json!(now)",
         "field": "",
@@ -396,7 +396,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2942,
+        "line": 2958,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_updated\",\"data\":{\"id\":id,\"snapshot\":snapshot}})",
         "field": "",
@@ -410,7 +410,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3064,
+        "line": 3080,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: bound account is cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -424,7 +424,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3066,
+        "line": 3082,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: bound account is cooling\"}})",
         "field": "",
@@ -438,7 +438,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3132,
+        "line": 3148,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: all accounts are cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -452,7 +452,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3134,
+        "line": 3150,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: all accounts are cooling\"}})",
         "field": "",
@@ -466,7 +466,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3144,
+        "line": 3160,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"invalid_request_error\",\"message\":format!(\"quota-baton: no usable {} account — open the tray\",provider.as_str())}})",
         "field": "",
@@ -480,7 +480,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3998,
+        "line": 4018,
         "rule": "admin-json",
         "snippet": "json!(\"quota_notice\")",
         "field": "",
@@ -494,7 +494,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3999,
+        "line": 4019,
         "rule": "admin-json",
         "snippet": "json!(account.id)",
         "field": "",
@@ -508,7 +508,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4000,
+        "line": 4020,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\",\"data\":data})",
         "field": "",
@@ -522,7 +522,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4037,
+        "line": 4057,
         "rule": "admin-json",
         "snippet": "json!([\r\n        account.health,\r\n        account.user_state,\r\n        account.drain,\r\n        account.allow_credits,\r\n        account.quota_cooling,\r\n        account.payment_until\r\n    ])",
         "field": "",
@@ -564,7 +564,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/accounts/takeover.rs",
-        "line": 794,
+        "line": 795,
         "rule": "admin-json",
         "snippet": "json!({\"id\":journal.account.id,\r\n        \"renamed_to\":(journal.retired && !journal.keep_source).then_some(&journal.destination),\"refresh\":journal.result})",
         "field": "",
@@ -578,7 +578,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 52,
+        "line": 21,
         "rule": "serde-default",
         "snippet": "default",
         "field": "replace_linked",
@@ -592,7 +592,21 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 271,
+        "line": 23,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "no_browser",
+        "field_type": "bool",
+        "owner": "struct:LoginRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Login request may omit manual paste mode, defaulting no_browser to false so existing callers retain the browser and loopback callback behavior; only explicit true starts the listener-free manual flow."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 223,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\r\n                    \"code\": error.code(), \"message\": error.message()\r\n                }})",
         "field": "",
@@ -606,7 +620,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 303,
+        "line": 255,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\r\n                \"code\":error.code(),\"message\":error.message(),\r\n            }})",
         "field": "",
@@ -620,7 +634,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 330,
+        "line": 282,
         "rule": "serde-default",
         "snippet": "default",
         "field": "inherit",
@@ -634,7 +648,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 405,
+        "line": 357,
         "rule": "serde-default",
         "snippet": "default = \"default_drain_timeout\"",
         "field": "drain_timeout_secs",
@@ -648,7 +662,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 625,
+        "line": 573,
         "rule": "admin-json",
         "snippet": "json!({\"changed\":[],\"removed\":[],\"resync\":true})",
         "field": "",
@@ -662,7 +676,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 872,
+        "line": 657,
         "rule": "serde-default",
         "snippet": "default",
         "field": "force",
@@ -676,7 +690,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/bindings.rs",
-        "line": 1254,
+        "line": 1227,
         "rule": "admin-json",
         "snippet": "json!({\"id\":crate::routing::session_id(key),\"account\":g.account,\"policy\":self.policies.plan(launch::policy_key(&d, Some(key)))})",
         "field": "",
@@ -1194,7 +1208,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/routing.rs",
-        "line": 1753,
+        "line": 1717,
         "rule": "admin-json",
         "snippet": "json!({\"revision\":state.revision,\"defaults\":self.defaults,\"projects\":state.projects,\"sessions\":state.sessions.keys().map(|id| (id.clone(), self.resolve(&state,id))).collect::<BTreeMap<_,_>>()})",
         "field": "",

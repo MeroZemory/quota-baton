@@ -390,6 +390,16 @@ fn valid_path(file: &str) -> bool {
         && file.ends_with(".rs")
         && file.split('/').all(|x| !matches!(x, "" | "." | ".."))
 }
+fn comparison_key(key: &Key) -> Key {
+    let mut key = key.clone();
+    // Checkout line endings do not change Rust semantics. Preserve every other
+    // byte and the exact path/line/owner/field identity of each approval.
+    key.snippet = key.snippet.replace("\r\n", "\n");
+    key.attribute = key.attribute.replace("\r\n", "\n");
+    key.field_type = key.field_type.replace("\r\n", "\n");
+    key
+}
+
 fn enforce(manifest: &Manifest, sources: &BTreeMap<String, String>) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let mut paths = BTreeSet::new();
@@ -439,7 +449,7 @@ fn enforce(manifest: &Manifest, sources: &BTreeMap<String, String>) -> Result<()
             || key.snippet.is_empty()
             || allowance.count == 0
             || allowance.reason.trim().is_empty()
-            || approvals.insert(key.clone(), allowance).is_some()
+            || approvals.insert(comparison_key(key), allowance).is_some()
         {
             errors.push(format!(
                 "{}:{}: invalid/duplicate baseline entry",
@@ -449,8 +459,9 @@ fn enforce(manifest: &Manifest, sources: &BTreeMap<String, String>) -> Result<()
     }
     let mut counts = BTreeMap::new();
     for finding in &findings {
-        *counts.entry(finding.key.clone()).or_insert(0usize) += 1;
-        if !approvals.contains_key(&finding.key) {
+        let key = comparison_key(&finding.key);
+        *counts.entry(key.clone()).or_insert(0usize) += 1;
+        if !approvals.contains_key(&key) {
             errors.push(finding.diagnostic("new/unapproved occurrence"));
         }
     }
@@ -672,6 +683,22 @@ mod selftests {
         assert!(check(&format!("{old}\n{old}"), &policy).is_err());
         let twice = "fn f(){json!({});json!({});}";
         assert!(check(twice, &approved("fn f(){json!({});}")).is_err());
+    }
+    #[test]
+    fn checkout_line_endings_preserve_only_the_same_exact_occurrence() {
+        let lf = "struct S {\n#[serde(\ndefault\n)]\nlegacy: Option<\nString\n>,\n}\nfn f(){json!({\n\"ok\":true\n});}";
+        let crlf = lf.replace('\n', "\r\n");
+        let policy = approved(lf);
+        assert!(check(&crlf, &policy).is_ok());
+        assert!(check(lf, &approved(&crlf)).is_ok());
+        for changed in [
+            crlf.replace("true", "false"),
+            crlf.replace("legacy", "other"),
+            crlf.replace("\"ok\":true", "\"ok\": true"),
+            format!("\r\n{crlf}"),
+        ] {
+            assert!(check(&changed, &policy).is_err());
+        }
     }
     #[test]
     fn aliases_and_nested_macros_are_scanned_without_rejecting_ordinary_macros() {

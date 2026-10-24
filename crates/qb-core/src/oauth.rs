@@ -2,6 +2,7 @@
 mod callback;
 pub(crate) mod claude_profile;
 mod exchange;
+mod manual;
 mod parameters;
 
 use crate::account_runtime::AccountRuntime;
@@ -28,6 +29,14 @@ pub enum LoginError {
     CallbackBindFailed { port: u16 },
     #[error("로그인 요청을 찾을 수 없습니다.")]
     NotFound,
+    #[error("이 로그인 요청은 수동 입력을 받지 않습니다.")]
+    NotManual,
+    #[error("이미 로그인 입력을 제출했습니다. 로그인을 다시 시작해 주세요.")]
+    AlreadySubmitted,
+    #[error("로그인 요청이 만료되었습니다. 로그인을 다시 시작해 주세요.")]
+    Expired,
+    #[error("로그인 요청이 취소되었습니다.")]
+    Cancelled,
     #[error(
         "CPA에 연결된 계정입니다. 별도 토큰 충돌을 막기 위해 로그인을 거절했습니다. 연결을 바꾸려면 replace_linked를 명시해 주세요."
     )]
@@ -52,6 +61,7 @@ struct Session {
     status: watch::Sender<LoginStatus>,
     cancel: watch::Sender<bool>,
     finished_at: Mutex<Option<tokio::time::Instant>>,
+    manual: Option<manual::Submission>,
 }
 
 const TERMINAL_RETENTION: Duration = Duration::from_secs(600);
@@ -116,24 +126,78 @@ impl LoginService {
         provider: Provider,
         replace_linked: bool,
     ) -> Result<LoginStart, LoginError> {
+        self.start_mode(provider, replace_linked, false).await
+    }
+
+    /// Start a paste flow without binding a callback listener. Claude uses its
+    /// provider paste page; Codex keeps its registered localhost callback URI.
+    pub async fn start_manual(
+        &self,
+        provider: Provider,
+        replace_linked: bool,
+    ) -> Result<LoginStart, LoginError> {
+        self.start_mode(provider, replace_linked, true).await
+    }
+
+    /// Submit once; poll `status` for exchange/persistence completion. Even an
+    /// invalid submission consumes the attempt. The caller owns/wipes `input`;
+    /// all secret-bearing copies owned by this service are zeroized.
+    pub async fn submit_manual(&self, login_id: &str, input: &str) -> Result<(), LoginError> {
+        let session = self.session(login_id)?;
+        session
+            .manual
+            .as_ref()
+            .ok_or(LoginError::NotManual)?
+            .submit(input, &session.status, &session.cancel)
+    }
+
+    async fn start_mode(
+        &self,
+        provider: Provider,
+        replace_linked: bool,
+        manual: bool,
+    ) -> Result<LoginStart, LoginError> {
         prune_sessions(&mut self.inner.sessions.lock().unwrap());
-        let mut params = Parameters::new(provider);
+        let params = Parameters::new(provider);
         #[cfg(all(feature = "testkit", debug_assertions))]
-        if let Some(test) = &self.inner.test {
-            params.apply_test(test)?;
+        let params = {
+            let mut params = params;
+            if let Some(test) = &self.inner.test {
+                params.apply_test(test)?;
+            }
+            params
+        };
+        self.start_parameters(params, replace_linked, manual).await
+    }
+
+    async fn start_parameters(
+        &self,
+        mut params: Parameters,
+        replace_linked: bool,
+        manual: bool,
+    ) -> Result<LoginStart, LoginError> {
+        let provider = params.provider;
+        if manual {
+            params.use_manual_redirect();
         }
         let login_id = parameters::random_secret();
-        let listeners = match callback::Listeners::bind(params.port).await {
-            Ok(listeners) => listeners,
-            Err(error) => {
-                self.inner
-                    .obs
-                    .record_login(provider, &login_id, "failed", None);
-                return Err(error);
-            }
+        let listeners = if manual {
+            None
+        } else {
+            Some(match callback::Listeners::bind(params.port).await {
+                Ok(listeners) => listeners,
+                Err(error) => {
+                    self.inner
+                        .obs
+                        .record_login(provider, &login_id, "failed", None);
+                    return Err(error);
+                }
+            })
         };
-        params.port = listeners.port();
-        let state = parameters::random_secret();
+        if let Some(listeners) = &listeners {
+            params.port = listeners.port();
+        }
+        let state = zeroize::Zeroizing::new(parameters::random_secret());
         let verifier = zeroize::Zeroizing::new(parameters::random_secret());
         let auth_url = params.auth_url(&state, &verifier);
         let pending = LoginStatus {
@@ -143,10 +207,19 @@ impl LoginService {
         };
         let (status, _) = watch::channel(pending);
         let (cancel, mut cancelled) = watch::channel(false);
+        let expires = tokio::time::Instant::now() + Duration::from_secs(600);
+        let (manual, input) = match listeners {
+            Some(listeners) => (None, manual::Input::Browser(listeners)),
+            None => {
+                let (submission, receiver) = manual::Submission::new(&params, &state, expires);
+                (Some(submission), manual::Input::Manual(receiver))
+            }
+        };
         let session = Arc::new(Session {
             status,
             cancel,
             finished_at: Mutex::new(None),
+            manual,
         });
         self.inner
             .sessions
@@ -158,15 +231,18 @@ impl LoginService {
         let obs = self.inner.obs.clone();
         let runtime = self.inner.runtime.lock().unwrap().clone();
         let task_id = login_id.clone();
-        let expires = tokio::time::Instant::now() + Duration::from_secs(600);
         obs.record_login(provider, &login_id, "started", None);
         // The task deliberately does not hold Inner: dropping the service cancels it.
         tokio::spawn(async move {
-            let deadline = tokio::time::sleep_until(expires);
+            let deadline = async {
+                if tokio::time::Instant::now() < expires {
+                    tokio::time::sleep_until(expires).await;
+                }
+            };
             tokio::pin!(deadline);
             let outcome = {
                 let flow = async {
-                    let code = listeners.callback(&params.path, &state).await?;
+                    let code = input.code(&params, &state).await?;
                     let (account, tokens) = tokio::time::timeout(
                         Duration::from_secs(30),
                         exchange::exchange(&client, &params, &code, &verifier, &state),
@@ -277,6 +353,10 @@ impl LoginService {
 #[cfg(test)]
 #[path = "oauth/session_fixes_tests.rs"]
 mod session_fixes_tests;
+
+#[cfg(test)]
+#[path = "oauth/manual_tests.rs"]
+mod manual_tests;
 
 #[cfg(all(feature = "testkit", debug_assertions))]
 #[derive(Clone)]

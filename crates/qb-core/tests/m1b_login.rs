@@ -33,7 +33,12 @@ struct Harness {
 impl Harness {
     async fn new() -> Self {
         let serial = SERIAL.lock().await;
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m1b-login-tests");
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/m1b-login-tests");
         fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let home = root.path().join("home");
