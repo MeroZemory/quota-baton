@@ -575,7 +575,11 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/n10/outside-owner-fixtures");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/n10/outside-owner-fixtures");
             fs::create_dir_all(&base).unwrap();
             let home = tempfile::tempdir_in(base).unwrap();
             let owner = OutsideOwner::new_at(home.path(), at(0, 1));

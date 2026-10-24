@@ -2065,7 +2065,12 @@ mod tests {
     }
 
     fn directory() -> tempfile::TempDir {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/observability-tests");
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/observability-tests");
         fs::create_dir_all(&base).unwrap();
         tempfile::tempdir_in(base).unwrap()
     }
@@ -2873,8 +2878,5 @@ mod tests {
         assert_eq!(body[0], b'{');
     }
     #[cfg(windows)]
-    mod windows_only {
-        use super::*;
-        include!("platform/windows/observability_tests.rs");
-    }
+    mod windows_only;
 }

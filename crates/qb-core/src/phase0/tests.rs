@@ -2,7 +2,12 @@ use super::*;
 use axum::{body::Body, response::Response};
 
 fn directory() -> tempfile::TempDir {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/phase0-tests");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".sandbox/phase0-tests");
     std::fs::create_dir_all(&root).unwrap();
     tempfile::tempdir_in(root).unwrap()
 }

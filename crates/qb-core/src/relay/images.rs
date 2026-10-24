@@ -1101,7 +1101,11 @@ mod tests {
     impl ImageAdmissionFixture {
         fn new() -> Self {
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/n10-image-admission");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/n10-image-admission");
             std::fs::create_dir_all(&base).unwrap();
             let root = tempfile::tempdir_in(base).unwrap();
             let imports = root.path().join("imports");
@@ -1126,7 +1130,7 @@ mod tests {
                 selectors.push(format!("codex:{email}"));
             }
             let store = AccountStore::acquire(&root.path().join("home")).unwrap();
-            crate::accounts::import::run(&store, &imports, &selectors, false).unwrap();
+            crate::platform::seed_account_fixtures(&store, &imports, &selectors, false).unwrap();
             let ids: Vec<_> = store.list().unwrap().into_iter().map(|a| a.id).collect();
             for id in &ids {
                 store

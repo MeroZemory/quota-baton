@@ -3070,7 +3070,11 @@ mod issue_operation_binding_tests {
     #[test]
     fn cancellation_behind_actual_binding_gate_prevents_placement() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r11-operation-tests");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
         let table = BindingTable::new(dir.path(), crate::config::RoutingConfig::default()).unwrap();

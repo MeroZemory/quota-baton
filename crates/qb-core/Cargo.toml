@@ -37,7 +37,6 @@ zeroize.workspace = true
 qb-proto.workspace = true
 
 [dev-dependencies]
-qb-tray = { path = "../qb-tray" }
 qb-proto = { workspace = true, features = ["contract-tests"] }
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 quote = "=1.0.47"
@@ -49,11 +48,15 @@ reqwest.workspace = true
 qb-testkit.workspace = true
 http-body-util.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+qb-tray = { path = "../qb-tray" }
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"
+ring = "=0.17.14"
 
 [features]
 default = []

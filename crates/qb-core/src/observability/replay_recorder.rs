@@ -1826,8 +1826,12 @@ mod tests {
         (directory, recorder, archive)
     }
     fn fixture_dir() -> tempfile::TempDir {
-        let root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r142-recorder-fixtures");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r142-recorder-fixtures");
         fs::create_dir_all(&root).unwrap();
         tempfile::tempdir_in(root).unwrap()
     }

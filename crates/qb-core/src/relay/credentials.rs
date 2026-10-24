@@ -1738,7 +1738,11 @@ mod tests {
     fn late_linked_failure_cannot_cool_same_token_after_ownership_change() {
         use crate::accounts::{Identity, ImportMode, SourceMatch};
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r2a-ownership-race");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r2a-ownership-race");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let store = AccountStore::acquire(root.path()).unwrap();
@@ -1842,7 +1846,11 @@ mod tests {
     async fn r4_unavailable_auth_cools_model_eligible_account_and_guards_token() {
         use crate::accounts::{Identity, TokenMeta, UserState};
         let sandbox = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/hardening-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/hardening-fixtures");
         std::fs::create_dir_all(&sandbox).unwrap();
         let root = tempfile::tempdir_in(sandbox).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);

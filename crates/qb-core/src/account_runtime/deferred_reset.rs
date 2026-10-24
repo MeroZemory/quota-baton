@@ -1223,7 +1223,11 @@ mod tests {
         }
         fn with_reset_hold(reset_hold_secs: u64) -> Self {
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/r13-part-c/n5d-native/fixtures");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/r13-part-c/n5d-native/fixtures");
             std::fs::create_dir_all(&base).unwrap();
             let home = tempfile::tempdir_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -2047,9 +2051,17 @@ mod tests {
         };
         let wait_bound =
             wake.saturating_duration_since(Instant::now()) + std::time::Duration::from_secs(5);
-        tokio::time::timeout(wait_bound, tokio::time::sleep_until(wake))
-            .await
-            .unwrap();
+        tokio::time::timeout(wait_bound, async {
+            tokio::time::sleep_until(wake).await;
+            // The production monotonic wake and wall reset are sampled
+            // separately. Wait for both clocks without changing either bound.
+            while Utc::now() < reset_at {
+                let remaining = (reset_at - Utc::now()).to_std().unwrap_or_default();
+                tokio::time::sleep(remaining).await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(Utc::now() >= reset_at);
         (wake, reset_at)
     }

@@ -1174,6 +1174,7 @@ dependencies = [
  "quote",
  "rand 0.9.2",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

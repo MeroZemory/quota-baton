@@ -683,6 +683,7 @@ fn finish_prepare(
             .ok_or(TakeoverError::Invalid)?,
         deps.source.now().format("%Y%m%d")
     ));
+    let protected_tokens = store.protect_takeover_tokens(&account.id, &tokens)?;
     Ok(Preparation::Commit(Box::new(Journal {
         schema: 1,
         operation: digest(inspect_digest.as_bytes()),
@@ -695,7 +696,7 @@ fn finish_prepare(
         destination,
         account,
         expected,
-        protected_tokens: Some(AccountStore::protect_takeover_tokens(&tokens)?),
+        protected_tokens: Some(protected_tokens),
         retired: false,
         retirement_started: false,
         superseded: false,

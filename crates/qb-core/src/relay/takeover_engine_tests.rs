@@ -84,7 +84,11 @@ impl EngineFixture {
     fn with_expiry(hours: i64) -> Self {
         use sha2::Digest;
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/staging/r6-core/engine-homes");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/staging/r6-core/engine-homes");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(root.path()).unwrap());

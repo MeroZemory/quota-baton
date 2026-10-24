@@ -453,7 +453,11 @@ mod accounting_tests {
     impl Fixture {
         fn new() -> Self {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/r14-ledger-tests");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/r14-ledger-tests");
             std::fs::create_dir_all(&root).unwrap();
             let home = tempfile::tempdir_in(root).unwrap();
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
@@ -821,7 +825,11 @@ mod admission_tests {
     #[test]
     fn attempt_bookkeeping_never_admits_a_binding_or_spends_a_dispatch_receipt() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/ledger-admission");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/ledger-admission");
         std::fs::create_dir_all(&base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
         let table = crate::bindings::BindingTable::new(
@@ -874,8 +882,12 @@ mod timeout_phase_tests {
 
     #[test]
     fn r13_g_completion_drop_keeps_phase_only_for_a_real_timeout() {
-        let root =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-g-ledger");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r13-g-ledger");
         std::fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let obs = Arc::new(Observability::new(home.path(), None).unwrap());

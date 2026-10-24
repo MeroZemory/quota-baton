@@ -95,6 +95,7 @@ fn sensitive(name: &str) -> bool {
 }
 
 pub fn init(home: &Path) -> anyhow::Result<WorkerGuard> {
+    crate::platform::prepare_runtime_home(home)?;
     let writer = RollingLog::new(home.join("logs"))?;
     let (writer, guard) = tracing_appender::non_blocking(writer);
     let file = tracing_subscriber::fmt::layer()
@@ -168,11 +169,10 @@ impl RollingLog {
                 self.sequence
             );
             self.sequence += 1;
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(self.directory.join(filename))
-            {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            crate::platform::configure_secret_open(&mut options);
+            match options.open(self.directory.join(filename)) {
                 Ok(file) => {
                     self.file = Some(file);
                     self.size = 0;

@@ -155,7 +155,12 @@ mod tests {
 
     #[test]
     fn n6t_pin_owner_veto_precedes_policy_publication_and_move_charge() {
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/n6t-pin");
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/n6t-pin");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let table =

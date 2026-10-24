@@ -474,7 +474,11 @@ mod tests {
         }
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/ws-capacity-tests");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/ws-capacity-tests");
         std::fs::create_dir_all(&root).unwrap();
         for case in ["wrong_target", "wrong_source", "dead_reservation"] {
             let home = tempfile::tempdir_in(&root).unwrap();
@@ -702,7 +706,11 @@ mod tests {
             bindings::{BindingTable, Candidate, Decision, DispatchAdmission, MoveObservations},
         };
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/ws-capacity-tests");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/ws-capacity-tests");
         std::fs::create_dir_all(&root).unwrap();
         let home = tempfile::tempdir_in(root).unwrap();
         let table =

@@ -330,8 +330,12 @@ fn scan_with(
 mod tests {
     use super::*;
     fn fixture() -> tempfile::TempDir {
-        let base =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r7-filename-tests");
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/r7-filename-tests");
         fs::create_dir_all(&base).unwrap();
         tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap()
     }

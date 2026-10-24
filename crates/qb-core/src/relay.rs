@@ -3460,7 +3460,11 @@ mod tests {
     async fn n6t_selected_successor_retires_failure_before_independent_recovery() {
         use super::*;
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/n6t-successor");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/n6t-successor");
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let cpa = root.path().join("cpa");
@@ -3476,7 +3480,7 @@ mod tests {
             activate.push(format!("codex:{email}"));
         }
         let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
-        crate::accounts::import::run(&store, &cpa, &activate, false).unwrap();
+        crate::platform::seed_account_fixtures(&store, &cpa, &activate, false).unwrap();
         let obs = Arc::new(Observability::new(store.home(), None).unwrap());
         let mut config = Config::default();
         config.upstream.codex_base = "http://127.0.0.1:9".into();
@@ -3633,7 +3637,11 @@ mod tests {
         use serde_json::{Value, json};
         for exclude_all in [false, true] {
             let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.sandbox/r1-tray2-fixtures");
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/r1-tray2-fixtures");
             std::fs::create_dir_all(&base).unwrap();
             let root = tempfile::tempdir_in(base).unwrap();
             let cpa = root.path().join("cpa");
@@ -3649,7 +3657,7 @@ mod tests {
                 activate.push(format!("codex:{email}"));
             }
             let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
-            crate::accounts::import::run(&store, &cpa, &activate, false).unwrap();
+            crate::platform::seed_account_fixtures(&store, &cpa, &activate, false).unwrap();
             let fake = ScriptedUpstream::start().await.unwrap();
             let mut config = Config::default();
             config.server.data_port = 0;
@@ -3774,7 +3782,11 @@ mod tests {
             session::Session,
         };
         let sandbox = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/hardening-fixtures");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/hardening-fixtures");
         std::fs::create_dir_all(&sandbox).unwrap();
         let root = tempfile::tempdir_in(sandbox).unwrap();
         let cpa = root.path().join("cpa");
@@ -3794,7 +3806,7 @@ mod tests {
                 Err(error) => panic!("synthetic fixture lease: {error}"),
             }
         };
-        crate::accounts::import::run(
+        crate::platform::seed_account_fixtures(
             &store,
             &cpa,
             &["codex:placement@example.invalid".into()],

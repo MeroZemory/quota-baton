@@ -746,7 +746,12 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/a1");
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".sandbox/a1");
             std::fs::create_dir_all(&root).unwrap();
             let dir = tempfile::tempdir_in(root).unwrap();
             let obs = Arc::new(Observability::new(dir.path(), None).unwrap());
