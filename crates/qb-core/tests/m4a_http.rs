@@ -6234,6 +6234,14 @@ async fn r15_real_core_state_shared_envelope_reserializes_without_top_level_loss
     let body = response.bytes().await.unwrap();
     let original: Value = serde_json::from_slice(&body).unwrap();
     type Envelope = qb_proto::AdminState<Value, Value, Value>;
+    type TypedEnvelope = qb_proto::AdminState<
+        qb_proto::AdminAccount,
+        qb_proto::admin_warning::AdminWarning,
+        qb_proto::admin_pool::AdminPools,
+    >;
+    let typed: TypedEnvelope = serde_json::from_slice(&body).unwrap();
+    assert_eq!(serde_json::to_vec(&typed).unwrap().as_slice(), &body[..]);
+    assert_eq!(typed.accounts.len(), 1);
     let shared: Envelope = serde_json::from_slice(&body).unwrap();
     let serialized = serde_json::to_vec(&shared).unwrap();
     let decoded: Value = serde_json::from_slice(&serialized).unwrap();

@@ -6,7 +6,7 @@ use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{AdminClient, HealthResponse, TraySnapshot};
+use super::{AdminClient, HealthResponse, PresentationSnapshot as TraySnapshot};
 use qb_tray::dashboard_model::{
     ActivityResponse, DashboardSnapshot, SessionsResponse, UsageHistory,
 };
@@ -164,7 +164,8 @@ pub fn encode(bundle: &SnapshotBundleV1) -> anyhow::Result<Vec<u8>> {
 }
 
 impl SnapshotBundleV1 {
-    /// The exact TraySnapshot serialization -> v2 path used by live polling.
+    /// Project the explicitly sanitized legacy archive shape. Raw live polling
+    /// retains the complete typed account and object source separately.
     pub fn project(&self, now: SystemTime) -> anyhow::Result<DashboardSnapshot> {
         self.validate()?;
         let bytes = serialize_limited(&self.state, MAX_COMPONENT_BYTES, true)?;

@@ -1,6 +1,6 @@
 //! Typed worker-to-shell notice projection. No raw core errors or upstream bodies.
 use crate::{
-    client::TraySnapshot,
+    client::PresentationSnapshot as TraySnapshot,
     tray_icon::{
         pixels::Badge,
         signals::{self, Kind, Signal, Subject},
@@ -97,7 +97,7 @@ fn target(signal: Signal<'_>) -> Target {
 
 fn account_message(
     snapshot: &TraySnapshot,
-    account: &crate::client::TrayAccount,
+    account: &crate::client::PresentationAccount,
     kind: Kind,
     wall: SystemTime,
 ) -> (String, String) {
