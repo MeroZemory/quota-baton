@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N8/R15 라우팅·가져오기 집중 통과, 갱신·SSE·정적 검사 통합 중
+현재 마일스톤: N8/R15 주요 응답 공유 계약 집중 통과, 정적 검사·최종 계약 통합 중
 목표: CLI·tray·dashboard의 제공자 요약을 한 계산으로 맞추고 검증 없는 통합 잔여시간을 표시하지 않기
 핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); pooled 실제 보정·백테스트 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 14:55 KST (관리 응답 계약 집중 검증; 최종 관문 별도)
+갱신: 2026-10-24 15:04 KST (실제 계정 작업·SSE 전송 통과; 전체 관문 별도)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -480,6 +480,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 14:34 | R15 action·error 공유 응답 | proto57·실제 m4b77·m0 HTTP9·보호 admin1·strict lint/fmt/diff0 | 기존 성공/오류 키 순서·null/생략·인증 거절 유지 | 022d13f; action-error-fingerprint.json. 독립 source PASS; 나머지 이력·응답·최종 관문 별도 |
 | 2026-10-24 14:41 | R15 실제 이력 공유 계약 | proto60·core2·tray3·실제 HTTP1·snapshot5·R7HTTP5·provider4·dashboard bin6·strict lint/fmt/diff0 | sparse omission·null gap/open span·archive 호환 분리 | b0b471d; history-response-fingerprint.json. 제네릭 bound 지적 보완; 잘못된 lib filter0 제외 후 bin6 확인. 최종 관문 별도 |
 | 2026-10-24 14:55 | R15 소유권·생명주기·라우팅·가져오기 공유 계약 | 실제 보호 HTTP·CLI·proto 집중 검사와 strict lint/fmt/diff 통과 | 원본 실패 보존; 저장 API fixture와 writer 종료 순서 수정 | control-adoption-fingerprint.json 및 routing-import-fingerprint.json; 전체 R15 관문 별도 |
+| 2026-10-24 15:04 | R15 갱신·인수·진단·SSE 공유 계약 | 실제 AdminClient 계정 작업1·core SSE4·tray SSE8·실제 수동갱신1·사용량1·phase0 HTTP1·인수 client3·strict lint0 | 동일 실제 응답 바이트 보존; 0선택 lib filter 제외 | aa0d278; remaining-responses-fingerprint.json; 실제 인수 교차 client와 최종 관문 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
