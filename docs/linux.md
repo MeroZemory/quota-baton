@@ -208,6 +208,9 @@ PKCE checks are shared with the browser flow. Invalid or reused input requires a
 new login. An explicitly requested paste fallback gets a new ten-minute budget;
 device polling never extends the device code's expiry. Ctrl+C cancels the pending
 login and releases a standalone CLI's account-store lease.
+If standard input closes without a code, the CLI cancels the pending login and
+says that no code was entered and account information was unchanged once
+cancellation is confirmed. If authentication completed first, it reports success.
 The usual login without `--no-browser` retains the browser and loopback callback
 flow.
 
