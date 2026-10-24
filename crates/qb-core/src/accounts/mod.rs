@@ -10,13 +10,20 @@ pub mod import;
 mod lease;
 pub mod linked;
 pub mod login;
+#[cfg(windows)]
 pub(crate) mod shared_profile;
 mod store;
-#[cfg(not(feature = "testkit"))]
+#[cfg(all(windows, not(feature = "testkit")))]
 pub(crate) mod takeover;
+mod takeover_receipt;
+// Explicit testkit retains the injected, platform-independent transaction API.
+// Native client source adapters remain selected separately below.
 #[cfg(feature = "testkit")]
 #[doc(hidden)]
 pub mod takeover;
+#[cfg(all(unix, not(feature = "testkit")))]
+#[path = "../platform/unix/takeover/accounts.rs"]
+pub(crate) mod takeover;
 #[cfg(windows)]
 pub(crate) mod takeover_native;
 #[cfg(unix)]

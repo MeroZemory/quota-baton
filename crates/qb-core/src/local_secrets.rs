@@ -45,4 +45,6 @@ fn load_file(path: &Path) -> anyhow::Result<String> {
     crate::platform::load_secret_file(path)
 }
 
+// Common unit fixtures validate permissions through the native helper.
+#[cfg(test)]
 pub(crate) use crate::platform::restrict;

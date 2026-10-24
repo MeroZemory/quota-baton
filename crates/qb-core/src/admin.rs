@@ -22,6 +22,8 @@ pub struct LoginRequest {
     pub replace_linked: bool,
     #[serde(default)]
     pub no_browser: bool,
+    #[serde(default)]
+    pub paste_redirect: bool,
 }
 
 pub fn login_routes(service: crate::oauth::LoginService) -> Router {
@@ -48,7 +50,14 @@ async fn start_login(
     let Ok(Json(request)) = request else {
         return error(StatusCode::BAD_REQUEST, "로그인 요청이 올바르지 않습니다.");
     };
-    let started = if request.no_browser {
+    if request.paste_redirect
+        && (!request.no_browser || request.provider != crate::accounts::Provider::Codex)
+    {
+        return error(StatusCode::BAD_REQUEST, "로그인 요청이 올바르지 않습니다.");
+    }
+    let started = if request.paste_redirect {
+        service.start_paste_redirect(request.replace_linked).await
+    } else if request.no_browser {
         service
             .start_manual(request.provider, request.replace_linked)
             .await
@@ -134,35 +143,16 @@ fn error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-#[derive(Clone)]
-struct RuntimeAdmin {
-    relay: Arc<crate::relay::RelayState>,
-    data_port: u16,
-    #[cfg(feature = "testkit")]
-    adoption_probe: Option<fn() -> source_features::ProbeState>,
-}
-
-pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> Router {
-    runtime_router(RuntimeAdmin {
-        relay,
-        data_port,
-        #[cfg(feature = "testkit")]
-        adoption_probe: None,
-    })
-}
-
+#[cfg(windows)]
+#[path = "admin/runtime_windows.rs"]
+mod runtime_state;
+#[cfg(unix)]
+#[path = "platform/unix/admin_runtime.rs"]
+mod runtime_state;
+use runtime_state::RuntimeAdmin;
+pub use runtime_state::runtime_routes;
 #[cfg(feature = "testkit")]
-pub fn runtime_routes_with_adoption_probe(
-    relay: Arc<crate::relay::RelayState>,
-    data_port: u16,
-    probe: fn() -> source_features::ProbeState,
-) -> Router {
-    runtime_router(RuntimeAdmin {
-        relay,
-        data_port,
-        adoption_probe: Some(probe),
-    })
-}
+pub use runtime_state::runtime_routes_with_adoption_probe;
 
 fn runtime_router(state: RuntimeAdmin) -> Router {
     source_features::runtime_routes(

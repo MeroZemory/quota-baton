@@ -1,6 +1,7 @@
 //! Owned OAuth login. This module never opens a browser or logs callback URLs.
 mod callback;
 pub(crate) mod claude_profile;
+mod device;
 mod exchange;
 mod manual;
 mod parameters;
@@ -9,10 +10,13 @@ use crate::account_runtime::AccountRuntime;
 use crate::accounts::{AccountStore, Provider};
 use crate::observability::Observability;
 use parameters::Parameters;
-pub use qb_proto::admin_login::{LoginStart, LoginState, LoginStatus};
+pub use qb_proto::admin_login::{DevicePrompt, LoginStart, LoginState, LoginStatus};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::watch;
@@ -31,6 +35,14 @@ pub enum LoginError {
     NotFound,
     #[error("이 로그인 요청은 수동 입력을 받지 않습니다.")]
     NotManual,
+    #[error(
+        "Device-code login is unavailable. Enable it in ChatGPT Security settings (personal account), or ask your workspace admin to allow it. You can use paste-redirect login instead."
+    )]
+    DeviceUnavailable,
+    #[error(
+        "Device-code login was rate limited. No new code was requested. You can use paste-redirect login instead."
+    )]
+    DeviceRateLimited,
     #[error("이미 로그인 입력을 제출했습니다. 로그인을 다시 시작해 주세요.")]
     AlreadySubmitted,
     #[error("로그인 요청이 만료되었습니다. 로그인을 다시 시작해 주세요.")]
@@ -64,6 +76,11 @@ struct Session {
     manual: Option<manual::Submission>,
 }
 
+enum LoginInput {
+    Callback(manual::Input),
+    Device(device::Authorization),
+}
+
 const TERMINAL_RETENTION: Duration = Duration::from_secs(600);
 
 fn prune_sessions(sessions: &mut HashMap<String, Arc<Session>>) {
@@ -88,8 +105,11 @@ struct Inner {
     obs: Arc<Observability>,
     runtime: Mutex<Option<Arc<AccountRuntime>>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    cancel_generation: AtomicU64,
     #[cfg(all(feature = "testkit", debug_assertions))]
     test: Option<LoginTestConfig>,
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    device_test: Option<DeviceTestConfig>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -108,8 +128,11 @@ impl LoginService {
                 obs,
                 runtime: Mutex::new(None),
                 sessions: Mutex::new(HashMap::new()),
+                cancel_generation: AtomicU64::new(0),
                 #[cfg(all(feature = "testkit", debug_assertions))]
                 test: None,
+                #[cfg(all(feature = "testkit", debug_assertions))]
+                device_test: None,
             }),
         }
     }
@@ -129,14 +152,27 @@ impl LoginService {
         self.start_mode(provider, replace_linked, false).await
     }
 
-    /// Start a paste flow without binding a callback listener. Claude uses its
-    /// provider paste page; Codex keeps its registered localhost callback URI.
+    /// No callback bind: Claude paste-code; Codex device authorization.
     pub async fn start_manual(
         &self,
         provider: Provider,
         replace_linked: bool,
     ) -> Result<LoginStart, LoginError> {
-        self.start_mode(provider, replace_linked, true).await
+        match provider {
+            Provider::Claude => self.start_mode(provider, replace_linked, true).await,
+            Provider::Codex => {
+                let params = self.parameters(provider)?;
+                self.start_device_parameters(params, replace_linked).await
+            }
+        }
+    }
+
+    /// Explicit Codex fallback; never requests another device code.
+    pub async fn start_paste_redirect(
+        &self,
+        replace_linked: bool,
+    ) -> Result<LoginStart, LoginError> {
+        self.start_mode(Provider::Codex, replace_linked, true).await
     }
 
     /// Submit once; poll `status` for exchange/persistence completion. Even an
@@ -158,6 +194,11 @@ impl LoginService {
         manual: bool,
     ) -> Result<LoginStart, LoginError> {
         prune_sessions(&mut self.inner.sessions.lock().unwrap());
+        let params = self.parameters(provider)?;
+        self.start_parameters(params, replace_linked, manual).await
+    }
+
+    fn parameters(&self, provider: Provider) -> Result<Parameters, LoginError> {
         let params = Parameters::new(provider);
         #[cfg(all(feature = "testkit", debug_assertions))]
         let params = {
@@ -165,19 +206,59 @@ impl LoginService {
             if let Some(test) = &self.inner.test {
                 params.apply_test(test)?;
             }
+            if let Some(test) = &self.inner.device_test {
+                params.device_code = test.usercode_url.clone();
+                params.device_token = test.poll_url.clone();
+                params.device_interval = Some(test.poll_interval);
+                params.device_lifetime = test.lifetime;
+            }
             params
         };
-        self.start_parameters(params, replace_linked, manual).await
+        Ok(params)
+    }
+
+    async fn start_device_parameters(
+        &self,
+        params: Parameters,
+        replace_linked: bool,
+    ) -> Result<LoginStart, LoginError> {
+        // No task/session is published before this single request finishes.
+        // Dropping start cancels the actual request, without a hidden poller.
+        let generation = self.inner.cancel_generation.load(Ordering::Acquire);
+        let authorization = device::request(&self.inner.client, &params).await?;
+        self.start_prepared(
+            params,
+            replace_linked,
+            true,
+            Some((authorization, generation)),
+        )
+        .await
     }
 
     async fn start_parameters(
         &self,
-        mut params: Parameters,
+        params: Parameters,
         replace_linked: bool,
         manual: bool,
     ) -> Result<LoginStart, LoginError> {
+        self.start_prepared(params, replace_linked, manual, None)
+            .await
+    }
+
+    async fn start_prepared(
+        &self,
+        mut params: Parameters,
+        replace_linked: bool,
+        manual: bool,
+        device: Option<(device::Authorization, u64)>,
+    ) -> Result<LoginStart, LoginError> {
+        let generation = device.as_ref().map(|(_, generation)| *generation);
+        let device = device.map(|(authorization, _)| authorization);
+        prune_sessions(&mut self.inner.sessions.lock().unwrap());
         let provider = params.provider;
-        if manual {
+        if device.is_some() {
+            params.use_device_redirect();
+        } else if manual {
             params.use_manual_redirect();
         }
         let login_id = parameters::random_secret();
@@ -199,7 +280,11 @@ impl LoginService {
         }
         let state = zeroize::Zeroizing::new(parameters::random_secret());
         let verifier = zeroize::Zeroizing::new(parameters::random_secret());
-        let auth_url = params.auth_url(&state, &verifier);
+        let prompt = device.as_ref().map(device::Authorization::prompt);
+        let auth_url = match &prompt {
+            Some(prompt) => prompt.verification_url.clone(),
+            None => params.auth_url(&state, &verifier),
+        };
         let pending = LoginStatus {
             status: LoginState::Pending,
             account_id: None,
@@ -207,12 +292,22 @@ impl LoginService {
         };
         let (status, _) = watch::channel(pending);
         let (cancel, mut cancelled) = watch::channel(false);
-        let expires = tokio::time::Instant::now() + Duration::from_secs(600);
-        let (manual, input) = match listeners {
-            Some(listeners) => (None, manual::Input::Browser(listeners)),
-            None => {
+        let expires = device.as_ref().map_or_else(
+            || tokio::time::Instant::now() + Duration::from_secs(600),
+            |authorization| authorization.expires,
+        );
+        let (manual, input) = match (device, listeners) {
+            (Some(authorization), _) => (None, LoginInput::Device(authorization)),
+            (_, Some(listeners)) => (
+                None,
+                LoginInput::Callback(manual::Input::Browser(listeners)),
+            ),
+            (_, None) => {
                 let (submission, receiver) = manual::Submission::new(&params, &state, expires);
-                (Some(submission), manual::Input::Manual(receiver))
+                (
+                    Some(submission),
+                    LoginInput::Callback(manual::Input::Manual(receiver)),
+                )
             }
         };
         let session = Arc::new(Session {
@@ -221,11 +316,17 @@ impl LoginService {
             finished_at: Mutex::new(None),
             manual,
         });
-        self.inner
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(login_id.clone(), session.clone());
+        {
+            let mut sessions = self.inner.sessions.lock().unwrap();
+            // Serialize initial-device publication against cancel_all. An
+            // initial HTTP request cannot publish a new poller after shutdown.
+            if generation.is_some_and(|generation| {
+                generation != self.inner.cancel_generation.load(Ordering::Acquire)
+            }) {
+                return Err(LoginError::Cancelled);
+            }
+            sessions.insert(login_id.clone(), session.clone());
+        }
         let store = self.inner.store.clone();
         let client = self.inner.client.clone();
         let obs = self.inner.obs.clone();
@@ -242,7 +343,14 @@ impl LoginService {
             tokio::pin!(deadline);
             let outcome = {
                 let flow = async {
-                    let code = input.code(&params, &state).await?;
+                    let (code, verifier) = match input {
+                        LoginInput::Callback(input) => {
+                            (input.code(&params, &state).await?, verifier)
+                        }
+                        LoginInput::Device(authorization) => {
+                            device::poll(&client, &params, authorization).await?
+                        }
+                    };
                     let (account, tokens) = tokio::time::timeout(
                         Duration::from_secs(30),
                         exchange::exchange(&client, &params, &code, &verifier, &state),
@@ -283,6 +391,7 @@ impl LoginService {
                     _ = &mut deadline => LoginStatus { status: LoginState::Expired, account_id: None, error: None },
                     result = &mut flow => match result {
                         Ok(id) => LoginStatus { status: LoginState::Completed, account_id: Some(id), error: None },
+                        Err(LoginError::Expired) => LoginStatus { status: LoginState::Expired, account_id: None, error: None },
                         Err(error) => LoginStatus { status: LoginState::Failed, account_id: None, error: Some(error.to_string()) },
                     },
                 }
@@ -296,7 +405,11 @@ impl LoginService {
             *session.finished_at.lock().unwrap() = Some(tokio::time::Instant::now());
             session.status.send_replace(outcome);
         });
-        Ok(LoginStart { login_id, auth_url })
+        Ok(LoginStart {
+            login_id,
+            auth_url,
+            device: prompt,
+        })
     }
 
     pub async fn status(&self, login_id: &str) -> Result<LoginStatus, LoginError> {
@@ -322,14 +435,11 @@ impl LoginService {
 
     /// Await listener release before dropping the credential lease on shutdown.
     pub async fn cancel_all(&self) {
-        let sessions: Vec<_> = self
-            .inner
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
+        let sessions: Vec<_> = {
+            let sessions = self.inner.sessions.lock().unwrap();
+            self.inner.cancel_generation.fetch_add(1, Ordering::AcqRel);
+            sessions.values().cloned().collect()
+        };
         for session in &sessions {
             let _ = session.cancel.send(true);
         }
@@ -357,6 +467,56 @@ mod session_fixes_tests;
 #[cfg(test)]
 #[path = "oauth/manual_tests.rs"]
 mod manual_tests;
+
+#[cfg(test)]
+#[path = "oauth/device_tests.rs"]
+mod device_tests;
+
+#[cfg(all(feature = "testkit", debug_assertions))]
+#[derive(Clone)]
+pub struct DeviceTestConfig {
+    pub usercode_url: String,
+    pub poll_url: String,
+    pub poll_interval: Duration,
+    pub lifetime: Duration,
+}
+
+#[cfg(all(feature = "testkit", debug_assertions))]
+impl LoginService {
+    pub fn with_device_test_config(mut self, test: DeviceTestConfig) -> Result<Self, LoginError> {
+        for endpoint in [&test.usercode_url, &test.poll_url] {
+            let url = reqwest::Url::parse(endpoint).map_err(|_| LoginError::InvalidTestEndpoint)?;
+            let ip = url
+                .host_str()
+                .ok_or(LoginError::InvalidTestEndpoint)?
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| LoginError::InvalidTestEndpoint)?;
+            if !ip.is_loopback()
+                || url.scheme() != "http"
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || matches!(url.port_or_known_default(), Some(10100 | 10101))
+            {
+                return Err(LoginError::InvalidTestEndpoint);
+            }
+        }
+        if test.poll_interval.is_zero()
+            || test.poll_interval > Duration::from_secs(60)
+            || test.lifetime.is_zero()
+            || test.lifetime > Duration::from_secs(900)
+        {
+            return Err(LoginError::InvalidTestEndpoint);
+        }
+        Arc::get_mut(&mut self.inner)
+            .ok_or(LoginError::InvalidTestEndpoint)?
+            .device_test = Some(test);
+        Ok(self)
+    }
+}
 
 #[cfg(all(feature = "testkit", debug_assertions))]
 #[derive(Clone)]

@@ -818,10 +818,10 @@ pub(crate) async fn handle_takeover(home: &Path, config: &Config, takeover: bool
         }
         drop(response);
         loop {
-            if let Ok(current) = health(&client, &base, &token).await {
-                if successor(&old, &current)? {
-                    return Ok(true);
-                }
+            if let Ok(current) = health(&client, &base, &token).await
+                && successor(&old, &current)?
+            {
+                return Ok(true);
             }
             sleep(POLL_INTERVAL).await;
         }
