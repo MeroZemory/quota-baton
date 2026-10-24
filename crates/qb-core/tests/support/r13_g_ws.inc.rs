@@ -1,4 +1,5 @@
 include!("r13_g_capacity.inc.rs");
+include!("r13_h_capacity.inc.rs");
 
 #[cfg(feature = "testkit")]
 mod r13_g {

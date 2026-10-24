@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
+async fn r13_h_four_bound_sessions_keep_source_and_all_fall_back_at_cap() {
     let h = Harness::new_with_options(2, false, false, None, Some((30, 2))).await;
     h.fake.state.keep_old_connections();
     let source = h.ids[0].clone();
@@ -36,6 +36,12 @@ async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
         .observe_headers(&target, Provider::Codex, &headers)
         .await;
     let waits_before = h.state.ws_capacity_waits_for_test();
+    let dials_before = h.fake.state.requests().len();
+    let moves_before = h
+        .ledger()
+        .iter()
+        .filter(|row| row["event"] == "binding_move")
+        .count();
     let pending: Vec<_> = sessions
         .iter()
         .map(|session| {
@@ -43,7 +49,6 @@ async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
             tokio::spawn(async move { connect_async(request).await })
         })
         .collect();
-    let mut landed = Vec::new();
     let mut http_fallbacks = 0;
     for request in pending {
         let result = tokio::time::timeout(Duration::from_secs(4), request)
@@ -51,23 +56,34 @@ async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
             .unwrap()
             .unwrap();
         match result {
-            Ok((socket, response)) => {
-                assert_eq!(response.headers()["x-quota-baton-account"], target.as_str());
-                landed.push(socket);
+            Ok((mut socket, _)) => {
+                let _ = socket.close(None).await;
+                panic!("bound capped session must return HTTP fallback without migration");
             }
             Err(Error::Http(response)) => {
                 assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+                let body: Value =
+                    serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
+                assert_eq!(body["error"]["type"], "websocket_capacity");
                 http_fallbacks += 1;
             }
             Err(other) => panic!("unexpected synthetic upgrade result: {other}"),
         }
     }
+    assert_eq!(http_fallbacks, sessions.len());
     assert_eq!(
-        landed.len(),
-        1,
-        "one successful spill, not a vacuous all-refused cap"
+        h.fake.state.requests().len(),
+        dials_before,
+        "known bound cap must not dial any destination"
     );
-    assert_eq!(http_fallbacks, 3);
+    assert_eq!(
+        h.ledger()
+            .iter()
+            .filter(|row| row["event"] == "binding_move")
+            .count(),
+        moves_before,
+        "capacity fallback must not publish binding_move"
+    );
     assert!(
         h.state.ws_capacity_waits_for_test() >= waits_before + 4,
         "each existing session must first wait on its source slot"
@@ -80,15 +96,13 @@ async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
                 .bindings
                 .current(Some(&format!("codex:{session}")))
                 .as_deref()
-                == Some(target.as_str()))
+                == Some(source.as_str()))
             .count(),
-        1,
-        "denied spill admission cannot publish a moved binding"
+        sessions.len(),
+        "every existing session must preserve its original binding"
     );
     assert_eq!(h.store.load(&source).unwrap().health, Health::Ready);
     assert_eq!(h.store.load(&target).unwrap().health, Health::Ready);
-    for socket in &mut landed {
-        socket.close(None).await.unwrap();
-    }
+    assert_eq!(h.state.ws_reserved_for_test(&target), 0);
     occupied.close(None).await.unwrap();
 }

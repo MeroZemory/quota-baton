@@ -1,6 +1,7 @@
 //! Process-local capacity-spill admission, serialized with binding publication.
 use super::*;
 
+#[cfg(test)]
 pub(crate) struct CapacitySpillPermit {
     table: std::sync::Weak<BindingTable>,
     target: String,
@@ -9,12 +10,14 @@ pub(crate) struct CapacitySpillPermit {
     committed: bool,
 }
 
+#[cfg(test)]
 impl CapacitySpillPermit {
     pub(crate) fn commit(mut self) {
         self.committed = true;
     }
 }
 
+#[cfg(test)]
 impl Drop for CapacitySpillPermit {
     fn drop(&mut self) {
         if self.committed {
@@ -91,6 +94,7 @@ impl BindingTable {
 
     /// Called from the selector's admission callback while mutations is held.
     /// Never treats a timer, cached candidate or reset as fresh usage evidence.
+    #[cfg(test)]
     pub(crate) fn admit_capacity_spill(
         self: &Arc<Self>,
         key: Option<&str>,

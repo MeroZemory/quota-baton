@@ -893,21 +893,37 @@ impl BindingTable {
             coverage: previous.as_ref().filter(|_| !model_move).map(|_| &coverage),
             model_move,
         };
+        let entitled_targets: BTreeSet<_> = sources
+            .iter()
+            .filter(|c| {
+                model.as_deref().is_none_or(|m| {
+                    entitlements
+                        .get(&c.account.id)
+                        .is_some_and(|models| models.contains(m))
+                })
+            })
+            .map(|c| c.account.id.clone())
+            .collect();
+        let mut sole_target = None;
         let (account, reason) = if usable && !model_move {
             (previous.clone().unwrap(), "launch_resume")
         } else {
-            let (choice, _) = self.select_ordered(
+            let (choice, _, sole) = self.select_with_return_guard(
                 &d,
                 Provider::Codex,
                 Some(&key),
                 None,
                 model.as_deref(),
                 &filtered,
+                sources,
+                Some(&entitled_targets),
+                observations,
                 None,
                 now,
                 false,
                 Some(&preference),
             );
+            sole_target = sole;
             match choice {
                 PreviewDecision::Selected { account } => (
                     account,
@@ -981,6 +997,7 @@ impl BindingTable {
                     .as_deref()
                     .and_then(|id| sources.iter().find(|c| c.account.id == id)),
                 candidates,
+                sole_target.as_ref(),
                 observations,
                 model.as_deref(),
                 reason,
@@ -2962,6 +2979,84 @@ mod r11_active_adoption_tests {
                 Some("m1")
             );
             assert_eq!(table.policies.list(), policies);
+        }
+    }
+    #[test]
+    fn r13_h_managed_return_uses_entitlement_filtered_full_sources() {
+        for alternative_entitled in [false, true] {
+            let (_home, table, mut cs, mut es) = fixture(Mode::Recover);
+            place(&table, &cs, &es);
+            table
+                .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            // First move with the existing owner-bound pin fixture.
+            let pins = crate::debug_pin::DebugPins::default();
+            pins.set(Provider::Codex, Some(REAL.into()), "b".into());
+            let pin = pins.selection(Provider::Codex, Some(REAL)).unwrap();
+            let now = Utc::now();
+            let initial = table.choose_with_hold_at_admitted_proof(
+                Provider::Codex,
+                Some(REAL),
+                None,
+                Some("m1"),
+                &cs,
+                &cs,
+                MoveObservations::same(MoveObservation::before_collection()),
+                Some("b"),
+                100,
+                false,
+                false,
+                now,
+                None,
+                |_| Some(DispatchAdmission::ordinary().with_pin(Some(pin))),
+            );
+            match initial {
+                Decision::Selected { account, lease, .. } => {
+                    assert_eq!(account, "b");
+                    lease.dispatched();
+                    drop(lease);
+                }
+                other => panic!("initial move: {other:?}"),
+            }
+            cs[1].account.user_state = UserState::Paused;
+            let mut third = cs[0].clone();
+            third.account.id = "c".into();
+            cs.push(third);
+            es.insert(
+                "c".into(),
+                if alternative_entitled {
+                    BTreeSet::from(["m1".into()])
+                } else {
+                    BTreeSet::from(["m2".into()])
+                },
+            );
+            let resume = LaunchRequest {
+                anchor_key: "launch:r13-h-resume",
+                resume_key: Some(REAL),
+                account_pref: None,
+                ..request(SOURCE)
+            };
+            let placed = table
+                .place_launch_for_issue_admitted(
+                    resume,
+                    &cs,
+                    MoveObservations::same(MoveObservation::before_collection()),
+                    &es,
+                    now,
+                    None,
+                    None,
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(placed.account, if alternative_entitled { "c" } else { "a" });
+            assert_eq!(
+                placed.moves[0].reason,
+                if alternative_entitled {
+                    "forced"
+                } else {
+                    "ping_pong_return_forced_by_unusable_source"
+                }
+            );
         }
     }
 }

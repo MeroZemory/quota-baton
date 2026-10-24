@@ -297,7 +297,13 @@ impl BindingTable {
         if !moving && permit.is_some() {
             return Err(RebindError::Evidence);
         }
-        let label = if moving {
+        let label = if moving
+            && permit
+                .as_ref()
+                .is_some_and(|permit| permit.emergency_return())
+        {
+            "ping_pong_return_forced_by_unusable_source"
+        } else if moving {
             reason.as_ref().unwrap().diagnostic_label(&cx, self, &d)
         } else {
             cx.label
@@ -433,7 +439,8 @@ impl BindingTable {
             let g = group(k);
             let accepted = Self::accepted_in(d, Some(k), account);
             let selected_reason = reason;
-            let reason = if hold_timed_out {
+            let reason = if hold_timed_out && reason != "ping_pong_return_forced_by_unusable_source"
+            {
                 "reset_hold_timeout"
             } else {
                 reason
@@ -964,6 +971,7 @@ mod tests {
                 "sample-target",
                 Some(&sources[0]),
                 &sources,
+                None,
                 MoveObservations::untracked(),
                 None,
                 "forced",
@@ -1068,6 +1076,7 @@ mod tests {
                     "sample-target",
                     Some(&sources[0]),
                     &sources,
+                    None,
                     MoveObservations::untracked(),
                     None,
                     caller_label,
