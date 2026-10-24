@@ -25,7 +25,7 @@ impl std::ops::DerefMut for PresentationSnapshot {
 }
 impl<'de> Deserialize<'de> for PresentationSnapshot {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        qb_proto::admin_state::deserialize_compat(deserializer, false).map(Self)
+        qb_proto::admin_state::deserialize_legacy(deserializer, false).map(Self)
     }
 }
 

@@ -61,7 +61,41 @@ where
     W: Deserialize<'de>,
     P: Deserialize<'de> + Default,
 {
+    deserialize_compat_mode(
+        deserializer,
+        require_accounts,
+        cfg!(any(test, feature = "contract-tests")),
+    )
+}
+
+/// Archived presentation has a separate, deliberate future-field compatibility
+/// policy. Live consumers use deserialize_compat, including strict gate builds.
+pub fn deserialize_legacy<'de, D, A, W, P>(
+    deserializer: D,
+    require_accounts: bool,
+) -> Result<AdminState<A, W, P>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    A: Deserialize<'de>,
+    W: Deserialize<'de>,
+    P: Deserialize<'de> + Default,
+{
+    deserialize_compat_mode(deserializer, require_accounts, false)
+}
+
+fn deserialize_compat_mode<'de, D, A, W, P>(
+    deserializer: D,
+    require_accounts: bool,
+    reject_unknown_fields: bool,
+) -> Result<AdminState<A, W, P>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    A: Deserialize<'de>,
+    W: Deserialize<'de>,
+    P: Deserialize<'de> + Default,
+{
     struct StateVisitor<A, W, P> {
+        reject_unknown_fields: bool,
         require_accounts: bool,
         marker: std::marker::PhantomData<(A, W, P)>,
     }
@@ -100,6 +134,15 @@ where
                     state.$field = $value;
                 }};
             }
+            macro_rules! metric {
+                ($ty:ident) => {
+                    if self.reject_unknown_fields {
+                        map.next_value::<CompatMetric<$ty, true>>()?.0
+                    } else {
+                        map.next_value::<CompatMetric<$ty, false>>()?.0
+                    }
+                };
+            }
             while let Some(field) = map.next_key::<String>()? {
                 match field.as_str() {
                     "pools" => read!(pools, map.next_value()?),
@@ -108,15 +151,32 @@ where
                     "capabilities" => read!(capabilities, map.next_value()?),
                     "accounts" => read!(accounts, map.next_value()?),
                     "inflight" => {
-                        read!(inflight, map.next_value::<CompatMetric<StateInflight>>()?.0)
+                        read!(inflight, metric!(StateInflight))
                     }
-                    "memory" => read!(memory, map.next_value::<CompatMetric<StateMemory>>()?.0),
+                    "memory" => read!(memory, metric!(StateMemory)),
                     "bindings" => {
-                        read!(bindings, map.next_value::<CompatMetric<StateBindings>>()?.0)
+                        read!(bindings, metric!(StateBindings))
                     }
                     "data_port" => read!(data_port, map.next_value()?),
                     "version" => read!(version, map.next_value()?),
                     _ => {
+                        if self.reject_unknown_fields {
+                            return Err(serde::de::Error::unknown_field(
+                                &field,
+                                &[
+                                    "pools",
+                                    "warnings",
+                                    "draining",
+                                    "capabilities",
+                                    "accounts",
+                                    "inflight",
+                                    "memory",
+                                    "bindings",
+                                    "data_port",
+                                    "version",
+                                ],
+                            ));
+                        }
                         map.next_value::<serde::de::IgnoredAny>()?;
                     }
                 }
@@ -129,19 +189,20 @@ where
     }
     deserializer.deserialize_map(StateVisitor {
         require_accounts,
+        reject_unknown_fields,
         marker: std::marker::PhantomData,
     })
 }
 
 // Decode the existing metric types with their historical missing-member defaults
 // only at the compatibility boundary; no second metric contract struct is kept.
-struct CompatMetric<T>(T);
+struct CompatMetric<T, const REJECT_UNKNOWN: bool>(T);
 macro_rules! compat_metric {
     ($ty:ident { $($field:ident),+ }) => {
-        impl<'de> Deserialize<'de> for CompatMetric<$ty> {
+        impl<'de, const REJECT_UNKNOWN: bool> Deserialize<'de> for CompatMetric<$ty, REJECT_UNKNOWN> {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                struct MetricVisitor;
-                impl<'de> serde::de::Visitor<'de> for MetricVisitor {
+                struct MetricVisitor<const REJECT_UNKNOWN: bool>;
+                impl<'de, const REJECT_UNKNOWN: bool> serde::de::Visitor<'de> for MetricVisitor<REJECT_UNKNOWN> {
                     type Value = $ty;
                     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                         f.write_str(concat!("a ", stringify!($ty), " object"))
@@ -157,13 +218,16 @@ macro_rules! compat_metric {
                                     }
                                     metric.$field = map.next_value()?;
                                 },)+
-                                _ => { map.next_value::<serde::de::IgnoredAny>()?; }
+                                _ => {
+                                    if REJECT_UNKNOWN { return Err(serde::de::Error::unknown_field(&field, &[$(stringify!($field)),+])); }
+                                    map.next_value::<serde::de::IgnoredAny>()?;
+                                }
                             }
                         }
                         Ok(metric)
                     }
                 }
-                deserializer.deserialize_map(MetricVisitor).map(Self)
+                deserializer.deserialize_map(MetricVisitor::<REJECT_UNKNOWN>).map(Self)
             }
         }
     };
@@ -274,5 +338,27 @@ mod tests {
         let decoded: State = serde_json::from_value(old).unwrap();
         assert_eq!(decoded.draining, None);
         assert_eq!(decoded.capabilities, None);
+    }
+}
+
+#[cfg(test)]
+mod live_unknown_field_tests {
+    use super::*;
+    type Wire = AdminState<serde_json::Value, serde_json::Value, serde_json::Value>;
+    #[test]
+    fn actual_compat_path_rejects_unknown_root_and_each_metric_in_gate() {
+        for raw in [
+            r#"{"accounts":[],"unknown":1}"#,
+            r#"{"accounts":[],"inflight":{"unknown":1}}"#,
+            r#"{"accounts":[],"memory":{"unknown":1}}"#,
+            r#"{"accounts":[],"bindings":{"unknown":1}}"#,
+        ] {
+            let mut decoder = serde_json::Deserializer::from_str(raw);
+            let result: Result<Wire, _> = deserialize_compat(&mut decoder, true);
+            assert!(result.unwrap_err().to_string().contains("unknown field"));
+            let mut legacy = serde_json::Deserializer::from_str(raw);
+            let result: Wire = deserialize_legacy(&mut legacy, true).unwrap();
+            assert!(result.accounts.is_empty());
+        }
     }
 }
