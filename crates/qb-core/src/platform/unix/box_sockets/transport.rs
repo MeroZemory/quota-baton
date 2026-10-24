@@ -405,11 +405,11 @@ impl Connections {
             state.live.values().filter_map(Weak::upgrade).collect()
         }; // Drop strong handles OUTSIDE the registration mutex.
         for connection in live {
-            if let Err(error) = shutdown(&connection.control) {
-                if error.kind() != io::ErrorKind::NotConnected {
-                    failed = true;
-                    self.fail(); // Publish before releasing this retained IO handle.
-                }
+            if let Err(error) = shutdown(&connection.control)
+                && error.kind() != io::ErrorKind::NotConnected
+            {
+                failed = true;
+                self.fail(); // Publish before releasing this retained IO handle.
             }
         }
         if failed {
