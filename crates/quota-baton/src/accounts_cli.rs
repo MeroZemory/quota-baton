@@ -1099,8 +1099,11 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-type CliAccountState =
-    qb_proto::AdminState<serde_json::Value, serde_json::Value, serde_json::Value>;
+type CliAccountState = qb_proto::AdminState<
+    serde_json::Value,
+    qb_proto::admin_warning::AdminWarning,
+    Option<qb_proto::admin_pool::ReadPools>,
+>;
 
 async fn live_account_views(
     home: &Path,
@@ -1217,7 +1220,14 @@ fn provider_list_lines(
                 forecast: forecast.as_ref(),
             })
             .collect();
-        let eligible = state.and_then(|state| state.pools[provider.as_str()]["eligible"].as_u64());
+        let eligible = state.and_then(|state| {
+            state
+                .pools
+                .as_ref()
+                .and_then(|pools| pools.get(provider.as_str()))
+                .and_then(Option::as_ref)
+                .and_then(|pool| pool.eligible)
+        });
         let summary = provider_forecast::summarize(provider, &inputs, eligible, now);
         lines.push(provider_list_line(&summary, state.is_some(), english));
     }
@@ -2024,7 +2034,17 @@ mod r13f_provider_list_tests {
                 "다음 소진 sample"
             }));
         }
-        assert_eq!(state.pools["codex"]["eligible"], 2);
+        assert_eq!(
+            state
+                .pools
+                .as_ref()
+                .unwrap()
+                .codex
+                .as_ref()
+                .unwrap()
+                .eligible,
+            Some(2)
+        );
         let old: CliAccountState = qb_proto::admin_state::deserialize_compat(
             json!({"accounts":[row("sample-acct")]}),
             true,
@@ -2217,11 +2237,65 @@ mod r13f_provider_list_tests {
         assert_eq!(legacy.inflight.bytes, 0);
         assert_eq!(legacy.memory.private_bytes, 0);
         assert_eq!(legacy.bindings.count, 0);
-        assert!(legacy.pools.is_null());
+        assert!(legacy.pools.is_none());
         assert_eq!(legacy.draining, None);
         assert_eq!(legacy.capabilities, None);
         assert!(decode_cli_account_state(b"{}").is_err());
         assert!(decode_cli_account_state(br#"{"accounts":null}"#).is_err());
         assert!(decode_cli_account_state(br#"{"accounts":[]} {}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r15_pool_warning_transport_tests {
+    use super::*;
+
+    #[test]
+    fn raw_pool_and_state_warning_duplicates_never_collapse() {
+        for raw in [
+            r#"{"accounts":[],"pools":{"codex":{"eligible":1,"eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"eligible":"bad","eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"eligible":null,"eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":null,"codex":{"eligible":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"unavailable":null,"unavailable":2}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"cooling":{"auth":1,"auth":2}}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"cooling":{"auth":null,"auth":2}}}}"#,
+            r#"{"accounts":[],"pools":{"codex":{"cooling":null,"cooling":{}}}}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":0,"unknown_count":1}]}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":null,"unknown_count":1}]}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":"bad","unknown_count":1}]}"#,
+            r#"{"accounts":[],"warnings":[{"kind":"move_breaker","observed_at":"2030-01-01T00:00:00Z","move_list":[{"from":null,"from":"a","to":"b"}],"until":"2030-01-01T00:04:00Z","session":"0123456789ab","from":"a","to":"b","reason":"global_trip","forced":false}]}"#,
+        ] {
+            assert!(
+                decode_cli_account_state(raw.as_bytes()).is_err(),
+                "accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_sparse_pools_remain_unknown_and_warning_payload_is_preserved() {
+        let raw = r#"{"accounts":[],"pools":{"codex":{"eligible":2}},"warnings":[{"kind":"move_reread","observed_at":"2030-01-01T00:00:00Z","reread_tokens":100001,"known_count":2,"unknown_count":1}]}"#;
+        let state = decode_cli_account_state(raw.as_bytes()).unwrap();
+        let pools = state.pools.as_ref().unwrap();
+        assert!(pools.claude.is_none());
+        let codex = pools.codex.as_ref().unwrap();
+        assert_eq!(codex.eligible, Some(2));
+        assert!(codex.cooling.is_none());
+        assert!(codex.unavailable.is_none());
+        let wire = serde_json::to_value(&state.warnings[0]).unwrap();
+        assert_eq!(wire["known_count"], 2);
+        assert_eq!(wire["unknown_count"], 1);
+        for raw in [r#"{"accounts":[]}"#, r#"{"accounts":[],"pools":null}"#] {
+            assert!(
+                decode_cli_account_state(raw.as_bytes())
+                    .unwrap()
+                    .pools
+                    .is_none()
+            );
+        }
+        // /state does not adopt the separate SSE quota_notice schema.
+        let raw = r#"{"accounts":[],"warnings":[{"kind":"quota_notice","account":"a"}]}"#;
+        assert!(decode_cli_account_state(raw.as_bytes()).is_err());
     }
 }

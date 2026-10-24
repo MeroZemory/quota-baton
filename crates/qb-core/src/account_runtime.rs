@@ -3030,21 +3030,29 @@ impl AccountRuntime {
 /// Paused/disabled/relogin/probe-pending accounts are unavailable; active
 /// canonical coolings are grouped by reason. No credential fields are read.
 pub fn pool_counts(accounts: &[Value]) -> Value {
-    let mut pools = json!({
-        "claude": {"eligible":0,"cooling":{},"unavailable":0},
-        "codex": {"eligible":0,"cooling":{},"unavailable":0}
-    });
+    serde_json::to_value(typed_pool_counts(accounts))
+        .expect("pool counts contain only JSON-safe fields")
+}
+
+/// Typed form for the shared admin response. The compatibility Value wrapper
+/// above preserves existing internal consumers; classification is computed once.
+pub fn typed_pool_counts(accounts: &[Value]) -> qb_proto::admin_pool::AdminPools {
+    let mut pools: qb_proto::admin_pool::AdminPools = Default::default();
     for account in accounts {
         let Some(provider @ ("claude" | "codex")) = account["provider"].as_str() else {
             continue;
         };
-        let pool = &mut pools[provider];
+        let pool = if provider == "claude" {
+            &mut pools.claude
+        } else {
+            &mut pools.codex
+        };
         let kind = account["health"]["kind"].as_str().unwrap_or("unknown");
         if account["user_state"] != "active"
             || account["probe_pending"] == true
             || !matches!(kind, "ready" | "cooling")
         {
-            pool["unavailable"] = json!(pool["unavailable"].as_u64().unwrap_or(0) + 1);
+            pool.unavailable += 1;
         } else if kind == "cooling" {
             // Store-backed views have already expired their health. A volatile
             // store-error remains blocked until its pending write succeeds,
@@ -3064,9 +3072,9 @@ pub fn pool_counts(accounts: &[Value]) -> Value {
                     )
                 })
                 .unwrap_or("unknown");
-            pool["cooling"][reason] = json!(pool["cooling"][reason].as_u64().unwrap_or(0) + 1);
+            pool.cooling.increment(reason);
         } else {
-            pool["eligible"] = json!(pool["eligible"].as_u64().unwrap_or(0) + 1);
+            pool.eligible += 1;
         }
     }
     pools

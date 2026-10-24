@@ -20,6 +20,8 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+type StateWarning = qb_proto::admin_warning::AdminWarning<DateTime<Utc>>;
+
 const LEDGER_MAX_BYTES: u64 = 500_000_000;
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const WARN_INTERVAL: StdDuration = StdDuration::from_secs(60);
@@ -251,7 +253,7 @@ pub struct Observability {
     replay: std::sync::Mutex<Option<Arc<replay_runtime::Runtime>>>,
     dashboard: Arc<crate::dashboard::runtime::Runtime>,
     accounting: std::sync::Mutex<reread_accounting::Registry>,
-    move_warnings: std::sync::Mutex<VecDeque<(Instant, serde_json::Value)>>,
+    move_warnings: std::sync::Mutex<VecDeque<(Instant, StateWarning)>>,
     reread_notice_tokens: AtomicU64,
     reread_alerted: std::sync::atomic::AtomicBool,
     // One recent aggregate only; hidden trays recover transient broadcast loss.
@@ -394,9 +396,12 @@ impl Observability {
         let above = snapshot.hour.tokens >= self.reread_notice_tokens.load(Ordering::Acquire);
         let was_above = self.reread_alerted.swap(above, Ordering::AcqRel);
         if above && !was_above {
-            self.move_warning(serde_json::json!({"kind":"move_reread", "observed_at":at,
-                "reread_tokens":snapshot.hour.tokens,
-                "known_count":snapshot.hour.known_count, "unknown_count":snapshot.hour.unknown_count}));
+            self.move_warning(StateWarning::MoveReread {
+                observed_at: at,
+                reread_tokens: snapshot.hour.tokens,
+                known_count: snapshot.hour.known_count,
+                unknown_count: snapshot.hour.unknown_count,
+            });
         }
         Ok(result)
     }
@@ -417,18 +422,30 @@ impl Observability {
             "until":event.until, "newly_tripped":event.newly_tripped, "forced":event.forced}),
         ));
         if event.newly_tripped {
-            self.move_warning(serde_json::json!({
-                "kind":"move_breaker", "observed_at":Utc::now(),
-                "move_list":event.move_list, "until":event.until,
-                "session":session, "from":event.from, "to":event.to,
-                "reason":event.reason, "forced":event.forced}));
+            self.move_warning(StateWarning::MoveBreaker {
+                observed_at: Utc::now(),
+                move_list: event
+                    .move_list
+                    .iter()
+                    .map(|pair| qb_proto::admin_warning::AdminMovePair {
+                        from: pair.from.clone(),
+                        to: pair.to.clone(),
+                    })
+                    .collect(),
+                until: event.until,
+                session,
+                from: event.from.clone(),
+                to: event.to.clone(),
+                reason: event.reason.clone(),
+                forced: event.forced,
+            });
         }
     }
     pub fn configure_move_notice(&self, threshold: u64) {
         self.reread_notice_tokens
             .store(threshold.clamp(1, 1_000_000_000), Ordering::Release);
     }
-    fn move_warning(&self, value: serde_json::Value) {
+    fn move_warning(&self, value: StateWarning) {
         let mut warnings = self.move_warnings.lock().unwrap_or_else(|e| e.into_inner());
         warnings.retain(|(at, _)| at.elapsed() < StdDuration::from_secs(600));
         if warnings.len() >= 32 {
@@ -436,6 +453,10 @@ impl Observability {
         }
         warnings.push_back((Instant::now(), value.clone()));
         drop(warnings);
+        // The ledger/SSE envelopes remain their existing protocol. Only /state
+        // stores and returns the shared warning payload directly.
+        let value =
+            serde_json::to_value(value).expect("state warning contains only JSON-safe fields");
         self.enqueue(Command::Ledger(
             serde_json::json!({"ts":Utc::now(), "event":"core_warning", "data":value}),
         ));
@@ -523,7 +544,7 @@ impl Observability {
         );
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"token_refresh","account":account,"trigger":trigger,"outcome":outcome,"expires_at":expires_at})));
     }
-    pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
+    pub(crate) fn recent_warnings(&self) -> Vec<StateWarning> {
         let mut recent = self.recent_burst.lock().unwrap_or_else(|e| e.into_inner());
         if recent
             .as_ref()
@@ -531,9 +552,14 @@ impl Observability {
         {
             *recent = None;
         }
-        let mut values: Vec<_> = recent.as_ref().map(|(_, ts, count)| {
-            serde_json::json!({"kind":"burst", "burst_new_sessions":count, "observed_at":ts})
-        }).into_iter().collect();
+        let mut values: Vec<_> = recent
+            .as_ref()
+            .map(|(_, ts, count)| StateWarning::Burst {
+                burst_new_sessions: u64::from(*count),
+                observed_at: *ts,
+            })
+            .into_iter()
+            .collect();
         let mut warnings = self.move_warnings.lock().unwrap_or_else(|e| e.into_inner());
         warnings.retain(|(at, _)| at.elapsed() < StdDuration::from_secs(600));
         values.extend(warnings.iter().map(|(_, value)| value.clone()));
@@ -2412,13 +2438,20 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         let warnings = obs.recent_warnings();
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0]["burst_new_sessions"], 32);
-        assert_eq!(warnings[0].as_object().unwrap().len(), 3);
+        let wire = serde_json::to_value(&warnings[0]).unwrap();
+        assert_eq!(wire["burst_new_sessions"], 32);
+        assert_eq!(wire.as_object().unwrap().len(), 3);
         obs.recent_burst.lock().unwrap().as_mut().unwrap().0 -= StdDuration::from_secs(600);
         assert!(obs.recent_warnings().is_empty());
         assert!(obs.recent_burst.lock().unwrap().is_none());
         obs.remember_burst(33);
-        assert_eq!(obs.recent_warnings()[0]["burst_new_sessions"], 33);
+        assert!(matches!(
+            obs.recent_warnings()[0],
+            StateWarning::Burst {
+                burst_new_sessions: 33,
+                ..
+            }
+        ));
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
