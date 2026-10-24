@@ -427,6 +427,81 @@ impl Harness {
     }
 }
 
+#[tokio::test]
+async fn r15_launch_route_shared_response_exact_roundtrip() {
+    let h = Harness::new(Provider::Codex).await;
+    tokio::time::timeout(DEADLINE, async {
+        // Follow the protected m4a_http R11 route harness: the general m4b
+        // fixture has data_port=0, which issuance deliberately rejects.
+        let mut config = Config::default();
+        config.server.data_port = 0;
+        config.server.admin_port = 0;
+        let servers = http::spawn_with_routes(
+            &config,
+            LocalSecrets {
+                client_key: "synthetic-client".into(),
+                admin_token: "synthetic-admin".into(),
+            },
+            relay::router(h.state.clone()),
+            qb_core::admin::runtime_routes(h.state.clone(), h.servers.data_addr.port()),
+        )
+        .await
+        .unwrap();
+        let url = format!("http://{}/admin/v1/launches", servers.admin_addr);
+        let request = json!({"model":"synthetic-model", "model_is_explicit":true});
+        let denied = h.client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        denied.bytes().await.unwrap();
+        assert!(h.fake.state.requests().is_empty());
+        for _ in h.ids() {
+            h.fake.state.push(ScriptedResponse::json(
+                StatusCode::OK,
+                r#"{"models":[{"slug":"synthetic-model"}]}"#,
+            ));
+        }
+        let response = h
+            .client
+            .post(&url)
+            .bearer_auth("synthetic-admin")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["pragma"], "no-cache");
+        assert_eq!(response.headers()["content-type"], "application/json");
+        // Actual protected-route bytes, not a constructed stand-in reply.
+        let body = response.bytes().await.unwrap();
+        let reply: qb_proto::admin_launch::LaunchReply = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&reply).unwrap().as_slice(),
+            body.as_ref()
+        );
+        assert!(h.ids().contains(&reply.account));
+        assert_eq!(reply.model.as_deref(), Some("synthetic-model"));
+        assert_eq!(reply.catalog_url, format!("{}/models", reply.base_url));
+        let prefix = format!("http://127.0.0.1:{}/l/", h.servers.data_addr.port());
+        let token = reply
+            .base_url
+            .strip_prefix(&prefix)
+            .unwrap()
+            .strip_suffix("/v1")
+            .unwrap();
+        assert_eq!(token.len(), 43);
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        );
+        assert!(!h.fake.state.requests().is_empty());
+        servers.shutdown();
+        servers.wait_for_listener_close().await;
+    })
+    .await
+    .expect("synthetic launch response contract deadline");
+}
+
 fn usage(provider: Provider, percent: u32) -> HeaderMap {
     let mut headers = HeaderMap::new();
     match provider {

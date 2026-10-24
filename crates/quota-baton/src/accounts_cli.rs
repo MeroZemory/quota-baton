@@ -1,6 +1,9 @@
 use clap::{Args, Subcommand, ValueEnum};
 use qb_core::{accounts::AccountStore, config::Config};
-use qb_proto::{CpaImportRequest, ImportMode};
+use qb_proto::{
+    CpaImportRequest, ImportMode,
+    admin_login::{LoginStart, LoginState, LoginStatus},
+};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -1497,8 +1500,57 @@ enum LoginBackend {
     Local(qb_core::oauth::LoginService),
 }
 
+// These CLI responses have always required named object fields. Delegate the
+// original map directly, retaining the shared DTO's duplicate-key checks.
+struct LoginObject<T>(T);
+#[cfg(test)]
+mod r15_login_object_tests {
+    use super::*;
+    #[test]
+    fn cli_login_requires_named_objects_and_retains_duplicate_checks() {
+        for raw in [
+            r#"["synthetic-login","https://example.test/login"]"#,
+            r#"{"login_id":"a","login_id":"b","auth_url":"https://example.test/login"}"#,
+        ] {
+            assert!(serde_json::from_str::<LoginObject<LoginStart>>(raw).is_err());
+        }
+        for raw in [
+            r#"["completed",null,null]"#,
+            r#"{"status":"pending","status":"completed"}"#,
+        ] {
+            assert!(serde_json::from_str::<LoginObject<LoginStatus>>(raw).is_err());
+        }
+        let start: LoginObject<LoginStart> = serde_json::from_str(
+            r#"{"login_id":"synthetic-login","auth_url":"https://example.test/login"}"#,
+        )
+        .unwrap();
+        assert_eq!(start.0.login_id, "synthetic-login");
+        let status: LoginObject<LoginStatus> =
+            serde_json::from_str(r#"{"status":"completed"}"#).unwrap();
+        assert_eq!(status.0.status, LoginState::Completed);
+    }
+}
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for LoginObject<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+            type Value = LoginObject<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a login response object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(LoginObject)
+            }
+        }
+        deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+    }
+}
+
 impl LoginBackend {
-    async fn status(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+    async fn status(&self, id: &str) -> anyhow::Result<LoginStatus> {
         match self {
             Self::Admin {
                 client,
@@ -1516,9 +1568,11 @@ impl LoginBackend {
             )
             .await?
             .error_for_status()?
-            .json()
-            .await?),
-            Self::Local(service) => Ok(serde_json::to_value(service.status(id).await?)?),
+            .json::<LoginObject<LoginStatus>>()
+            .await
+            .map_err(|_| anyhow::anyhow!("로그인 상태를 확인해 주세요."))?
+            .0),
+            Self::Local(service) => Ok(service.status(id).await?),
         }
     }
 
@@ -1571,9 +1625,12 @@ async fn login(
                 println_utf8!("{}", login_failure(payload["error"]["message"].as_str()));
                 return Err(error.into());
             }
-            let start: serde_json::Value = response.json().await?;
-            let id = start["login_id"]
-                .as_str()
+            let start = response
+                .json::<LoginObject<LoginStart>>()
+                .await
+                .map_err(|_| anyhow::anyhow!("로그인 응답을 확인해 주세요."))?
+                .0;
+            let id = Some(start.login_id.as_str())
                 .filter(|id| {
                     !id.is_empty()
                         && id.len() <= 100
@@ -1583,7 +1640,7 @@ async fn login(
                 })
                 .ok_or_else(|| anyhow::anyhow!("로그인 응답을 확인해 주세요."))?
                 .to_owned();
-            let url = start["auth_url"].as_str().unwrap_or_default().to_owned();
+            let url = start.auth_url;
             (
                 LoginBackend::Admin {
                     client,
@@ -1674,26 +1731,25 @@ async fn login(
                 }
                 status = backend.status(&id) => status?,
             };
-            match status["status"].as_str() {
-                Some("pending") => {}
-                Some("completed") => {
+            match status.status {
+                LoginState::Pending => {}
+                LoginState::Completed => {
                     println_utf8!("로그인을 완료했습니다.");
                     return Ok(());
                 }
-                Some("cancelled") => {
+                LoginState::Cancelled => {
                     println_utf8!("로그인을 취소했습니다.");
                     return Ok(());
                 }
-                Some("expired") => {
+                LoginState::Expired => {
                     println_utf8!("로그인 시간이 만료되었습니다. 다시 시작해 주세요.");
                     anyhow::bail!("로그인 시간이 만료되었습니다.");
                 }
-                Some("failed") => {
+                LoginState::Failed => {
                     // Never print the returned error/code or any account fields.
-                    println_utf8!("{}", login_failure(status["error"].as_str()));
+                    println_utf8!("{}", login_failure(status.error.as_deref()));
                     anyhow::bail!("로그인에 실패했습니다.");
                 }
-                _ => anyhow::bail!("로그인 상태를 확인해 주세요."),
             }
             tokio::select! {
                 signal = &mut interrupt => {

@@ -80,14 +80,7 @@ pub struct LaunchRequest {
     pub urgent: bool,
 }
 
-/// URLs contain a routing handle. Deliberately no Debug or Display.
-#[derive(serde::Serialize)]
-pub struct LaunchReply {
-    pub base_url: String,
-    pub catalog_url: String,
-    pub account: String,
-    pub model: Option<String>,
-}
+pub use qb_proto::admin_launch::LaunchReply;
 
 #[derive(Clone, Copy, Debug)]
 pub enum LaunchError {

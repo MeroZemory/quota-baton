@@ -150,32 +150,43 @@ impl Harness {
         secret_free(&text);
         serde_json::from_str(&text).unwrap()
     }
+    async fn login_reply<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        response: reqwest::Response,
+    ) -> T {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.bytes().await.expect("login body read failed");
+        secret_free(std::str::from_utf8(&body).expect("login body is not UTF-8"));
+        let decoded: T = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("login response violates shared contract"));
+        let encoded = serde_json::to_vec(&decoded)
+            .unwrap_or_else(|_| panic!("login response encoding failed"));
+        // Never dump login IDs, authorization URLs or response bodies on failure.
+        assert!(
+            encoded.as_slice() == body.as_ref(),
+            "login body roundtrip changed bytes"
+        );
+        decoded
+    }
+
     async fn start(&self, provider: Provider) -> LoginStart {
-        serde_json::from_value(
-            self.json(
-                self.request(reqwest::Method::POST, "/accounts/login")
-                    .json(&json!({"provider":provider}))
-                    .send()
-                    .await
-                    .unwrap(),
-                StatusCode::OK,
-            )
-            .await,
+        self.login_reply(
+            self.request(reqwest::Method::POST, "/accounts/login")
+                .json(&json!({"provider":provider}))
+                .send()
+                .await
+                .unwrap(),
         )
-        .unwrap()
+        .await
     }
     async fn status(&self, id: &str) -> LoginStatus {
-        serde_json::from_value(
-            self.json(
-                self.request(reqwest::Method::GET, &format!("/accounts/login/{id}"))
-                    .send()
-                    .await
-                    .unwrap(),
-                StatusCode::OK,
-            )
-            .await,
+        self.login_reply(
+            self.request(reqwest::Method::GET, &format!("/accounts/login/{id}"))
+                .send()
+                .await
+                .unwrap(),
         )
-        .unwrap()
+        .await
     }
     async fn terminal(&self, id: &str) -> LoginStatus {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -191,20 +202,16 @@ impl Harness {
         .unwrap()
     }
     async fn cancel(&self, id: &str) -> LoginStatus {
-        serde_json::from_value(
-            self.json(
-                self.request(
-                    reqwest::Method::POST,
-                    &format!("/accounts/login/{id}/cancel"),
-                )
-                .send()
-                .await
-                .unwrap(),
-                StatusCode::OK,
+        self.login_reply(
+            self.request(
+                reqwest::Method::POST,
+                &format!("/accounts/login/{id}/cancel"),
             )
-            .await,
+            .send()
+            .await
+            .unwrap(),
         )
-        .unwrap()
+        .await
     }
     fn replies(&self, provider: Provider) {
         let claims = json!({"email":"admin@example.invalid", "https://api.openai.com/auth": {

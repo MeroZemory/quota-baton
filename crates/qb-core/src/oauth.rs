@@ -8,50 +8,13 @@ use crate::account_runtime::AccountRuntime;
 use crate::accounts::{AccountStore, Provider};
 use crate::observability::Observability;
 use parameters::Parameters;
-use serde::{Deserialize, Serialize};
+pub use qb_proto::admin_login::{LoginStart, LoginState, LoginStatus};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::watch;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LoginStart {
-    pub login_id: String,
-    pub auth_url: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoginState {
-    Pending,
-    Completed,
-    Failed,
-    Cancelled,
-    Expired,
-}
-
-impl LoginState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Expired => "expired",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LoginStatus {
-    pub status: LoginState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum LoginError {
