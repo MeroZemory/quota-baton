@@ -12,6 +12,9 @@ use serde::{
     de::{DeserializeOwned, Deserializer},
 };
 
+#[path = "client/history.rs"]
+mod history;
+
 #[path = "client/snapshot.rs"]
 pub mod snapshot;
 
@@ -152,23 +155,39 @@ impl AdminClient {
         &self,
         days: u8,
     ) -> Result<qb_tray::dashboard_model::ActivityResponse, ClientError> {
+        history::activity(&self.dashboard_activity_raw(days).await?)
+    }
+
+    /// Authoritative live graph before display-only defaults/enrichment.
+    pub async fn dashboard_activity_raw(
+        &self,
+        days: u8,
+    ) -> Result<qb_core::dashboard::history::response::ActivityPage, ClientError> {
         if !(1..=7).contains(&days) {
             return Err(ClientError::AccountAction(
                 "기록 조회 기간이 올바르지 않습니다",
             ));
         }
-        self.dashboard_get(
-            &format!("/admin/v1/activity?days={days}&limit=2000"),
-            "events",
-        )
-        .await
+        let bytes = self
+            .dashboard_bytes(&format!("/admin/v1/activity?days={days}&limit=2000"))
+            .await?;
+        Self::decode_dashboard_object(&bytes)
     }
 
     pub async fn dashboard_usage_history(
         &self,
     ) -> Result<qb_tray::dashboard_model::UsageHistory, ClientError> {
-        self.dashboard_get("/admin/v1/usage-history?hours=48", "accounts")
-            .await
+        history::usage(&self.dashboard_usage_history_raw().await?)
+    }
+
+    /// Preserve null gaps/open credit spans and all nested truncation facts.
+    pub async fn dashboard_usage_history_raw(
+        &self,
+    ) -> Result<qb_core::dashboard::history::UsageView, ClientError> {
+        let bytes = self
+            .dashboard_bytes("/admin/v1/usage-history?hours=48")
+            .await?;
+        Self::decode_dashboard_object(&bytes)
     }
 
     async fn dashboard_get<T: DeserializeOwned>(

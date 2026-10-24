@@ -1,4 +1,6 @@
 //! Disk-safe reducers. Types deliberately have no label, raw-ID/prefix, path or JSON payload field.
+pub mod response;
+
 use super::{AccountId, Invalid, MoveReason, RequestOutcome, SessionId};
 use crate::accounts::Provider;
 use chrono::{DateTime, Duration, Utc};
@@ -558,25 +560,13 @@ struct UsageDisk {
     schema: u8,
     accounts: BTreeMap<AccountId, AccountSeries>,
 }
-#[derive(Serialize)]
-pub struct UsageWindowView {
-    pub name: WindowName,
-    pub points: Vec<(DateTime<Utc>, Option<f64>)>,
-    pub resets: Vec<DateTime<Utc>>,
-    pub truncated: bool,
-}
-#[derive(Serialize)]
-pub struct UsageAccountView {
-    pub id: AccountId,
-    pub windows: Vec<UsageWindowView>,
-    pub credits_spans: Vec<(DateTime<Utc>, Option<DateTime<Utc>>)>,
-    pub truncated: bool,
-}
-#[derive(Serialize)]
-pub struct UsageView {
-    pub accounts: Vec<UsageAccountView>,
-    pub truncated: bool,
-}
+// Shared current response views; retained reducers/storage use their existing
+// domain identifiers, timestamps and window validation unchanged.
+pub type UsageWindowView = qb_proto::history_response::UsageWindow<DateTime<Utc>, WindowName>;
+pub type UsageAccountView =
+    qb_proto::history_response::UsageAccount<DateTime<Utc>, AccountId, WindowName>;
+pub type UsageView = qb_proto::history_response::UsageHistory<DateTime<Utc>, AccountId, WindowName>;
+
 #[derive(Clone, Default)]
 pub struct UsageHistory {
     accounts: BTreeMap<AccountId, AccountSeries>,

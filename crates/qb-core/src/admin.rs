@@ -555,7 +555,10 @@ async fn dashboard_activity(
         query.limit.unwrap_or(200),
         query.days.unwrap_or(7),
     ) {
-        Ok(page) => Json(page).into_response(),
+        Ok(page) => Json(crate::dashboard::history::response::ActivityPage::from(
+            page,
+        ))
+        .into_response(),
         Err(_) => dashboard_invalid(),
     }
 }
