@@ -65,7 +65,7 @@ pub(super) fn source(value: &Source) -> Result<AdminSource, ()> {
 
 pub(super) fn health(value: &Health) -> AdminHealth {
     match value {
-        Health::Ready => AdminHealth::Ready,
+        Health::Ready => AdminHealth::Ready {},
         Health::Cooling {
             reason,
             until,
@@ -105,8 +105,8 @@ pub(crate) fn pools(accounts: &[AdminAccount]) -> qb_proto::admin_pool::AdminPoo
             continue;
         }
         match &account.health {
-            AdminHealth::Ready => pool.eligible += 1,
-            AdminHealth::NeedsRelogin { .. } => pool.unavailable += 1,
+            AdminHealth::Ready {} => pool.eligible += 1,
+            AdminHealth::NeedsRelogin { .. } | AdminHealth::Unknown(_) => pool.unavailable += 1,
             AdminHealth::Cooling { reason, .. } => pool.cooling.increment(match reason {
                 AdminHealthReason::Quota => "quota",
                 AdminHealthReason::Rate => "rate",
@@ -155,7 +155,7 @@ mod tests {
             plan: None,
             user_state: AdminUserState::Active,
             source: AdminSource::Oauth,
-            health: AdminHealth::Ready,
+            health: AdminHealth::Ready {},
             probe_pending: false,
             pacing: AdminPacing {
                 backoff_until: None,

@@ -133,7 +133,7 @@ pub enum AdminHealthReason {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[cfg_attr(any(test, feature = "contract-tests"), serde(deny_unknown_fields))]
 pub enum AdminHealth {
-    Ready,
+    Ready {},
     Cooling {
         reason: AdminHealthReason,
         until: String,
@@ -149,6 +149,51 @@ pub enum AdminHealth {
         reason: String,
         since: String,
     },
+    #[serde(untagged)]
+    Unknown(AdminUnknownHealth),
+}
+
+/// Preserve a future health kind without treating it as a known usable state.
+/// A malformed known kind must never fall through to this compatibility case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminUnknownHealth {
+    pub kind: String,
+    #[serde(flatten)]
+    pub fields: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for AdminUnknownHealth {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = std::collections::BTreeMap<String, serde_json::Value>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a health object with unique fields")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut fields = Self::Value::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    if fields.insert(key, value).is_some() {
+                        return Err(M::Error::custom("duplicate health field"));
+                    }
+                }
+                Ok(fields)
+            }
+        }
+        let mut fields = deserializer.deserialize_map(Fields)?;
+        let kind = fields
+            .remove("kind")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| D::Error::custom("health kind must be a string"))?;
+        if matches!(kind.as_str(), "ready" | "cooling" | "needs_relogin") {
+            return Err(D::Error::custom("invalid known health state"));
+        }
+        Ok(Self { kind, fields })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +414,36 @@ mod tests {
         // omits generation/takeover_pending. This assertion must stay on the
         // wire DTO, never on a normalized presentation projection.
         assert!(serialized["source"].is_object());
+    }
+
+    #[test]
+    fn future_health_roundtrip_preserves_fields_but_never_accepts_malformed_known_state() {
+        let future =
+            json!({"kind":"future_health","reason":{"detail":"sample-reason"},"since":null});
+        let parsed: AdminHealth = serde_json::from_value(future.clone()).unwrap();
+        assert!(matches!(&parsed, AdminHealth::Unknown(_)));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), future);
+        for (case, invalid) in [
+            json!({"kind":"cooling","reason":"quota"}),
+            json!({"kind":"needs_relogin","reason":"sample-reason"}),
+            json!({"kind":"ready","unexpected":true}),
+            json!({"reason":"sample-reason"}),
+            json!({"kind":null}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                serde_json::from_value::<AdminHealth>(invalid).is_err(),
+                "case {case}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<AdminHealth>(
+                r#"{"kind":"future_health","reason":1,"reason":2}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

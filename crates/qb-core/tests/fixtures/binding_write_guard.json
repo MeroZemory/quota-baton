@@ -981,12 +981,6 @@
     },
     {
       "path": "crates/qb-core/src/bindings/capacity_spill.rs",
-      "function": "BindingTable::admit_capacity_spill",
-      "expression": "method: d .Alone capacity_spills .Alone insert Parenthesis( target .Alone to_owned Parenthesis( ) ,Alone sequence )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/capacity_spill.rs",
       "function": "BindingTable::attach_outside_use_failure",
       "expression": "assignment: self .Alone data .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) .Alone outside_failure =Alone Some Parenthesis( failure )",
       "count": 1
@@ -1007,18 +1001,6 @@
       "path": "crates/qb-core/src/bindings/capacity_spill.rs",
       "function": "BindingTable::set_outside_use_unknown",
       "expression": "assignment: self .Alone data .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) .Alone outside_unknown =Alone unknown",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/capacity_spill.rs",
-      "function": "CapacitySpillPermit as Drop::drop",
-      "expression": "method: d .Alone capacity_spills .Alone insert Parenthesis( self .Alone target .Alone clone Parenthesis( ) ,Alone previous )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/capacity_spill.rs",
-      "function": "CapacitySpillPermit as Drop::drop",
-      "expression": "method: d .Alone capacity_spills .Alone remove Parenthesis( &Alone self .Alone target )",
       "count": 1
     },
     {

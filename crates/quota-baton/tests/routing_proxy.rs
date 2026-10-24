@@ -43,7 +43,17 @@ async fn routing_cli_never_sends_admin_credentials_to_an_environment_proxy() {
                     "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                 );
                 count.fetch_add(1, Ordering::SeqCst);
-                axum::Json(serde_json::json!({"projects":{},"sessions":{}}))
+                let reply: qb_proto::admin_routing::RoutingGet =
+                    serde_json::from_value(serde_json::json!({
+                        "revision": 0,
+                        "defaults": qb_core::routing::Settings::default(),
+                        "projects": {},
+                        "sessions": {},
+                        "observed_sessions": [],
+                        "forecast_shadow": [],
+                    }))
+                    .unwrap();
+                axum::Json(reply)
             }),
         );
         axum::serve(admin, router).await.unwrap();

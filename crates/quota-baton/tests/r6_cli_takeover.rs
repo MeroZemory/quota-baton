@@ -28,7 +28,16 @@ struct Observed {
 #[derive(Clone)]
 struct Mock {
     observed: Arc<Mutex<Vec<Observed>>>,
-    refresh_ok: Value,
+    refresh_ok: bool,
+    invalid_reply: Option<InvalidReply>,
+}
+
+#[derive(Clone, Copy)]
+enum InvalidReply {
+    Health,
+    Inspect,
+    Commit,
+    RefreshNull,
 }
 
 impl Mock {
@@ -50,13 +59,18 @@ async fn health(State(mock): State<Mock>, headers: HeaderMap) -> (StatusCode, Js
     if !mock.record("health", &headers, Value::Null) {
         return (StatusCode::UNAUTHORIZED, Json(json!({})));
     }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok":true, "version":"99.1.0-synthetic", "pid":1, "started_at":"2026-01-01T00:00:00Z",
-            "access_token":"r6-access-secret", "refresh_token":"r6-refresh-secret",
-        })),
-    )
+    let mut value = serde_json::to_value(qb_proto::HealthResponse {
+        ok: true,
+        version: "99.1.0-synthetic".into(),
+        pid: 1,
+        started_at: "2026-01-01T00:00:00Z".into(),
+    })
+    .unwrap();
+    if matches!(mock.invalid_reply, Some(InvalidReply::Health)) {
+        value["access_token"] = json!("r6-access-secret");
+        value["refresh_token"] = json!("r6-refresh-secret");
+    }
+    (StatusCode::OK, Json(value))
 }
 
 async fn takeover(
@@ -67,23 +81,50 @@ async fn takeover(
     if !mock.record("takeover", &headers, body.clone()) {
         return (StatusCode::UNAUTHORIZED, Json(json!({})));
     }
-    let value = match body["phase"].as_str() {
-        Some("inspect") => json!({
-            "email":"synthetic@example.invalid", "plan":"free", "provider_account_id":"synthetic-account",
-            "source_path":body["path"], "source_last_refresh":null,
-            "source_mtime":"2026-01-01T00:00:00Z", "owner_alive":false,
-            "existing_id":null, "inspect_digest":DIGEST,
-            "access_token":"r6-access-secret", "refresh_token":"r6-refresh-secret",
-            "id_token":"eyJr6.synthetic.jwt", "unexpected":{"client_secret":"r6-client-secret"},
-        }),
-        Some("commit") if body["inspect_digest"] == DIGEST => json!({
-            "id":"cx-synthetic", "renamed_to":null,
-            "refresh":{"ok":mock.refresh_ok, "token_expires_at":"2026-01-01T01:00:00Z",
-                "access_token":"r6-access-secret", "refresh_token":"r6-refresh-secret"},
-            "id_token":"eyJr6.synthetic.jwt", "unexpected":{"client_secret":"r6-client-secret"},
-        }),
+    let phase = body["phase"].as_str();
+    let mut value = match phase {
+        Some("inspect") => serde_json::to_value(qb_proto::admin_takeover::TakeoverInspect {
+            email: Some("synthetic@example.invalid".into()),
+            plan: Some("free".into()),
+            provider_account_id: Some("synthetic-account".into()),
+            source_path: body["path"].as_str().unwrap().into(),
+            source_last_refresh: None,
+            source_mtime: Some("2026-01-01T00:00:00Z".into()),
+            owner_alive: false,
+            existing_id: None,
+            inspect_digest: DIGEST.into(),
+        })
+        .unwrap(),
+        Some("commit") if body["inspect_digest"] == DIGEST => {
+            serde_json::to_value(qb_proto::admin_takeover::TakeoverCommit {
+                id: "cx-synthetic".into(),
+                renamed_to: None,
+                refresh: qb_proto::admin_takeover::TakeoverRefresh {
+                    ok: mock.refresh_ok,
+                    token_expires_at: Some("2026-01-01T01:00:00Z".into()),
+                },
+            })
+            .unwrap()
+        }
         _ => return (StatusCode::BAD_REQUEST, Json(json!({}))),
     };
+    if matches!(
+        (phase, mock.invalid_reply),
+        (Some("inspect"), Some(InvalidReply::Inspect))
+            | (Some("commit"), Some(InvalidReply::Commit))
+    ) {
+        value["access_token"] = json!("r6-access-secret");
+        value["refresh_token"] = json!("r6-refresh-secret");
+        value["id_token"] = json!("eyJr6.synthetic.jwt");
+        value["unexpected"] = json!({"client_secret":"r6-client-secret"});
+        if phase == Some("commit") {
+            value["refresh"]["access_token"] = json!("r6-access-secret");
+            value["refresh"]["refresh_token"] = json!("r6-refresh-secret");
+        }
+    }
+    if phase == Some("commit") && matches!(mock.invalid_reply, Some(InvalidReply::RefreshNull)) {
+        value["refresh"]["ok"] = Value::Null;
+    }
     (StatusCode::OK, Json(value))
 }
 
@@ -100,7 +141,11 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    async fn new(refresh_ok: Value) -> Self {
+    async fn new(refresh_ok: bool) -> Self {
+        Self::with_invalid_reply(refresh_ok, None).await
+    }
+
+    async fn with_invalid_reply(refresh_ok: bool, invalid_reply: Option<InvalidReply>) -> Self {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r6-cli-spawned");
         std::fs::create_dir_all(&base).unwrap();
         let home = tempfile::tempdir_in(base).unwrap();
@@ -117,6 +162,7 @@ impl Fixture {
         let mock = Mock {
             observed: Default::default(),
             refresh_ok,
+            invalid_reply,
         };
         let router = Router::new()
             .route("/admin/v1/health", get(health))
@@ -268,7 +314,7 @@ fn safe_output(output: &Output) -> (String, String) {
 #[tokio::test]
 async fn no_yes_exits_two_with_one_authenticated_inspect_and_no_commit() {
     for provider in ["codex", "claude"] {
-        let fixture = Fixture::new(json!(true)).await;
+        let fixture = Fixture::new(true).await;
         let output = fixture.run(provider, false, false).await;
         assert_eq!(output.status.code(), Some(2));
         fixture.assert_requests(provider, false, false);
@@ -291,7 +337,7 @@ async fn no_yes_exits_two_with_one_authenticated_inspect_and_no_commit() {
 #[tokio::test]
 async fn yes_exits_zero_with_exactly_inspect_then_digest_commit_and_no_secrets() {
     for (provider, flags) in [("codex", false), ("claude", true)] {
-        let fixture = Fixture::new(json!(true)).await;
+        let fixture = Fixture::new(true).await;
         let output = fixture.run(provider, true, flags).await;
         assert_eq!(output.status.code(), Some(0));
         fixture.assert_requests(provider, true, flags);
@@ -305,18 +351,48 @@ async fn yes_exits_zero_with_exactly_inspect_then_digest_commit_and_no_secrets()
 }
 
 #[tokio::test]
-async fn false_or_unknown_refresh_requires_checking_without_claiming_relogin() {
-    for refresh_ok in [json!(false), Value::Null] {
-        let fixture = Fixture::new(refresh_ok).await;
+async fn false_refresh_requires_checking_without_claiming_relogin() {
+    let fixture = Fixture::new(false).await;
+    let output = fixture.run("codex", true, false).await;
+    assert_eq!(output.status.code(), Some(1));
+    fixture.assert_requests("codex", true, false);
+    let (stdout, stderr) = safe_output(&output);
+    assert!(stdout.contains("가져오기 완료"));
+    assert!(stdout.contains("갱신 확인 필요"));
+    assert!(stderr.contains("갱신을 확인하지 못했습니다"));
+    assert!(!stdout.contains("다시 로그인 필요"));
+    assert!(!stderr.contains("다시 로그인 필요"));
+    assert!(!stdout.contains("갱신 성공"));
+}
+
+#[tokio::test]
+async fn malformed_success_replies_reject_without_echo_or_claiming_completion() {
+    for invalid in [
+        InvalidReply::Health,
+        InvalidReply::Inspect,
+        InvalidReply::Commit,
+        InvalidReply::RefreshNull,
+    ] {
+        let fixture = Fixture::with_invalid_reply(true, Some(invalid)).await;
         let output = fixture.run("codex", true, false).await;
         assert_eq!(output.status.code(), Some(1));
-        fixture.assert_requests("codex", true, false);
+        if matches!(invalid, InvalidReply::Health) {
+            let observed = fixture.mock.observed.lock().unwrap();
+            assert_eq!(
+                observed.iter().map(|r| r.route).collect::<Vec<_>>(),
+                ["health"]
+            );
+            assert!(observed.iter().all(|r| r.authenticated));
+            assert!(!fixture.source_path().exists());
+            assert!(!fixture.home.path().join("accounts").exists());
+        } else {
+            fixture.assert_requests("codex", !matches!(invalid, InvalidReply::Inspect), false);
+        }
         let (stdout, stderr) = safe_output(&output);
-        assert!(stdout.contains("가져오기 완료"));
-        assert!(stdout.contains("갱신 확인 필요"));
-        assert!(stderr.contains("갱신을 확인하지 못했습니다"));
+        assert!(!stdout.contains("가져오기 완료"));
+        assert!(!stdout.contains("갱신 성공"));
         assert!(!stdout.contains("다시 로그인 필요"));
         assert!(!stderr.contains("다시 로그인 필요"));
-        assert!(!stdout.contains("갱신 성공"));
+        assert!(!stderr.is_empty());
     }
 }

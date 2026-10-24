@@ -244,7 +244,12 @@ async fn listeners_enforce_c2_and_protect_extra_admin_routes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let health: qb_proto::HealthResponse = response.json().await.unwrap();
+    let body = response.bytes().await.unwrap();
+    let health: qb_proto::HealthResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&health).unwrap().as_slice(),
+        body.as_ref()
+    );
     assert!(health.ok);
     assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(health.pid, std::process::id());
