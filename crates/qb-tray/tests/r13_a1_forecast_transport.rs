@@ -11,6 +11,9 @@ use qb_tray::{
     state::{DashboardState, Tab},
     v2,
 };
+#[path = "support/r15_admin_account_fixture.rs"]
+mod admin_fixture;
+
 use serde_json::json;
 
 #[tokio::test]
@@ -23,16 +26,16 @@ async fn r13_a1_http_forecast_survives_poll_dto_flyout_and_both_dashboard_tabs()
     let detail = qb_core::usage_forecast_display::lines(&forecast, false).join("\n");
     assert!(!summary.text.is_empty());
     assert!(!detail.is_empty());
-    let payload = json!({"version":"synthetic-admin", "accounts":[
-        {"id":"cx-a1","provider":"codex","label":"합성 Codex","user_state":"active",
-         "health":{"kind":"ready"},"source":{"kind":"oauth"},
-         "windows":[{"name":"5h","used_pct":70.,"reset_at":clock.utc()+chrono::Duration::hours(4)}],
-         "usage_forecast":forecast},
-        {"id":"cl-a1","provider":"claude","label":"합성 Claude","user_state":"active",
-         "health":{"kind":"ready"},"source":{"kind":"cpa","mode":"adopted"},
-         "windows":[{"name":"5h","used_pct":70.,"reset_at":clock.utc()+chrono::Duration::hours(4)}],
-         "usage_forecast":forecast}
-    ]});
+    let mut codex = admin_fixture::account("cx-a1", "codex", json!(forecast));
+    codex["label"] = json!("합성 Codex");
+    codex["windows"] = json!([{"name":"5h","used_pct":70.,
+        "reset_at":clock.utc()+chrono::Duration::hours(4),"observed_at":clock.utc(),"status":null}]);
+    let mut claude = admin_fixture::account("cl-a1", "claude", json!(forecast));
+    claude["label"] = json!("합성 Claude");
+    claude["source"] = json!({"kind":"cpa","mode":"adopted","dir":"synthetic-source",
+        "match":{"account_uuid":"synthetic-claude-origin","email":"cl-a1@example.invalid"}});
+    claude["windows"] = codex["windows"].clone();
+    let payload = json!({"version":"synthetic-admin", "accounts":[codex, claude]});
     // Live polling uses /state, whose account entries use the same view as
     // /accounts. Do not inject v2 directly: the DTO round trip was the bug.
     let wire = serde_json::to_vec(&payload).unwrap();
@@ -130,17 +133,16 @@ async fn r13_a1_http_forecast_survives_poll_dto_flyout_and_both_dashboard_tabs()
 }
 
 #[test]
-fn r13_a1_missing_and_null_forecast_keep_legacy_admin_payload_compatible() {
+fn r13_a1_archived_missing_and_null_forecast_keep_presentation_compatible() {
     for extra in [json!({}), json!({"usage_forecast":null})] {
         let mut account = json!({"id":"legacy","provider":"codex","user_state":"active","health":{"kind":"ready"}});
         account
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        let snapshot: client::TraySnapshot =
-            serde_json::from_value(json!({"accounts":[account]})).unwrap();
+        // Archived presentation compatibility is separate from the current live DTO.
         let projected = v2::project(
-            &serde_json::to_string(&snapshot).unwrap(),
+            &serde_json::to_string(&json!({"accounts":[account]})).unwrap(),
             std::time::SystemTime::now(),
         )
         .unwrap();
@@ -149,5 +151,45 @@ fn r13_a1_missing_and_null_forecast_keep_legacy_admin_payload_compatible() {
         assert_eq!(row.forecast_lines, ["측정 중"]);
         assert_eq!(row.forecast_tooltip, "측정 중");
         assert!(!row.forecast_warning);
+    }
+}
+
+#[test]
+fn r15_live_complete_account_keeps_required_keys_and_rejects_malformed_fields() {
+    let account = admin_fixture::account(
+        "live-contract",
+        "codex",
+        admin_fixture::measuring_forecast(),
+    );
+    let wire = json!({"accounts":[account.clone()]});
+    let decoded: client::TraySnapshot = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        serde_json::to_value(decoded).unwrap()["accounts"][0],
+        account
+    );
+    assert_eq!(account.as_object().unwrap().len(), 32);
+    // A missing required nullable member must not silently become null.
+    for key in account.as_object().unwrap().keys() {
+        let mut missing = account.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(
+            serde_json::from_value::<client::TraySnapshot>(json!({"accounts":[missing]})).is_err(),
+            "accepted missing live account key {key}"
+        );
+    }
+    for (key, invalid) in [
+        ("usage_forecast", json!(null)),
+        ("generation", json!(null)),
+        ("takeover_pending", json!("false")),
+        ("source", json!({"kind":"cpa","mode":"adopted"})),
+        ("pacing", json!({"waiting":0})),
+    ] {
+        let mut malformed = account.clone();
+        malformed[key] = invalid;
+        assert!(
+            serde_json::from_value::<client::TraySnapshot>(json!({"accounts":[malformed]}))
+                .is_err(),
+            "accepted malformed live account key {key}"
+        );
     }
 }

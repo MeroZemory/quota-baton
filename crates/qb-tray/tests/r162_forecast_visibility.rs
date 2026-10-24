@@ -6,6 +6,9 @@
 #[allow(dead_code)]
 mod forecast_fixture;
 
+#[path = "support/r15_admin_account_fixture.rs"]
+mod admin_fixture;
+
 use chrono::{DateTime, Duration, FixedOffset, Local, Utc};
 use qb_core::usage_forecast::{AccountUsageForecast, ForecastOutcome};
 use qb_tray::{
@@ -97,18 +100,22 @@ fn forecast(case: Case) -> AccountUsageForecast {
 
 fn account(id: &str, provider: &str, case: Case) -> Value {
     let f = forecast(case);
-    json!({
-        "id":id,"provider":provider,"label":format!("Synthetic {id}"),
-        "plan":"plus","user_state":"active","health":{"kind":"ready"},
-        "source":{"kind":"oauth"},"pool_eligible":true,
-        "eligible_for_new_session":true,"active_sessions":1,"bound_sessions":1,
-        "credits_in_use":false,"allow_credits":true,
-        "credits":{"has_credits":true,"balance":80.0,"unlimited":false},
-        "windows":f.windows.iter().map(|w|json!({
-            "name":w.name,"used_pct":w.used_pct,"reset_at":w.reset_at,
-            "observed_at":w.observed_at
-        })).collect::<Vec<_>>(),"observed_at":AT,"usage_forecast":f
-    })
+    let mut account = admin_fixture::account(id, provider, json!(f));
+    account["active_sessions"] = json!(1);
+    account["bound_sessions"] = json!(1);
+    account["allow_credits"] = json!(true);
+    account["credits"] = json!({"has_credits":true,"balance":80.0,"unlimited":false});
+    account["windows"] = json!(
+        f.windows
+            .iter()
+            .map(|w| json!({
+                "name":w.name,"used_pct":w.used_pct,"reset_at":w.reset_at,
+                "observed_at":w.observed_at,"status":null
+            }))
+            .collect::<Vec<_>>()
+    );
+    account["observed_at"] = json!(AT);
+    account
 }
 
 fn state(accounts: Vec<Value>) -> Value {
@@ -691,11 +698,9 @@ async fn r162_provider_lines_keep_usable_next_recovery_and_actual_credit_evidenc
     active["health"] = json!({"kind":"cooling","reason":"quota","scope":"account",
         "until":now()+Duration::hours(4)});
     active["pool_eligible"] = json!(false);
-    active["eligible_for_new_session"] = json!(false);
     next["health"] = json!({"kind":"cooling","reason":"quota","scope":"account",
         "until":now()+Duration::hours(2)});
     next["pool_eligible"] = json!(false);
-    next["eligible_for_new_session"] = json!(false);
     let recovering = poll(&state(vec![active, next])).await;
     let mut credit = account("paid", "codex", Case::Exhausted);
     credit["credits_in_use"] = json!(true);
