@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: CLI·tray·dashboard의 제공자 요약을 한 계산으로 맞추고 검증 없는 통합 잔여시간을 표시하지 않기
 핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); pooled 실제 보정·백테스트 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 14:07 KST (직접 typed 계정·CLI·현재 fixture 통과; 호환 해석 엄격성·나머지 응답·전체 R15 진행)
+갱신: 2026-10-24 14:15 KST (실제 live decoder 엄격 검사 통과; launch/login·나머지 응답·전체 R15 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -473,6 +473,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 13:49 | R15 pool·경고 공유 계약 단위 | proto23·core1160·실제HTTP1·tray354·CLI8·notice18·forecast전송30 통과, workspace strict lint·fmt/diff0 | 원래 경고 순서·pool의 알 수 없음·raw 중복키 거절·capture 허용목록 유지 | 3bdaf59; pool-warning-fingerprint.json. 제네릭 추론 명시 보완, 실제 populated 중첩 계약·계정·정적/전체 관문 별도 |
 | 2026-10-24 13:59 | R15 실제 계정 중첩 전송 단위 | proto28·실제 core→AdminClient1·source 전송5·실제HTTP1·forecast37, workspace strict lint·fmt/diff0 | 동일 응답의 전체 키·값 보존 및 인수 계정 기존 갱신 메뉴 | ed2dd97; account-transport-fingerprint.json. 실제 기존 정보 손실 red→수정, cross-client 테스트만 rustfmt 동일성 보완; 직접 typed 생산자·CLI·fixture·전체 관문 별도 |
 | 2026-10-24 14:07 | R15 직접 계정 생산자·CLI·현재 fixture | core1164·CLI2·실제AdminClient1·tray354·전송31·한영표시3·dashboard I/O6, strict lint·fmt/diff0 | 권위32키 직접 구성·기존30키 wrapper 보존·미지정 필드 조작 없는 합성 현재 응답 | bb2c637·72bd38e; account-producer-fingerprint.json. unused test-helper 범위 보완, 0개 filter 제외 후 실제6개 확인; 정적/다른 응답/최종 관문 별도 |
+| 2026-10-24 14:15 | R15 실제 호환 decoder 엄격 검사 | proto·실제 Tray/CLI·실제HTTP·tray lib·strict lint/fmt/diff 통과 | 알 수 없는 root/metric 필드 baseline101→수정0·archive 별도 호환 | 0287d76; live-compat-strict-fingerprint.json. 나머지 응답/정적/최종 관문 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
