@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N8/R15 응답·정적 집중 통과, 전체 관문과 실제 화면 검증 중
-목표: WS 연결 수 제한으로 계정을 이동하지 않고, 사용 불가 계정에서 유일한 복귀처로 안전하게 복구하기
+현재 마일스톤: N8/R15 공유 계약 최종 관문 완료·설치 인계; 다음 N6r 초기 상태·재생 구현
+목표: 서버·CLI·트레이의 관리자 응답 계약을 공유하고 실제 전송과 화면에서 필드 손실을 검증하기
 핵심 지표: 남은 출시 2/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 숫자 통합 예측·실제 재생은 미수용
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 16:19 KST (오류 계약과 최종 정적 집중 통과; 전체 관문 진행)
+갱신: 2026-10-24 17:49 KST (R15 b492eda 동일 입력 전체 기능3899·코어1310·실제 HWND10/추가PNG2 검수)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -110,12 +110,12 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N3 R9.5 move progress, interruption safety, readable preview | S1 | none | `impl/r9.5`, brief R9.5-move-progress.md | golden ko/en output, Ctrl+C tests per step, finish/rollback after a kill |
 | N4 R12.11 canary version timeout | S1 | none | `impl/r12.11` (proposal kept) | slow-version, timeout-to-cache and unparseable regressions |
 | N7 Part F pooled runway: calibration and 24 h backtest | W, then S1 | none for the backtest; the UI after N1 | backtest worker in `.sandbox/r13f-backtest/` | backtest error at 1 h and 3 h against a stated bound |
-| N8 R15 compiled admin contract | S1 | none | `impl/r15`, brief R15-contract.md | contract round trips, static guard, property tests |
+| N8 R15 compiled admin contract | completed gate; S2 install | none | `impl/r15`, brief R15-contract.md | shared nested responses, round trips, static guard, routing properties; qualified full matrix and real-path KO/EN captures passed |
 | N9 README final and v0.2.0 release | S2 and design | N1 and N2 installed | design session | public export scan clean, release assets built from the export |
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (remaining ready work, supervisor priority): N7 UI/backtest, N8, N6r (implement remaining producers/adapter while genuine export inputs are gathered). R13.G, N5d-native and N6t gates are complete; S2 owns installation. Earlier N1–N6 minimum, N5a–c, N10, N5d bounded close, N5i, N11, N3 and N4 deliveries are preserved in the gate records.
+**Current S1 order** (remaining ready work): N6r (implement and verify initial producers/reader/restore adapter), N7 calibration/backtest. N8/R15 final gate is complete; S2 owns installation. R13.G, N5d-native and N6t gates are complete; S2 owns installation. Earlier N1–N6 minimum, N5a–c, N10, N5d bounded close, N5i, N11, N3 and N4 deliveries are preserved in the gate records.
 
 **Start now in W:** N5m and the N7 backtest.
 
@@ -242,6 +242,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 13:26 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | 제공자 기본 사실 관문 완료; 실제24시간 보정·pooled 숫자 미수용으로 출시 수 유지 |
 | 2026-10-24 13:31 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | 설계 세션 확인: N5d-native cc12102 12:10 설치·Part F 사실9fcc560 13:31 설치; 통합 숫자 예측은 보정·백테스트 미수용 |
 | 2026-10-24 16:11 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | 설계 세션의 N5d-native 12:10 설치 수용 반영; R13.H 집중 관문은 출시 수 변화 없음, pooled 숫자 미출시 |
+| 2026-10-24 17:49 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 2/3 | R15 공유 응답 계약 최종 관문 완료; 원본 실패16 집중 복구·전체 기능3899/코어1310 통과·실제 화면 검수; 통합 숫자/실제 재생 미수용 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -486,14 +487,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 15:10 | R15 실제 인수·사용량 반환값 보존 | proto 인수2·실제 r6 HTTP7·실제 AdminClient 계정1·all-feature strict lint/fmt/diff0 | 확인·실행·완료재실행의 실제 반환값과 원본응답 일치; Usage 원본 비교 보강 | 0e314a2; takeover-actual-fingerprint.json; 전체 관문 별도 |
 | 2026-10-24 16:11 | R13.H WS 용량·제한된 복귀 | 앞선 core1160·최종 core6/WS5·원본 WS148/1의 실패 기대 집중 복구·기본/전체 strict core lint·fmt/diff 통과 | 3세션 같은 계정 HTTP·유일 복귀·대안 선택·중복 예외 및 전역 예산 거부 | R13.H-evidence/delivery-fingerprint.json; 미사용 테스트 재수출 제거·실패 원본 보존·명시적 lease 종료, 전체 workspace/설치 미주장 |
 | 2026-10-24 16:19 | R15 계정 오류 응답 공유 계약 | proto·core·tray·CLI·실제 HTTP 오류·strict lint·syn guard 집중 통과 | code/outcome/message/retry_after 순서·생략·기존 분류 보존; 정확한7허용 제거·선택3필드 검토 | 7f419f5; account-errors-fingerprint.json; 전체 관문 별도 |
+| 2026-10-24 17:49 | R15 최종 계약 관문 | 전체 기능3899/0/36제외·코어1310/0/1제외·실제 HWND10/추가PNG2 검수 | 전체 행렬·집중 복구·실제 DTO 경로 | delivery-fingerprint.json; 원본 기본3475/16/19제외 보존·집중 원인별 복구·strict lint/fmt/guard/build/check exit0; 검사 간 중복 합산 안 함 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R13.H 사용자 멈춤 수정 | 집중 관문 통과·미설치 | 설계 세션 실제 설치와 영향 세션 확인 | 병합 해시 인계·설치 S2 |
-| 공유 admin 계약 | R15 다수 transport/guard 단위 커밋·보존 | 오류 lint/manifest 통과·최종 행렬·실제 경로 캡처 | impl/r15 소스 고정 후 전체 관문 |
-| 통합 숫자 예측·실제 재생 | 기본 사실 설치, 실제 export 수령 | 실제24시간 보정·epoch별 복원 대조 | N7 백테스트와 N6r 생산자/reader/adapter |
+| 실제 재생 초기 상태·복원 | recorder 최소 설치; 초기 producer/reader 후보 준비 | owner 전체 초기 cut·복원·실제 epoch별 대조 | N6r 후보 집중 통합·나머지 owner/clock 구현 |
+| 통합 숫자 예측 | 기본 사실 설치; 보정 export의 scoreable pair 0 | 실제24시간 보정·백테스트 수용 | 고정 기준 유지·입력 adapter 보완·관측 결손 명시 |
+| R15 설치 | 전체 관문·실제 화면 검수 완료 | 설계 세션 설치와 smoke | 최종 병합 해시·검사 지문 인계(S2) |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
