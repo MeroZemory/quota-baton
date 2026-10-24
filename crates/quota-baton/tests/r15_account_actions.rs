@@ -28,7 +28,7 @@ use qb_tray::client::{
     ClientError, ReleaseHoldWire,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     fs,
     sync::{Arc, Mutex},

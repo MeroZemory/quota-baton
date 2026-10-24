@@ -140,6 +140,12 @@
       "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
     },
     {
+      "file": "crates/qb-proto/src/admin_account_error.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Account error schema production scope, direct cfg(test) exclusions only; exactly three reviewed omission defaults, no JSON allowances."
+    },
+    {
       "file": "crates/qb-proto/src/admin_action.rs",
       "json": true,
       "defaults": true,
@@ -656,35 +662,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 769,
-        "rule": "admin-json",
-        "snippet": "json!({\"error\":{\"code\":code,\"message\":message}})",
-        "field": "",
-        "field_type": "",
-        "owner": "",
-        "attribute": ""
-      },
-      "count": 1,
-      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in takeover_account."
-    },
-    {
-      "key": {
-        "file": "crates/qb-core/src/admin.rs",
-        "line": 854,
-        "rule": "admin-json",
-        "snippet": "json!({\"error\":{\"code\":code,\"message\":message}})",
-        "field": "",
-        "field_type": "",
-        "owner": "",
-        "attribute": ""
-      },
-      "count": 1,
-      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in adopt_account."
-    },
-    {
-      "key": {
-        "file": "crates/qb-core/src/admin.rs",
-        "line": 868,
+        "line": 872,
         "rule": "serde-default",
         "snippet": "default",
         "field": "force",
@@ -697,78 +675,8 @@
     },
     {
       "key": {
-        "file": "crates/qb-core/src/admin.rs",
-        "line": 894,
-        "rule": "admin-json",
-        "snippet": "json!(message)",
-        "field": "",
-        "field_type": "",
-        "owner": "",
-        "attribute": ""
-      },
-      "count": 1,
-      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_account."
-    },
-    {
-      "key": {
-        "file": "crates/qb-core/src/admin.rs",
-        "line": 895,
-        "rule": "admin-json",
-        "snippet": "json!({\"error\":value})",
-        "field": "",
-        "field_type": "",
-        "owner": "",
-        "attribute": ""
-      },
-      "count": 1,
-      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_account."
-    },
-    {
-      "key": {
-        "file": "crates/qb-core/src/admin.rs",
-        "line": 916,
-        "rule": "admin-json",
-        "snippet": "json!({\"error\":{\"code\":\"poll_too_soon\",\"message\":\"Usage poll interval has not elapsed\",\"retry_after\":retry_after}})",
-        "field": "",
-        "field_type": "",
-        "owner": "",
-        "attribute": ""
-      },
-      "count": 1,
-      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_usage."
-    },
-    {
-      "key": {
-        "file": "crates/qb-core/src/admin.rs",
-        "line": 921,
-        "rule": "admin-json",
-        "snippet": "json!({\"error\":{\"code\":\"poll_excluded\",\"message\":\"Account cannot be polled\"}})",
-        "field": "",
-        "field_type": "",
-        "owner": "",
-        "attribute": ""
-      },
-      "count": 1,
-      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_usage."
-    },
-    {
-      "key": {
-        "file": "crates/qb-core/src/admin.rs",
-        "line": 922,
-        "rule": "admin-json",
-        "snippet": "json!({\"error\":{\"code\":\"poll_unavailable\",\"message\":\"Usage poll unavailable\"}})",
-        "field": "",
-        "field_type": "",
-        "owner": "",
-        "attribute": ""
-      },
-      "count": 1,
-      "reason": "Existing registered admin response/error/acknowledgement or bounded SSE construction; migrate by route, preserve status and exact shape; reviewed occurrence in refresh_usage."
-    },
-    {
-      "key": {
         "file": "crates/qb-core/src/bindings.rs",
-        "line": 1251,
+        "line": 1254,
         "rule": "admin-json",
         "snippet": "json!({\"id\":crate::routing::session_id(key),\"account\":g.account,\"policy\":self.policies.plan(launch::policy_key(&d, Some(key)))})",
         "field": "",
@@ -1384,7 +1292,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 37,
+        "line": 38,
         "rule": "serde-default",
         "snippet": "default",
         "field": "session_key",
@@ -1398,7 +1306,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 53,
+        "line": 54,
         "rule": "serde-default",
         "snippet": "default",
         "field": "dir",
@@ -1412,7 +1320,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 55,
+        "line": 56,
         "rule": "serde-default",
         "snippet": "default",
         "field": "activate",
@@ -1426,7 +1334,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 57,
+        "line": 58,
         "rule": "serde-default",
         "snippet": "default",
         "field": "dry_run",
@@ -1618,6 +1526,48 @@
       },
       "count": 1,
       "reason": "Absent affected-group count remains None and omitted; actual zero remains present. Existing core ActivityData serialization and direct history response projection preserve this omission policy; present null is rejected by the concrete current response type."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_account_error.rs",
+        "line": 48,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "code",
+        "field_type": "Option<String>",
+        "owner": "struct:AccountErrorDetail",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Supported message-only account error envelopes omit code; missing restores None, not a fabricated code or success. Present String rejects null; serialization omits None. Classification receipt only; no mutation, lease or deferred-reset authority."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_account_error.rs",
+        "line": 54,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "outcome",
+        "field_type": "Option<RefreshTerminal>",
+        "owner": "struct:AccountErrorDetail",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Nonterminal errors omit outcome; missing restores None, never success or terminal authority. Present six-value RefreshTerminal rejects null; serialization omits None. Classification receipt only; no mutation, lease or deferred-reset authority."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_account_error.rs",
+        "line": 61,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "retry_after",
+        "field_type": "Option<u64>",
+        "owner": "struct:AccountErrorDetail",
+        "attribute": "#[serde(\r\n        default,\r\n        skip_serializing_if = \"Option::is_none\",\r\n        deserialize_with = \"present\"\r\n    )]"
+      },
+      "count": 1,
+      "reason": "Errors outside poll throttling omit retry_after; missing restores None, not zero or retry permission. Present u64 rejects null; observed zero stays Some(0) and is emitted; serialization omits None. Classification receipt only; no mutation, lease or deferred-reset authority."
     }
   ]
 }
