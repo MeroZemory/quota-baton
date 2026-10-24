@@ -396,7 +396,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2941,
+        "line": 2942,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_updated\",\"data\":{\"id\":id,\"snapshot\":snapshot}})",
         "field": "",
@@ -410,7 +410,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3063,
+        "line": 3064,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: bound account is cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -424,7 +424,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3065,
+        "line": 3066,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: bound account is cooling\"}})",
         "field": "",
@@ -438,7 +438,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3131,
+        "line": 3132,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: all accounts are cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -452,7 +452,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3133,
+        "line": 3134,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: all accounts are cooling\"}})",
         "field": "",
@@ -466,7 +466,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3143,
+        "line": 3144,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"invalid_request_error\",\"message\":format!(\"quota-baton: no usable {} account — open the tray\",provider.as_str())}})",
         "field": "",
@@ -480,7 +480,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3997,
+        "line": 3998,
         "rule": "admin-json",
         "snippet": "json!(\"quota_notice\")",
         "field": "",
@@ -494,7 +494,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3998,
+        "line": 3999,
         "rule": "admin-json",
         "snippet": "json!(account.id)",
         "field": "",
@@ -508,7 +508,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3999,
+        "line": 4000,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\",\"data\":data})",
         "field": "",
@@ -522,7 +522,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4036,
+        "line": 4037,
         "rule": "admin-json",
         "snippet": "json!([\r\n        account.health,\r\n        account.user_state,\r\n        account.drain,\r\n        account.allow_credits,\r\n        account.quota_cooling,\r\n        account.payment_until\r\n    ])",
         "field": "",

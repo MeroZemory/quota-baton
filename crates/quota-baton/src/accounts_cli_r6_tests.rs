@@ -18,11 +18,18 @@ struct Mock {
 }
 
 fn metadata() -> Value {
-    json!({"email":"synthetic@example.invalid", "plan":"free", "provider_account_id":"synthetic-id",
-        "source_path":"synthetic/missing-home", "source_last_refresh":null,
-        "source_mtime":"2026-01-01T00:00:00Z", "owner_alive":false,
-        "existing_id":null, "inspect_digest":"synthetic-digest",
-        "access_token":"synthetic-secret", "unexpected":{"refresh_token":"synthetic-secret"}})
+    serde_json::to_value(qb_proto::admin_takeover::TakeoverInspect {
+        email: Some("synthetic@example.invalid".into()),
+        plan: Some("free".into()),
+        provider_account_id: Some("synthetic-id".into()),
+        source_path: "synthetic/missing-home".into(),
+        source_last_refresh: None,
+        source_mtime: Some("2026-01-01T00:00:00Z".into()),
+        owner_alive: false,
+        existing_id: None,
+        inspect_digest: "synthetic-digest".into(),
+    })
+    .unwrap()
 }
 
 async fn health(State(mock): State<Mock>, headers: HeaderMap) -> (StatusCode, axum::Json<Value>) {
@@ -50,7 +57,15 @@ async fn handle(
         axum::Json(if body["phase"] == "inspect" {
             mock.inspect
         } else {
-            json!({"id":"cx-synthetic", "renamed_to":"synthetic/renamed", "refresh":{"ok":true,"token_expires_at":"2026-01-01T01:00:00Z"},"access_token":"synthetic-secret"})
+            serde_json::to_value(qb_proto::admin_takeover::TakeoverCommit {
+                id: "cx-synthetic".into(),
+                renamed_to: Some("synthetic/renamed".into()),
+                refresh: qb_proto::admin_takeover::TakeoverRefresh {
+                    ok: true,
+                    token_expires_at: Some("2026-01-01T01:00:00Z".into()),
+                },
+            })
+            .unwrap()
         }),
     )
 }
@@ -260,14 +275,19 @@ async fn missing_takeover_route_reports_safe_local_and_remote_versions() {
 
 #[test]
 fn warnings_and_results_only_render_allowlisted_scalar_fields() {
-    let normal = takeover_inspect_lines(&metadata(), false).join("\n");
+    // Keep hostile extra fields at the presentation boundary, independently of
+    // the strict live transport fixtures above.
+    let mut hostile = metadata();
+    hostile["access_token"] = json!("synthetic-secret");
+    hostile["unexpected"] = json!({"refresh_token":"synthetic-secret"});
+    let normal = takeover_inspect_lines(&hostile, false).join("\n");
     assert!(normal.contains("원래 앱"));
     assert!(normal.contains("synthetic@example.invalid"));
     assert!(normal.contains("원본 수정 시각"));
     assert!(normal.contains("원래 앱 실행 중: 감지되지 않음 (최선의 확인)"));
     assert!(!normal.contains("synthetic-secret"));
     assert!(!normal.contains("synthetic-digest"));
-    let stronger = takeover_inspect_lines(&metadata(), true).join("\n");
+    let stronger = takeover_inspect_lines(&hostile, true).join("\n");
     assert!(stronger.contains("전체 토큰 계열이 폐기"));
     let result = takeover_result_line(
         &json!({"id":"cx-synthetic", "refresh":{"ok":false}, "access_token":"synthetic-secret"}),

@@ -11,6 +11,53 @@ use std::{
 };
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Current producer fields surround each presentation edge case. Deliberately
+// malformed dates and future health payloads remain unchanged inside the row.
+fn current_status_fixture(mut state: serde_json::Value) -> serde_json::Value {
+    for row in state["accounts"].as_array_mut().unwrap() {
+        let mut complete = serde_json::json!({
+            "outside_used":false,"pool_eligible":false,"takeover_pending":false,
+            "quota_cooling":null,"quota_credit_releasable":false,"observed_at":null,
+            "quota_notice":null,"credits_in_use":false,
+            "usage_forecast":{"as_of":"2030-01-01T00:00:00Z","observed_at":null,
+                "windows":[],"earliest_window":null,"credit":null,"truncated":false},
+            "has_alternative":false,"id":"sample-acct","generation":1,
+            "last_refresh_at":null,"provider":"codex","label":"-","email":"",
+            "plan":null,"user_state":"active","source":{"kind":"oauth"},
+            "health":{"kind":"ready"},"probe_pending":false,
+            "pacing":{"backoff_until":null,"step":0,"release_interval_ms":250,"waiting":0},
+            "windows":[],"credits":null,"last_used_at":null,"bound_sessions":0,
+            "token_expires_at":null,"drain":false,"allow_credits":false,
+            "refresh_attention":false,"active_sessions":0,"spread_threshold":0
+        });
+        complete
+            .as_object_mut()
+            .unwrap()
+            .extend(row.as_object().unwrap().clone());
+        if complete["health"]["kind"] == "cooling" {
+            complete["health"]
+                .as_object_mut()
+                .unwrap()
+                .entry("scope")
+                .or_insert_with(|| "account".into());
+        }
+        for window in complete["windows"].as_array_mut().unwrap() {
+            for key in ["reset_at", "observed_at", "status"] {
+                window
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(key)
+                    .or_insert(serde_json::Value::Null);
+            }
+        }
+        // Exercise the shared contract before sending the synthetic response.
+        let _: qb_proto::AdminAccount = serde_json::from_value(complete.clone()).unwrap();
+        *row = complete;
+    }
+    state
+}
+
 struct Core {
     child: Arc<Mutex<Child>>,
     timed_out: Arc<AtomicBool>,
@@ -2139,11 +2186,11 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
     )
     .unwrap();
     std::fs::write(home.path().join("admin.token"), "synthetic-admin-secret").unwrap();
-    let state = serde_json::json!({"accounts":[{
+    let state = current_status_fixture(serde_json::json!({"accounts":[{
         "id":"cx-synthetic", "provider":"codex", "label":"합성 🧪\t계정\n\u{1b}",
-        "user_state":"active", "health":{"kind":"future_health", "reason":{"access_token":"synthetic-reason-secret"}},
-        "windows":[], "access_token":"synthetic-access-secret", "secret_dpapi_b64":"synthetic-dpapi-secret"
-    }]});
+        "user_state":"active", "health":{"kind":"future_health", "reason":{"access_token":"synthetic-reason-secret","nested_token":"synthetic-access-secret","secret_dpapi_b64":"synthetic-dpapi-secret"}},
+        "windows":[]
+    }]}));
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
         for (route, body) in [
@@ -2191,7 +2238,7 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
     )
     .unwrap();
     std::fs::write(home.path().join("admin.token"), "synthetic-admin-token").unwrap();
-    let state = serde_json::json!({"accounts":[
+    let state = current_status_fixture(serde_json::json!({"accounts":[
         {"id":"cx-expired-five", "provider":"codex", "label":"합성 🧪", "user_state":"active",
          "health":{"kind":"ready"}, "probe_pending":true, "windows":[
             {"name":"5h", "used_pct":100.0, "reset_at":"2000-01-01T09:00:00.123+09:00"},
@@ -2208,7 +2255,7 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
          "health":{"kind":"cooling", "reason":"auth", "until":"2099-01-01T00:00:00Z"},
          "windows":[{"name":"7d", "used_pct":25.0, "reset_at":"invalid"},
                     {"name":"43200m", "used_pct":2.0, "reset_at":"2099-02-01T00:00:00Z"}]}
-    ]});
+    ]}));
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
         // Both process launches query health, then state; no real core or upstream.
@@ -2268,11 +2315,11 @@ fn c6_4_status_renders_per_provider_pool_counts() {
     )
     .unwrap();
     std::fs::write(home.path().join("admin.token"), "synthetic-admin-secret").unwrap();
-    let state = serde_json::json!({"accounts":[
+    let state = current_status_fixture(serde_json::json!({"accounts":[
         {"id":"a","provider":"claude","user_state":"active","health":{"kind":"ready"}},
         {"id":"b","provider":"claude","user_state":"active","health":{"kind":"cooling","reason":"payment","until":"2099-01-01T00:00:00Z"}},
         {"id":"c","provider":"codex","user_state":"disabled","health":{"kind":"ready"}}
-    ]});
+    ]}));
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
         for (route, body) in [

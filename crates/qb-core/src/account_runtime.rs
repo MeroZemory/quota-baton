@@ -2363,7 +2363,7 @@ impl AccountRuntime {
                     pool_eligible: a.user_state == UserState::Active
                         && !pending
                         && !takeover_fenced.contains(&a.id)
-                        && matches!(health, AdminHealth::Ready),
+                        && matches!(health, AdminHealth::Ready {}),
                     takeover_pending: takeover_fenced.contains(&a.id),
                     quota_cooling: a.quota_cooling.as_ref().map(|value| AdminQuotaCooling {
                         window: value.window.clone(),
@@ -2374,6 +2374,7 @@ impl AccountRuntime {
                     observed_at: serde_json::from_value(quota["observed_at"].clone())
                         .map_err(|_| ())?,
                     quota_notice: quota_notice
+                        .filter(|notice| !notice.is_null())
                         .map(serde_json::from_value)
                         .transpose()
                         .map_err(|_| ())?,
