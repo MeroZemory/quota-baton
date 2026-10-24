@@ -18,6 +18,30 @@ mod history;
 #[path = "client/snapshot.rs"]
 pub mod snapshot;
 
+pub type AccountActionWire = qb_proto::admin_action::AccountActionReply<
+    qb_proto::admin_account::AdminProvider,
+    qb_proto::admin_account::AdminUserState,
+    qb_proto::admin_account::AdminHealth,
+>;
+pub type ReleaseHoldWire = qb_proto::admin_action::ReleaseHoldReply<
+    qb_proto::admin_account::AdminProvider,
+    qb_proto::admin_account::AdminUserState,
+    qb_proto::admin_account::AdminHealth,
+>;
+
+/// Local result discrimination; not a new serialized wire tag or envelope.
+pub enum AccountActionResponse {
+    Changed(AccountActionWire),
+    Released(ReleaseHoldWire),
+    Usage(Box<qb_proto::AdminAccount>),
+}
+
+fn account_reply_presentation<T: Serialize>(raw: &T) -> Result<PresentationAccount, ClientError> {
+    let invalid = || ClientError::AccountAction("계정 응답 형식이 올바르지 않습니다");
+    let bytes = serde_json::to_vec(raw).map_err(|_| invalid())?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
+}
+
 #[derive(Debug, Clone)]
 pub struct AdminClient {
     http: reqwest::Client,
@@ -276,12 +300,28 @@ impl AdminClient {
         id: &str,
         patch: AccountPatch,
     ) -> Result<PresentationAccount, ClientError> {
-        self.send_json(
-            reqwest::Method::PATCH,
-            &format!("/admin/v1/accounts/{id}"),
-            &patch,
-        )
-        .await
+        let raw = self.patch_account_raw(id, patch).await?;
+        account_reply_presentation(&raw)
+    }
+
+    pub async fn patch_account_raw(
+        &self,
+        id: &str,
+        patch: AccountPatch,
+    ) -> Result<AccountActionWire, ClientError> {
+        test_response_delay().await;
+        let response = self
+            .request(reqwest::Method::PATCH, &format!("/admin/v1/accounts/{id}"))
+            .json(&patch)
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        let bytes = Self::check_response(response)
+            .await?
+            .bytes()
+            .await
+            .map_err(ClientError::Decode)?;
+        Self::decode_dashboard_object(&bytes)
     }
 
     pub async fn account_action(
@@ -289,17 +329,38 @@ impl AdminClient {
         id: &str,
         action: AccountAction,
     ) -> Result<PresentationAccount, ClientError> {
+        match self.account_action_raw(id, action).await? {
+            AccountActionResponse::Changed(raw) => account_reply_presentation(&raw),
+            AccountActionResponse::Released(raw) => account_reply_presentation(&raw),
+            AccountActionResponse::Usage(raw) => account_reply_presentation(&raw),
+        }
+    }
+
+    /// Each route keeps its own exact shared graph before presentation.
+    pub async fn account_action_raw(
+        &self,
+        id: &str,
+        action: AccountAction,
+    ) -> Result<AccountActionResponse, ClientError> {
         test_response_delay().await;
         let response = self
             .account_action_request(id, action)
             .send()
             .await
             .map_err(ClientError::Transport)?;
-        Self::check_response(response)
+        let bytes = Self::check_response(response)
             .await?
-            .json()
+            .bytes()
             .await
-            .map_err(ClientError::Decode)
+            .map_err(ClientError::Decode)?;
+        match action {
+            AccountAction::ReleaseHold => {
+                Self::decode_dashboard_object(&bytes).map(AccountActionResponse::Released)
+            }
+            AccountAction::RefreshUsage => Self::decode_dashboard_object(&bytes)
+                .map(|raw| AccountActionResponse::Usage(Box::new(raw))),
+            _ => Self::decode_dashboard_object(&bytes).map(AccountActionResponse::Changed),
+        }
     }
 
     fn account_action_request(&self, id: &str, action: AccountAction) -> reqwest::RequestBuilder {
@@ -313,6 +374,16 @@ impl AdminClient {
     }
 
     pub async fn refresh_tokens(&self, id: &str) -> Result<(), ClientError> {
+        let summary = self.refresh_tokens_raw(id).await?;
+        let value = serde_json::to_value(summary)
+            .map_err(|_| ClientError::AccountAction("갱신 응답을 확인할 수 없습니다"))?;
+        refresh_result(StatusCode::OK, &value)
+    }
+
+    pub async fn refresh_tokens_raw(
+        &self,
+        id: &str,
+    ) -> Result<qb_proto::admin_refresh::ManualRefreshReply, ClientError> {
         let response = self
             .http
             .post(format!("{}/admin/v1/accounts/{id}/refresh", self.base_url))
@@ -323,8 +394,13 @@ impl AdminClient {
             .await
             .map_err(ClientError::Transport)?;
         let status = response.status();
+        if status.is_success() {
+            let bytes = response.bytes().await.map_err(ClientError::Decode)?;
+            return Self::decode_dashboard_object(&bytes);
+        }
         let summary: serde_json::Value = response.json().await.map_err(ClientError::Decode)?;
-        refresh_result(status, &summary)
+        refresh_result(status, &summary)?;
+        Err(ClientError::Http(status))
     }
 
     pub async fn delete_account(&self, id: &str) -> Result<(), ClientError> {
@@ -337,12 +413,20 @@ impl AdminClient {
         provider: &str,
         path: &str,
     ) -> Result<TakeoverInspect, ClientError> {
-        self.send_json(
-            reqwest::Method::POST,
-            "/admin/v1/accounts/takeover",
-            &serde_json::json!({"provider":provider,"path":path,"phase":"inspect"}),
-        )
-        .await
+        let response = self
+            .request(reqwest::Method::POST, "/admin/v1/accounts/takeover")
+            .json(&serde_json::json!({"provider":provider,"path":path,"phase":"inspect"}))
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        let bytes = Self::check_response(response)
+            .await?
+            .bytes()
+            .await
+            .map_err(ClientError::Decode)?;
+        let wire: qb_proto::admin_takeover::TakeoverInspect =
+            Self::decode_dashboard_object(&bytes)?;
+        takeover_presentation(&wire)
     }
 
     pub async fn takeover_commit(
@@ -360,11 +444,13 @@ impl AdminClient {
             .send()
             .await
             .map_err(ClientError::Transport)?;
-        Self::check_response(response)
+        let bytes = Self::check_response(response)
             .await?
-            .json()
+            .bytes()
             .await
-            .map_err(ClientError::Decode)
+            .map_err(ClientError::Decode)?;
+        let wire: qb_proto::admin_takeover::TakeoverCommit = Self::decode_dashboard_object(&bytes)?;
+        takeover_presentation(&wire)
     }
 
     pub async fn start_login(&self, provider: &str) -> Result<LoginStart, ClientError> {
@@ -1126,6 +1212,12 @@ mod tests {
         );
         assert!(!rendered.contains("synthetic-id"));
     }
+}
+
+fn takeover_presentation<T: Serialize, U: DeserializeOwned>(wire: &T) -> Result<U, ClientError> {
+    let invalid = || ClientError::AccountAction("계정 가져오기 응답 형식이 올바르지 않습니다");
+    let bytes = serde_json::to_vec(wire).map_err(|_| invalid())?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
 }
 
 /// Allowlist only. Never retain or render unknown response fields or a token.
@@ -1894,6 +1986,55 @@ mod login_contract_tests {
             let decoded: LoginStatus = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(decoded.status, state);
             assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
+    }
+}
+
+#[cfg(test)]
+mod r15_account_action_consumer_tests {
+    use super::*;
+    #[test]
+    fn raw_action_and_release_preserve_ack_and_match_existing_display() {
+        for released in [false, true] {
+            let raw = if released {
+                r#"{"id":"sample-acct","released":true,"provider":"codex","label":"sample-acct","email":"sample-acct@example.test","plan":null,"user_state":"paused","health":{"kind":"ready"},"drain":false,"allow_credits":false}"#
+            } else {
+                r#"{"id":"sample-acct","provider":"codex","label":"sample-acct","email":"sample-acct@example.test","plan":null,"user_state":"paused","health":{"kind":"ready"},"drain":false,"allow_credits":false}"#
+            };
+            let (serialized, display) = if released {
+                let typed: ReleaseHoldWire =
+                    AdminClient::decode_dashboard_object(raw.as_bytes()).unwrap();
+                assert!(typed.released);
+                (
+                    serde_json::to_string(&typed).unwrap(),
+                    account_reply_presentation(&typed).unwrap(),
+                )
+            } else {
+                let typed: AccountActionWire =
+                    AdminClient::decode_dashboard_object(raw.as_bytes()).unwrap();
+                (
+                    serde_json::to_string(&typed).unwrap(),
+                    account_reply_presentation(&typed).unwrap(),
+                )
+            };
+            assert_eq!(serialized, raw);
+            let previous: PresentationAccount = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                serde_json::to_value(display).unwrap(),
+                serde_json::to_value(previous).unwrap()
+            );
+        }
+        for bad in [
+            r#"{"id":"sample-acct"}"#,
+            r#"{"id":"sample-acct","id":"sample-acct"}"#,
+            "[]",
+        ] {
+            assert!(
+                AdminClient::decode_dashboard_object::<AccountActionWire>(bad.as_bytes()).is_err()
+            );
+            assert!(
+                AdminClient::decode_dashboard_object::<ReleaseHoldWire>(bad.as_bytes()).is_err()
+            );
         }
     }
 }

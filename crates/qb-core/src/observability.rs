@@ -590,7 +590,10 @@ impl Observability {
         })));
         self.progress(serde_json::json!({
             "event": "core_warning",
-            "data": {"kind": "burst", "burst_new_sessions": observed_count},
+            "data": qb_proto::admin_sse::BurstWarning {
+                kind: qb_proto::admin_sse::WarningKind::Burst,
+                burst_new_sessions: observed_count,
+            },
         }));
     }
     pub fn core_warning(&self, account: &str, code: &str) {

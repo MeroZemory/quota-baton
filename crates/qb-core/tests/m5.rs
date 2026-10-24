@@ -1021,7 +1021,10 @@ async fn admin_refresh_returns_account_view_too_soon_and_quota_updated_event() {
         .push(usage(25.0, Utc::now().timestamp() + 3600));
     let response = h.refresh().await;
     assert_eq!(response.status(), StatusCode::OK);
-    let view: Value = response.json().await.unwrap();
+    let body = response.bytes().await.unwrap();
+    let shared: qb_proto::AdminAccount = serde_json::from_slice(&body).unwrap();
+    assert_eq!(serde_json::to_vec(&shared).unwrap(), body.as_ref());
+    let view = serde_json::to_value(shared).unwrap();
     assert_eq!(view["id"], h.id);
     assert_eq!(view["plan"], "plus");
     assert_eq!(view["windows"][0]["used_pct"], 25.0);
@@ -1511,7 +1514,11 @@ async fn r2a_manual_refresh_admin_returns_safe_success_and_terminal_summary() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let summary: Value = response.json().await.unwrap();
+        let body = response.bytes().await.unwrap();
+        let shared: qb_proto::admin_refresh::ManualRefreshReply =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(serde_json::to_vec(&shared).unwrap(), body.as_ref());
+        let summary = serde_json::to_value(shared).unwrap();
         assert_eq!(summary.as_object().unwrap().len(), 3);
         assert_eq!(summary["outcome"], "success");
         assert_eq!(
@@ -1535,7 +1542,11 @@ async fn r2a_manual_refresh_admin_returns_safe_success_and_terminal_summary() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let summary: Value = response.json().await.unwrap();
+        let body = response.bytes().await.unwrap();
+        let shared: qb_proto::admin_refresh::ManualRefreshReply =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(serde_json::to_vec(&shared).unwrap(), body.as_ref());
+        let summary = serde_json::to_value(shared).unwrap();
         assert_eq!(summary.as_object().unwrap().len(), 3);
         assert_eq!(summary["outcome"], "refresh_token_reused");
         assert!(matches!(h.account().health, Health::NeedsRelogin { .. }));
