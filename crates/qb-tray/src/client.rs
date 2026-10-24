@@ -5,6 +5,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
+pub use qb_proto::admin_login::{LoginStart, LoginStatus};
 use reqwest::{StatusCode, header};
 use serde::{
     Deserialize, Serialize,
@@ -493,23 +494,6 @@ pub struct AccountPatch {
     pub drain: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_credits: Option<bool>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct LoginStart {
-    pub login_id: String,
-    pub auth_url: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct LoginStatus {
-    pub status: String,
-    #[serde(default)]
-    pub account_id: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1765,5 +1749,36 @@ mod r15_pool_warning_transport_tests {
         // /state does not adopt the separate SSE quota_notice schema.
         let raw = r#"{"accounts":[],"warnings":[{"kind":"quota_notice","account":"a"}]}"#;
         assert!(serde_json::from_str::<TraySnapshot>(raw).is_err());
+    }
+}
+
+#[cfg(test)]
+mod login_contract_tests {
+    use super::{LoginStart, LoginStatus};
+    use qb_proto::admin_login::LoginState;
+    use serde_json::json;
+
+    #[test]
+    fn shared_login_responses_keep_wire_keys_and_omissions() {
+        let start = json!({"login_id":"synthetic-login", "auth_url":"synthetic-url"});
+        let decoded: LoginStart = serde_json::from_value(start.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), start);
+        for (wire, state) in [
+            (json!({"status":"pending"}), LoginState::Pending),
+            (
+                json!({"status":"completed", "account_id":"synthetic-account"}),
+                LoginState::Completed,
+            ),
+            (
+                json!({"status":"failed", "error":"synthetic-error"}),
+                LoginState::Failed,
+            ),
+            (json!({"status":"cancelled"}), LoginState::Cancelled),
+            (json!({"status":"expired"}), LoginState::Expired),
+        ] {
+            let decoded: LoginStatus = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded.status, state);
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
     }
 }

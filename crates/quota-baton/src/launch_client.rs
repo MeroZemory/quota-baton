@@ -12,7 +12,8 @@
 //! No persistent configuration is written. All content-bearing Debug is redacted.
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use qb_proto::admin_launch::LaunchReply;
+use serde::Serialize;
 use std::{ffi::OsString, fmt, fs::File, io::Read, path::Path, time::Duration};
 use toml_edit::DocumentMut;
 
@@ -545,14 +546,6 @@ struct LaunchRequest<'a> {
     move_for_model: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     urgent: bool,
-}
-
-#[derive(Deserialize)]
-struct LaunchReply {
-    base_url: String,
-    catalog_url: String,
-    account: String,
-    model: Option<String>,
 }
 
 /// Authenticated, validated issuance. No Debug/Display: routing URLs are secrets.

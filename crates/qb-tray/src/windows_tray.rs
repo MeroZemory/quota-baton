@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use geometry::{FooterAction, MenuAction, Overlay, Target as HitTarget};
+use qb_proto::admin_login::LoginState;
 use qb_tray::i18n;
 use qb_tray::{
     v2, v2_geometry as geometry,
@@ -1423,15 +1424,21 @@ fn launch_login(hwnd: HWND, provider: String) {
                     return Ok(());
                 }
                 if matches!(
-                    status.status.as_str(),
-                    "completed" | "failed" | "expired" | "cancelled"
+                    status.status,
+                    LoginState::Completed
+                        | LoginState::Failed
+                        | LoginState::Expired
+                        | LoginState::Cancelled
                 ) {
-                    retry = matches!(status.status.as_str(), "failed" | "expired");
+                    retry = matches!(status.status, LoginState::Failed | LoginState::Expired);
                     with_current_login(generation, || {
                         view_state()
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .publish(owner, Some(format!("login:{provider}:{}", status.status)));
+                            .publish(
+                                owner,
+                                Some(format!("login:{provider}:{}", status.status.as_str())),
+                            );
                         unsafe {
                             let _ = PostMessageW(
                                 Some(HWND(hwnd_value as *mut c_void)),
