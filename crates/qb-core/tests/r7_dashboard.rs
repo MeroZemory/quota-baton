@@ -116,7 +116,14 @@ impl Harness {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        response.json().await.unwrap()
+        let bytes = response.bytes().await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        if path == "sessions" || path.starts_with("sessions?") {
+            let shared: qb_proto::admin_sessions::SessionsView =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_value(shared).unwrap(), value);
+        }
+        value
     }
     fn id() -> String {
         SessionId::from_key(&format!("codex:{SID}")).as_str().into()
@@ -361,6 +368,9 @@ async fn r7_http_authenticated_views_strip_private_label_and_preserve_upstream_b
         .insert("openai-model", "header-model".parse().unwrap());
     fake.state.push(response);
     let h = Harness::new(&fake.url).await;
+    // The same real listener/byte decoder covers both empty and populated lists.
+    let empty = h.get("sessions?range=all").await;
+    assert_eq!(empty["sessions"], json!([]));
     let mut events = h
         .client
         .get(format!("http://{}/admin/v1/events", h.servers.admin_addr))
@@ -420,6 +430,11 @@ async fn r7_http_authenticated_views_strip_private_label_and_preserve_upstream_b
     assert_eq!(detail["model"], "header-model");
     assert_eq!(detail["client"]["kind"], "codex_cli");
     let list = h.get("sessions?range=all").await;
+    assert_eq!(
+        list["sessions"][0]["label"]["best_effort"],
+        detail["label"]["best_effort"]
+    );
+    assert!(list["sessions"][0]["label"]["best_effort"].is_boolean());
     let wire = serde_json::to_string(&list).unwrap();
     assert!(!wire.contains("original_short_id"));
     assert!(!wire.contains(SID));
