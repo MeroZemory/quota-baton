@@ -123,8 +123,28 @@ enum Phase0Command {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    if qb_core::service::prepare_process().is_err() {
+        eprintln!("실패했습니다: 서비스 신호 초기화를 완료하지 못했습니다.");
+        std::process::exit(1);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let status = runtime.block_on(main_async());
+    drop(runtime);
+    let finished = qb_core::service::finish_process();
+    if status != 0 {
+        std::process::exit(status);
+    }
+    if finished.is_err() {
+        eprintln!("실패했습니다: 서비스 교체를 완료하지 못했습니다.");
+        std::process::exit(1);
+    }
+}
+
+async fn main_async() -> i32 {
     qb_core::set_console_utf8();
     if let Err(error) = run().await {
         if error
@@ -132,7 +152,8 @@ async fn main() {
             .is_some()
         {
             eprintln!("{error}");
-            std::process::exit(2);
+            qb_core::service::defer_error_exit(2);
+            return 2;
         }
         let message = friendly_error(&error);
         if message == "로그인 시간이 만료되었습니다. 다시 시작해 주세요." {
@@ -141,8 +162,10 @@ async fn main() {
             eprintln!("실패했습니다: {message}");
         }
         platform::keep_launch_error_visible();
-        std::process::exit(1);
+        qb_core::service::defer_error_exit(1);
+        return 1;
     }
+    0
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
@@ -298,8 +321,12 @@ async fn run() -> anyhow::Result<()> {
                 }
                 _ => anyhow::bail!("합성 인계 검사의 홈과 프로필 주소를 함께 지정하세요."),
             }
-            let _logs = qb_core::logging::init(&home)?;
             let config = qb_core::config::Config::load(&home)?;
+            if qb_core::service::handle_takeover(&home, &config, takeover).await? {
+                return Ok(());
+            }
+            qb_core::service::initialize_listeners(&config)?;
+            let _logs = qb_core::logging::init(&home)?;
             let mut imported_bindings = None;
             let started = std::time::Instant::now();
             let store = loop {
@@ -321,6 +348,7 @@ async fn run() -> anyhow::Result<()> {
                     Err(error) => return Err(error.into()),
                 }
             };
+            qb_core::service::retain_store_lease(&store)?;
             qb_core::set_process_priority()?;
             #[cfg(feature = "shape-capture")]
             let capture = capture_dir.map(|dir| qb_core::observability::CaptureOptions {
@@ -331,6 +359,7 @@ async fn run() -> anyhow::Result<()> {
             let capture = None;
             let observability =
                 std::sync::Arc::new(qb_core::observability::Observability::new(&home, capture)?);
+            qb_core::service::retain_observability(observability.clone())?;
             if takeover {
                 observability.record_takeover("lease_acquired");
             }
@@ -448,7 +477,8 @@ async fn run() -> anyhow::Result<()> {
                         relay.clone(),
                         config.server.data_port,
                     ))
-                    .merge(qb_core::debug_pin::routes(store, pins));
+                    .merge(qb_core::debug_pin::routes(store, pins))
+                    .merge(qb_core::service::routes(relay.clone()));
             #[cfg(feature = "phase0")]
             let admin_routes = admin_routes.merge(qb_core::relay::phase0_routes(relay.clone()));
             let secrets = qb_core::local_secrets::load_or_create(&home)?;
@@ -462,61 +492,90 @@ async fn run() -> anyhow::Result<()> {
             if takeover {
                 observability.record_takeover("listening");
             }
-            println_utf8!("프록시를 시작했습니다.");
+            let startup_failure =
+                qb_core::service::defer_startup_error(qb_core::service::notify_ready().and_then(
+                    |_| print_stdout(format_args!("프록시를 시작했습니다.")).map_err(Into::into),
+                ))?;
             let polling = relay.quota.start();
             let refreshing = relay.start_refresh_scheduler();
             let catalogs = relay.start_catalog_scheduler();
             let memory_guard = relay.start_memory_guard();
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => { result?; }
-                _ = relay.wait_for_drain() => {}
+            if startup_failure.is_none() {
+                qb_core::service::wait_for_shutdown(relay.clone()).await?;
             }
-            polling.abort();
-            refreshing.abort();
-            catalogs.abort();
-            memory_guard.abort();
-            let _ = polling.await;
-            let _ = refreshing.await;
-            let _ = catalogs.await;
-            let _ = memory_guard.await;
-            // Stop accepting new connections before handing the credential
-            // lease to the successor. Existing handlers remain alive under
-            // axum's graceful-shutdown drain.
-            servers.shutdown();
-            servers.wait_for_listener_close().await;
-            if relay.is_draining() {
-                relay.release_lease_after_drain();
-            }
-            let drain_deadline = relay.drain_timeout();
-            let _ = tokio::time::timeout(drain_deadline, async {
-                let _ = tokio::join!(&mut servers.data_task, &mut servers.admin_task);
-                while relay
-                    .inflight_requests
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    > 0
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            qb_core::service::complete_shutdown(async {
+                polling.abort();
+                refreshing.abort();
+                catalogs.abort();
+                memory_guard.abort();
+                let _ = polling.await;
+                let _ = refreshing.await;
+                let _ = catalogs.await;
+                let _ = memory_guard.await;
+                // Stop accepting new connections before handing the credential
+                // lease to the successor. Existing handlers remain alive under
+                // axum's graceful-shutdown drain.
+                servers.shutdown();
+                servers.wait_for_listener_close().await;
+                if relay.is_draining() && qb_core::service::should_release_lease_early() {
+                    relay.release_lease_after_drain();
                 }
-            })
-            .await;
-            drop(servers);
-            login.cancel_all().await;
-            // The lease must outlive detached token consumption and durable writes.
-            while relay.shutdown_refreshes().await.is_err() {
-                println_utf8!("종료 중 토큰 저장 작업이 끝나기를 기다립니다.");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
-            tokio::task::spawn_blocking(move || {
-                if relay.is_draining() {
-                    observability.record_takeover("exited");
+                let drain_deadline = relay.drain_timeout();
+                let clean = qb_core::service::drain_connections(
+                    async {
+                        let (data, admin) =
+                            tokio::join!(&mut servers.data_task, &mut servers.admin_task);
+                        while relay
+                            .inflight_requests
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            > 0
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        data.is_ok_and(|result| result.is_ok())
+                            && admin.is_ok_and(|result| result.is_ok())
+                    },
+                    drain_deadline,
+                )
+                .await;
+                qb_core::service::validate_listener_drain(clean)?;
+                drop(servers);
+                login.cancel_all().await;
+                // The lease must outlive detached token consumption and durable writes.
+                while relay.shutdown_refreshes().await.is_err() {
+                    if qb_core::service::retry_durable_cleanup() {
+                        qb_core::service::shutdown_retry_notice();
+                    } else {
+                        println_utf8!("종료 중 토큰 저장 작업이 끝나기를 기다립니다.");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
-                let binding_flush = relay.bindings.flush();
-                observability.shutdown_replay();
-                binding_flush?;
-                observability.flush()
+                // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
+                tokio::task::spawn_blocking(move || {
+                    if relay.is_draining() {
+                        observability.record_takeover("exited");
+                    }
+                    loop {
+                        let binding_flush = relay.bindings.flush();
+                        observability.shutdown_replay();
+                        match binding_flush.and_then(|_| observability.flush()) {
+                            Ok(()) => break Ok(()),
+                            Err(_) if qb_core::service::retry_durable_cleanup() => {
+                                qb_core::service::shutdown_retry_notice();
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    }
+                })
+                .await??;
+                Ok(())
             })
-            .await??;
+            .await?;
+            if let Some(error) = startup_failure {
+                return Err(error);
+            }
+            qb_core::service::finish()?;
         }
         Command::Status { options } => {
             let config = qb_core::config::Config::load(&home)?;

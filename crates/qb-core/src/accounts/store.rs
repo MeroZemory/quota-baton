@@ -184,8 +184,20 @@ impl AccountStore {
         Ok(store)
     }
 
+    /// Keep the managed service lease through runtime and writer shutdown.
+    pub(crate) fn retain_service_lease(&self) -> anyhow::Result<()> {
+        let guard = self
+            .lease
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service lease unavailable"))?;
+        guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("service lease unavailable"))?
+            .retain_for_service()
+    }
+
     /// Release the home lease while read-only runtime objects are still
-    /// alive.  Takeover uses this after all writers and refresh tasks stop;
+    /// alive. Takeover uses this after all writers and refresh tasks stop;
     /// ordinary shutdown still releases it through Drop.
     pub fn release_lease(&self) {
         self.stop_writes();
