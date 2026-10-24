@@ -509,8 +509,9 @@ process.exit(result.status ?? 1);
             "catalog must be released after the child exits"
         );
         assert_eq!(&native[6..], native_args(mode));
-        let expect_version_probe =
-            mode == "fresh-empty" && cfg!(all(feature = "testkit", debug_assertions));
+        // Eligible fresh launches probe capabilities in ordinary builds too.
+        // The unsupported fixture version must still use the original runner.
+        let expect_version_probe = mode == "fresh-empty";
         assert_eq!(
             root.join("version-probed").exists(),
             expect_version_probe,
