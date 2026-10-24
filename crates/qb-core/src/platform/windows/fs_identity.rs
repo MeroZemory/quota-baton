@@ -16,7 +16,7 @@ pub(crate) fn binding_snapshot_preopen(path: &Path, metadata: &Metadata) -> io::
             "invalid binding snapshot trust or size",
         ));
     }
-    crate::local_secrets::restrict(path).map_err(io::Error::other)
+    super::secrets::restrict(path).map_err(io::Error::other)
 }
 
 pub(crate) fn configure_snapshot_open(options: &mut OpenOptions) {
@@ -31,7 +31,7 @@ pub(crate) fn routing_policy_preopen(path: &Path, metadata: &Metadata) -> anyhow
     if metadata_is_reparse(metadata) {
         anyhow::bail!("routing policy reparse point refused");
     }
-    crate::local_secrets::restrict(path)?;
+    super::secrets::restrict(path)?;
     Ok(())
 }
 

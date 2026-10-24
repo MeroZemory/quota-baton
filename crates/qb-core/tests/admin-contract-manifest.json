@@ -44,6 +44,18 @@
       "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
     },
     {
+      "file": "crates/qb-core/src/accounts/takeover_receipt.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/accounts/takeover/refresh_source.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
       "file": "crates/qb-core/src/admin.rs",
       "json": true,
       "defaults": true,
@@ -122,7 +134,19 @@
       "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
     },
     {
+      "file": "crates/qb-core/src/relay/takeover_windows.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
       "file": "crates/qb-core/src/relay/credentials.rs",
+      "json": true,
+      "defaults": false,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/relay/credentials/takeover.rs",
       "json": true,
       "defaults": false,
       "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
@@ -276,6 +300,18 @@
       "json": true,
       "defaults": true,
       "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Shared proto contract defaults (including optional requests)."
+    },
+    {
+      "file": "crates/qb-core/src/admin/runtime_windows.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/platform/unix/admin_runtime.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
     }
   ],
   "baseline": [
@@ -548,7 +584,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/accounts/takeover.rs",
-        "line": 525,
+        "line": 399,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"email\":journal.account.email,\"plan\":journal.account.plan,\"provider_account_id\":provider_account_id,\r\n            \"source_path\":proof.path,\"source_last_refresh\":journal.account.token_meta.last_refresh_at,\r\n            \"source_mtime\":proof.modified,\"owner_alive\":deps.source.owner(request.provider, proof) != Owner::Stopped,\r\n            \"existing_id\":exists.then_some(&journal.account.id),\"inspect_digest\":journal.inspect_digest,\r\n        })",
         "field": "",
@@ -562,7 +598,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/accounts/takeover.rs",
-        "line": 598,
+        "line": 472,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"email\":profile.email,\"plan\":profile.plan,\"provider_account_id\":provider_account_id,\r\n            \"source_path\":snapshot.proof.path,\"source_last_refresh\":meta.last_refresh_at,\r\n            \"source_mtime\":snapshot.proof.modified,\r\n            \"owner_alive\":deps.source.owner(request.provider, &snapshot.proof) != Owner::Stopped,\r\n            \"existing_id\":existing.as_ref().map(|a| &a.id),\"inspect_digest\":inspect_digest,\r\n        })",
         "field": "",
@@ -576,7 +612,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/accounts/takeover.rs",
-        "line": 795,
+        "line": 669,
         "rule": "admin-json",
         "snippet": "json!({\"id\":journal.account.id,\r\n        \"renamed_to\":(journal.retired && !journal.keep_source).then_some(&journal.destination),\"refresh\":journal.result})",
         "field": "",
@@ -618,7 +654,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 223,
+        "line": 213,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\r\n                    \"code\": error.code(), \"message\": error.message()\r\n                }})",
         "field": "",
@@ -632,7 +668,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 255,
+        "line": 245,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\r\n                \"code\":error.code(),\"message\":error.message(),\r\n            }})",
         "field": "",
@@ -646,7 +682,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 282,
+        "line": 272,
         "rule": "serde-default",
         "snippet": "default",
         "field": "inherit",
@@ -660,7 +696,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 357,
+        "line": 347,
         "rule": "serde-default",
         "snippet": "default = \"default_drain_timeout\"",
         "field": "drain_timeout_secs",
@@ -674,7 +710,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 573,
+        "line": 563,
         "rule": "admin-json",
         "snippet": "json!({\"changed\":[],\"removed\":[],\"resync\":true})",
         "field": "",
@@ -688,7 +724,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 657,
+        "line": 647,
         "rule": "serde-default",
         "snippet": "default",
         "field": "force",
@@ -1192,7 +1228,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 206,
+        "line": 207,
         "rule": "admin-json",
         "snippet": "json!({\"account\":a.id,\"forecast\":self.observability.forecast_view(&a.id,\r\n                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})",
         "field": "",
@@ -1206,7 +1242,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 1958,
+        "line": 1934,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\"type\": kind, \"message\": message}})",
         "field": "",
@@ -1594,6 +1630,20 @@
       },
       "count": 1,
       "reason": "Errors outside poll throttling omit retry_after; missing restores None, not zero or retry permission. Present u64 rejects null; observed zero stays Some(0) and is emitted; serialization omits None. Classification receipt only; no mutation, lease or deferred-reset authority."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/admin.rs",
+        "line": 25,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "paste_redirect",
+        "field_type": "bool",
+        "owner": "struct:LoginRequest",
+        "attribute": "#[serde(default)]"
+      },
+      "count": 1,
+      "reason": "Explicit Codex redirect-paste fallback defaults false; omission preserves device-code selection for no_browser and preserves browser behavior otherwise. Only Codex no_browser requests may opt in."
     }
   ]
 }

@@ -240,7 +240,7 @@ fn required(value: &serde_json::Value, name: &str) -> Result<String, LoginError>
         .map(str::to_owned)
         .ok_or(LoginError::InvalidIdentity)
 }
-fn user_agent() -> &'static str {
+pub(super) fn user_agent() -> &'static str {
     concat!("quota-baton/", env!("CARGO_PKG_VERSION"))
 }
 

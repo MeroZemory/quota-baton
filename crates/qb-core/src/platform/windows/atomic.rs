@@ -88,7 +88,7 @@ pub(crate) fn atomic_write_binding(path: &Path, bytes: &[u8]) -> std::io::Result
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         let mut file = options.open(&tmp)?;
-        crate::local_secrets::restrict(&tmp).map_err(std::io::Error::other)?;
+        super::secrets::restrict(&tmp).map_err(std::io::Error::other)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
