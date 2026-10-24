@@ -96,3 +96,11 @@ Two remaining compatibility questions need a gate decision if further evidence d
 These questions will be sent once with the milestone gate batch. No unsupported continuation, alternate transport or weaker proof is being enabled while the managed Codex parent is integrated.
 
 D26 amendment2 (`9f085d6`, 2026-10-24) settles both native questions: no Claude TUI continuation; permanent far-wait move on that path. Codex WS requires a C9 full poll plus qb-owned exactly-one-forwarded-create evidence after pinned-source verification. No frame inference. N6t precedes that producer; ordinary native activation remains off. The bounded official0.163/0.164 source prerequisite is recorded in main `.sandbox/research/d26-ws-single-flight/README.md`, not runtime acceptance.
+
+## R13 Part F: real calibration/backtest input
+
+Non-blocking request for the provider-facts gate batch. Shared provider facts can ship independently; pooled numeric runway stays unavailable.
+
+Please supply a sanitized, body-free last-24-hour quota/attempt-usage export if one exists. Needed: epoch-local account identities; provider and model/plan regimes; window duration, used percentage, reset and observation/availability times; active/drain/credit/outside-use coverage; all attempt token magnitudes or explicit unknowns (including retries); and observed exhaustion/right-censor labels. Do not include prompts, token strings, email addresses or project names. Recorder minimum account/collection events alone do not provide all these inputs. Historical gaps must remain unknown.
+
+Recommendation: use the real export to assess the predeclared calibration choices and justify 1h/3h error and token-coverage bounds before any numeric display. The implementer has only synthetic backtest preparation, not real acceptance. Meanwhile N6r producer/reader/restore work and R15 shared contracts remain independent ready work; this request does not block the whole goal or authorize live-profile access.

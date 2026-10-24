@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N5d-native 일반 제품 관문 완료 · 설치 인계
-목표: Codex0.164 지원 새 실행의 HTTP·WS 한도 후 자동 재개, 사용자 중지·입력 취소 보존
-핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); native 관문 완료·설치 수용 전
+현재 마일스톤: R13 Part F 제공자 기본 사실 집중 관문 완료 · 전체 관문 진행
+목표: CLI·tray·dashboard의 제공자 요약을 한 계산으로 맞추고 검증 없는 통합 잔여시간을 표시하지 않기
+핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); native 설치 수용·실제 보정 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 12:05 KST (N5d-native 관문 완료·self-merge 인계; 설치는 설계 세션)
+갱신: 2026-10-24 12:42 KST (공통 요약 bc2a34a·집중503·실제10HWND/2PNG 수용; 전체 행렬 종료 신호로 재개)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -238,6 +238,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 07:14 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | native HTTP 무조회·반복2회·pause 집중 관문 통과, WS·Claude 전체 미수용·일반 활성화 없음 |
 | 2026-10-24 08:40 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N6t 단일 근거형 이동 경로 관문 통과; 입력별 전체 검사·실패 집중 보완 지문 보존. 실제24시간 replay와 일반 native 활성화 별도 |
 | 2026-10-24 12:05 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5d-native 일반 release 실제 HTTP/WS·중지/입력 취소·정상 종료7/7 관문 완료; 설치 수용 전 |
+| 2026-10-24 12:42 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R13 F 기본 사실 공통화 bc2a34a 집중503·실제10HWND/2PNG 수용; 전체 관문 진행·미병합·미설치, pooled 실측 보정 미완 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -463,13 +464,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 07:30 | N6t dev 결합 보완 집중 검증 | core1080·정적2/67반례·실제HTTP5/WS4·row6a1·native HTTP2 통과, strict core 기본/전체 lint·fmt0 | typed 권위 보존·5h 먼 한도 사유·현재/신규 모델 동의 구분 | a2eca02·06d1596; label hook 제거101→정확복원, 독립 Sol source PASS. dev 활동 연산4개만 manifest 추가(275 distinct), 전체 관문 다음 |
 | 2026-10-24 08:40 | N6t 최종 관문 | 기본3154통과/3실패→영향 HTTP118·정책75통과; 전체3550통과/1실패→런처 기본·전체각1통과; 코어1203통과 | owner 증거·정적67반례·실제 HTTP/WS·기본/전체 strict lint·읽기 전용 check | ed2cb87; n6t-close-fingerprint.json 입력별 재사용, 원본 실패 보존. 새 전체 green 합계로 주장하지 않음; N6r 별도 |
 | 2026-10-24 12:05 | N5d-native 일반 제품 최종 관문 | ownership39·entry13·하네스11·native7/7·strict lint·release/read-only/fmt0 | 동일 대화 reset 후1회 재개·중지/입력0재개·소유 프로세스/홈 정리 | f154b6a; n5d-ordinary-final-fingerprint.json. 원본 workspace 실패와 집중 복구 입력별 재사용, 새 전체 green 합계 아님 |
+| 2026-10-24 12:42 | R13 F 제공자 기본 사실 집중 관문 | core9·CLI6·tray477·DTO/layout11 = 503 통과; strict 세 범위·build/fmt/diff0, 실제 한영10HWND/2PNG | 공유 계산·사용 가능 수와 측정 비율 구분·크레딧 잔여시간 대상 명시 | bc2a34a; R13.F-evidence/focused-fingerprint.json. 독립 표시 결함2개 정확 red2→수정, Python 사전도구32통과는 합성만; 전체 행렬·숫자 예측 미수용 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | C+E native 설치 | 일반 release native7/7 관문 완료·미설치 | 설계 세션 설치·실제 확인 | 병합 해시와 지원 버전/범위 인계 |
-| 제공자 통합 예측 | 기본 사실·부분 범위 표시 설치; pooled runway 미출시 | 보정과 실제24시간 백테스트 | N7 공유 요약 통합·근거 확보, 숫자 우회 없음 |
+| 제공자 통합 예측 | 기본 사실 공통화 집중503·실제12PNG 수용, 전체 관문 진행; pooled 미출시 | 전체 관문과 보정·실제24시간 백테스트 | 행렬 종료 신호 확인·기본 사실 병합; 실제 export 요청·N8 독립 진행 |
 | 실제24시간 라우팅 재생 | 최소 기록·typed rebind 설치, 복원 초기 상태/adapter 미완 | epoch별 실제 초기 상태·loss·동일 router 대조 | N6r 생산자·읽기·복원 adapter 구현, export 근거 구분 |
 <!-- gaps:end -->
 
