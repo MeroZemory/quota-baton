@@ -196,6 +196,60 @@ login. Ctrl+C cancels the pending login and releases its account-store lease.
 The usual login without `--no-browser` retains the browser and loopback callback
 flow.
 
+## Per-box keys and optional listeners
+
+A box is identified by its own client key. Enrollment does not require a
+listener declaration. A key-only box can authenticate on the core's existing
+loopback data port; the admin port always requires the host admin credential.
+Keep that port private to the host unless a separately trusted proxy exposes it.
+
+For an Incus system container, declare its optional Unix listener in the host
+configuration before enrolling it:
+
+```toml
+[[boxes]]
+name = "sample-box"
+listen = "unix"
+```
+
+The managed service creates `/run/quota-baton/boxes/sample-box.sock` when that
+name is enrolled. The socket accepts only that box's key. Through an Incus proxy,
+the client still uses a loopback URL and sends its own key:
+
+```bash
+incus config device add sample-box qb proxy \
+  listen=tcp:127.0.0.1:10200 \
+  connect=unix:/run/quota-baton/boxes/sample-box.sock bind=instance
+```
+
+`bind=instance` puts the listening TCP endpoint inside the container. Keep its
+visible port equal to the configured data port so Host validation stays exact.
+`listen = "tcp:127.0.0.1:<port>"` is reserved for later VM support; this build
+refuses that listener kind rather than silently substituting another transport.
+
+The orchestrator uses the authenticated host admin API:
+
+| Method and path | Operation |
+| --- | --- |
+| `GET /admin/v1/boxes` | List names, epochs and revocation state; never keys. |
+| `POST /admin/v1/boxes` | Enroll `{"name":"sample-box"}`; return its key once. |
+| `POST /admin/v1/boxes/sample-box/revoke` | Revoke this epoch and close its active streams. |
+| `POST /admin/v1/boxes/sample-box/launches` | Register a Codex launch using the usual launch options; return its scoped lease URL. |
+
+Store the enrollment response privately and deliver only the box's own client
+key and lease URL to that box. Do not put keys in command arguments, shell
+history or logs. A lease issued for one box cannot be used by another box or an
+ordinary global client. Claude can use its box key on the regular data routes.
+The orchestrator retains the admin credential; boxes never need it.
+
+An authenticated box may send `x-qb-root-session` as a placement preference.
+Normal eligibility and capacity rules still apply, and the header is removed
+before forwarding upstream. A header alone never establishes box identity.
+Revocation stops fresh admission and interrupts the revoked box's response
+streams and upgrades, while already admitted durable credential writes finish
+under the retained service lease. An idle shared HTTP keepalive may remain open;
+every subsequent request must authenticate again and is refused after revocation.
+
 ## Qualification and limits
 
 The P2 fixture used systemd 255 and glibc 2.39. Reload retained the same PID and

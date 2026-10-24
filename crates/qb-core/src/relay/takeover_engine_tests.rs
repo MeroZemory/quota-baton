@@ -420,6 +420,7 @@ async fn r6_fresh_login_discards_pending_rotation_after_real_write_failure_and_d
         failed_token: zeroize::Zeroizing::new(tokens.access_token.clone()),
         store_error_in_memory: false,
         takeover_operation: Some(journal.operation.clone()),
+        box_request: None,
     };
     // A real deny-delete file handle makes the atomic replacement fail.
     let held = std::fs::OpenOptions::new()

@@ -1,3 +1,4 @@
+mod box_scope;
 pub(crate) mod credentials;
 mod headers;
 mod hold;
@@ -217,7 +218,7 @@ impl RelayState {
         };
         let key = session.key.clone().ok_or(())?;
         let table = self.bindings.clone();
-        tokio::task::spawn_blocking(move || table.associate_project(&key, &project))
+        crate::boxes::spawn_blocking(move || table.associate_project(&key, &project))
             .await
             .map_err(|_| ())?
             .map_err(|_| ())
@@ -354,7 +355,7 @@ impl RelayState {
             }),
             Err(ManualRefreshError::Terminal { outcome }) => {
                 let store = self.store.clone();
-                let account = tokio::task::spawn_blocking(move || store.load(&id))
+                let account = crate::boxes::spawn_blocking(move || store.load(&id))
                     .await
                     .map_err(|_| ManualRefreshError::Unavailable)?
                     .map_err(|_| ManualRefreshError::Unavailable)?;
@@ -387,7 +388,7 @@ impl RelayState {
     pub fn start_memory_guard(&self) -> tokio::task::JoinHandle<()> {
         let guard = self.memory_guard.clone();
         let obs = self.observability.clone();
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
@@ -439,7 +440,7 @@ impl RelayState {
         let bindings = self.bindings.clone();
         let store = self.store.clone();
         let obs = self.observability.clone();
-        let exported = tokio::task::spawn_blocking(move || {
+        let exported = crate::boxes::spawn_blocking(move || {
             store.stop_writes();
             obs.freeze_quota()?;
             bindings.freeze()?;
@@ -485,6 +486,13 @@ impl RelayState {
             }
             notified.await;
         }
+    }
+
+    /// Active box-service shutdown wakes upgraded owners without starting a
+    /// takeover, freezing writers, or changing takeover health/lease state.
+    pub(crate) fn notify_box_service_stop(&self) {
+        self.drain_started.store(true, Ordering::Release);
+        self.drain_start_notify.notify_waiters();
     }
 
     pub async fn wait_for_drain_start(&self) {
@@ -825,7 +833,7 @@ impl RelayState {
                     delay = (delay * 2).min(Duration::from_millis(500));
                     let store = self.store.clone();
                     let id = account.id.clone();
-                    match tokio::task::spawn_blocking(move || store.load(&id)).await {
+                    match crate::boxes::spawn_blocking(move || store.load(&id)).await {
                         Ok(Ok(updated)) => *account = updated,
                         _ => {
                             account.user_state = UserState::Paused;
@@ -922,7 +930,7 @@ impl RelayState {
             );
         }
         let read_store = store.clone();
-        let mut accounts = tokio::task::spawn_blocking(move || read_store.list())
+        let mut accounts = crate::boxes::spawn_blocking(move || read_store.list())
             .await
             .map_err(|_| ())?
             .map_err(|_| ())?;
@@ -947,7 +955,7 @@ impl RelayState {
         let runtime = self.accounts.clone();
         let obs = self.observability.clone();
         let bindings = self.bindings.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             let mut candidates = Vec::new();
             let mut evidence = Vec::new();
             let mut store_evidence = Vec::new();
@@ -1098,7 +1106,7 @@ impl RelayState {
         let table = self.bindings.clone();
         let owned_account = account.to_owned();
         let owned_key = key.map(str::to_owned);
-        let (active, threshold, groups_hit, marked) = tokio::task::spawn_blocking(move || {
+        let (active, threshold, groups_hit, marked) = crate::boxes::spawn_blocking(move || {
             table.note_client_rate(
                 provider,
                 &owned_account,
@@ -1160,6 +1168,9 @@ impl RelayState {
         id: &str,
         model: Option<&str>,
     ) -> bool {
+        if !crate::boxes::dispatch_allowed() {
+            return false;
+        }
         self.dispatch_checked(key, id, model, true).await
     }
     async fn dispatch_checked(
@@ -1179,7 +1190,7 @@ impl RelayState {
         let owned_model = model.map(str::to_owned);
         let owned_key = key.map(str::to_owned);
         let runtime = self.accounts.clone();
-        let eligible = tokio::task::spawn_blocking(move || {
+        let eligible = crate::boxes::spawn_blocking(move || {
             if !store.takeover_fenced(&owned_id).is_ok_and(|fenced| !fenced) {
                 return false;
             }
@@ -1212,6 +1223,7 @@ impl RelayState {
                     .is_none_or(|current| current == id)
             })
             && !self.is_draining()
+            && crate::boxes::dispatch_allowed()
     }
 
     async fn select_request(
@@ -1317,7 +1329,7 @@ impl RelayState {
         ) {
             let store = self.store.clone();
             let pending_id = ticket.id.clone();
-            let same_provider = tokio::task::spawn_blocking(move || {
+            let same_provider = crate::boxes::spawn_blocking(move || {
                 store
                     .load(&pending_id)
                     .is_ok_and(|a| a.provider == provider)
@@ -1405,6 +1417,7 @@ impl RelayState {
             let evidence = move_evidence.clone();
             let hold_allowed = !completion.reset_hold_used;
             let hold_timed_out = completion.reset_hold_timed_out;
+            let root_hint = completion.root_hint().cloned();
             let admit = admit.clone();
             let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let denied_choice = denied.clone();
@@ -1416,9 +1429,9 @@ impl RelayState {
             let failure_evidence = completion.failure_evidence.clone().or_else(|| {
                 self.reconnect_failure(session.key.as_deref(), reconnect_source.as_deref(), model)
             });
-            let choice = tokio::task::spawn_blocking(move || {
+            let choice = crate::boxes::spawn_blocking(move || {
                 let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
-                    table.choose_with_hold_at_admitted_proof(
+                    table.choose_with_hold_at_admitted_proof_and_root_hint(
                         provider,
                         key.as_deref(),
                         parent.as_deref(),
@@ -1435,23 +1448,25 @@ impl RelayState {
                         hold_timed_out,
                         chrono::Utc::now(),
                         coverage.as_ref(),
+                        root_hint.as_ref(),
                         |account| {
                             // BindingTable holds mutations through this
                             // admission and publication, including ordinary HTTP.
                             let mut admission = None;
-                            let allowed = selection_guard::admit(&selection_operation, || {
-                                if !eligible(
-                                    account,
-                                    table.existing_placement(key.as_deref(), account),
-                                ) {
-                                    return false;
-                                }
-                                admission = admit.as_ref().map_or_else(
-                                    || Some(crate::bindings::DispatchAdmission::ordinary()),
-                                    |admit| admit(account),
-                                );
-                                admission.is_some()
-                            });
+                            let allowed = crate::boxes::dispatch_allowed()
+                                && selection_guard::admit(&selection_operation, || {
+                                    if !eligible(
+                                        account,
+                                        table.existing_placement(key.as_deref(), account),
+                                    ) {
+                                        return false;
+                                    }
+                                    admission = admit.as_ref().map_or_else(
+                                        || Some(crate::bindings::DispatchAdmission::ordinary()),
+                                        |admit| admit(account),
+                                    );
+                                    admission.is_some()
+                                });
                             denied_choice.store(!allowed, Ordering::Release);
                             if allowed {
                                 admission.map(|admission| {
@@ -1695,7 +1710,7 @@ impl RelayState {
         }
         let store = self.store.clone();
         let account_id = id.to_owned();
-        let account = tokio::task::spawn_blocking(move || store.load(&account_id))
+        let account = crate::boxes::spawn_blocking(move || store.load(&account_id))
             .await
             .map_err(|_| ())?
             .map_err(|_| ())?;
@@ -1757,7 +1772,7 @@ impl RelayState {
         }
         let store = self.store.clone();
         let account_id = id.to_owned();
-        let account = tokio::task::spawn_blocking(move || store.load(&account_id))
+        let account = crate::boxes::spawn_blocking(move || store.load(&account_id))
             .await
             .map_err(|_| ())?
             .map_err(|_| ())?;
@@ -1844,13 +1859,13 @@ async fn replay_capture(
             payload.map_err(|_| anyhow::anyhow!("Invalid phase0 replay request"))?;
         let store = state.store.clone();
         let id = payload.account_id.clone();
-        let (account, tokens) = tokio::task::spawn_blocking(move || {
+        let (account, tokens) = crate::boxes::spawn_blocking(move || {
             let account = store.load(&id)?;
             let tokens = store.tokens(&account)?;
             Ok::<_, crate::accounts::StoreError>((account, tokens))
         })
         .await??;
-        let prepared = tokio::task::spawn_blocking(move || {
+        let prepared = crate::boxes::spawn_blocking(move || {
             crate::phase0::prepare(
                 &payload.capture_path,
                 account.provider,
@@ -1880,7 +1895,7 @@ async fn replay_capture(
         let response = relay(State(state.clone()), request).await;
         let store = state.store.clone();
         let id = account.id.clone();
-        if let Ok(Ok(tokens)) = tokio::task::spawn_blocking(move || {
+        if let Ok(Ok(tokens)) = crate::boxes::spawn_blocking(move || {
             let current = store.load(&id)?;
             store.tokens(&current)
         })
@@ -1977,7 +1992,12 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
             "quota-baton successor is unavailable",
         )
     };
-    if state.handover_port == 0 {
+    if state.handover_port == 0
+        || request
+            .extensions()
+            .get::<crate::boxes::BoxAuthority>()
+            .is_some()
+    {
         return unavailable();
     }
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2086,6 +2106,43 @@ async fn precommit_timeout<T>(
     }
 }
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
+    let box_authority = request
+        .extensions()
+        .get::<crate::boxes::BoxAuthority>()
+        .cloned();
+    request.extensions_mut().remove::<crate::boxes::RootHint>();
+    match crate::boxes::take_root(request.headers_mut(), box_authority.as_ref()) {
+        Ok(Some(hint)) => {
+            request.extensions_mut().insert(hint);
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return native_error(
+                StatusCode::BAD_REQUEST,
+                if request.uri().path().contains("messages") {
+                    Provider::Claude
+                } else {
+                    Provider::Codex
+                },
+                "invalid_request_error",
+                "Invalid box routing hint",
+            );
+        }
+    }
+    // A scoped grant is bound to its authenticated ingress. A draining box
+    // request must never enter the ordinary loopback handover path.
+    if box_authority.is_some() && state.is_draining() {
+        return native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            if request.uri().path().contains("messages") {
+                Provider::Claude
+            } else {
+                Provider::Codex
+            },
+            "box_draining",
+            "Box service is draining",
+        );
+    }
     // Strip routing handles before deadlines, ledger, capture, upstream URLs or
     // error construction. Authentication has already run on the local port.
     let normalized = match crate::launch_path::normalize(request.uri()) {
@@ -2121,13 +2178,26 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             "계정 지정 실행 기능을 준비 중입니다. 일반 codex-qb를 사용해 주세요.",
         );
     }
-    let launch_pin = normalized.token.and_then(|token| {
-        let pin = state.launch_tokens.get_or_pin(&token).ok().map(Arc::new);
+    let launch_pin = if let Some(token) = normalized.token {
+        let authority = request.extensions().get::<crate::boxes::BoxAuthority>();
+        let pin = match box_scope::pin_token(&state.launch_tokens, &token, authority) {
+            Ok(pin) => pin,
+            Err(()) => {
+                return native_error(
+                    StatusCode::UNAUTHORIZED,
+                    Provider::Codex,
+                    "launch_unavailable",
+                    "Invalid launch credential",
+                );
+            }
+        };
         request
             .extensions_mut()
             .insert(launch::LaunchIngress { pin: pin.clone() });
         pin
-    });
+    } else {
+        None
+    };
     if request.method() == Method::GET && request.uri().path() == "/v1/qb/native-owner" {
         return native_reset::upgrade(state, request, launch_pin).await;
     }
@@ -2243,12 +2313,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     };
     let routed = route(&parts.method, path, &parts.headers);
     let provider = routed.as_ref().map_or(family, |(family, _)| *family);
-    let mut completion = Completion::new(
+    let mut completion = Completion::new_for_request(
         state.observability.clone(),
         &parts.method,
         path,
         provider,
         &parts.headers,
+        &parts.extensions,
     );
     completion.precommit_deadline = parts.extensions.get::<RequestDeadline>().map(|d| d.0);
     completion.track(state.inflight_requests.clone());
@@ -2369,7 +2440,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         let headers = parts.headers.clone();
         let prefix = upload.prefix.clone();
         // 선택적 키 관찰은 런타임 스레드에서 큰 JSON을 파싱하지 않는다.
-        tokio::task::spawn_blocking(move || observability.capture_request(&headers, &prefix))
+        crate::boxes::spawn_blocking(move || observability.capture_request(&headers, &prefix))
             .await
             .ok()
             .flatten()
@@ -2409,7 +2480,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     } else if let Some(ForcedAccount(id)) = parts.extensions.get::<ForcedAccount>() {
         let store = state.store.clone();
         let id = id.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             store
                 .load(&id)
                 .map(|account| (account.provider == provider).then_some(account))
@@ -2491,7 +2562,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         let account = account.id.clone();
         let raw = upload.prefix.clone();
         if !matches!(
-            tokio::task::spawn_blocking(move || capture.record(&route, &headers, &account, &raw))
+            crate::boxes::spawn_blocking(move || capture.record(&route, &headers, &account, &raw))
                 .await,
             Ok(Ok(_))
         ) {
@@ -3089,7 +3160,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 .extensions
                 .get::<launch::LaunchIngress>()
                 .and_then(|ingress| ingress.pin.clone());
-            let task = tokio::task::spawn_blocking(move || {
+            let task = crate::boxes::spawn_blocking(move || {
                 let preserve = accounts
                     .observed_http_far_wait(
                         &bindings,
@@ -3457,6 +3528,106 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn lineage_completion_reaches_actual_relay_selection_without_resurrecting_exclusions() {
+        use super::*;
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/l1-relay-lineage");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let cpa = root.path().join("synthetic-input");
+        std::fs::create_dir_all(&cpa).unwrap();
+        let mut activate = Vec::new();
+        for n in 0..2 {
+            let email = format!("lineage-{n}@example.invalid");
+            std::fs::write(cpa.join(format!("{n}.json")), serde_json::to_vec(&serde_json::json!({
+                "type":"codex", "email":email, "account_id":format!("synthetic-lineage-{n}"),
+                "access_token":format!("synthetic-lineage-access-{n}"), "refresh_token":"synthetic-refresh",
+                "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-10-13T00:00:01Z"
+            })).unwrap()).unwrap();
+            activate.push(format!("codex:{email}"));
+        }
+        let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
+        crate::platform::seed_account_fixtures(&store, &cpa, &activate, false).unwrap();
+        let obs = Arc::new(Observability::new(store.home(), None).unwrap());
+        let mut config = Config::default();
+        config.routing.weak_evidence_new_sessions = 100;
+        config.upstream.codex_base = "http://127.0.0.1:9".into();
+        config.upstream.anthropic_base = "http://127.0.0.1:9".into();
+        let state =
+            RelayState::new(store, &config, obs.clone(), Arc::new(DebugPins::default())).unwrap();
+        let mut candidates = state
+            .candidates(Provider::Codex, None, None, &BTreeSet::new())
+            .await
+            .unwrap();
+        candidates.sort_by(|a, b| a.account.id.cmp(&b.account.id));
+        assert_eq!(candidates.len(), 2);
+        let native_id = candidates[0].account.id.clone();
+        let root_id = candidates[1].account.id.clone();
+        match state.bindings.choose(
+            Provider::Codex,
+            Some("codex:hint-root"),
+            None,
+            None,
+            &candidates[1..],
+            None,
+            100,
+        ) {
+            crate::bindings::Decision::Selected { account, lease, .. } => {
+                assert_eq!(account, root_id);
+                lease.dispatched();
+            }
+            other => panic!("synthetic root placement failed: {other:?}"),
+        }
+        for (name, extension, excluded, expected) in [
+            ("hinted", true, false, &root_id),
+            ("plain", false, false, &native_id),
+            ("excluded", true, true, &native_id),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-qb-root-session", "codex:hint-root".parse().unwrap());
+            let mut extensions = axum::http::Extensions::new();
+            if extension {
+                extensions.insert(crate::boxes::RootHint::parse("codex:hint-root").unwrap());
+            }
+            let session = session::Session {
+                key: Some(format!("codex:lineage-{name}")),
+                parent: None,
+                model: None,
+            };
+            let original_key = session.key.clone();
+            let mut completion = Completion::new_for_request(
+                obs.clone(),
+                &Method::POST,
+                "/v1/responses",
+                Provider::Codex,
+                &headers,
+                &extensions,
+            );
+            completion.precommit_deadline = Some(Instant::now() + Duration::from_secs(10));
+            completion.selection_cost = Some(100);
+            completion.session(&session);
+            let tried = if excluded {
+                BTreeSet::from([root_id.clone()])
+            } else {
+                BTreeSet::new()
+            };
+            let account = state
+                .select_request(Provider::Codex, &session, &mut completion, None, &tried)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&account.id, expected, "{name}");
+            assert_eq!(session.key, original_key);
+            assert!(session.parent.is_none());
+            completion.binding.as_ref().unwrap().dispatched();
+        }
+    }
+
+    #[tokio::test]
     async fn n6t_selected_successor_retires_failure_before_independent_recovery() {
         use super::*;
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3563,7 +3734,7 @@ mod tests {
         let (release, wait) = tokio::sync::oneshot::channel();
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let ready = entered.clone();
-        let task = tokio::spawn(super::precommit_timeout(
+        let task = crate::boxes::spawn(super::precommit_timeout(
             std::time::Duration::from_millis(30),
             observed,
             async move {
@@ -3839,7 +4010,7 @@ mod tests {
         let guard = state.tokens.block_selection_for_test(&id).await;
         let waiting_state = state.clone();
         let waiting_obs = obs.clone();
-        let first = tokio::spawn(async move {
+        let first = crate::boxes::spawn(async move {
             let mut completion = Completion::new(
                 waiting_obs,
                 &axum::http::Method::POST,

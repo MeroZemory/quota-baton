@@ -78,7 +78,7 @@ pub(super) async fn register(
     let task_operation = operation.clone();
     let task_accounts = accounts.clone();
     let task_owner = original_owner.clone();
-    let task = tokio::task::spawn_blocking(move || {
+    let task = crate::boxes::spawn_blocking(move || {
         // Exact native receipt and actual write witness are rechecked under
         // the existing Store/runtime/binding/policy gates. Cancellation of this
         // async caller revokes operation; the blocking result owns rollback.

@@ -130,7 +130,43 @@ impl BindingTable {
         hold_allowed: bool,
         preference: Option<&launch::SelectionPreference<'_>>,
     ) -> (PreviewDecision, SelectionReason, Option<SoleEligibleTarget>) {
-        let selected = self.select_ordered(
+        self.select_with_return_guard_and_root_hint(
+            d,
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            sources,
+            entitled_targets,
+            observations,
+            pinned,
+            now,
+            hold_allowed,
+            preference,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn select_with_return_guard_and_root_hint(
+        &self,
+        d: &Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        sources: &[Candidate],
+        entitled_targets: Option<&BTreeSet<String>>,
+        observations: MoveObservations,
+        pinned: Option<&str>,
+        now: DateTime<Utc>,
+        hold_allowed: bool,
+        preference: Option<&launch::SelectionPreference<'_>>,
+        root_hint: Option<&crate::boxes::RootHint>,
+    ) -> (PreviewDecision, SelectionReason, Option<SoleEligibleTarget>) {
+        let selected = self.select_ordered_and_root_hint(
             d,
             provider,
             key,
@@ -141,6 +177,7 @@ impl BindingTable {
             now,
             hold_allowed,
             preference,
+            root_hint,
         );
         let PreviewDecision::Selected { account } = &selected.0 else {
             return (selected.0, selected.1, None);
@@ -225,7 +262,7 @@ impl BindingTable {
             });
         drop(guard);
         if selected_blocked && !alternatives.is_empty() {
-            let alternative = self.select_ordered(
+            let alternative = self.select_ordered_and_root_hint(
                 d,
                 provider,
                 key,
@@ -236,6 +273,7 @@ impl BindingTable {
                 now,
                 hold_allowed,
                 preference,
+                root_hint,
             );
             return (alternative.0, alternative.1, None);
         }
@@ -256,7 +294,66 @@ impl BindingTable {
         hold_allowed: bool,
         preference: Option<&launch::SelectionPreference<'_>>,
     ) -> (PreviewDecision, SelectionReason) {
-        let plan = self.policies.plan(launch::policy_key(d, key));
+        self.select_ordered_and_root_hint(
+            d,
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            pinned,
+            now,
+            hold_allowed,
+            preference,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn select_ordered_and_root_hint(
+        &self,
+        d: &Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        now: DateTime<Utc>,
+        hold_allowed: bool,
+        preference: Option<&launch::SelectionPreference<'_>>,
+        root_hint: Option<&crate::boxes::RootHint>,
+    ) -> (PreviewDecision, SelectionReason) {
+        let (plan, policy_exists) = if root_hint.is_some() {
+            self.policies.placement_plan(launch::policy_key(d, key))
+        } else {
+            (self.policies.plan(launch::policy_key(d, key)), true)
+        };
+        let hinted_account = root_hint.and_then(|hint| {
+            let key = key?;
+            let root = group(key);
+            if parent.is_some()
+                || pinned.is_some()
+                || preference.is_some_and(|p| p.model_move)
+                || policy_exists
+                || plan.anchor.is_some()
+                || plan.project.is_some()
+                || d.groups.contains_key(root)
+                || d.bindings.contains_key(key)
+                || d.launches.contains_key(root)
+                || d.launch_anchors.contains_key(root)
+                || d.launch_anchors.contains_key(key)
+                || d.launch_aliases.contains_key(root)
+                || d.launch_aliases.contains_key(key)
+                || d.launch_retention.contains_key(root)
+                || d.active.contains_key(root)
+                || d.pins.contains_key(root)
+            {
+                return None;
+            }
+            self.retained_binding(d, hint.for_provider(provider)?, now)
+                .map(|binding| binding.account.as_str())
+        });
         let (choice, code) = self.select_ranked(
             d,
             provider,
@@ -269,6 +366,7 @@ impl BindingTable {
             hold_allowed,
             preference,
             &plan,
+            hinted_account,
         );
         let evidence = if matches!(code, SelectionCode::ColdRebalance | SelectionCode::Overload) {
             match (&choice, key) {
@@ -313,6 +411,7 @@ impl BindingTable {
         hold_allowed: bool,
         preference: Option<&launch::SelectionPreference<'_>>,
         plan: &crate::routing::Plan,
+        hinted_account: Option<&str>,
     ) -> (PreviewDecision, SelectionCode) {
         let policy_key = launch::policy_key(d, key);
         let model_move = preference.is_some_and(|p| p.model_move);
@@ -721,6 +820,7 @@ impl BindingTable {
         let chosen = if !gated.is_empty() {
             prefer_pacing_and_evidence(&mut gated, d, &self.config, now);
             launch::prefer(&mut gated, preference);
+            prefer_root_hint(&mut gated, hinted_account);
             // Approximate reset cohorts require one fixed anchor.
             let anchor = gated
                 .iter()
@@ -735,6 +835,7 @@ impl BindingTable {
             let mut fallback: Vec<_> = partition.iter().map(|entry| (entry.0, &entry.1)).collect();
             prefer_pacing_and_evidence(&mut fallback, d, &self.config, now);
             launch::prefer(&mut fallback, preference);
+            prefer_root_hint(&mut fallback, hinted_account);
             fallback
                 .iter()
                 .min_by(|(a, x), (b, y)| {
@@ -750,6 +851,17 @@ impl BindingTable {
             }),
             reason,
         )
+    }
+}
+
+// Advisory narrowing only: never introduce an account discarded by native gates.
+fn prefer_root_hint<T>(pool: &mut Vec<(&Candidate, T)>, account: Option<&str>) {
+    if let Some(account) = account
+        && pool
+            .iter()
+            .any(|(candidate, _)| candidate.account.id == account)
+    {
+        pool.retain(|(candidate, _)| candidate.account.id == account);
     }
 }
 
@@ -1054,3 +1166,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lineage_tests;

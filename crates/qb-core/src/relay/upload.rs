@@ -296,7 +296,7 @@ pub(super) async fn read(
     let retain_state = state.clone();
     #[cfg(test)]
     let retention_pause = TEST_RETENTION_PAUSE.with(|pause| pause.borrow_mut().take());
-    let retention_task = tokio::task::spawn_blocking(move || {
+    let retention_task = crate::boxes::spawn_blocking(move || {
         #[cfg(test)]
         if let Some(pause) = retention_pause {
             pause.wait();
@@ -332,7 +332,7 @@ pub(super) async fn read(
             }
         }
     });
-    tokio::spawn(async move {
+    crate::boxes::spawn(async move {
         // Forward every body frame immediately. Retention batching happens
         // exclusively on the side channel below and must never delay relay
         // writes.

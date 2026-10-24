@@ -4,6 +4,7 @@ pub mod admin_account;
 pub mod admin_account_error;
 pub mod admin_action;
 pub mod admin_adopt;
+pub mod admin_boxes;
 pub mod admin_control;
 pub mod admin_error;
 pub mod admin_import;

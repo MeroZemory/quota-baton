@@ -349,6 +349,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             };
             qb_core::service::retain_store_lease(&store)?;
+            let mut box_service = qb_core::service::BoxServiceOwner::prepare(&home, &config)?;
             qb_core::set_process_priority()?;
             #[cfg(feature = "shape-capture")]
             let capture = capture_dir.map(|dir| qb_core::observability::CaptureOptions {
@@ -478,24 +479,29 @@ async fn run() -> anyhow::Result<()> {
                         config.server.data_port,
                     ))
                     .merge(qb_core::debug_pin::routes(store, pins))
-                    .merge(qb_core::service::routes(relay.clone()));
+                    .merge(qb_core::service::routes(relay.clone()))
+                    .merge(box_service.admin_routes(relay.clone(), config.server.data_port));
             #[cfg(feature = "phase0")]
             let admin_routes = admin_routes.merge(qb_core::relay::phase0_routes(relay.clone()));
             let secrets = qb_core::local_secrets::load_or_create(&home)?;
-            let mut servers = qb_core::http::spawn_with_routes(
-                &config,
-                secrets,
-                qb_core::relay::router(relay.clone()),
-                admin_routes,
-            )
-            .await?;
+            let mut servers = box_service
+                .spawn_http(
+                    &config,
+                    secrets,
+                    qb_core::relay::router(relay.clone()),
+                    admin_routes,
+                )
+                .await?;
             if takeover {
                 observability.record_takeover("listening");
             }
-            let startup_failure =
-                qb_core::service::defer_startup_error(qb_core::service::notify_ready().and_then(
-                    |_| print_stdout(format_args!("프록시를 시작했습니다.")).map_err(Into::into),
-                ))?;
+            let startup_failure = qb_core::service::defer_startup_error(
+                box_service.start(relay.clone()).and_then(|_| {
+                    qb_core::service::notify_ready().and_then(|_| {
+                        print_stdout(format_args!("프록시를 시작했습니다.")).map_err(Into::into)
+                    })
+                }),
+            )?;
             let polling = relay.quota.start();
             let refreshing = relay.start_refresh_scheduler();
             let catalogs = relay.start_catalog_scheduler();
@@ -504,6 +510,7 @@ async fn run() -> anyhow::Result<()> {
                 qb_core::service::wait_for_shutdown(relay.clone()).await?;
             }
             qb_core::service::complete_shutdown(async {
+                box_service.begin_drain();
                 polling.abort();
                 refreshing.abort();
                 catalogs.abort();
@@ -550,6 +557,14 @@ async fn run() -> anyhow::Result<()> {
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
+                // Pending rotations retain their box admission, so durable
+                // credential retries precede the exact-grant quiescence wait.
+                // Preserve lifecycle errors until mandatory core flush finishes.
+                let box_cleanup = box_service
+                    .join()
+                    .await
+                    .and_then(|_| box_service.freeze())
+                    .and_then(|_| box_service.check_complete());
                 // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
                 tokio::task::spawn_blocking(move || {
                     if relay.is_draining() {
@@ -569,6 +584,7 @@ async fn run() -> anyhow::Result<()> {
                     }
                 })
                 .await??;
+                box_cleanup?;
                 Ok(())
             })
             .await?;

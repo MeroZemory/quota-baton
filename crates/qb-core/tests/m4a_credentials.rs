@@ -2,6 +2,8 @@
 
 // Compile the bounded internal credential layer against the production modules.
 pub use qb_core::{account_runtime, accounts, observability};
+#[path = "support/unscoped_tasks.rs"]
+mod boxes;
 #[path = "../src/relay/credentials.rs"]
 #[allow(dead_code)] // This isolated harness exercises a subset of the shared production gate.
 mod credentials;
