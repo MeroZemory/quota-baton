@@ -244,7 +244,7 @@ async fn safety(
             request.uri().path(),
         );
     }
-    if let Err(response) = check_host_origin(&request, state.port) {
+    if let Some(response) = check_host_origin(&request, state.port) {
         return response;
     }
     box_ingress::clear_box_extensions(&mut request);
@@ -264,17 +264,18 @@ async fn safety(
         .any(|key| equal(key, &state.key));
     // Global credentials retain their existing OR semantics. Only otherwise
     // unauthenticated data requests enter the stricter box credential parser.
-    if !wrong_port && !authorized && !state.admin {
-        if let Some(registry) = &state.registry {
-            if let Some(key) = box_ingress::box_credential(request.headers()) {
-                match registry.try_identify(&key) {
-                    Ok(authority) => {
-                        return box_ingress::run_box_request(request, next, authority).await;
-                    }
-                    Err(crate::boxes::RegistryError::Unauthorized) => {}
-                    Err(_) => return box_ingress::authentication_unavailable(request.uri().path()),
-                }
+    if !wrong_port
+        && !authorized
+        && !state.admin
+        && let Some(registry) = &state.registry
+        && let Some(key) = box_ingress::box_credential(request.headers())
+    {
+        match registry.try_identify(&key) {
+            Ok(authority) => {
+                return box_ingress::run_box_request(request, next, authority).await;
             }
+            Err(crate::boxes::RegistryError::Unauthorized) => {}
+            Err(_) => return box_ingress::authentication_unavailable(request.uri().path()),
         }
     }
     if wrong_port || !authorized {
@@ -293,7 +294,7 @@ async fn safety(
     next.run(request).await
 }
 
-fn check_host_origin(request: &Request, port: u16) -> Result<(), Response> {
+fn check_host_origin(request: &Request, port: u16) -> Option<Response> {
     let hosts = request.headers().get_all("host");
     let mut hosts = hosts.iter();
     let host = hosts.next().and_then(|value| value.to_str().ok());
@@ -302,7 +303,7 @@ fn check_host_origin(request: &Request, port: u16) -> Result<(), Response> {
     });
     if !valid || hosts.next().is_some() {
         tracing::warn!(port, "Rejected request with invalid Host");
-        return Err(error(
+        return Some(error(
             StatusCode::MISDIRECTED_REQUEST,
             "invalid_request_error",
             "Invalid Host",
@@ -310,14 +311,14 @@ fn check_host_origin(request: &Request, port: u16) -> Result<(), Response> {
         ));
     }
     if request.headers().contains_key("origin") {
-        return Err(error(
+        return Some(error(
             StatusCode::FORBIDDEN,
             "invalid_request_error",
             "Origin is forbidden",
             request.uri().path(),
         ));
     }
-    Ok(())
+    None
 }
 
 fn single_header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {

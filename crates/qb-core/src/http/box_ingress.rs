@@ -53,7 +53,7 @@ where
     // Scope comes solely from state fixed by the selected listener. No header,
     // URL, lease token or preexisting extension supplies authentication evidence.
     clear_box_extensions(&mut request);
-    if let Err(response) = check_host_origin(&request, state.port) {
+    if let Some(response) = check_host_origin(&request, state.port) {
         return response;
     }
     let Some(key) = box_credential(request.headers()) else {

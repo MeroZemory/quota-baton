@@ -307,18 +307,17 @@ async fn upgrade_inner(
         .get::<crate::boxes::BoxAuthority>()
         .cloned();
     // Only the ingress-admitted grant may own an upgraded connection.
-    if let Some(admitted) = crate::boxes::current_request() {
-        if box_authority
+    if let Some(admitted) = crate::boxes::current_request()
+        && box_authority
             .as_ref()
             .is_none_or(|authority| authority.scope() != admitted.scope() || authority.is_revoked())
-        {
-            return native_error(
-                StatusCode::UNAUTHORIZED,
-                Provider::Codex,
-                "authentication_error",
-                "Invalid box credential",
-            );
-        }
+    {
+        return native_error(
+            StatusCode::UNAUTHORIZED,
+            Provider::Codex,
+            "authentication_error",
+            "Invalid box credential",
+        );
     }
     let client_upgrade = hyper::upgrade::on(&mut request);
     let launcher_label = request
