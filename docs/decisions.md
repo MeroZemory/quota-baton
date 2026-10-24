@@ -938,3 +938,40 @@ Minutes are dropped once the remainder is a day or more. The provider summary us
 1. **Claude interactive TUI: no native continuation.** No supported non-user command resumes the same quota-stopped Claude Code TUI. qb does not type into it, guess keystrokes or restart it (D3, and the rule that agents never type into the user's own Claude sessions). Claude far 5h waits therefore stay on the amendment 1 path (move) permanently, and the dashboard labels Claude sessions "이동 (Claude는 자동 재개 미지원)" where it would otherwise offer waiting. A separately specified owned-client mechanism is out of scope until a supported interface exists.
 2. **Codex WS quota errors: an independent full-poll producer, not frame inference.** A wrapped quota error on a WebSocket does not by itself register a reset wait. On such an error, qb runs one usage poll (C9) for that account. It registers the wait only when the poll reports the 5h window as exhausted, with a reset time, and the error arrived on a qb-owned connection that had exactly one qb-forwarded `response.create` in flight. That in-flight request is the attempt identity. It is qb's own relay state, not timing or adjacency. Verify in the Codex 0.163/0.164 source that a connection never has two responses in flight. If it can, decline registration on WS, which then keeps the amendment 1 move. Incomplete or unlabelled frames never register.
 3. Until a path is accepted, the far wait on it keeps the amendment 1 move, so no session stops without a resume.
+
+
+## D31. Linux headless core for the home server — Accepted (user direction, 2026-10-24/25)
+
+**Request.** The user is moving coding-agent work to a home server (Ubuntu Server 24.04, Tailscale). Agents run inside per-project Incus system containers ("boxes"). The server must have its own quota-baton before any agent runs there. No tunnel from the server to the PC's core is allowed.
+
+**User decisions (2026-10-25).**
+- Accounts are **not moved** from the PC. The server qb logs in to the accounts it uses **on its own**, which gives it separate OAuth sessions and refresh tokens. The PC qb and CPA keep theirs.
+- The PC keeps the irreplaceable Codex login; the server does not log it in.
+- The CPA-linked Claude accounts stay as they are on the PC. Retiring CPA (R2 Part B) is not needed for this.
+
+Two cores then use some of the same accounts. Each sees the other's use as outside use, so D30 makes it give way automatically. Usage polls show the combined use, so forecasts stay honest.
+
+**Scope.**
+1. **Portable core.** `windows` becomes a target-specific dependency and Windows modules sit behind `cfg(windows)`. Platform traits:
+   - secrets: DPAPI on Windows. On Linux, a file encrypted with a key delivered by systemd `LoadCredentialEncrypted=` (systemd-creds: TPM2 if present, else the host key). A 0600 file is allowed only with an explicit config flag.
+   - lease: a named mutex on Windows, `flock` on Linux.
+   - atomic replace: MoveFileExW on Windows, `rename(2)` plus fsync of the file and its directory on Linux.
+   - process liveness.
+   The tray, Windows launchers and conversation moves are not built for Linux.
+2. **Headless service.** A systemd unit runs as a dedicated `quota-baton` user, with `StateDirectory` and `RuntimeDirectory` and hardening. `serve --takeover` upgrades with no refused connects, as on Windows.
+3. **Browserless login.** `accounts login <provider> --no-browser` prints the URL. Claude uses its paste-the-code flow. Codex accepts the final redirect URL pasted back, or the callback port forwarded with `ssh -L`.
+4. **Per-box access.**
+   - Each box gets its own Unix-socket listener (`/run/quota-baton/boxes/<box>.sock`) and its own labelled, revocable client key, bound to that socket.
+   - An Incus proxy device maps the box's `127.0.0.1:<port>` to that socket. The Host header stays loopback, so the C2 Host check holds, and no host TCP port is exposed to boxes.
+   - The admin API stays host-only for the orchestrator. Boxes never get the admin credential.
+   - The orchestrator registers launches through the admin API and passes the lease base URL into the box.
+5. **Lineage hint.** An orchestrator header `x-qb-root-session` is a placement preference (keep related sessions on the root's account when it has room). qb strips it before upstream, like other C3 credential and routing headers.
+6. **Out of scope.** Gemini and Antigravity (D8). Moving accounts between cores.
+
+**Acceptance (real path on the server).**
+- Codex and Claude sessions run from inside a box through the proxy device.
+- A per-box key is revoked, and the box loses access.
+- A takeover upgrade has 0 refused connects.
+- The core survives a reboot.
+- A browserless login works for each provider.
+- Concurrent use of a shared account with the PC is detected as outside use.
