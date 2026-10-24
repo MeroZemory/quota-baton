@@ -29,6 +29,11 @@ pub(crate) struct Candidate {
     leg: Leg,
     sent: Sent,
 }
+// Veto-only receipt; it cannot mint a candidate or authorize registration.
+pub(super) struct HandoffLiveness {
+    leg: Leg,
+    sent: Sent,
+}
 impl Sent {
     fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -133,6 +138,12 @@ impl Drop for WriteTicket {
     }
 }
 impl Candidate {
+    pub(super) fn handoff_liveness(&self) -> HandoffLiveness {
+        HandoffLiveness {
+            leg: self.leg.clone(),
+            sent: self.sent.clone(),
+        }
+    }
     // Final synchronous registration boundary, NOT a snapshot or proof mint.
     // Candidate is consumed even on decline. The witness lock stays held until
     // register RETURNS: overlap/close/retire cannot interleave with registration.
@@ -166,6 +177,22 @@ impl Candidate {
         let result = register();
         drop(state);
         Some(result)
+    }
+}
+
+impl HandoffLiveness {
+    // Callback may only perform the final synchronous local handoff. No outer
+    // gate, helper reentry, await or I/O while this veto boundary is held.
+    pub(super) fn with_live<R>(&self, handoff: impl FnOnce() -> R) -> Option<R> {
+        let state = self.leg.0.lock().ok()?;
+        if state.closed || state.tainted {
+            return None;
+        }
+        let attempt = state.current.as_ref()?;
+        if !attempt.sent.matches(&self.sent) || !attempt.flushed || !attempt.claimed {
+            return None;
+        }
+        Some(handoff())
     }
 }
 
@@ -420,5 +447,61 @@ mod tests {
             next.start(Some("codex:sample-root"), Some("sample-model"))
                 .is_none()
         );
+    }
+    #[test]
+    fn handoff_liveness_is_a_veto_only_receipt_for_the_original_send() {
+        let leg = Leg::new("sample-source");
+        let sent = flushed(&leg);
+        let candidate = leg.quota_candidate().unwrap();
+        let handoff = candidate.handoff_liveness();
+        assert_eq!(
+            candidate.with_current(
+                "sample-source",
+                Some("codex:sample-root"),
+                Some("sample-model"),
+                || 7
+            ),
+            Some(7)
+        );
+        assert_eq!(handoff.with_live(|| 9), Some(9));
+        leg.retire(&sent);
+        flushed(&leg);
+        assert_eq!(
+            handoff.with_live(|| panic!("replacement attempt")),
+            None::<()>
+        );
+    }
+
+    #[test]
+    fn handoff_liveness_cannot_survive_overlap_or_closed_leg() {
+        for close in [false, true] {
+            let leg = Leg::new("sample-source");
+            flushed(&leg);
+            let candidate = leg.quota_candidate().unwrap();
+            let handoff = candidate.handoff_liveness();
+            assert!(
+                candidate
+                    .with_current(
+                        "sample-source",
+                        Some("codex:sample-root"),
+                        Some("sample-model"),
+                        || ()
+                    )
+                    .is_some()
+            );
+            if close {
+                leg.close();
+            } else {
+                assert!(
+                    leg.start(Some("codex:sample-root"), Some("sample-model"))
+                        .is_none()
+                );
+            }
+            assert!(
+                handoff
+                    .with_live(|| panic!("revoked physical send"))
+                    .is_none()
+            );
+        }
     }
 }
