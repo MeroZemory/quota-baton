@@ -12,6 +12,9 @@ mod outcome;
 mod quota_wait;
 mod response;
 mod selection_guard;
+#[cfg(windows)]
+#[path = "relay/takeover_windows.rs"]
+mod takeover_windows;
 mod upload;
 mod websocket;
 pub(crate) use outcome::RequestFailureEvidence;
@@ -168,8 +171,6 @@ pub struct RelayState {
     tokens: TokenGates,
     images: Mutex<images::ImageState>,
     image_account_config: BTreeMap<String, crate::config::AccountConfig>,
-    #[cfg(all(feature = "testkit", debug_assertions))]
-    takeover_test_dependencies: Option<crate::accounts::takeover::Dependencies>,
     websocket: crate::config::WebsocketConfig,
     ws_capacity: Arc<websocket::capacity::Capacity>,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), outcome::ReconnectEvidence>>,
@@ -247,7 +248,7 @@ impl RelayState {
         source_root: &std::path::Path,
         profile_endpoint: String,
     ) -> anyhow::Result<Self> {
-        self.takeover_test_dependencies = Some(
+        self.tokens.takeover_context = self.tokens.takeover_context.with_dependencies(
             crate::accounts::takeover_native::synthetic(
                 self.client.clone(),
                 self.store.home(),
@@ -261,29 +262,6 @@ impl RelayState {
             })?,
         );
         Ok(self)
-    }
-
-    pub(crate) async fn takeover_account(
-        &self,
-        request: crate::accounts::takeover::TakeoverRequest,
-    ) -> Result<serde_json::Value, crate::accounts::takeover::TakeoverError> {
-        if self.is_draining() {
-            return Err(crate::accounts::takeover::TakeoverError::Unavailable);
-        }
-        let dependencies = crate::accounts::takeover_native::production(self.client.clone());
-        #[cfg(all(feature = "testkit", debug_assertions))]
-        let dependencies = self
-            .takeover_test_dependencies
-            .clone()
-            .unwrap_or(dependencies);
-        self.tokens
-            .takeover(
-                self.store.clone(),
-                self.observability.clone(),
-                request,
-                dependencies,
-            )
-            .await
     }
 
     pub(crate) fn recent_warnings(
@@ -762,8 +740,6 @@ impl RelayState {
             tokens,
             images: Mutex::new(images::ImageState::default()),
             image_account_config: config.accounts.clone(),
-            #[cfg(all(feature = "testkit", debug_assertions))]
-            takeover_test_dependencies: None,
             websocket: config.websocket.clone(),
             ws_capacity: Arc::new(websocket::capacity::Capacity::default()),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),

@@ -9,6 +9,26 @@ use serde::{Deserialize, Serialize};
 pub struct LoginStart {
     pub login_id: String,
     pub auth_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<DevicePrompt>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "contract-tests"), serde(deny_unknown_fields))]
+pub struct DevicePrompt {
+    pub verification_url: String,
+    pub user_code: String,
+    pub expires_in: u64,
+}
+
+impl std::fmt::Debug for DevicePrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevicePrompt")
+            .field("verification_url", &self.verification_url)
+            .field("user_code", &"[redacted]")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +88,30 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<LoginStart>(wire).is_err());
         }
+    }
+
+    #[test]
+    fn device_prompt_roundtrips_and_debug_redacts_code() {
+        let start: LoginStart = round_trip(json!({
+            "login_id":"synthetic-login",
+            "auth_url":"https://auth.openai.com/codex/device",
+            "device": {
+                "verification_url":"https://auth.openai.com/codex/device",
+                "user_code":"SYNTHETIC-SECRET",
+                "expires_in":899
+            }
+        }));
+        assert!(!format!("{start:?}").contains("SYNTHETIC-SECRET"));
+        for invalid in [
+            json!({}),
+            json!({"verification_url":"synthetic", "user_code":"synthetic", "expires_in":-1}),
+        ] {
+            let wire = json!({"login_id":"synthetic", "auth_url":"synthetic", "device":invalid});
+            assert!(serde_json::from_value::<LoginStart>(wire).is_err());
+        }
+        let duplicate =
+            r#"{"login_id":"synthetic","auth_url":"synthetic","device":null,"device":null}"#;
+        assert!(serde_json::from_str::<LoginStart>(duplicate).is_err());
     }
 
     #[test]
@@ -169,6 +213,7 @@ mod tests {
         let start = LoginStart {
             login_id: "synthetic".into(),
             auth_url: "synthetic-url".into(),
+            device: None,
         };
         assert_eq!(
             serde_json::to_string(&start).unwrap(),

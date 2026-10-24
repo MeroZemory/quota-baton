@@ -36,6 +36,25 @@ The Codex main updates this block at each unit and gate close; the design sessio
 10. **Independent review**, where the brief asks for one: a different model family from the implementer.
 11. **Routing changes (D29):** replay at least 24 complete hours of real, body-free decision inputs through the candidate and the installed router. Follow the evidence rules below. Missing inputs or incomplete coverage do not pass. The explicitly requested R14 first delivery ships its runtime protection before this second-delivery replay gate; its report must retain that outstanding requirement.
 
+For Linux phases, also run the following in the approved Linux container and
+single `qb-linux-target` volume, sequentially with the Windows checks:
+
+```sh
+cargo check --workspace --exclude qb-tray --target x86_64-unknown-linux-gnu
+cargo clippy --workspace --exclude qb-tray --lib --bins --target x86_64-unknown-linux-gnu -- -D warnings
+cargo clippy --workspace --exclude qb-tray --lib --bins --all-features --target x86_64-unknown-linux-gnu -- -D warnings
+cargo clippy --release --workspace --exclude qb-tray --lib --bins --target x86_64-unknown-linux-gnu -- -D warnings
+```
+
+Linux lint covers production libraries and binaries; Linux-compatible unit,
+authenticated HTTP, CLI and platform-boundary tests run separately. Existing
+Windows GUI integration fixtures are not Linux targets. Windows retains the
+full workspace and all-target checks above.
+
+Both target checks remain mandatory. Compiler warnings are repaired rather than
+accepted as a Linux baseline; Windows behavior and platform boundaries remain
+part of the same phase gate.
+
 ### Routing replay evidence (D29)
 
 The replay gate compares the production selection paths, not a replacement model
