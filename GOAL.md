@@ -89,6 +89,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R14.2 | 완료(N6 최소): 기본 꺼짐·schema3·bounded 7일 보존·off switch·실제 합성 HTTP/종료 집중 관문. 초기 cut/전체 owner/실제24시간 replay는 N6t/N6r 별도; 128 MiB 기록 활성화. 설치 동결 해제: 여러 epoch의 24시간 export 허용, epoch별 초기 상태·loss manifest로 각각 재생한 뒤 합산; 단일 epoch를 기다리지 않음 |
 | R13.H | 집중 관문 완료·dev 병합 인계: bound WS 용량 제한은 같은 계정 HTTP 426 경로, 새 출발 계정 소진 후 유일한 복귀처에 한정된 복귀 예외·이동 예산 보존. 집중 관문 후 dev 병합, 설치는 S2 |
 | R15 | 완료(N8): 공유 중첩 admin 계약·실제 응답 왕복·정적 guard·라우팅 속성. b492eda 최종 보완; 원본 기본16실패 원인별 집중 복구, 전체 기능3899/0/36제외·코어1310/0/1제외·기본/전체 strict lint·build/read-only check 통과. 실제 core→AdminClient→tray KO/EN HWND10 및 추가PNG2 직접 검수. 설치 S2; 지문 R15-evidence/delivery-fingerprint.json |
+| L1 | 다음(최우선, 사용자 요청 2026-10-25): 홈 서버용 Linux 헤드리스 코어. D31, brief `.sandbox/briefs/L1-linux-headless.md`, 브랜치 `impl/linux`. P0 컴파일 관문 → P1 플랫폼 계층 → P2 systemd 서비스 → P3 브라우저 없는 로그인 → P4 칸별 소켓·키 → P5 서버 실제 수용(설계 세션). N6r·N7은 각 브랜치에 보류 |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |

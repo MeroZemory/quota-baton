@@ -115,7 +115,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (remaining ready work): N6r (implement and verify initial producers/reader/restore adapter), N7 calibration/backtest. N8/R15 final gate is complete; S2 owns installation. R13.G, N5d-native and N6t gates are complete; S2 owns installation. Earlier N1–N6 minimum, N5a–c, N10, N5d bounded close, N5i, N11, N3 and N4 deliveries are preserved in the gate records.
+**Current S1 order** (remaining ready work): **L1 Linux headless core first** (D31, user request 2026-10-25; `impl/linux`, brief `.sandbox/briefs/L1-linux-headless.md`), then N6r (parked on `impl/r14-replay`) and N7 calibration (parked on its own branch). N8/R15 final gate is complete; S2 owns installation. R13.G, N5d-native and N6t gates are complete; S2 owns installation. Earlier N1–N6 minimum, N5a–c, N10, N5d bounded close, N5i, N11, N3 and N4 deliveries are preserved in the gate records.
 
 **Start now in W:** N5m and the N7 backtest.
 
