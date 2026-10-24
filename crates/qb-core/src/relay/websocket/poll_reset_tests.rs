@@ -55,6 +55,7 @@ const CREATED: &str = r#"{"type":"response.created","response":{"id":"poll-origi
 const QUOTA_ERROR: &str = "  {\"type\":\"error\",\"response_id\":\"poll-original\",\"status\":429,\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"synthetic only\"},\"extra\":17} \n";
 type Socket = WebSocketStream<TcpStream>;
 
+#[track_caller]
 fn require<T, E>(result: Result<T, E>) -> T {
     match result {
         Ok(value) => value,
@@ -340,7 +341,13 @@ impl Fixture {
                 .insert("session-id", require(THREAD.parse()));
         }
         let stream = require(bounded(TcpStream::connect(self.address)).await);
-        let (socket, response) = require(bounded(client_async(request, stream)).await);
+        let (socket, response) = match bounded(client_async(request, stream)).await {
+            Ok(upgraded) => upgraded,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                panic!("synthetic {suffix} upgrade refused: {}", response.status())
+            }
+            Err(_) => panic!("synthetic {suffix} upgrade transport failed"),
+        };
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         socket
     }
@@ -412,22 +419,62 @@ impl Drop for Fixture {
 }
 
 async fn ping(socket: &mut Socket) {
-    require(bounded(socket.send(Message::Ping(b"poll-pending".to_vec().into()))).await);
-    assert!(matches!(bounded(socket.next()).await,
-        Some(Ok(Message::Pong(bytes))) if bytes.as_ref() == b"poll-pending"));
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let payload = format!("poll-pending-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    bounded(async {
+        require(
+            socket
+                .send(Message::Ping(payload.as_bytes().to_vec().into()))
+                .await,
+        );
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Pong(bytes))) if bytes.as_ref() == payload.as_bytes() => return,
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Ping(_))) => require(socket.flush().await),
+                _ => panic!("expected correlated synthetic Pong, not application data or closure"),
+            }
+        }
+    })
+    .await;
 }
 
 async fn assert_text(socket: &mut Socket, expected: &str) {
-    assert!(matches!(bounded(socket.next()).await,
-        Some(Ok(Message::Text(text))) if text.as_bytes() == expected.as_bytes()));
+    bounded(async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(_))) => require(socket.flush().await),
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Text(text))) => {
+                    assert!(
+                        text.as_bytes() == expected.as_bytes(),
+                        "original text bytes changed"
+                    );
+                    return;
+                }
+                _ => panic!("expected original text, not binary data or closure"),
+            }
+        }
+    })
+    .await;
 }
 
 async fn close_data(socket: &mut Socket) {
     require(bounded(socket.close(None)).await);
-    assert!(matches!(
-        bounded(socket.next()).await,
-        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
-    ));
+    assert_closed(socket).await;
+}
+
+async fn assert_closed(socket: &mut Socket) {
+    bounded(async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                _ => panic!("closure leaked application data"),
+            }
+        }
+    })
+    .await;
 }
 
 fn usage_body(primary: u64, secondary: u64, reset: i64) -> Value {
@@ -532,24 +579,8 @@ async fn delayed_c9_upstream_ping_gets_local_pong_before_response_release() {
         DeferredResetStatus::Empty
     ));
     require(release.send(()));
-    // Forwarding a control frame to the client is permitted, but it must not
-    // be needed for the upstream Pong already observed above.
-    bounded(async {
-        loop {
-            match data.next().await {
-                Some(Ok(Message::Ping(bytes))) => {
-                    assert_eq!(bytes.as_ref(), b"upstream-c9-pending");
-                    require(data.flush().await);
-                }
-                Some(Ok(Message::Text(text))) => {
-                    assert_eq!(text.as_bytes(), QUOTA_ERROR.as_bytes());
-                    break;
-                }
-                _ => panic!("missing original error after upstream Ping"),
-            }
-        }
-    })
-    .await;
+    // Controls may be forwarded, but cannot supply the already observed Pong.
+    assert_text(&mut data, QUOTA_ERROR).await;
     assert!(matches!(
         fixture.relay.accounts.deferred_reset_status(&scope, THREAD),
         DeferredResetStatus::Waiting { reset_at, .. } if reset_at.timestamp() == reset
@@ -571,10 +602,7 @@ async fn delayed_c9_upstream_close_replays_original_error_and_cannot_register_la
     // Original error must take the ordinary fallback before Close, without
     // waiting for the poll or publishing an obligation for the closed leg.
     assert_text(&mut data, QUOTA_ERROR).await;
-    assert!(matches!(
-        bounded(data.next()).await,
-        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
-    ));
+    assert_closed(&mut data).await;
     assert_eq!(fixture.upstream.returned.available_permits(), 0);
     assert!(scope.live());
     assert!(matches!(
@@ -606,7 +634,9 @@ async fn partial_c9_cannot_borrow_cached_weekly_or_rewrite_original_error() {
     // or proof constructor. Nothing from this healthy report can register.
     let seed = fixture.upstream.enqueue(usage_body(20, 30, reset));
     require(seed.send(()));
-    require(bounded(fixture.relay.quota.poll(&fixture.account)).await);
+    bounded(fixture.relay.quota.poll(&fixture.account))
+        .await
+        .unwrap_or_else(|error| panic!("synthetic seed C9 GET failed: {error:?}"));
     signal(&fixture.upstream.arrived).await;
     signal(&fixture.upstream.returned).await;
     let cached = fixture
