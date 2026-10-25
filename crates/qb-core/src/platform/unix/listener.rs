@@ -1,4 +1,6 @@
 //! Retained systemd listeners and ordinary standalone binding.
+use super::box_sockets::transport::{BoundBoxSocket, BoxListener, SocketDirectory};
+use crate::boxes::BoxScope;
 use std::{
     convert::Infallible,
     ffi::OsString,
@@ -13,6 +15,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use tokio::net::TcpListener;
+#[path = "box_listener_bank.rs"]
+mod box_bank;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ListenerPorts {
@@ -20,7 +24,7 @@ pub(crate) struct ListenerPorts {
     pub admin: u16,
 }
 
-// One immutable process-lifetime bank. The initialization lock prevents racing
+// One process-lifetime bank; only its box state is mutable. The initialization lock prevents racing
 // constructors from ever claiming ownership of the same inherited descriptors.
 static INITIALIZE: Mutex<()> = Mutex::new(());
 static ACTIVATION: OnceLock<Activation> = OnceLock::new();
@@ -34,6 +38,7 @@ struct Bank {
     originals: [OwnedFd; 2],
     ports: ListenerPorts,
     roles: [Role; 2],
+    boxes: Mutex<box_bank::BoxBank>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,8 +122,14 @@ pub(crate) fn initialize_activation(ports: ListenerPorts) -> io::Result<()> {
             "activation already initialized",
         ));
     }
+    let box_manifest = std::env::var_os("QB_BOX_LISTENERS");
     let mode = match Environment::read().roles(std::process::id())? {
-        None => Activation::Standalone,
+        None => {
+            if box_manifest.is_some() {
+                return Err(invalid("box manifest requires managed activation"));
+            }
+            Activation::Standalone
+        }
         Some(roles) => {
             if ports.data == 0 || ports.admin == 0 || ports.data == ports.admin {
                 return Err(invalid("invalid managed listener ports"));
@@ -133,12 +144,15 @@ pub(crate) fn initialize_activation(ports: ListenerPorts) -> io::Result<()> {
             for (fd, port) in descriptors.into_iter().zip(mapped) {
                 validate_socket(fd, port)?;
             }
+            // Early prepare_inherited_box_fds restored CLOEXEC before runtime creation.
+            let boxes = box_bank::BoxBank::inherit(box_manifest.as_deref())?;
             Activation::Managed(Bank {
                 // Exclusively claimed once; do not construct std listeners from
                 // these originals or close/shutdown them anywhere else.
                 originals: unsafe { [OwnedFd::from_raw_fd(3), OwnedFd::from_raw_fd(4)] },
                 ports,
                 roles,
+                boxes: Mutex::new(boxes),
             })
         }
     };
@@ -152,7 +166,9 @@ pub(crate) async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
         None => {
             // Library callers need no process startup initialization when all
             // managed/activation metadata is absent. Do not publish a bank here.
-            if Environment::read().roles(std::process::id())?.is_some() {
+            if std::env::var_os("QB_BOX_LISTENERS").is_some()
+                || Environment::read().roles(std::process::id())?.is_some()
+            {
                 return Err(invalid("managed activation not initialized").into());
             }
             standalone_bind_listener(port).await
@@ -173,6 +189,62 @@ pub(crate) async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
     }
 }
 
+/// Must be called by service::prepare_process BEFORE threads/runtime are created.
+/// Stateless: does not own descriptors or publish a second bank.
+pub(crate) fn prepare_inherited_box_fds() -> io::Result<()> {
+    box_bank::prepare()
+}
+
+fn managed_boxes() -> io::Result<std::sync::MutexGuard<'static, box_bank::BoxBank>> {
+    let Some(Activation::Managed(bank)) = ACTIVATION.get() else {
+        return Err(invalid("managed bank required for box listeners"));
+    };
+    bank.boxes
+        .lock()
+        .map_err(|_| invalid("box bank synchronization failed"))
+}
+pub(crate) fn box_activation_managed() -> io::Result<bool> {
+    match ACTIVATION.get() {
+        Some(Activation::Managed(_)) => Ok(true),
+        Some(Activation::Standalone) => Ok(false),
+        None => {
+            if Environment::read().roles(std::process::id())?.is_some()
+                || std::env::var_os("QB_BOX_LISTENERS").is_some()
+            {
+                return Err(invalid("managed activation not initialized"));
+            }
+            Ok(false)
+        }
+    }
+}
+pub(crate) fn has_box_scope(scope: &BoxScope) -> io::Result<bool> {
+    managed_boxes()?.has_scope(scope)
+}
+
+pub(crate) fn reconcile_boxes(directory: &SocketDirectory, active: &[BoxScope]) -> io::Result<()> {
+    managed_boxes()?.reconcile(directory, active)
+}
+pub(crate) fn retain_box(bound: &mut Option<BoundBoxSocket>) -> io::Result<()> {
+    managed_boxes()?.retain(bound)
+}
+pub(crate) fn duplicate_box(scope: &BoxScope) -> io::Result<BoxListener> {
+    managed_boxes()?.duplicate(scope)
+}
+pub(crate) fn begin_box_retirement(scope: &BoxScope) -> io::Result<()> {
+    managed_boxes()?.begin_retirement(scope)
+}
+/// Private service owner must retain and terminally join every transport/IO and
+/// blocking writer, and persist revocation, BEFORE calling this synchronous API.
+/// Cancellation/Drop is not completion. Error retains the exact retiring entry.
+pub(crate) fn finish_box_retirement(scope: &BoxScope) -> io::Result<()> {
+    managed_boxes()?.finish_retirement(scope)
+}
+
+pub(crate) fn freeze_boxes() -> io::Result<()> {
+    managed_boxes()?.freeze();
+    Ok(())
+}
+
 /// Called only after authorized reload drain and all durable cleanup succeeded.
 /// `serve_argv` excludes argv0 and starts with `serve`. The absolute installed
 /// name is retained at initial startup, never resolved through current_exe.
@@ -187,6 +259,18 @@ pub(crate) fn exec_activation(
         _ => return Err(invalid("managed activation bank required for exec")),
     };
     bank.validate_for_exec()?;
+    let mut boxes = bank
+        .boxes
+        .lock()
+        .map_err(|_| invalid("box bank synchronization failed"))?;
+    let (box_manifest, mut descriptors) = match boxes.exec_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            boxes.fail();
+            return Err(error);
+        }
+    };
+    descriptors.extend(bank.originals.iter().map(AsRawFd::as_raw_fd));
     // Build arguments/environment before the guarded commit. Command::exec
     // replaces this process directly; there is no fork or post-fork callback.
     let mut command = Command::new(installed_path);
@@ -195,25 +279,26 @@ pub(crate) fn exec_activation(
         .env("QB_SYSTEMD_MANAGED", "1")
         .env("LISTEN_PID", std::process::id().to_string())
         .env("LISTEN_FDS", "2")
-        .env("LISTEN_FDNAMES", bank.names());
+        .env("LISTEN_FDNAMES", bank.names())
+        .env("QB_BOX_LISTENERS", box_manifest);
 
     // Main's pre-runtime prepare_process blocks TERM/INT before worker creation.
     // Its sigtimedwait monitor and this guard share one mutex. The guard checks
     // the stopping latch + pending signals; the mask stays blocked across exec.
     // The successor must consume pending stop signals before announcing READY.
     // Blocking only this calling thread would NOT implement that protocol.
-    super::service::with_exec_signal_guard(|| {
+    let outcome = super::service::with_exec_signal_guard(|| {
         // No child may be spawned between clearing these bits and exec.
         let result: io::Result<Infallible> = (|| {
-            for original in &bank.originals {
-                clear_cloexec(original.as_raw_fd())?;
+            for &fd in &descriptors {
+                clear_cloexec(fd)?;
             }
             Err(command.exec())
         })();
-        // Only failure returns. Try BOTH restorations even when the first fails.
+        // Only failure returns. Attempt EVERY TCP and box restoration on error.
         let mut restore_failed = false;
-        for original in &bank.originals {
-            if set_cloexec(original.as_raw_fd()).is_err() {
+        for &fd in &descriptors {
+            if set_cloexec(fd).is_err() {
                 restore_failed = true;
             }
         }
@@ -223,7 +308,11 @@ pub(crate) fn exec_activation(
             ));
         }
         result
-    })
+    });
+    if outcome.is_err() {
+        boxes.fail();
+    }
+    outcome
 }
 
 fn validate_exec_arguments(installed_path: &Path, serve_argv: &[OsString]) -> io::Result<()> {

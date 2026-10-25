@@ -342,6 +342,9 @@ impl RateBudget {
         !self.is_committed() && !state.forced_sent && state.retries < self.max_retries
     }
     fn can_send(&self) -> bool {
+        if !crate::boxes::dispatch_allowed() {
+            return false;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.forced |= std::time::Instant::now() >= self.deadline;
         !self.is_committed() && !state.forced_sent

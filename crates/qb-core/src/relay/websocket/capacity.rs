@@ -917,7 +917,7 @@ mod tests {
         rejected.connection_limit();
         drop((live, rejected));
         let (ready, started) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn({
+        let task = crate::boxes::spawn({
             let capacity = capacity.clone();
             async move {
                 let _pending = capacity.reserve("a").unwrap();

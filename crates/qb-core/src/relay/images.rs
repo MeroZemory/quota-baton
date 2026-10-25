@@ -456,7 +456,7 @@ async fn current_account(
 ) -> Result<Option<(Account, crate::accounts::Tokens, bool)>, ()> {
     let state = state.clone();
     let store = state.store.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::boxes::spawn_blocking(move || {
         let _gate = store.transaction().map_err(|_| ())?;
         current_account_unlocked(&store, &state.images, &id, bound.as_deref(), &|id| {
             state.accounts.outside_protected(id)
@@ -675,7 +675,7 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
     completion.record.retained_copy = retained.is_some();
     let mut body = upload.body;
     let store = state.store.clone();
-    let snapshots = tokio::task::spawn_blocking(move || {
+    let snapshots = crate::boxes::spawn_blocking(move || {
         let metadata = AccountStore::list_metadata(store.home()).map_err(|_| ())?;
         let _gate = store.transaction().map_err(|_| ())?;
         let known: BTreeSet<_> = metadata.iter().map(|a| a.id.clone()).collect();
@@ -817,6 +817,14 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
         if let Some(query) = parts.uri.query() {
             url.push('?');
             url.push_str(query);
+        }
+        if !crate::boxes::dispatch_allowed() {
+            return error(
+                &mut completion,
+                edit,
+                StatusCode::UNAUTHORIZED,
+                "box_revoked",
+            );
         }
         state.accounts.note_own_usage_send(&account.id);
         let upstream = match state

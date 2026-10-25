@@ -21,7 +21,7 @@ impl TokenGates {
         this.takeover_context = this
             .takeover_context
             .with_dependencies(dependencies.clone());
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             let _activity = activity;
             // Serialize source snapshots as well as new identities. The account
             // gate below is still shared with every D17 token consumer.
@@ -50,7 +50,7 @@ impl TokenGates {
             // The child blocking task retains lifecycle activity if this
             // detached parent is ever aborted, as do existing D17 read tasks.
             let write_activity = this.lifecycle.track_write();
-            let journal = tokio::task::spawn_blocking(move || {
+            let journal = crate::boxes::spawn_blocking(move || {
                 let _activity = write_activity;
                 let _guard = guard;
                 takeover::install(&install_store, &install_dependencies, journal)
@@ -85,7 +85,7 @@ impl TokenGates {
             }
             // A durable receipt, never uncertainty=false, determines completion.
             let finalize_activity = this.lifecycle.track_write();
-            tokio::task::spawn_blocking(move || {
+            crate::boxes::spawn_blocking(move || {
                 let _activity = finalize_activity;
                 takeover::finalize(&store, journal)
             })

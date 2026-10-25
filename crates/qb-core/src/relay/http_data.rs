@@ -96,7 +96,7 @@ impl RelayState {
         let work_key = key.to_owned();
         let model = model.map(str::to_owned);
         let pin = ingress.and_then(|ingress| ingress.pin.clone());
-        let task = tokio::task::spawn_blocking(move || {
+        let task = crate::boxes::spawn_blocking(move || {
             let fallback = accounts.current_http_initial_far_wait(
                 &bindings,
                 crate::bindings::HttpWaitRequest {

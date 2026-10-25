@@ -30,3 +30,6 @@ pub(crate) use account_fixtures::seed_account_fixtures;
 mod listener;
 pub(crate) mod service;
 pub(crate) use listener::bind_listener;
+
+mod box_sockets;
+pub(crate) use box_sockets::SocketSet as NativeSocketSet;

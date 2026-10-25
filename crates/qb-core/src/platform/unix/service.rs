@@ -271,6 +271,7 @@ pub(crate) fn prepare_process() -> Result<()> {
     if tokio::runtime::Handle::try_current().is_ok() || PROCESS.get().is_some() {
         bail!("managed process preparation order invalid");
     }
+    super::listener::prepare_inherited_box_fds()?;
     let process = capture_process(args)?;
     let signals = stop_signals();
     // Every subsequently created runtime/monitor thread inherits this mask.

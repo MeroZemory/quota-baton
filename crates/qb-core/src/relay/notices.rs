@@ -113,7 +113,7 @@ impl RelayState {
         model: Option<&str>,
     ) {
         let store = self.store.clone();
-        let Ok(Ok((accounts, credential_ids))) = tokio::task::spawn_blocking(move || {
+        let Ok(Ok((accounts, credential_ids))) = crate::boxes::spawn_blocking(move || {
             let accounts = store.list()?;
             let ids: BTreeSet<_> = accounts
                 .iter()

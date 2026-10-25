@@ -210,6 +210,7 @@ fn exec_metadata_retains_original_descriptor_role_order() {
             },
             originals: [data.into(), admin.into()],
             roles,
+            boxes: Mutex::new(box_bank::BoxBank::inherit(None).unwrap()),
         };
         assert_eq!(bank.names(), expected);
     }

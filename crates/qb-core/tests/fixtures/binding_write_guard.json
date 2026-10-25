@@ -75,61 +75,61 @@
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "assignment: *Alone known =Alone Parenthesis( *Alone known ) .Alone max Parenthesis( request_bytes )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "assignment: account =Alone old .Alone account .Alone id .Alone clone Parenthesis( )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "assignment: d .Alone defer_count_changes =Alone false",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( group Parenthesis( key ) .Alone to_owned Parenthesis( ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( group Parenthesis( key ) .Alone to_owned Parenthesis( ) ) .Alone or_default Parenthesis( )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "method: d .Alone placements .Alone entry Parenthesis( c .Alone account .Alone id .Alone clone Parenthesis( ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "method: d .Alone placements .Alone entry Parenthesis( c .Alone account .Alone id .Alone clone Parenthesis( ) ) .Alone or_default Parenthesis( )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "method: self .Alone rebind Parenthesis( context ,Alone authority ,Alone permit ,Alone |Alone reason |Alone Brace( self .Alone policies .Alone dispatch Parenthesis( policy_key .Alone as_deref Parenthesis( ) ,Alone &Alone account ,Alone previous .Alone as_deref Parenthesis( ) ,Alone reason ,Alone now ,Alone ) ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "mutable-escape: &Alone mut *Alone data",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "mutable-escape: &Alone mut d",
       "count": 1
     },

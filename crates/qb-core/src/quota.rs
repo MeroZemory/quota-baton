@@ -271,7 +271,7 @@ impl UsagePoller {
     async fn load(&self, id: &str) -> Result<Account, PollError> {
         let store = self.store.clone();
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || store.load(&id))
+        crate::boxes::spawn_blocking(move || store.load(&id))
             .await
             .map_err(|_| PollError::Unavailable)?
             .map_err(|error| match error {
@@ -282,7 +282,7 @@ impl UsagePoller {
     /// Reconcile linked credentials under the core's lease before binding listeners.
     pub async fn startup_reload(&self) -> Result<(), PollError> {
         let store = self.store.clone();
-        let accounts = tokio::task::spawn_blocking(move || store.list())
+        let accounts = crate::boxes::spawn_blocking(move || store.list())
             .await
             .map_err(|_| PollError::Unavailable)?
             .map_err(|_| PollError::Unavailable)?;
@@ -336,7 +336,7 @@ impl UsagePoller {
             };
             // The refresh and token-conditional failure transition both
             // survive cancellation of the three-second request hook.
-            if let Some((updated, refreshed)) = tokio::spawn(async move {
+            if let Some((updated, refreshed)) = crate::boxes::spawn(async move {
                 let retry = gates_task
                     .after_401(store.clone(), obs, failed_account.clone(), &failed_tokens)
                     .await?;
@@ -621,7 +621,7 @@ impl UsagePoller {
     }
     pub async fn tick(&self) {
         let store = self.store.clone();
-        let Ok(Ok(accounts)) = tokio::task::spawn_blocking(move || store.list()).await else {
+        let Ok(Ok(accounts)) = crate::boxes::spawn_blocking(move || store.list()).await else {
             // A transient read failure must not erase daily profile deadlines.
             return;
         };
@@ -664,7 +664,7 @@ impl UsagePoller {
     }
     pub fn start(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             loop {
                 let Some(poller) = weak.upgrade() else {
                     return;
@@ -678,7 +678,7 @@ impl UsagePoller {
     pub async fn before_unavailable(&self, provider: Provider) {
         let store = self.store.clone();
         let work = async {
-            let accounts = tokio::task::spawn_blocking(move || store.list())
+            let accounts = crate::boxes::spawn_blocking(move || store.list())
                 .await
                 .ok()
                 .and_then(Result::ok)
@@ -1055,7 +1055,7 @@ mod tests {
             f.fake.state.push(response);
         }
         let poller = f.relay.quota.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::boxes::spawn(async move {
             poller.tick().await;
         });
         tokio::time::timeout(Duration::from_secs(3), async {

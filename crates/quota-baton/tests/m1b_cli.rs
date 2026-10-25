@@ -734,7 +734,16 @@ fn manual_eof_and_invalid_input_cancel_without_printing_secrets() {
                     request: None,
                 },
                 cancel(),
-            ],
+            ]
+            .into_iter()
+            .chain(input.is_none().then_some(Reply {
+                method: "GET",
+                path: "/admin/v1/accounts/login/synthetic-login",
+                status: "200 OK",
+                body: serde_json::json!({"status":"cancelled"}),
+                request: None,
+            }))
+            .collect(),
         );
         let result = output_with_stdin(
             command(home.path()).args(["accounts", "login", "codex", "--no-browser"]),
@@ -746,6 +755,83 @@ fn manual_eof_and_invalid_input_cancel_without_printing_secrets() {
         assert!(!String::from_utf8_lossy(&result.stdout).contains("로그인을 완료했습니다"));
         assert!(!home.path().join("accounts").exists());
         no_secrets(&result);
+    }
+}
+
+#[test]
+fn no_browser_eof_checks_terminal_before_claiming_no_account_changes() {
+    for (provider, device) in [("claude", false), ("codex", true), ("codex", false)] {
+        for terminal in ["cancelled", "completed", "failed"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let home = fixture(listener.local_addr().unwrap().port());
+            let start = if device {
+                device_start(900)
+            } else {
+                let host = if provider == "claude" {
+                    "claude.ai"
+                } else {
+                    "auth.openai.com"
+                };
+                Reply {
+                    method: "POST",
+                    path: "/admin/v1/accounts/login",
+                    status: "200 OK",
+                    body: serde_json::json!({"login_id":"synthetic-login","auth_url":format!("https://{host}/oauth/authorize")}),
+                    request: Some(
+                        serde_json::json!({"provider":provider,"replace_linked":false,"no_browser":true}),
+                    ),
+                }
+            };
+            let mut outcome = serde_json::json!({"status":terminal});
+            if terminal == "completed" {
+                outcome["account_id"] = SECRET.into();
+            } else if terminal == "failed" {
+                outcome["error"] = SECRET.into();
+            }
+            let mut replies = vec![
+                health("200 OK", true),
+                start,
+                device_pending(),
+                cancel(),
+                Reply {
+                    method: "GET",
+                    path: "/admin/v1/accounts/login/synthetic-login",
+                    status: "200 OK",
+                    body: outcome,
+                    request: None,
+                },
+            ];
+            if terminal == "failed" {
+                // An unverified terminal outcome retains ordinary outer cleanup.
+                replies.push(cancel());
+            }
+            let server = serve_manual(listener, replies);
+            let result = output_with_stdin(
+                command(home.path()).args(["accounts", "login", provider, "--no-browser"]),
+                None,
+                false,
+            );
+            server.join().unwrap();
+            assert_eq!(result.status.success(), terminal == "completed");
+            let output = format!(
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                output.contains("로그인을 완료했습니다"),
+                terminal == "completed"
+            );
+            assert_eq!(
+                output.contains("계정 정보는 변경하지 않았습니다"),
+                terminal == "cancelled"
+            );
+            if terminal == "cancelled" {
+                assert!(output.contains("로그인 코드를 입력하지 않았습니다"));
+            }
+            assert!(!home.path().join("accounts").exists());
+            no_secrets(&result);
+        }
     }
 }
 

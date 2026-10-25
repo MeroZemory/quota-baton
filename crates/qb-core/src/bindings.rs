@@ -783,6 +783,9 @@ pub struct BindingLease {
     epoch: Arc<()>,
     pub after_move: bool,
     defer: bool,
+    // A cancelled JoinHandle can drop this result outside its task context.
+    // Last field: retain the grant through the destructor AND table-Arc Drop.
+    _box_request: Option<crate::boxes::BoxRequest>,
 }
 impl std::fmt::Debug for BindingLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2383,7 +2386,7 @@ impl BindingTable {
         let table = self.clone();
         let key = key.map(str::to_owned);
         let account = account.to_owned();
-        tokio::task::spawn_blocking(move || table.begin_request(key.as_deref(), &account))
+        crate::boxes::spawn_blocking(move || table.begin_request(key.as_deref(), &account))
             .await
             .context("routing reservation worker")
     }
@@ -2415,6 +2418,7 @@ impl BindingTable {
             Arc::new(())
         };
         BindingLease {
+            _box_request: crate::boxes::current_request(),
             epoch_key,
             epoch,
             table: self.clone(),
@@ -2655,6 +2659,44 @@ impl BindingTable {
         coverage: Option<&BTreeSet<String>>,
         admit: impl FnOnce(&str) -> Option<DispatchAdmission>,
     ) -> Decision {
+        self.choose_with_hold_at_admitted_proof_and_root_hint(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            move_evidence,
+            observations,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            now,
+            coverage,
+            None,
+            admit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_with_hold_at_admitted_proof_and_root_hint(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        move_evidence: &[Candidate],
+        observations: MoveObservations,
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        coverage: Option<&BTreeSet<String>>,
+        root_hint: Option<&crate::boxes::RootHint>,
+        admit: impl FnOnce(&str) -> Option<DispatchAdmission>,
+    ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         for c in candidates {
@@ -2684,7 +2726,7 @@ impl BindingTable {
             coverage: Some(coverage),
             model_move: false,
         });
-        let (choice, selection, sole_target) = self.select_with_return_guard(
+        let (choice, selection, sole_target) = self.select_with_return_guard_and_root_hint(
             &d,
             provider,
             key,
@@ -2698,6 +2740,7 @@ impl BindingTable {
             now,
             hold_allowed,
             preference.as_ref(),
+            root_hint,
         );
         let mut reason = selection.code();
         let mut account = match choice {
