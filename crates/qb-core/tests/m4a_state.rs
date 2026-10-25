@@ -1490,7 +1490,7 @@ mod runtime_regressions {
         let body: Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(
             body["error"]["message"],
-            "quota-baton: no usable codex account — open the tray"
+            "quota-baton: no usable codex account — run quota-baton accounts login codex --no-browser"
         );
     }
     #[tokio::test]
