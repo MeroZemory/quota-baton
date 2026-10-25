@@ -3159,7 +3159,7 @@ impl AccountRuntime {
             );
             result
         } else {
-            let mut error = json!({"error":{"type":"invalid_request_error","message":format!("quota-baton: no usable {} account — open the tray",provider.as_str())}});
+            let mut error = json!({"error":{"type":"invalid_request_error","message":format!("quota-baton: no usable {0} account — run quota-baton accounts login {0} --no-browser",provider.as_str())}});
             if provider == Provider::Claude {
                 error["type"] = "error".into();
             }

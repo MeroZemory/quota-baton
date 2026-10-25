@@ -317,7 +317,7 @@ async fn handshake_failure_rows_never_return_426_and_keep_raw_bodies() {
             assert_eq!(response.status(), 400);
             let text = String::from_utf8_lossy(response.body().as_ref().unwrap());
             assert!(text.contains("no usable codex account"));
-            assert!(text.contains("— open the tray"));
+            assert!(text.contains("— run quota-baton accounts login codex --no-browser"));
         }
         _ => panic!("expected no account"),
     }
