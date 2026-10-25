@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: L1 P4 칸별 접근 구현 관문 완료; P5 배포 바이너리 준비
+현재 마일스톤: L1 P4 설치 수용·headless 안내 보완 관문 완료; P5 배포 바이너리 준비
 목표: 공통 코드를 유지하며 홈 서버용 Linux 구현 P0–P4를 완성하기
 핵심 지표: Linux 구현 관문 5/5 (P0–P4); 실제 공급자 완료 로그인 0/2·P5 서버 수용 전
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-25 10:22 KST (P4 코드 b180f63·fixture f76f10f/3c1feba; 원본 실패 보존·집중 보완 관문·build/read-only check 통과)
+갱신: 2026-10-25 10:40 KST (P4 설치 3217fb2 확인; 안내 bed85c1 양쪽 target·기존 회귀3·strict lint 통과, 새 release·실제 로그인 별도)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -269,6 +269,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 08:18 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 4/5 | P3.1 fe151f5 device-code·붙여넣기 전환·Linux release strict 0경고; P4 WIP와 실제 공급자 로그인 별도 |
 | 2026-10-25 09:05 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 4/5 | P3.1 547d3b1 Windows·GPU 서버 설치 수용 확인; P4 전체 Windows 관문 진행 중, 실제 공급자 로그인 0/2 별도 |
 | 2026-10-25 10:22 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P4 양쪽 target·strict lint·실제 HTTP/WS·두 컨테이너·전체 행렬 뒤 집중 보완·제품 빌드·읽기 전용 check 완료. 실제 로그인·Incus·재부팅은 P5 별도 |
+| 2026-10-25 10:40 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P4 Windows·실제 Linux 격리/철회 설치 수용; headless no-account 안내 bed85c1 집중 관문 통과. P5 새 배포본·실제 완료 로그인 별도 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -529,12 +530,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 09:34 | L1 P4 Windows 기본 관문 집중 보완 | 기본 core1284/3·쓰기 guard1실패·takeover8/1; 동일 바이너리 advance7·publication4·takeover1 통과 | 최초 실패를 보존하며 실패 가족만 재확인 | 원인 미단정; 쓰기 guard 승인 함수명10곳만 f76f10f 수정, 전체 기능·단독 코어·빌드·실제 읽기 전용 check 남음 |
 | 2026-10-25 10:22 | L1 P4 최종 실패 가족 보완 | 전체 기능 move guard9/3 뒤 clean 재빌드12/0; 단독 core1279/1 뒤 deferred 기본29/0·전체29/0·strict lint 통과 | 실패 기록 보존·해당 가족만 보완 | 3실패는 fixture mutex 입장30초; 반복 consume 실패 원인 미확정, 3c1feba는 제품과 같은 두 시각 전제조건 보완이며 원인 입증 아님 |
 | 2026-10-25 10:22 | L1 P4 제품·Windows 읽기 전용 확인 | cargo build exit0·실제 launch-client --check exit0 | Windows 동작 유지·실제 프로필 무변경 | p4-product-close; 이후 변경은 cfg(test) 헬퍼뿐, production prefix 동일 지문으로 재사용 |
+| 2026-10-25 10:40 | L1 P4 설치·두 칸 실제 Linux | Windows takeover1285/0·Codex/Claude smoke; GPU Ubuntu26/systemd259 own key400·cross/no key401·A철회200·B유지 | 설계 세션 설치 수용 | 3217fb2; Docker+socat는 Incus 대역, 400은 no-account이며 실제 공급자 완료 로그인 아님 |
+| 2026-10-25 10:40 | L1 headless no-account 안내 | 기존 HTTP·WS·runtime 회귀 각1통과, Windows/Linux target check·strict core lint 통과 | terminal400·provider형태 유지하며 tray없는 환경에서도 실행할 안내 | bed85c1; 첫 testkit 누락 명령 오류 보존 후 올바른 기능으로 검사; 새 제품 배포 빌드 예정 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| Linux P5 배포 바이너리 | P4 구현 관문 5/5; Bookworm builder glibc2.36 확인 | 고정 소스 release·ELF·SHA·Ubuntu24 합성 runtime | sole Linux target로 release 빌드·실행 자격 확인 |
+| Linux P5 배포 바이너리 | 이전 P4 release ELF2.34 확인; no-account 안내 보완 관문 완료 | 안내 포함 고정 소스 release·ELF·SHA·Ubuntu24 합성 runtime | sole Linux target로 새 release·검토된 health helper 명시 주입 |
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 P5 수용 |
 | Linux P5 서버 수용 | GPU 서버 재로드 확인; Incus 칸·재부팅 미수용 | Bookworm release·실제 칸 접근·철회·업그레이드·재부팅·PC와 공유 계정 외부 사용 감지 | P4 뒤 배포 바이너리 준비; N6r·N7 각 브랜치 보류 |
 <!-- gaps:end -->
