@@ -39,6 +39,17 @@ The Codex main updates this block at each unit and gate close; the design sessio
 For Linux phases, also run the following in the approved Linux container and
 single `qb-linux-target` volume, sequentially with the Windows checks:
 
+Check the actual packaged units first (from the gate's committed source):
+
+```sh
+git archive HEAD packaging/linux | python3 packaging/linux/check_archive.py
+```
+
+On Windows, stream the archive bytes into the checker in the approved Linux
+container with the source mounted read-only. Do not pass the archive through a
+text pipeline. The same checker accepts the delivery tarball on stdin. Missing,
+duplicate, nonregular units or any CR byte fail the gate.
+
 ```sh
 cargo check --workspace --exclude qb-tray --target x86_64-unknown-linux-gnu
 cargo clippy --workspace --exclude qb-tray --lib --bins --target x86_64-unknown-linux-gnu -- -D warnings
