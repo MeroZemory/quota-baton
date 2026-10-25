@@ -17,6 +17,9 @@ use tokio::{
 
 use crate::{config::Config, local_secrets::LocalSecrets};
 
+mod box_ingress;
+pub(crate) use box_ingress::protect_box_routes;
+
 pub struct RunningServers {
     pub data_addr: SocketAddr,
     pub admin_addr: SocketAddr,
@@ -88,6 +91,7 @@ struct Safety {
     key: Arc<str>,
     other_key: Arc<str>,
     admin: bool,
+    registry: Option<crate::boxes::BoxRegistry>,
 }
 
 pub async fn spawn(config: &Config, secrets: LocalSecrets) -> anyhow::Result<RunningServers> {
@@ -114,6 +118,17 @@ pub async fn spawn_with_routes(
     data_routes: Router,
     extra_admin: Router,
 ) -> anyhow::Result<RunningServers> {
+    spawn_with_box_registry(config, secrets, data_routes, extra_admin, None).await
+}
+
+/// The service owner supplies its existing registry; admin ingress never uses it.
+pub(crate) async fn spawn_with_box_registry(
+    config: &Config,
+    secrets: LocalSecrets,
+    data_routes: Router,
+    extra_admin: Router,
+    registry: Option<crate::boxes::BoxRegistry>,
+) -> anyhow::Result<RunningServers> {
     anyhow::ensure!(
         !secrets.client_key.is_empty() && !secrets.admin_token.is_empty(),
         "local secrets must not be empty"
@@ -138,6 +153,7 @@ pub async fn spawn_with_routes(
             key: client_key.clone(),
             other_key: admin_token.clone(),
             admin: false,
+            registry,
         },
         safety,
     ));
@@ -166,6 +182,7 @@ pub async fn spawn_with_routes(
                 key: admin_token,
                 other_key: client_key,
                 admin: true,
+                registry: None,
             },
             safety,
         ));
@@ -216,7 +233,7 @@ pub async fn spawn_with_routes(
 async fn safety(
     State(state): State<Safety>,
     ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if !peer.ip().is_loopback() {
@@ -227,29 +244,10 @@ async fn safety(
             request.uri().path(),
         );
     }
-    let hosts = request.headers().get_all("host");
-    let mut hosts = hosts.iter();
-    let host = hosts.next().and_then(|value| value.to_str().ok());
-    let valid = host.is_some_and(|host| {
-        host == format!("127.0.0.1:{}", state.port) || host == format!("localhost:{}", state.port)
-    });
-    if !valid || hosts.next().is_some() {
-        tracing::warn!(port = state.port, "Rejected request with invalid Host");
-        return error(
-            StatusCode::MISDIRECTED_REQUEST,
-            "invalid_request_error",
-            "Invalid Host",
-            request.uri().path(),
-        );
+    if let Some(response) = check_host_origin(&request, state.port) {
+        return response;
     }
-    if request.headers().contains_key("origin") {
-        return error(
-            StatusCode::FORBIDDEN,
-            "invalid_request_error",
-            "Origin is forbidden",
-            request.uri().path(),
-        );
-    }
+    box_ingress::clear_box_extensions(&mut request);
     let bearer = single_header(request.headers(), "authorization")
         .and_then(|value| value.strip_prefix("Bearer "));
     let api_key = (!state.admin)
@@ -264,6 +262,22 @@ async fn safety(
         .into_iter()
         .flatten()
         .any(|key| equal(key, &state.key));
+    // Global credentials retain their existing OR semantics. Only otherwise
+    // unauthenticated data requests enter the stricter box credential parser.
+    if !wrong_port
+        && !authorized
+        && !state.admin
+        && let Some(registry) = &state.registry
+        && let Some(key) = box_ingress::box_credential(request.headers())
+    {
+        match registry.try_identify(&key) {
+            Ok(authority) => {
+                return box_ingress::run_box_request(request, next, authority).await;
+            }
+            Err(crate::boxes::RegistryError::Unauthorized) => {}
+            Err(_) => return box_ingress::authentication_unavailable(request.uri().path()),
+        }
+    }
     if wrong_port || !authorized {
         let message = if !state.admin && bearer.is_some_and(|token| token.starts_with("eyJ")) {
             "ChatGPT 토큰이 아니라 quota-baton 클라이언트 키를 써야 합니다"
@@ -278,6 +292,33 @@ async fn safety(
         );
     }
     next.run(request).await
+}
+
+fn check_host_origin(request: &Request, port: u16) -> Option<Response> {
+    let hosts = request.headers().get_all("host");
+    let mut hosts = hosts.iter();
+    let host = hosts.next().and_then(|value| value.to_str().ok());
+    let valid = host.is_some_and(|host| {
+        host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
+    });
+    if !valid || hosts.next().is_some() {
+        tracing::warn!(port, "Rejected request with invalid Host");
+        return Some(error(
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid_request_error",
+            "Invalid Host",
+            request.uri().path(),
+        ));
+    }
+    if request.headers().contains_key("origin") {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "invalid_request_error",
+            "Origin is forbidden",
+            request.uri().path(),
+        ));
+    }
+    None
 }
 
 fn single_header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {

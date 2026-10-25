@@ -72,7 +72,8 @@ pub(super) async fn upgrade(
     request: Request,
     pin: Option<Arc<LaunchPin>>,
 ) -> Response {
-    if state.is_draining()
+    if !crate::boxes::dispatch_allowed()
+        || state.is_draining()
         || request.uri().query().is_some()
         || [
             "origin",
@@ -91,16 +92,46 @@ pub(super) async fn upgrade(
     let Ok(upgrade) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if !crate::boxes::dispatch_allowed() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let box_request = crate::boxes::current_request();
+    let box_authority = parts
+        .extensions
+        .get::<crate::boxes::BoxAuthority>()
+        .cloned();
+    if box_request.as_ref().is_some_and(|request| {
+        box_authority
+            .as_ref()
+            .is_none_or(|authority| authority.scope() != request.scope() || authority.is_revoked())
+    }) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Ok(owner) = pin.open_deferred_owner() else {
         return StatusCode::CONFLICT.into_response();
     };
     upgrade
         .max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| control(state, socket, pin, owner))
+        .on_upgrade(move |socket| async move {
+            // Axum creates the upgrade task itself, outside our spawn wrapper.
+            // Retain the authenticated box lifetime on that actual task too.
+            if let Some(request) = box_request {
+                crate::boxes::scope_request(
+                    request,
+                    control(state, socket, pin, owner, box_authority),
+                )
+                .await;
+            } else {
+                control(state, socket, pin, owner, box_authority).await;
+            }
+        })
 }
 
 async fn send(socket: &mut WebSocket, request_id: Option<u64>, event: Event) -> Result<(), ()> {
+    if !crate::boxes::dispatch_allowed() {
+        return Err(());
+    }
     let reply = Reply {
         version: VERSION,
         request_id,
@@ -113,7 +144,8 @@ async fn send(socket: &mut WebSocket, request_id: Option<u64>, event: Event) -> 
     timeout(CONTROL_TIMEOUT, socket.send(Message::Text(bytes.into())))
         .await
         .map_err(|_| ())?
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    crate::boxes::dispatch_allowed().then_some(()).ok_or(())
 }
 
 async fn control(
@@ -121,7 +153,18 @@ async fn control(
     mut socket: WebSocket,
     _pin: Arc<LaunchPin>,
     owner: LaunchOwnerLease,
+    box_authority: Option<crate::boxes::BoxAuthority>,
 ) {
+    // Watch the same authenticated grant retained by the upgraded task. Idle
+    // sockets must wake on revoke; ordinary TCP owners have no box watcher.
+    let box_revoked = async move {
+        if let Some(authority) = box_authority {
+            authority.watch_revocation().revoked().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(box_revoked);
     let scope = owner.scope();
     let mut thread: Option<String> = None;
     let mut observed = false;
@@ -129,6 +172,9 @@ async fn control(
     let mut announced_due: Option<(DeferredResetId, u64)> = None;
     let mut grant_issued = false;
     loop {
+        if !crate::boxes::dispatch_allowed() {
+            break;
+        }
         // Poll once to arm notifications BEFORE status inspection. A future
         // merely constructed but not polled would miss registration/recovery.
         let watch_reset = !grant_issued;
@@ -152,7 +198,7 @@ async fn control(
         let status = status_thread
             .filter(|_| !grant_issued)
             .map(|thread| state.accounts.deferred_reset_status(&scope, thread));
-        if !scope.live() || state.is_draining() {
+        if !crate::boxes::dispatch_allowed() || !scope.live() || state.is_draining() {
             break;
         }
         let mut wake = None;
@@ -195,7 +241,7 @@ async fn control(
                 DeferredResetStatus::Empty => {}
             }
         }
-        if !scope.live() || state.is_draining() {
+        if !crate::boxes::dispatch_allowed() || !scope.live() || state.is_draining() {
             break;
         }
         if changed_ready {
@@ -212,12 +258,18 @@ async fn control(
         };
         let message = tokio::select! {
             biased;
+            _ = &mut box_revoked => break,
             _ = state.wait_for_drain_start() => break,
             _ = &mut changed, if !changed_ready => continue,
             _ = timer => continue,
             message = socket.next() => message,
         };
         let Some(Ok(message)) = message else { break };
+        // socket.next() may have waited across revocation. No fresh command,
+        // including Observe/Cancel or Ping, may run on the stale grant.
+        if !crate::boxes::dispatch_allowed() {
+            break;
+        }
         let bytes = match message {
             Message::Text(text) => text,
             Message::Ping(bytes) => {
@@ -294,7 +346,10 @@ async fn control(
                     let work_scope = scope.clone();
                     let accounts = state.accounts.clone();
                     let bindings = state.bindings.clone();
-                    let mut task = tokio::task::spawn_blocking(move || {
+                    let mut task = crate::boxes::spawn_blocking(move || {
+                        if !crate::boxes::dispatch_allowed() {
+                            return Err(());
+                        }
                         accounts.advance_deferred_reset(
                             &bindings,
                             &work_scope,
@@ -304,12 +359,19 @@ async fn control(
                     });
                     let result = tokio::select! {
                         biased;
+                        // Dropping this handle never aborts the owned blocking
+                        // job; admitted writes keep their inherited lifetime.
+                        _ = &mut box_revoked => break,
                         _ = state.wait_for_drain_start() => break,
                         _ = tokio::time::sleep_until(operation.deadline()) => break,
                         _ = socket.next() => break,
                         result = &mut task => result,
                     };
-                    if !operation.can_reply() || !scope.live() || state.is_draining() {
+                    if !crate::boxes::dispatch_allowed()
+                        || !operation.can_reply()
+                        || !scope.live()
+                        || state.is_draining()
+                    {
                         break;
                     }
                     if matches!(result, Ok(Ok(true))) {
@@ -341,7 +403,10 @@ async fn control(
                 let work_scope = scope.clone();
                 let accounts = state.accounts.clone();
                 let bindings = state.bindings.clone();
-                let mut task = tokio::task::spawn_blocking(move || {
+                let mut task = crate::boxes::spawn_blocking(move || {
+                    if !crate::boxes::dispatch_allowed() {
+                        return Err(());
+                    }
                     if consume {
                         accounts
                             .consume_deferred_reset(
@@ -370,12 +435,17 @@ async fn control(
                 // In particular, a close/cancel must not wait behind Store I/O.
                 let result = tokio::select! {
                     biased;
+                    _ = &mut box_revoked => break,
                     _ = state.wait_for_drain_start() => break,
                     _ = tokio::time::sleep_until(operation.deadline()) => break,
                     _ = socket.next() => break,
                     result = &mut task => result,
                 };
-                if !operation.can_reply() || !scope.live() || state.is_draining() {
+                if !crate::boxes::dispatch_allowed()
+                    || !operation.can_reply()
+                    || !scope.live()
+                    || state.is_draining()
+                {
                     break;
                 }
                 match result {
@@ -394,7 +464,7 @@ async fn control(
                 }
             }
         };
-        if !scope.live() || state.is_draining() {
+        if !crate::boxes::dispatch_allowed() || !scope.live() || state.is_draining() {
             break;
         }
         if send(&mut socket, Some(last_request), event).await.is_err() {

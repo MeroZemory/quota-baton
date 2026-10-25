@@ -59,7 +59,7 @@ pub(in crate::relay) fn body(
     // 한 조각만 대기시키고 종료 청크가 소비될 때까지 completion을 함께 보관한다.
     let (tx, rx) = mpsc::channel(1);
     let response_headers = response_headers.clone();
-    tokio::spawn(async move {
+    crate::boxes::spawn(async move {
         let mut json_body = response_headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
@@ -178,7 +178,7 @@ pub(in crate::relay) fn body(
                         let store = runtime.store.clone();
                         let account = account.clone();
                         let failed = failed.clone();
-                        let written = tokio::task::spawn_blocking(move || {
+                        let written = crate::boxes::spawn_blocking(move || {
                             store.update_metadata_for_token(&account, &failed, |account| {
                                 account.apply_health_signal(
                                     crate::accounts::HealthSignal::Revoked {

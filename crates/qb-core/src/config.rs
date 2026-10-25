@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub boxes: Vec<BoxConfig>,
     #[serde(skip_serializing_if = "SecretsConfig::is_default")]
     pub secrets: SecretsConfig,
     pub server: ServerConfig,
@@ -20,6 +22,51 @@ pub struct Config {
     pub ui: UiConfig,
     pub routing_replay: RoutingReplayConfig,
     pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+/// Endpoint declarations never create or contain credentials.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoxConfig {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<BoxListen>,
+}
+
+/// Listener binding is additional to the per-box key's identity.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum BoxListen {
+    Unix,
+    Tcp(u16),
+}
+
+impl TryFrom<String> for BoxListen {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value == "unix" {
+            return Ok(Self::Unix);
+        }
+        let port = value
+            .strip_prefix("tcp:127.0.0.1:")
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .ok_or("invalid box listener; expected unix or tcp:127.0.0.1:<port>")?;
+        if value != format!("tcp:127.0.0.1:{port}") {
+            return Err("invalid box listener port");
+        }
+        Ok(Self::Tcp(port))
+    }
+}
+
+impl From<BoxListen> for String {
+    fn from(value: BoxListen) -> Self {
+        match value {
+            BoxListen::Unix => "unix".into(),
+            BoxListen::Tcp(port) => format!("tcp:127.0.0.1:{port}"),
+        }
+    }
 }
 
 /// Linux secret storage is explicit; Windows retains its native DPAPI protector.
@@ -475,6 +522,28 @@ mod image_account_tests {
 }
 
 impl Config {
+    pub(crate) fn validate_boxes(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.boxes.len() <= 256,
+            "box configuration capacity reached"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut ports = std::collections::BTreeSet::new();
+        for endpoint in &self.boxes {
+            let name = crate::boxes::BoxName::parse(&endpoint.name)?;
+            anyhow::ensure!(seen.insert(name), "duplicate box name");
+            if let Some(BoxListen::Tcp(port)) = endpoint.listen {
+                anyhow::ensure!(port != 0, "invalid box listener port");
+                anyhow::ensure!(ports.insert(port), "duplicate box listener port");
+                anyhow::ensure!(
+                    port != self.server.data_port && port != self.server.admin_port,
+                    "box listener conflicts with a core port"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_account_aliases(&self) -> anyhow::Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         for account in self.accounts.values() {
@@ -523,6 +592,7 @@ impl Config {
         config.quota.validate()?;
         config.routing_replay.validate()?;
         config.validate_account_aliases()?;
+        config.validate_boxes()?;
         anyhow::ensure!(
             config.websocket.idle_close_secs < config.routing.rebalance_idle_secs,
             "websocket.idle_close_secs must be less than routing.rebalance_idle_secs"
@@ -531,6 +601,13 @@ impl Config {
         known.as_table_mut().expect("config table").insert(
             "secrets".into(),
             toml::Value::try_from(SecretsConfig::default())?,
+        );
+        known.as_table_mut().expect("config table").insert(
+            "boxes".into(),
+            toml::Value::try_from(vec![BoxConfig {
+                name: "sample-box".into(),
+                listen: Some(BoxListen::Unix),
+            }])?,
         );
         warn_unknown(&value, &known, "");
         if let Some(accounts) = value.get("accounts").and_then(toml::Value::as_table) {
@@ -1228,5 +1305,120 @@ linux_backend = "unknown"
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod box_config_tests {
+    use super::*;
+
+    #[test]
+    fn absent_boxes_preserve_default_serialized_shape() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.boxes.is_empty());
+        assert!(config.validate_boxes().is_ok());
+        assert!(
+            toml::Value::try_from(config)
+                .unwrap()
+                .get("boxes")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn declared_names_roundtrip_and_credentials_are_not_config_fields() {
+        let config: Config =
+            toml::from_str("[[boxes]]\nname='sample-box'\n[[boxes]]\nname='sample_2'\n").unwrap();
+        config.validate_boxes().unwrap();
+        assert!(config.boxes.iter().all(|item| item.listen.is_none()));
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(!encoded.contains("listen"));
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert!(decoded.boxes.iter().all(|item| item.listen.is_none()));
+        assert_eq!(
+            decoded
+                .boxes
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sample-box", "sample_2"]
+        );
+        decoded.validate_boxes().unwrap();
+        assert!(
+            toml::from_str::<Config>("[[boxes]]\nname='sample-box'\nkey='sample-key'\n").is_err()
+        );
+    }
+
+    #[test]
+    fn unsafe_duplicate_and_oversized_declarations_are_refused() {
+        for name in [
+            "",
+            "../sample",
+            "Sample",
+            "/sample",
+            "sample.sock",
+            "-sample",
+        ] {
+            let mut config = Config::default();
+            config.boxes.push(BoxConfig {
+                name: name.into(),
+                listen: Some(BoxListen::Unix),
+            });
+            assert!(config.validate_boxes().is_err(), "{name:?}");
+        }
+        let mut config = Config {
+            boxes: vec![
+                BoxConfig {
+                    name: "sample-box".into(),
+                    listen: Some(BoxListen::Unix),
+                };
+                2
+            ],
+            ..Config::default()
+        };
+        assert!(config.validate_boxes().is_err());
+        config.boxes = (0..257)
+            .map(|index| BoxConfig {
+                name: format!("sample-{index}"),
+                listen: Some(BoxListen::Unix),
+            })
+            .collect();
+        assert!(config.validate_boxes().is_err());
+    }
+
+    #[test]
+    fn box_listener_kind_roundtrips_and_refuses_non_loopback_or_ambiguous_ports() {
+        for (value, expected) in [
+            ("unix", BoxListen::Unix),
+            ("tcp:127.0.0.1:10301", BoxListen::Tcp(10301)),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[[boxes]]\nname='sample-box'\nlisten='{value}'\n"))
+                    .unwrap();
+            config.validate_boxes().unwrap();
+            assert_eq!(config.boxes[0].listen, Some(expected.clone()));
+            let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(decoded.boxes[0].listen, Some(expected));
+        }
+        for value in [
+            "tcp:0.0.0.0:10301",
+            "tcp:localhost:10301",
+            "tcp:127.0.0.1:0",
+            "tcp:127.0.0.1:010301",
+            "tcp:127.0.0.1:65536",
+            "tcp:[::1]:10301",
+            "unix:/tmp/sample.sock",
+        ] {
+            assert!(BoxListen::try_from(value.to_owned()).is_err());
+        }
+        for ports in [(10301, 10301), (10200, 10301), (10301, 10201)] {
+            let config: Config = toml::from_str(&format!(
+                "[[boxes]]\nname='sample-a'\nlisten='tcp:127.0.0.1:{}'\n\
+                 [[boxes]]\nname='sample-b'\nlisten='tcp:127.0.0.1:{}'\n",
+                ports.0, ports.1
+            ))
+            .unwrap();
+            assert!(config.validate_boxes().is_err());
+        }
     }
 }

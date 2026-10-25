@@ -43,7 +43,7 @@ async fn prepare(
     // absent, unknown or expired. It does not prune, touch, adopt or reserve.
     let info = tokio::time::timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             table.models_launch_snapshot(request_key.as_deref(), anchor.as_deref())
         }),
     )
@@ -84,7 +84,7 @@ async fn prepare(
     // mutations, before pruning or writing advertised metadata. No retry/shop.
     let admitted = tokio::time::timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             table.record_models_advertised_for_operation(
                 &key,
                 &account,

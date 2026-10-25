@@ -2,6 +2,8 @@
 
 //! Synthetic OAuth completion at a retained adopted ID. No real provider/browser.
 pub use qb_core::{account_runtime, accounts, observability};
+#[path = "support/unscoped_tasks.rs"]
+mod boxes;
 #[path = "../src/relay/credentials.rs"]
 #[allow(dead_code)]
 mod credentials;

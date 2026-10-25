@@ -370,6 +370,38 @@ async fn close_owner(socket: &mut Socket, scope: &LaunchOwnerScope) {
 }
 
 #[tokio::test]
+async fn actual_idle_owner_service_stop_closes_without_takeover_or_client_close() {
+    let fixture = Fixture::new().await;
+    let mut socket = fixture.connect().await;
+    ping(&mut socket).await;
+    let scope = fixture.scope();
+    assert!(scope.live() && scope.root().is_none());
+    let closed = scope.notified();
+    tokio::pin!(closed);
+    closed.as_mut().enable();
+
+    // The active service owner calls this before terminal joins on TERM. No
+    // client close/frame, grant revoke, or asynchronous takeover drain is used.
+    fixture.state.notify_box_service_stop();
+    fixture.state.notify_box_service_stop(); // Repeated cleanup remains harmless.
+    assert!(!fixture.state.is_draining());
+    assert!(!fixture.state.store.writes_stopped());
+    bounded(fixture.state.wait_for_drain_start()).await; // Late waiter sees stop.
+    if scope.live() {
+        bounded(closed.as_mut()).await;
+    }
+    assert!(!scope.live());
+    terminal(&mut socket).await;
+    // Notification is not completed takeover/lease transfer authority.
+    {
+        let takeover_ready = fixture.state.wait_for_drain();
+        tokio::pin!(takeover_ready);
+        assert!(futures_util::poll!(takeover_ready.as_mut()).is_pending());
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn actual_idle_owner_close_revokes_and_fresh_epoch_can_reopen() {
     let fixture = Fixture::new().await;
     let mut socket = fixture.connect().await;

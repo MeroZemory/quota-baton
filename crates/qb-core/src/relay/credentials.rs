@@ -183,6 +183,9 @@ struct Rotation {
     failed_token: zeroize::Zeroizing<String>,
     store_error_in_memory: bool,
     takeover_operation: Option<String>,
+    // A retry may outlive its originating task. Keep the exact box admission
+    // through pending storage and the final credential write.
+    box_request: Option<crate::boxes::BoxRequest>,
 }
 
 #[derive(Default)]
@@ -259,7 +262,7 @@ impl TokenGates {
         }
         let id = account.id.clone();
         let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             let _guard = guard;
             snapshot(&store, &id).map(|(_, current)| current.access_token == *failed)
         })
@@ -275,7 +278,7 @@ impl TokenGates {
     ) -> Result<Account, ()> {
         let gate = self.gate(&account.id).await;
         let guard = gate.lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             let mut clock = guard;
             if store.takeover_fenced(&account.id).map_err(|_| ())? {
                 return Err(());
@@ -300,7 +303,7 @@ impl TokenGates {
         let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
         let gate = self.gate(&account.id).await;
         let guard = gate.lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             if let Some(pending) = &guard.pending
                 && pending.tokens.access_token != *failed
             {
@@ -355,7 +358,7 @@ impl TokenGates {
         }
         let id = account.id.clone();
         let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             let _guard = guard;
             store
                 .update_metadata_for_token(&id, &failed, |account| {
@@ -403,7 +406,7 @@ impl TokenGates {
         let gate = self.gate(&id).await;
         let guard = gate.lock_owned().await;
         let trigger = trigger.to_owned();
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             let mut clock = guard;
             let (current, _) = snapshot(&store, &id)?;
             if !is_linked(&current) {
@@ -426,7 +429,7 @@ impl TokenGates {
             return Ok(None);
         };
         let this = self.clone();
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             let _activity = activity;
             this.refresh_or_reload(store, obs, id, None, "refresh_ahead")
                 .await
@@ -451,7 +454,7 @@ impl TokenGates {
         let read_id = id.clone();
         // Capture access BEFORE waiting for the gate: a concurrent rotation is
         // our result too, even though manual refresh has no due-time restriction.
-        let (activity, failed, baseline) = tokio::task::spawn_blocking(move || {
+        let (activity, failed, baseline) = crate::boxes::spawn_blocking(move || {
             // The blocking credential read outlives a cancelled requesting future.
             // Keep it tracked until its result is dropped or handed to refresh.
             let activity = activity;
@@ -467,7 +470,7 @@ impl TokenGates {
         .await
         .map_err(|_| ManualRefreshError::Unavailable)??;
         let this = self.clone();
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             let _activity = activity;
             let (account, _) = this
                 .refresh_inner(
@@ -533,7 +536,7 @@ impl TokenGates {
         obs: Arc<Observability>,
     ) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -546,7 +549,7 @@ impl TokenGates {
                 }
                 let read_store = store.clone();
                 if let Ok(Ok(accounts)) =
-                    tokio::task::spawn_blocking(move || read_store.list()).await
+                    crate::boxes::spawn_blocking(move || read_store.list()).await
                 {
                     for account in accounts {
                         if !is_linked(&account)
@@ -594,7 +597,7 @@ impl TokenGates {
         let read_store = store.clone();
         let read_obs = observability.clone();
         let read_id = id.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::boxes::spawn_blocking(move || {
             let store = read_store;
             let observability = read_obs;
             let id = read_id;
@@ -622,7 +625,7 @@ impl TokenGates {
         .map_err(|_| ())??;
         if !is_linked(&result.0) && ahead_due(&result.0, chrono::Utc::now()) {
             let this = self.clone();
-            tokio::spawn(async move {
+            crate::boxes::spawn(async move {
                 let _ = this.refresh_ahead(store, observability, id).await;
             });
         }
@@ -642,7 +645,7 @@ impl TokenGates {
         let failed = zeroize::Zeroizing::new(failed.access_token.clone());
         let this = self.clone();
         // Dropping the requesting future does not abort the single-use refresh.
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             let _activity = activity;
             this.refresh_or_reload(
                 store,
@@ -667,7 +670,7 @@ impl TokenGates {
         let gate = self.gate(&account.id).await;
         let guard = gate.lock_owned().await;
         let failed = zeroize::Zeroizing::new(failed.access_token.clone());
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             let mut clock = guard;
             if clock
                 .pending
@@ -749,7 +752,7 @@ impl TokenGates {
         let status_id = id.clone();
         let operation = takeover_operation.clone();
         let dependencies = self.takeover_context.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::boxes::spawn_blocking(move || {
             use crate::accounts::takeover::ReceiptState;
             let receipt = status_store.takeover_receipt(&status_id).map_err(|_| ())?;
             if let Some(operation) = operation {
@@ -777,7 +780,7 @@ impl TokenGates {
         if failed.is_none() && takeover_operation.is_none() {
             let read_store = store.clone();
             let read_id = id.clone();
-            let metadata = tokio::task::spawn_blocking(move || read_store.load(&read_id))
+            let metadata = crate::boxes::spawn_blocking(move || read_store.load(&read_id))
                 .await
                 .map_err(|_| ())?
                 .map_err(|_| ())?;
@@ -791,7 +794,7 @@ impl TokenGates {
         }
         let read_store = store.clone();
         let read_operation = takeover_operation.clone();
-        let (current, tokens) = tokio::task::spawn_blocking(move || {
+        let (current, tokens) = crate::boxes::spawn_blocking(move || {
             if let Some(operation) = read_operation {
                 let current = read_store.load(&id).map_err(|_| ())?;
                 let tokens = read_store
@@ -816,7 +819,7 @@ impl TokenGates {
             } else {
                 "upstream_401"
             };
-            return tokio::task::spawn_blocking(move || {
+            return crate::boxes::spawn_blocking(move || {
                 let mut clock = clock;
                 let updated = reload(&store, &obs, current, trigger, &mut clock)?;
                 let (updated, tokens) = snapshot(&store, &updated.id)?;
@@ -892,7 +895,7 @@ impl TokenGates {
         uncertain.token_meta.refresh_uncertain = true;
         let old_tokens = copy_tokens(&tokens);
         let write_operation = takeover_operation.clone();
-        let current = match tokio::task::spawn_blocking(move || {
+        let current = match crate::boxes::spawn_blocking(move || {
             if let Some(operation) = write_operation {
                 use crate::accounts::takeover::{Receipt, ReceiptState};
                 let before = Receipt {
@@ -1015,7 +1018,7 @@ impl TokenGates {
                     let outcome = ManualRefreshTerminal::from_code(&reason);
                     clock.unknown_failures = 0;
                     self.runtime.set_refresh_attention(&current.id, false);
-                    tokio::task::spawn_blocking(move || {
+                    crate::boxes::spawn_blocking(move || {
                         transition(
                             &store,
                             &current,
@@ -1086,6 +1089,7 @@ impl TokenGates {
             failed_token: failed,
             store_error_in_memory: false,
             takeover_operation: takeover_operation.clone(),
+            box_request: crate::boxes::current_request(),
         };
         let result = persist_async(store.clone(), &rotation).await;
         match result {
@@ -1111,7 +1115,7 @@ impl TokenGates {
                 let warning_store = store.clone();
                 let expected = current.clone();
                 let rejected = rotation.failed_token.clone();
-                let warning = tokio::task::spawn_blocking(move || {
+                let warning = crate::boxes::spawn_blocking(move || {
                     transition(
                         &warning_store,
                         &expected,
@@ -1136,7 +1140,7 @@ impl TokenGates {
                 clock.pending = Some(rotation);
                 let this = self.clone();
                 let activity = self.lifecycle.track_write();
-                tokio::spawn(async move {
+                crate::boxes::spawn(async move {
                     let _activity = activity;
                     this.retry_rotation(store, obs, gate).await;
                 });
@@ -1389,7 +1393,7 @@ async fn restore_uncertainty(
 ) {
     let account = account.clone();
     let tokens = copy_tokens(tokens);
-    let _ = tokio::task::spawn_blocking(move || {
+    let _ = crate::boxes::spawn_blocking(move || {
         let mut cleared = account;
         cleared.token_meta.refresh_uncertain = uncertain;
         save_refresh_credentials(&store, &cleared, &tokens)
@@ -1421,7 +1425,9 @@ async fn persist_async(
     let tokens = copy_tokens(&rotation.tokens);
     let failed = zeroize::Zeroizing::new(rotation.failed_token.to_string());
     let operation = rotation.takeover_operation.clone();
-    tokio::task::spawn_blocking(move || {
+    let box_request = rotation.box_request.clone();
+    crate::boxes::spawn_blocking(move || {
+        let _box_request = box_request;
         for _ in 0..3 {
             let mut current = match store.load(&account.id) {
                 Ok(current) => current,

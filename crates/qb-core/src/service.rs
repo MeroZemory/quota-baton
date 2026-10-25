@@ -66,3 +66,6 @@ pub fn defer_startup_error(result: anyhow::Result<()>) -> anyhow::Result<Option<
 pub fn shutdown_retry_notice() {
     tracing::warn!("Waiting for durable service shutdown storage");
 }
+
+mod box_service;
+pub use box_service::{BoxService, BoxServiceOwner};

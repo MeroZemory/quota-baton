@@ -16,6 +16,8 @@ use crate::{
 };
 
 pub(in crate::relay) struct Completion {
+    // Request-local advisory input only; never part of RequestRecord or identity.
+    root_hint: Option<crate::boxes::RootHint>,
     pub(super) failure_evidence: Option<super::outcome::RequestFailureEvidence>,
     pub(super) failure_lifetime: Arc<std::sync::atomic::AtomicBool>,
     pub record: RequestRecord,
@@ -56,6 +58,7 @@ impl Completion {
         headers: &HeaderMap,
     ) -> Self {
         Self {
+            root_hint: None,
             failure_evidence: None,
             failure_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             dashboard_enabled: true,
@@ -124,6 +127,25 @@ impl Completion {
                 after_move: false,
             },
         }
+    }
+
+    /// The relay ingress has already authenticated and parsed this extension.
+    /// Raw headers and session ancestry cannot supply a placement hint here.
+    pub(super) fn new_for_request(
+        observability: Arc<Observability>,
+        method: &Method,
+        path: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        extensions: &axum::http::Extensions,
+    ) -> Self {
+        let mut completion = Self::new(observability, method, path, provider, headers);
+        completion.root_hint = extensions.get::<crate::boxes::RootHint>().cloned();
+        completion
+    }
+
+    pub(super) fn root_hint(&self) -> Option<&crate::boxes::RootHint> {
+        self.root_hint.as_ref()
     }
 
     pub fn session(&mut self, session: &Session) {
@@ -444,6 +466,86 @@ mod accounting_tests {
 
     const ROOT: &str = "claude:canonical";
     const CHILD: &str = "claude:canonical:agent:child";
+
+    #[test]
+    fn lineage_uses_only_the_current_request_extension_and_is_not_a_record_field() {
+        let fixture = Fixture::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-qb-root-session", "claude:raw-header".parse().unwrap());
+        let mut extensions = axum::http::Extensions::new();
+        extensions.insert(crate::boxes::RootHint::parse("claude:parsed-root").unwrap());
+        let mut completion = Completion::new_for_request(
+            fixture.obs.clone(),
+            &Method::POST,
+            "/v1/messages",
+            Provider::Claude,
+            &headers,
+            &extensions,
+        );
+        assert_eq!(
+            completion
+                .root_hint()
+                .unwrap()
+                .for_provider(Provider::Claude),
+            Some("claude:parsed-root")
+        );
+        // A later extension-map edit cannot replace this request's copied input.
+        extensions.insert(crate::boxes::RootHint::parse("claude:later-root").unwrap());
+        completion.end_attempt();
+        assert_eq!(
+            completion
+                .root_hint()
+                .unwrap()
+                .for_provider(Provider::Claude),
+            Some("claude:parsed-root")
+        );
+        let record = serde_json::to_value(&completion.record).unwrap();
+        assert!(record.get("root_hint").is_none());
+        let raw_record = serde_json::to_string(&completion.record).unwrap();
+        assert!(!raw_record.contains("claude:parsed-root"));
+        assert!(!raw_record.contains("claude:raw-header"));
+        let next = Completion::new_for_request(
+            fixture.obs.clone(),
+            &Method::POST,
+            "/v1/messages",
+            Provider::Claude,
+            &headers,
+            &axum::http::Extensions::new(),
+        );
+        assert!(next.root_hint().is_none());
+        let default = Completion::new(
+            fixture.obs.clone(),
+            &Method::GET,
+            "/v1/responses",
+            Provider::Codex,
+            &headers,
+        );
+        assert!(
+            default.root_hint().is_none(),
+            "legacy/WS constructors cannot infer from headers"
+        );
+    }
+
+    #[test]
+    fn lineage_is_not_inferred_from_native_session_identity_or_parent() {
+        let fixture = Fixture::new();
+        let session = Session {
+            key: Some("claude:native:agent:child".into()),
+            parent: Some("claude:native".into()),
+            model: None,
+        };
+        let mut completion = Completion::new(
+            fixture.obs.clone(),
+            &Method::POST,
+            "/v1/messages",
+            Provider::Claude,
+            &HeaderMap::new(),
+        );
+        completion.session(&session);
+        assert!(completion.root_hint().is_none());
+        assert_eq!(session.key.as_deref(), Some("claude:native:agent:child"));
+        assert_eq!(session.parent.as_deref(), Some("claude:native"));
+    }
 
     struct Fixture {
         table: Arc<BindingTable>,

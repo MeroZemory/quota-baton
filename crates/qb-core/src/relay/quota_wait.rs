@@ -228,7 +228,7 @@ async fn wait_optional_quota(
         } else {
             None
         };
-        let task = tokio::task::spawn_blocking(move || {
+        let task = crate::boxes::spawn_blocking(move || {
             if !caller_live(
                 &work_inputs.operation,
                 work_inputs.operation.deadline(),
@@ -636,7 +636,7 @@ async fn wait_native_cache(relay: &RelayState, interval: NativeCacheInterval) ->
         let accounts = relay.accounts.clone();
         let bindings = relay.bindings.clone();
         let read = interval.clone();
-        let task = tokio::task::spawn_blocking(move || {
+        let task = crate::boxes::spawn_blocking(move || {
             let Ok(_transaction) = accounts.store.transaction() else {
                 return Some(false);
             };

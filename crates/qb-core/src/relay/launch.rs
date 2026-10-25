@@ -218,33 +218,74 @@ struct PendingIssue {
     token: crate::launch_tokens::LaunchToken,
     pin: Option<crate::launch_tokens::LaunchPin>,
     published: bool,
+    box_scope: Option<crate::boxes::BoxScope>,
 }
 impl PendingIssue {
     fn new(
         registry: crate::launch_tokens::LaunchTokenRegistry,
         anchor: &str,
     ) -> Result<Self, LaunchError> {
-        let token = registry
-            .issue(crate::launch_tokens::LaunchMetadata {
-                binding_anchor_key: anchor.to_owned(),
-                advertised_models: BTreeSet::new(),
-            })
-            .map_err(issue_token_error)?;
+        Self::new_with_scope(registry, anchor, None)
+    }
+
+    fn new_scoped(
+        registry: crate::launch_tokens::LaunchTokenRegistry,
+        anchor: &str,
+        scope: crate::boxes::BoxScope,
+    ) -> Result<Self, LaunchError> {
+        Self::new_with_scope(registry, anchor, Some(scope))
+    }
+
+    fn new_with_scope(
+        registry: crate::launch_tokens::LaunchTokenRegistry,
+        anchor: &str,
+        box_scope: Option<crate::boxes::BoxScope>,
+    ) -> Result<Self, LaunchError> {
+        let metadata = crate::launch_tokens::LaunchMetadata {
+            binding_anchor_key: anchor.to_owned(),
+            advertised_models: BTreeSet::new(),
+        };
+        let token = match &box_scope {
+            Some(scope) => registry.issue_scoped(metadata, scope.clone()),
+            None => registry.issue(metadata),
+        }
+        .map_err(issue_token_error)?;
         let mut pending = Self {
             registry,
             token,
             pin: None,
             published: false,
+            box_scope,
         };
         pending.pin = Some(
             pending
                 .registry
-                .get_or_pin(pending.token.expose_secret())
+                .get_or_pin_scoped(pending.token.expose_secret(), pending.box_scope.as_ref())
                 .map_err(issue_token_error)?,
         );
         Ok(pending)
     }
+
+    /// Only the final synchronous handoff: no token/store mutation or guard Drop
+    /// inside the registry gate. Failure leaves this whole pending owner intact.
+    fn publish_scoped(
+        &mut self,
+        boxes: &crate::boxes::BoxRegistry,
+        operation: &crate::issue_operation::IssueOperation,
+    ) -> Result<(), LaunchError> {
+        let scope = self.box_scope.clone().ok_or(LaunchError::Unavailable)?;
+        boxes
+            .try_with_active_scope(&scope, || {
+                if !operation.can_reply() {
+                    return Err(LaunchError::Unavailable);
+                }
+                self.published = true;
+                Ok(())
+            })
+            .map_err(|_| LaunchError::Unavailable)?
+    }
 }
+
 impl Drop for PendingIssue {
     fn drop(&mut self) {
         self.pin.take();
@@ -466,6 +507,8 @@ mod tests {
     use qb_testkit::{ScriptedResponse, ScriptedUpstream};
     use serde_json::json;
     use std::{fs, path::Path};
+
+    mod scoped_issue_tests;
 
     #[test]
     fn request_model_bounds_compressed_metadata_windows() {
@@ -1436,6 +1479,103 @@ mod tests {
         assert_eq!(f.relay.bindings.export().unwrap(), before);
     }
 
+    fn scoped_pending_fixture() -> (
+        tempfile::TempDir,
+        crate::boxes::BoxRegistry,
+        crate::boxes::BoxScope,
+    ) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/tests/box-pending-issue");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let boxes = crate::boxes::BoxRegistry::open(home.path()).unwrap();
+        let (scope, _key) = boxes
+            .add(crate::boxes::BoxName::parse("sample-box").unwrap())
+            .unwrap()
+            .into_parts();
+        (home, boxes, scope)
+    }
+
+    #[test]
+    fn scoped_pending_pins_exact_scope_and_removes_unpublished_token() {
+        let (_home, _boxes, scope) = scoped_pending_fixture();
+        let tokens = crate::launch_tokens::LaunchTokenRegistry::default();
+        let pending =
+            PendingIssue::new_scoped(tokens.clone(), "launch:sample", scope.clone()).unwrap();
+        let key = zeroize::Zeroizing::new(pending.token.expose_secret().to_owned());
+        assert!(tokens.get_or_pin_scoped(&key, Some(&scope)).is_ok());
+        assert!(matches!(
+            tokens.get_or_pin(&key),
+            Err(crate::launch_tokens::LaunchTokenError::ScopeMismatch)
+        ));
+        drop(pending);
+        assert!(matches!(
+            tokens.get_or_pin_scoped(&key, Some(&scope)),
+            Err(crate::launch_tokens::LaunchTokenError::Missing)
+        ));
+    }
+
+    #[test]
+    fn scoped_pending_refuses_revoke_and_caller_drop_before_publication() {
+        for revoked in [false, true] {
+            let (_home, boxes, scope) = scoped_pending_fixture();
+            let tokens = crate::launch_tokens::LaunchTokenRegistry::default();
+            let mut pending =
+                PendingIssue::new_scoped(tokens.clone(), "launch:sample", scope.clone()).unwrap();
+            let key = zeroize::Zeroizing::new(pending.token.expose_secret().to_owned());
+            let operation = crate::issue_operation::IssueOperation::new(
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            );
+            let caller = operation.caller_guard();
+            if revoked {
+                boxes.revoke(scope.name()).unwrap();
+            } else {
+                drop(caller);
+            }
+            assert!(matches!(
+                pending.publish_scoped(&boxes, &operation),
+                Err(LaunchError::Unavailable)
+            ));
+            assert!(!pending.published);
+            drop(pending);
+            assert!(matches!(
+                tokens.get_or_pin_scoped(&key, Some(&scope)),
+                Err(crate::launch_tokens::LaunchTokenError::Missing)
+            ));
+        }
+    }
+
+    #[test]
+    fn scoped_pending_publication_preserves_token_scope_and_refuses_unscoped() {
+        let (_home, boxes, scope) = scoped_pending_fixture();
+        let tokens = crate::launch_tokens::LaunchTokenRegistry::default();
+        let operation = crate::issue_operation::IssueOperation::new(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        );
+        let _caller = operation.caller_guard();
+        let mut pending =
+            PendingIssue::new_scoped(tokens.clone(), "launch:sample", scope.clone()).unwrap();
+        let key = zeroize::Zeroizing::new(pending.token.expose_secret().to_owned());
+        pending.publish_scoped(&boxes, &operation).unwrap();
+        assert!(pending.published);
+        drop(pending);
+        assert!(tokens.get_or_pin_scoped(&key, Some(&scope)).is_ok());
+        assert!(matches!(
+            tokens.get_or_pin(&key),
+            Err(crate::launch_tokens::LaunchTokenError::ScopeMismatch)
+        ));
+        let mut ordinary = PendingIssue::new(tokens, "launch:ordinary").unwrap();
+        assert!(matches!(
+            ordinary.publish_scoped(&boxes, &operation),
+            Err(LaunchError::Unavailable)
+        ));
+        assert!(!ordinary.published);
+    }
+
     #[test]
     fn issue_launch_unpublished_token_rolls_back_on_error_and_unwind() {
         let registry = crate::launch_tokens::LaunchTokenRegistry::default();
@@ -1841,7 +1981,7 @@ mod operation_catalog_owner_tests {
         let task_operation = operation.clone();
         let mut caller = Box::pin(async move {
             let _caller = task_operation.caller_guard();
-            tokio::task::spawn_blocking(move || {
+            crate::boxes::spawn_blocking(move || {
                 let pending = PendingIssue::new(task_registry, "launch:operation-pin").unwrap();
                 task_operation.admit().unwrap();
                 entered
@@ -1873,7 +2013,7 @@ mod operation_catalog_owner_tests {
         let pending = PendingIssue::new(registry.clone(), "launch:operation-ready").unwrap();
         let handle = pending.token.expose_secret().to_owned();
         let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
-        let join = tokio::task::spawn_blocking(move || OutputOwner {
+        let join = crate::boxes::spawn_blocking(move || OutputOwner {
             pending: Some(pending),
             dropped: Some(dropped),
         });
@@ -1909,11 +2049,45 @@ impl RelayState {
         data_port: u16,
         operation: crate::issue_operation::IssueOperation,
     ) -> Result<LaunchReply, LaunchError> {
+        self.issue_launch_scoped_for_operation(request, data_port, operation, None)
+            .await
+    }
+
+    /// Host-admin registration resolves the actual grant before entering this
+    /// path. No label or caller-supplied socket address can construct a scope.
+    pub(crate) async fn issue_box_launch_for_operation(
+        &self,
+        request: LaunchRequest,
+        data_port: u16,
+        operation: crate::issue_operation::IssueOperation,
+        registry: crate::boxes::BoxRegistry,
+        authority: crate::boxes::BoxAuthority,
+    ) -> Result<LaunchReply, LaunchError> {
+        let admitted = authority.admit().map_err(|_| LaunchError::Unavailable)?;
+        crate::boxes::scope_request(
+            admitted,
+            self.issue_launch_scoped_for_operation(
+                request,
+                data_port,
+                operation,
+                Some((registry, authority)),
+            ),
+        )
+        .await
+    }
+
+    async fn issue_launch_scoped_for_operation(
+        &self,
+        request: LaunchRequest,
+        data_port: u16,
+        operation: crate::issue_operation::IssueOperation,
+        box_authority: Option<(crate::boxes::BoxRegistry, crate::boxes::BoxAuthority)>,
+    ) -> Result<LaunchReply, LaunchError> {
         // Guard also makes direct cancellation of this future observable.
         let caller = operation.caller_guard();
         let result = tokio::time::timeout_at(
             operation.deadline(),
-            self.issue_launch_with_preference(request, data_port, operation.clone()),
+            self.issue_launch_with_preference(request, data_port, operation.clone(), box_authority),
         )
         .await
         .map_err(|_| LaunchError::Unavailable)?;
@@ -1926,6 +2100,7 @@ impl RelayState {
         request: LaunchRequest,
         data_port: u16,
         operation: crate::issue_operation::IssueOperation,
+        box_authority: Option<(crate::boxes::BoxRegistry, crate::boxes::BoxAuthority)>,
     ) -> Result<LaunchReply, LaunchError> {
         operation.check().map_err(|_| LaunchError::Unavailable)?;
         validate_issue_request(&request, data_port)?;
@@ -1938,7 +2113,7 @@ impl RelayState {
         let prior_table = self.bindings.clone();
         let prior_key = resume_key.clone();
         let prior_operation = operation.clone();
-        let prior = tokio::task::spawn_blocking(move || {
+        let prior = crate::boxes::spawn_blocking(move || {
             prior_operation
                 .check()
                 .map_err(|_| LaunchError::Unavailable)?;
@@ -1961,7 +2136,7 @@ impl RelayState {
         }
         let store = self.store.clone();
         let list_operation = operation.clone();
-        let accounts = tokio::task::spawn_blocking(move || {
+        let accounts = crate::boxes::spawn_blocking(move || {
             list_operation
                 .check()
                 .map_err(|_| LaunchError::Unavailable)?;
@@ -2077,8 +2252,11 @@ impl RelayState {
         } else {
             request.model.clone().or(prior_model)
         };
+        let box_scope = box_authority
+            .as_ref()
+            .map(|(_, authority)| authority.scope().clone());
         let (reply, mut pending) =
-            tokio::task::spawn_blocking(move || -> Result<_, LaunchError> {
+            crate::boxes::spawn_blocking(move || -> Result<_, LaunchError> {
                 runtime
                     .with_selection_admission_models(&table, Provider::Codex, |eligible| {
                         let operation = task_operation;
@@ -2119,7 +2297,13 @@ impl RelayState {
                         let anchor = issue_anchor()?;
                         // Allocate before durable policy/binding mutation. Empty means no
                         // menu advertised yet; /models owns acceptance and metadata recording.
-                        let pending = PendingIssue::new(registry, &anchor)?;
+                        if !crate::boxes::dispatch_allowed() {
+                            return Err(LaunchError::Unavailable);
+                        }
+                        let pending = match box_scope {
+                            Some(scope) => PendingIssue::new_scoped(registry, &anchor, scope)?,
+                            None => PendingIssue::new(registry, &anchor)?,
+                        };
                         let placement = table
                             .place_launch_for_issue_evidence(
                                 crate::bindings::LaunchRequest {
@@ -2193,7 +2377,11 @@ impl RelayState {
         if !operation.can_reply() {
             return Err(LaunchError::Unavailable);
         }
-        pending.published = true;
+        if let Some((registry, _)) = box_authority {
+            pending.publish_scoped(&registry, &operation)?;
+        } else {
+            pending.published = true;
+        }
         Ok(reply)
     }
 
@@ -2368,7 +2556,7 @@ impl RelayState {
 
     pub fn start_catalog_scheduler(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let relay = self.clone();
-        tokio::spawn(async move {
+        crate::boxes::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -2377,7 +2565,7 @@ impl RelayState {
                     _ = tick.tick() => {}
                 }
                 let store = relay.store.clone();
-                let Ok(Ok(accounts)) = tokio::task::spawn_blocking(move || store.list()).await
+                let Ok(Ok(accounts)) = crate::boxes::spawn_blocking(move || store.list()).await
                 else {
                     continue;
                 };
@@ -2486,7 +2674,7 @@ impl RelayState {
         let task_operation = operation.clone();
         let resolved = tokio::time::timeout_at(
             deadline,
-            tokio::task::spawn_blocking(move || {
+            crate::boxes::spawn_blocking(move || {
                 table.resolve_launch_for_operation(
                     anchor.as_deref(),
                     key.as_deref(),
@@ -2587,7 +2775,7 @@ impl RelayState {
         let task_operation = operation.clone();
         tokio::time::timeout_at(
             deadline,
-            tokio::task::spawn_blocking(move || {
+            crate::boxes::spawn_blocking(move || {
                 table.record_launch_model_for_operation(
                     &key,
                     &account,

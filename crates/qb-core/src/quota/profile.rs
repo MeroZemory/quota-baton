@@ -185,7 +185,7 @@ impl UsagePoller {
             let plan = claude_profile::plan(&profile).map(str::to_owned);
             let store = self.store.clone();
             let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
-            return tokio::task::spawn_blocking(move || {
+            return crate::boxes::spawn_blocking(move || {
                 // This API holds the existing lease/transaction and merges into
                 // current metadata. A late response cannot overwrite a refresh,
                 // adoption or unrelated admin edit made since request dispatch.
