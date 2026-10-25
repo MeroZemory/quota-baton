@@ -2043,11 +2043,16 @@ mod tests {
         // The monotonic wake and UTC reset are sampled separately. A virtual
         // timer returning does not prove UTC advanced; use a real-time budget,
         // rather than a fixed number of potentially early timer completions.
-        while Utc::now() < reset_at {
+        while Instant::now() < wake || Utc::now() < reset_at {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(!remaining.is_zero(), "UTC did not reach the original reset");
+            assert!(
+                !remaining.is_zero(),
+                "original reset boundaries not reached"
+            );
             tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
         }
+        assert!(Instant::now() >= wake);
+        assert!(Utc::now() >= reset_at);
     }
 
     async fn original_due(f: &Fixture, scope: &LaunchOwnerScope) -> (Instant, DateTime<Utc>) {
