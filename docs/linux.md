@@ -173,13 +173,15 @@ data; this does not claim schema downgrade compatibility.
 
 ## Browserless account login
 
-Run the CLI in the same service-user environment and data home as the running
-core. It uses the authenticated admin API when the core is running; a standalone
-login uses the same account store and still requires its exclusive lease.
+Start the managed service first. From a host terminal, run the CLI as its service
+user with the same data home. It uses the authenticated admin API; a standalone
+login additionally needs credential delivery and the account store's exclusive
+lease. The server creates its own OAuth sessions: do not transfer the PC's
+account store, and keep the designated PC-only Codex login on the PC.
 
 ```bash
-quota-baton accounts login claude --no-browser
-quota-baton accounts login codex --no-browser
+sudo -u quota-baton env QB_HOME=/var/lib/quota-baton /usr/local/bin/quota-baton accounts login claude --no-browser
+sudo -u quota-baton env QB_HOME=/var/lib/quota-baton /usr/local/bin/quota-baton accounts login codex --no-browser
 ```
 
 Codex defaults to device-code login: open the printed verification URL on a
