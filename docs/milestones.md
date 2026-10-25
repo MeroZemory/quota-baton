@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: L1 P5 배포 묶음·Ubuntu 합성 실행 관문 완료; 실제 서버 수용 남음
+현재 마일스톤: L1 배포 GPU 수용·Linux LF 보완 관문 완료; 실제 로그인·서버 수용 남음
 목표: 공통 코드를 유지하며 홈 서버용 Linux 구현 P0–P4를 완성하기
 핵심 지표: Linux 구현 관문 5/5 (P0–P4); 실제 공급자 완료 로그인 0/2·P5 서버 수용 전
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-25 10:54 KST (배포 소스 53aeb9a; Bookworm ELF2.34·Ubuntu24 READY/인증/정상 TERM·Linux strict 통과; 실제 로그인 0/2)
+갱신: 2026-10-25 11:03 KST (배포 GPU 재로드2442/0 동일 PID; LF 1445ee3 실제 archive2·거절6·checkout4 통과; 실제 로그인 0/2)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -282,6 +282,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 10:22 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P4 양쪽 target·strict lint·실제 HTTP/WS·두 컨테이너·전체 행렬 뒤 집중 보완·제품 빌드·읽기 전용 check 완료. 실제 로그인·Incus·재부팅은 P5 별도 |
 | 2026-10-25 10:40 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P4 Windows·실제 Linux 격리/철회 설치 수용; headless no-account 안내 bed85c1 집중 관문 통과. P5 새 배포본·실제 완료 로그인 별도 |
 | 2026-10-25 10:54 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P5 안내 포함 Bookworm 배포 묶음·ELF2.34·Ubuntu24 인증 READY/정상 TERM 관문 완료; 실제 공급자 로그인 0/2·서버 수용은 별도 |
+| 2026-10-25 11:03 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P5 배포 묶음 GPU 설치 수용·재로드2442/0 동일 PID; Linux LF 속성·archive 집중 관문 통과, 실제 로그인/Incus/재부팅은 별도 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -546,13 +547,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 10:40 | L1 headless no-account 안내 | 기존 HTTP·WS·runtime 회귀 각1통과, Windows/Linux target check·strict core lint 통과 | terminal400·provider형태 유지하며 tray없는 환경에서도 실행할 안내 | bed85c1; 첫 testkit 누락 명령 오류 보존 후 올바른 기능으로 검사; 새 제품 배포 빌드 예정 |
 | 2026-10-25 10:54 | L1 P5 배포 호환·합성 실행 | 소스53aeb9a·Rust1.93.1·최대 GLIBC2.34; Ubuntu24/systemd255 READY·인증 health·정상 TERM·포트2개 닫힘·재시작0 | 배포 바이너리와 실제 실행 SHA 일치·정상 종료 | L1-P5.md; 문서와 같은 enable --now 실행에서 ExecMainCode1/status0. 이전 미보존 code0 원인은 미확정이며 원본 보존 |
 | 2026-10-25 10:54 | L1 P5 Linux strict·배포 묶음 | GNU target core/CLI 전체 기능 lib/bins -D warnings exit0; 압축 묶음9706427 bytes·9파일 readback 일치 | Linux 경고0·소스/서비스/라이선스 일치 | p5-hint-linux-strict-repair·delivery/manifest.json; 최초 Bookworm Clippy 미설치 오류는 컴파일 전 설정 오류로 보존. sole volume1517252608 bytes |
+| 2026-10-25 11:03 | L1 P5 배포 GPU 설치 수용 | archive1f277950·바이너리1f317e2f SHA 일치·SHA256SUMS 통과·reload2442/0 동일 PID | 설계 세션 실제 배포 확인 | 새 no-account 로그인 안내 확인; 실제 공급자 완료 로그인0/2·Incus/재부팅 별도 |
+| 2026-10-25 11:03 | Linux LF 배포·checkout | 실제 archive와 기존 배포본2통과·CR3/누락/중복/비정규 거절6·checkout4 LF | packaged unit CR0·LF 규칙 강제 | 1445ee3; L1-LF.md·linux-lf/completion.json. 원래 index LF·working CRLF, renormalize 뒤 blob 동일; Rust 지문 재사용 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
-| Linux P5 서버 수용 | Bookworm/Ubuntu24 합성 관문·배포 묶음 완료; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
+| Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
 | 보류 작업 재개 범위 | N6r·N7 각 브랜치 보존·미병합 | 설계 세션의 재개 지시와 해당 실제 입력 수용 | 임의 재개하지 않고 서버 수용 뒤 다음 ready node 확인 |
 <!-- gaps:end -->
 
