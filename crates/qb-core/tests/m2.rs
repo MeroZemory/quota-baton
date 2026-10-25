@@ -913,7 +913,7 @@ async fn no_account_and_debug_pin_routes() {
     assert_eq!(error["error"]["type"], "invalid_request_error");
     assert_eq!(
         error["error"]["message"],
-        "quota-baton: no usable claude account — open the tray"
+        "quota-baton: no usable claude account — run quota-baton accounts login claude --no-browser"
     );
     assert!(
         error["error"]["message"]
