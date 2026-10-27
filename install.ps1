@@ -136,10 +136,12 @@ function ResolveClient([string]$provider) {
 }
 function RetainRollbackGenerations([string]$directory) {
     try {
-        $backups = @(Get-ChildItem -LiteralPath $directory -File -ErrorAction Stop | Where-Object { $_.Name -match '^quota-baton(?:-tray)?\.exe\.old-\d{21}$' })
-        $generations = @($backups | ForEach-Object { ($_.Name -split '\.old-')[1] } | Sort-Object -Descending -Unique -ErrorAction Stop)
+        $backups = @(Get-ChildItem -LiteralPath $directory -File -ErrorAction Stop | Where-Object { $_.Name -match '^quota-baton(?:-tray)?\.exe\.old-(?:\d{21}|\d{8}-\d{6})$' })
+        # Legacy timestamps have second precision: normalize missing fractions to zero.
+        $generations = @($backups | ForEach-Object { (($_.Name -split '\.old-')[1]).Replace('-', '').PadRight(21, '0') } | Sort-Object -Descending -Unique -ErrorAction Stop)
         foreach ($backup in $backups) {
-            if ($generations.Count -gt 0 -and -not $backup.Name.EndsWith($generations[0])) {
+            $generation = (($backup.Name -split '\.old-')[1]).Replace('-', '').PadRight(21, '0')
+            if ($generations.Count -gt 0 -and $generation -ne $generations[0]) {
                 try { [IO.File]::Delete($backup.FullName) }
                 catch { Say "$(Korean 'm1') $(Korean 'm2'), $(Korean 'm3') $(Korean 'm4') $(Korean 'm5') $(Korean 'm6'): $($backup.FullName)" "In use, will be removed next time: $($backup.FullName)" }
             }
