@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 다운로드 실행과 잠긴 이전 파일이 있는 업그레이드를 끝까지 처리하고 트레이 복구하기
 핵심 지표: R17.1 설치 결함 보완 3/3 (인코딩, 정리·트레이, 실제 클라이언트); 공개 반영은 설계 세션
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-27 19:49 KST (PS5.1/7 각28통과·독립 검수·읽기 전용 launch check 통과)
+갱신: 2026-10-27 20:13 KST (레거시 백업 형식 포함 PS5.1/7 각28통과·독립 검수)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -287,6 +287,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-27 19:49 | R17 출시 준비 (분모 2: 자동 시작, 설치·제거 스크립트) | 2/2 | 설계 세션 v0.6.0 설치·공개 수용: upgrade 연결2102/0·자동 시작 등록·PATH 추가. 최초 실제 결함은 다음 보완 계열로 분리 |
 | 2026-10-27 19:49 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | 구현 메인이 사용자 brief의 세 결함을 수용 기준으로 선택; 이전 R17 2/2 종료. 최초 PS5.1/7 각26통과; 병합 전 dev의 일반 IEX/null PSCmdlet 수정 발견으로 텍스트 실행 결합 검증 필요 |
 | 2026-10-27 19:54 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | dev6d9ebf4의 IEX 핫픽스 결합·null WhatIf 보완 뒤 PS5.1/7 각28통과·독립 검수. 원본26개 입력 보존; 공개 main 반영은 설계 세션 |
+| 2026-10-27 20:13 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | 사용자 추가 지시의 레거시 백업 형식 포함. 혼합 형식 최신 쌍·잠긴 이전 파일·제거 소유권 회귀, PS5.1/7 각각28통과·스크립트 독립 검수 |
 <!-- metric:end -->
 
 <!-- support:begin -->

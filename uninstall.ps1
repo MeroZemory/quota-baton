@@ -63,7 +63,7 @@ if (Test-Path -LiteralPath $InstallDir) {
     if ($LASTEXITCODE -ne 0) { Fail (Korean 'm6') 'Unwire failed; installation retained.' }
     # Tray first, including our renamed rollback images. Never kill by image name.
     foreach ($name in @('quota-baton-tray.exe', 'quota-baton.exe')) {
-        $paths = @((Join-Path $InstallDir $name)) + @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object { $_.Name -match ('^' + [regex]::Escape($name) + '\.old-\d{21}$') } | ForEach-Object { $_.FullName })
+        $paths = @((Join-Path $InstallDir $name)) + @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object { $_.Name -match ('^' + [regex]::Escape($name) + '\.old-(?:\d{21}|\d{8}-\d{6})$') } | ForEach-Object { $_.FullName })
         $processes = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'quota-baton%'" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -in $paths })
         foreach ($process in $processes) {
             $current = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ProcessId)"
