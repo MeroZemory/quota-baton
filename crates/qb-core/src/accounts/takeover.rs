@@ -530,7 +530,16 @@ fn finish_prepare(
     }
     account.token_meta = meta;
     account.email = profile.email;
-    account.plan = profile.plan;
+    if account.provider == Provider::Claude {
+        // Keep known Free across an absent plan; paid evidence clears only the
+        // plan hold. Auth recovery below still owns its existing precedence.
+        account.apply_health_signal(
+            super::HealthSignal::PlanObservation { plan: profile.plan },
+            deps.source.now(),
+        );
+    } else {
+        account.plan = profile.plan;
+    }
     account.source = super::Source::Takeover {
         from: snapshot.proof.path.clone(),
         at: deps.source.now(),

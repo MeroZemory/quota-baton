@@ -1,3 +1,12 @@
+#[cfg(windows)]
+#[path = "cli/platform/windows.rs"]
+mod status_platform;
+#[cfg(unix)]
+#[path = "cli/platform/unix.rs"]
+mod status_platform;
+
+use status_platform::status_without_platform_trailer;
+
 use std::{
     io::{self, Read},
     path::Path,
@@ -2211,8 +2220,9 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
     assert!(status.contains("알 수 없음"));
     assert!(status.contains("합성 🧪 계정"));
     assert!(!status.contains('\u{1b}'));
-    assert_eq!(status.lines().count(), 6);
-    assert_eq!(status.lines().last(), Some("  소진 예측: 측정 중"));
+    let table_status = status_without_platform_trailer(&status);
+    assert_eq!(table_status.lines().count(), 6);
+    assert_eq!(table_status.lines().last(), Some("  소진 예측: 측정 중"));
     for secret in [
         "synthetic-admin-secret",
         "synthetic-access-secret",
@@ -2295,8 +2305,9 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
     assert!(redirected.stdout.is_empty());
     let file_bytes = std::fs::read(output_path).unwrap();
     for bytes in [&piped.stdout, &file_bytes] {
-        assert_eq!(std::str::from_utf8(bytes).unwrap(), expected);
-        assert_eq!(bytes.as_slice(), expected.as_bytes());
+        let table_status = status_without_platform_trailer(std::str::from_utf8(bytes).unwrap());
+        assert_eq!(table_status, expected);
+        assert_eq!(table_status.as_bytes(), expected.as_bytes());
         assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
     }
     assert!(!home.path().join("accounts").exists());

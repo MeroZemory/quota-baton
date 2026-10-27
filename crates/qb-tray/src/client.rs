@@ -2069,8 +2069,10 @@ mod r15_account_action_consumer_tests {
     #[test]
     fn r18_live_history_bridge_preserves_plan_change_fields() {
         let raw = serde_json::json!({"events":[{"seq":1,"ts":"2030-01-01T00:00:00Z",
-            "kind":"plan_changed","provider":"claude","account":"sample-free","account_to":null,
-            "notable":true,"data":{"previous_plan":"max_20x","new_plan":"free"}}],
+            "kind":"plan_changed","provider":"claude","account":"cl-000001","account_to":null,
+            "notable":true,"data":{"previous_plan":"max_20x","new_plan":"free",
+                "count":0,"max_wait_ms":0,"relayed":0,"moved_groups":0,
+                "sessions_truncated":false,"recovered":false}}],
             "next_seq":2,"truncated":false});
         let wire: qb_core::dashboard::history::response::ActivityPage =
             AdminClient::decode_dashboard_object(&serde_json::to_vec(&raw).unwrap()).unwrap();

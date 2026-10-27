@@ -232,6 +232,14 @@ impl UsagePoller {
         if !allowed(&account) {
             return Err(PollError::Excluded);
         }
+        // Reload first so a newer linked token can recover. An unchanged token
+        // rejected by the usage request must retain its native retry cooldown.
+        if matches!(&account.health, Health::Cooling {
+            reason: HealthReason::LinkStale, until, ..
+        } if *until > Utc::now())
+        {
+            return Err(PollError::Unavailable);
+        }
         for attempt in 0..2 {
             let mut response = self
                 .client

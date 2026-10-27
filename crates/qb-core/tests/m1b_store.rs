@@ -73,6 +73,109 @@ fn fixture() -> (tempfile::TempDir, AccountStore) {
     (home, store)
 }
 #[test]
+fn r18_claude_login_merges_free_evidence_and_paid_recovery_with_existing_holds() {
+    use qb_core::accounts::{HealthReason, HealthSignal, Provider, UserState};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    for plan in [None, Some("max_20x")] {
+        for hold in [
+            None,
+            Some(HealthReason::Auth),
+            Some(HealthReason::Payment),
+            Some(HealthReason::Quota),
+        ] {
+            for state in [UserState::Active, UserState::Paused] {
+                let (_home, store) = fixture();
+                let now = chrono::Utc::now();
+                let mut old = account(None, "fixture@example.invalid");
+                old.identity = Identity::Claude {
+                    account_uuid: "synthetic-login-claude".into(),
+                    organization_uuid: Some("synthetic-org".into()),
+                    email: old.email.clone(),
+                };
+                old.id = old.identity.id();
+                old.provider = Provider::Claude;
+                old.user_state = state;
+                old.drain = true;
+                old.allow_credits = true;
+                if let Some(reason) = hold {
+                    old.apply_health_signal(
+                        HealthSignal::Cooling {
+                            reason,
+                            until: now + chrono::Duration::hours(1),
+                            scope: "account".into(),
+                        },
+                        now,
+                    );
+                }
+                old.apply_health_signal(
+                    HealthSignal::PlanObservation {
+                        plan: Some("free".into()),
+                    },
+                    now,
+                );
+                if hold == Some(HealthReason::Auth) {
+                    old.auth_failures = 3;
+                }
+                let old = store.save(&old, &tokens(), None).unwrap();
+                let mut incoming = old.clone();
+                incoming.plan = plan.map(str::to_owned);
+                incoming.health = Health::Ready;
+                incoming.user_state = UserState::Active;
+                incoming.drain = false;
+                incoming.allow_credits = false;
+                let saved = login::save(&store, &incoming, &tokens(), false)
+                    .unwrap()
+                    .account;
+                assert_eq!(saved.plan.as_deref(), plan.or(Some("free")));
+                let expected = match hold {
+                    Some(HealthReason::Payment | HealthReason::Quota) => old.health.clone(),
+                    _ if plan.is_none() => Health::PlanWithoutClaudeCode,
+                    _ => Health::Ready,
+                };
+                assert_eq!(saved.health, expected);
+                assert_eq!(saved.user_state, old.user_state);
+                assert_eq!(saved.label, old.label);
+                assert_eq!(saved.drain, old.drain);
+                assert_eq!(saved.allow_credits, old.allow_credits);
+                assert_eq!(saved.payment_until, old.payment_until);
+                assert_eq!(saved.payment_failures, old.payment_failures);
+                assert_eq!(saved.auth_failures, 0);
+                assert_eq!(store.load(&saved.id).unwrap(), saved);
+                assert_eq!(
+                    saved.eligible(None),
+                    plan.is_some()
+                        && hold.is_none_or(|h| h == HealthReason::Auth)
+                        && state == UserState::Active
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn r18_claude_login_unknown_plan_does_not_preserve_stale_paid_plan() {
+    use qb_core::accounts::Provider;
+
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let (_home, store) = fixture();
+    let mut old = account(None, "fixture@example.invalid");
+    old.identity = Identity::Claude {
+        account_uuid: "synthetic-login-claude".into(),
+        organization_uuid: None,
+        email: old.email.clone(),
+    };
+    old.id = old.identity.id();
+    old.provider = Provider::Claude;
+    old.plan = Some("max_20x".into());
+    let old = store.save(&old, &tokens(), None).unwrap();
+    let mut incoming = old.clone();
+    incoming.plan = None;
+    let saved = login::save(&store, &incoming, &tokens(), false).unwrap();
+    assert_eq!(saved.account.plan, None);
+}
+
+#[test]
 fn c6_4_login_save_preserves_payment_counter_and_deadline() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for linked in [false, true] {

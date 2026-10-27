@@ -22,7 +22,10 @@ pub(crate) fn plan(profile: &Value) -> Option<&'static str> {
             "default_claude_free" | "free"
                 if profile["account"]["has_claude_max"] != true
                     && profile["account"]["has_claude_pro"] != true
-                    && !matches!(kind, Some("claude_max" | "claude_pro" | "pro")) => Some("free"),
+                    && !matches!(kind, Some("claude_max" | "claude_pro" | "pro")) =>
+            {
+                Some("free")
+            }
             _ => {
                 tracing::debug!(tier = %bounded_tier(tier), "Unknown Claude profile tier");
                 None
@@ -33,7 +36,9 @@ pub(crate) fn plan(profile: &Value) -> Option<&'static str> {
         return Some("max");
     }
     match kind {
-        Some("free" | "claude_free") if profile["account"]["has_claude_pro"] != true => Some("free"),
+        Some("free" | "claude_free") if profile["account"]["has_claude_pro"] != true => {
+            Some("free")
+        }
         Some("claude_pro" | "pro") => Some("pro"),
         None if profile["account"]["has_claude_pro"] == true => Some("pro"),
         Some(other) => {

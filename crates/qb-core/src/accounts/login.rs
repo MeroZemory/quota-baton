@@ -212,6 +212,16 @@ pub fn save(
         next.auth_failures = 0;
         next.payment_failures = old.payment_failures;
         next.payment_until = old.payment_until;
+        if next.provider == super::Provider::Claude {
+            // Merge the observation against stored evidence: an absent plan
+            // cannot erase Free, while a known paid plan heals only a plan hold.
+            let plan = next.plan.take();
+            next.plan = old.plan.clone();
+            next.apply_health_signal(
+                super::HealthSignal::PlanObservation { plan },
+                chrono::Utc::now(),
+            );
+        }
         next.expire_health(chrono::Utc::now());
         next.auth_probe_pending = false;
     }

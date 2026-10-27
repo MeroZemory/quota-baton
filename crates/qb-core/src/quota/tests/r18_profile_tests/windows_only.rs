@@ -82,5 +82,44 @@ async fn r18_linked_failed_and_successful_usage_each_refresh_plan_without_cpa_wr
             .iter()
             .all(|r| r.headers["authorization"] == "Bearer synthetic-r18-linked")
     );
-    assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+
+    p.store
+        .update_metadata(id, |account| {
+            account.apply_health_signal(
+                crate::accounts::HealthSignal::LinkStale {
+                    retry_at: Utc::now() + chrono::Duration::minutes(5),
+                },
+                Utc::now(),
+            );
+        })
+        .unwrap();
+    let before = f.fake.state.requests().len();
+    assert!(matches!(
+        bounded(p.refresh_permission_plan(id)).await,
+        Err(PollError::Unavailable)
+    ));
+    assert_eq!(f.fake.state.requests().len(), before);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+
+    let mut newer: serde_json::Value = serde_json::from_str(&content).unwrap();
+    newer["access_token"] = json!("synthetic-r18-linked-new");
+    newer["last_refresh"] = json!(Utc::now() + chrono::Duration::seconds(1));
+    let newer_content = newer.to_string();
+    std::fs::write(&path, &newer_content).unwrap();
+    f.fake.state.push(profile_reply("default_claude_max_20x"));
+    let recovered = bounded(p.refresh_permission_plan(id)).await.unwrap();
+    assert_eq!(recovered.health, Health::Ready);
+    assert_eq!(recovered.plan.as_deref(), Some("max_20x"));
+    let requests = f.fake.state.requests();
+    assert_eq!(requests.len(), before + 1);
+    assert_eq!(
+        requests.last().unwrap().path_and_query,
+        "/api/oauth/profile"
+    );
+    assert_eq!(
+        requests.last().unwrap().headers["authorization"],
+        "Bearer synthetic-r18-linked-new"
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), newer_content);
 }
