@@ -16,7 +16,7 @@ Implement quota-baton exactly as specified, row by row, until every row of the m
 2. **If no brief exists yet** for the next milestone, implement it directly from `docs/architecture.md` §17 and the referenced contract sections. Do not wait.
 3. **Branching.** Work only in the worktree `C:/_projects/SampleUser/quota-baton-impl`. Never create another worktree: switch branches inside this one (AGENTS.md build hygiene). Create the branch `impl/<m>` from `dev`, run `git merge dev` before each milestone and after each fix brief, and make atomic English commits. Never push. Merge into `dev` yourself only after the full gate (rule 4) and, for anything that touches launch or wiring, the read-only real-profile check `quota-baton.exe launch-client --check`. Never install or touch the real profile; the design session installs and verifies.
 4. **Verification.** The unit check, gate check and dependency-aware fingerprint reuse are defined in `docs/milestones.md`. Repair failing tests with focused re-runs. Run the full matrix once, as the final gate of a row. A docs-only change never re-runs a passed executable check, and a pre-existing failure outside the row's scope does not block the row.
-5. **Report once per row, at the gate; records batch at unit close.** Evidence, hashes, review verdicts and report updates are written once when a unit or gate closes. No record-only or diagnosis-only commits or turns; a diagnosis goes into the next change. Write `C:/_projects/SampleUser/quota-baton/.sandbox/reports/<M>.md` (body in English, under the Korean status head of rule 11). Then send the report:
+5. **Report once per row, at the gate; records batch at unit close.** Evidence, hashes, review verdicts and report updates are written once when a unit or gate closes. No record-only or diagnosis-only commits or turns; a diagnosis goes into the next change. This is enforced: in the implementation worktree a pre-commit hook rejects a commit whose staged files are only `GOAL.md`, `docs/milestones.md` or `docs/questions-for-supervisor.md`; put evidence and record updates into the implementation or gate commit they describe. Write `C:/_projects/SampleUser/quota-baton/.sandbox/reports/<M>.md` (body in English, under the Korean status head of rule 11). Then send the report:
 
    `herdr agent prompt <pane> "[quota-baton-codex 구현 보고 · 사용자 입력 아님] <short report>"`
 
@@ -35,6 +35,19 @@ Implement quota-baton exactly as specified, row by row, until every row of the m
 
     Then comes the plain-language result. Gate, mark, hash and test-count listings go into a collapsed `<details>` block at the end. When a milestone finishes, its report is updated to read as finished (never "running"). Follow `C:/_projects/research/methods/reporting/devlog-and-interim-report.md` for wording.
 8. **Follow every rule in `AGENTS.md`:** question routing, build hygiene, the retention of `.sandbox` artifacts, and no secret dumps.
+
+## Outcome series (root audit 2026-10-28; definitions fixed here, the denominators never change)
+
+Only these two series get metric rows in `docs/milestones.md`. A row is written only when an item is **accepted** (installed and passed its defining check), and never for preparation, component checks or briefs. Other work (user fixes such as R17, R17.1, R18) is reported in the report body and gets no series.
+
+- **Series B "결정적 수용 (분모 3)"** — the three outputs that remain decisive for the routing goal:
+  1. native continuation after a 5h reset, accepted in ordinary builds (accepted 2026-10-24, cc12102);
+  2. **N6r accepted replay:** the installed router and the candidate router are both executed (paired) over the actual >= 24 h recorder export, each epoch from its own initial state, and the candidate's aggregate moves are at most the installed router's (margin 0);
+  3. **N7 accepted pooled forecast:** the provider-wide runway is backtested on the actual 24 h export, its 1 h and 3 h errors are within the bounds stated in the N7 brief, and the number is shown in the installed UI.
+  Current value: 1/3. The old series ("새 경로 출시 2/2", "남은 출시 (분모 3)", the legacy 17/17 count) are closed and are not continued.
+- **Series C "Linux 실제 수용 (분모 1)"** — L1 P5 accepted on the real home server per `.sandbox/reports/L1-evidence/p5-acceptance-checklist.md` (Incus box through the proxy device, key revocation, takeover upgrade with 0 refused connects, reboot survival, one browserless login per provider). Current value: 0/1.
+
+**Stagnation rule.** If the next unit that works on a Series B item closes without accepting it, the design session runs a blind work-structure review (Opus max and Fable xhigh, independently, then compared) on how that item is being attacked, and adopts its result before the next unit on that item.
 
 ## Lanes and next ready nodes
 
@@ -87,12 +100,12 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |
 | R16.5 | 완료: 7cab418 잔여량 이력 유지·소진0·리셋100·한영 결과 문구. 집중466·strict lint·실제 core/AdminClient/tray10HWND·export2PNG 확인. 19353ac 설치 수용(06:58)·takeover 거절0/1,920; 다음 N5a |
 | R14.2 | 완료(N6 최소): 기본 꺼짐·schema3·bounded 7일 보존·off switch·실제 합성 HTTP/종료 집중 관문. 초기 cut/전체 owner/실제24시간 replay는 N6t/N6r 별도; 128 MiB 기록 활성화. 설치 동결 해제: 여러 epoch의 24시간 export 허용, epoch별 초기 상태·loss manifest로 각각 재생한 뒤 합산; 단일 epoch를 기다리지 않음 |
-| R13.H | 집중 관문 완료·dev 병합 인계: bound WS 용량 제한은 같은 계정 HTTP 426 경로, 새 출발 계정 소진 후 유일한 복귀처에 한정된 복귀 예외·이동 예산 보존. 집중 관문 후 dev 병합, 설치는 S2 |
+| R13.H | 완료·설치 수용(82dee98, 10-24 16:16, v0.5.0): 집중 관문 완료·dev 병합: bound WS 용량 제한은 같은 계정 HTTP 426 경로, 새 출발 계정 소진 후 유일한 복귀처에 한정된 복귀 예외·이동 예산 보존. 집중 관문 후 dev 병합, 설치는 S2 |
 | R15 | 완료(N8): 공유 중첩 admin 계약·실제 응답 왕복·정적 guard·라우팅 속성. b492eda 최종 보완; 원본 기본16실패 원인별 집중 복구, 전체 기능3899/0/36제외·코어1310/0/1제외·기본/전체 strict lint·build/read-only check 통과. 실제 core→AdminClient→tray KO/EN HWND10 및 추가PNG2 직접 검수. 설치 S2; 지문 R15-evidence/delivery-fingerprint.json |
-| L1 | 구현 P0–P4 관문 완료·P4 설치 3217fb2 수용·P5 배포 준비 관문 완료: D31, brief `.sandbox/briefs/L1-linux-headless.md`. 안내 포함 소스53aeb9a의 Bookworm Rust1.93.1 배포본(최대 GLIBC2.34), Ubuntu24/systemd255 인증 READY·정상 TERM·포트 닫힘·Linux strict 통과. 배포 묶음과 원본 실패·집중 보완은 `.sandbox/reports/L1-P5.md`. 실제 공급자 완료 로그인 0/2·실제 Incus 칸·철회·업그레이드·재부팅·공유 계정 외부 사용 감지는 P5 실제 수용으로 남음. GPU 배포 수용(reload2442/0 동일 PID); LF 속성·packaged unit CR 거절 관문1445ee3 완료. N6r·N7 각 브랜치 보류 |
+| L1 | 진행 중: P5 서버 수용 대기(홈 서버 꺼짐). 구현 P0–P4 관문 완료·P4 설치 3217fb2 수용·P5 배포 준비 관문 완료: D31, brief `.sandbox/briefs/L1-linux-headless.md`. 안내 포함 소스53aeb9a의 Bookworm Rust1.93.1 배포본(최대 GLIBC2.34), Ubuntu24/systemd255 인증 READY·정상 TERM·포트 닫힘·Linux strict 통과. 배포 묶음과 원본 실패·집중 보완은 `.sandbox/reports/L1-P5.md`. 실제 공급자 완료 로그인 0/2·실제 Incus 칸·철회·업그레이드·재부팅·공유 계정 외부 사용 감지는 P5 실제 수용으로 남음. GPU 배포 수용(reload2442/0 동일 PID); LF 속성·packaged unit CR 거절 관문1445ee3 완료. N6r·N7 각 브랜치 보류 |
 | R17 | 완료·v0.6.0 설치/공개 수용: install.ps1 upgrade 연결2102/0·자동 시작 등록·PATH 추가. 최초 실제 설치 결함은 R17.1에서 보완 |
 | R17.1 | 완료: ASCII/BOM 없는 설치·제거 스크립트, 잠긴 백업 정리 보류·finally 트레이 복구, 실제 클라이언트 탐지·wire 환경 일치. PS5.1/7 각28통과·레거시 백업 혼합 형식 재관문 각28통과·독립 검수 통과·read-only launch check0. 보고서 `.sandbox/reports/R17.1.md`; 공개 main 반영은 설계 세션 |
-| R18 | 진행 중: R17.1 우선 수정 동안 impl/plan-change의 adb1552에 WIP 보관(미컴파일); 이후 재개. 요금제 변경 감지·linked poll 최신화·구독일 조사. brief `R18-plan-change.md`; 날짜 필드/날짜만 조사하고 수동 갱신일 구현 전 결과 보고. `impl/plan-change`에서 구현 |
+| R18 | 진행 중: Part 1 지속 Free 상태·매 폴링 요금제 최신화·403 재확인·유료 확인 후 복구 구현. R18 22·quota 43·health 15·로그인 2·인계 3 집중 통과. 기본 행렬 3677통과/6실패 원본 보존 후 m5 25·quota 43·CLI 2 및 기본/전체 strict lint 보완 통과; 폐기된 연결 토큰 재조회 차단·새 토큰 복구 확인. 남은 Windows/Linux·한영 실제 경로 관문 전. Claude 구독 시작 사실만 표시(갱신 추정·알림·수동 설정 없음), Codex 이용 기간·3일 안내는 Part 2에 구현. 조사 완료·날짜 파서 후보만 준비, 아직 미반영. `impl/plan-change`; 보고서 `.sandbox/reports/R18.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |

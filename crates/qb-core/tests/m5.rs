@@ -342,11 +342,38 @@ async fn c6_4_payment_cooling_not_cleared_by_poll_or_small_success() {
             )
         };
         h.usage.state.push(response);
+        if provider == Provider::Claude {
+            h.usage.state.push(ScriptedResponse::json(
+                StatusCode::OK,
+                json!({
+                    "account": {"uuid": "synthetic-m5"},
+                    "organization": {
+                        "uuid": "synthetic-org",
+                        "rate_limit_tier": "default_claude_max_20x"
+                    }
+                })
+                .to_string(),
+            ));
+        }
         let polled = h.state.quota.poll(&h.id).await.unwrap();
         assert_eq!(polled.health, paid.health);
         assert_eq!(polled.payment_failures, 1);
         assert_eq!(polled.payment_until, paid.payment_until);
-        assert_eq!(h.usage.state.requests().len(), 1);
+        let requests = h.usage.state.requests();
+        let paths = if provider == Provider::Codex {
+            vec!["/backend-api/wham/usage"]
+        } else {
+            vec!["/api/oauth/usage", "/api/oauth/profile"]
+        };
+        assert_eq!(requests.len(), paths.len());
+        for (request, path) in requests.iter().zip(paths) {
+            assert_eq!(request.method, axum::http::Method::GET);
+            assert_eq!(request.path_and_query, path);
+            assert_eq!(
+                request.headers["authorization"],
+                "Bearer synthetic-access-old"
+            );
+        }
         h.state
             .accounts
             .transition(&h.id, qb_core::account_runtime::HealthSignal::Ready)
@@ -675,34 +702,73 @@ async fn claude_live_revocation_scenario_reloads_before_startup_or_poll() {
             let addr = listener.local_addr().unwrap();
             let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let profile_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let upstream_profile_calls = profile_calls.clone();
+            let upstream_requests = requests.clone();
             let upstream_revoked = revoked.clone();
             let upstream_calls = calls.clone();
-            let app = axum::Router::new().fallback(move |headers: HeaderMap| {
-                let revoked = upstream_revoked.clone();
-                let calls = upstream_calls.clone();
-                async move {
-                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if !revoked.load(std::sync::atomic::Ordering::SeqCst)
-                        || headers
+            let app = axum::Router::new().fallback(
+                move |method: axum::http::Method, uri: axum::http::Uri, headers: HeaderMap| {
+                    let revoked = upstream_revoked.clone();
+                    let calls = upstream_calls.clone();
+                    let profile_calls = upstream_profile_calls.clone();
+                    let requests = upstream_requests.clone();
+                    async move {
+                        requests.lock().unwrap().push((
+                            method,
+                            uri.to_string(),
+                            headers["authorization"].to_str().unwrap().to_owned(),
+                        ));
+                        let profile = match uri.path() {
+                            "/api/oauth/usage" => {
+                                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                false
+                            }
+                            "/api/oauth/profile" => {
+                                profile_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                true
+                            }
+                            _ => return (StatusCode::NOT_FOUND, axum::Json(json!({}))),
+                        };
+                        let expected_token = if revoked.load(std::sync::atomic::Ordering::SeqCst) {
+                            "Bearer synthetic-access-new"
+                        } else {
+                            "Bearer synthetic-access-old"
+                        };
+                        if headers
                             .get("authorization")
-                            .is_some_and(|v| v == "Bearer synthetic-access-new")
-                    {
-                        (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "five_hour": {"utilization": 1.0},
-                                "seven_day": {"utilization": 73.0},
-                                "iguana_necktie": {"utilization": 100.0}
-                            })),
-                        )
-                    } else {
-                        (
-                            StatusCode::UNAUTHORIZED,
-                            axum::Json(json!({"error": {"code": "token_revoked"}})),
-                        )
+                            .is_some_and(|v| v == expected_token)
+                        {
+                            if profile {
+                                return (
+                                    StatusCode::OK,
+                                    axum::Json(json!({
+                                        "account": {"uuid": "synthetic-m5"},
+                                        "organization": {
+                                            "uuid": "synthetic-org",
+                                            "rate_limit_tier": "default_claude_max_20x"
+                                        }
+                                    })),
+                                );
+                            }
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "five_hour": {"utilization": 1.0},
+                                    "seven_day": {"utilization": 73.0},
+                                    "iguana_necktie": {"utilization": 100.0}
+                                })),
+                            )
+                        } else {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"error": {"code": "token_revoked"}})),
+                            )
+                        }
                     }
-                }
-            });
+                },
+            );
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let mut config = Config::default();
             config.upstream.claude_usage_base = format!("http://{addr}");
@@ -745,6 +811,38 @@ async fn claude_live_revocation_scenario_reloads_before_startup_or_poll() {
                 calls.load(std::sync::atomic::Ordering::SeqCst),
                 if startup { 1 } else { 2 }
             );
+            assert_eq!(
+                profile_calls.load(std::sync::atomic::Ordering::SeqCst),
+                if startup { 1 } else { 2 }
+            );
+            let mut expected = Vec::new();
+            if !startup {
+                expected.extend([
+                    (
+                        axum::http::Method::GET,
+                        "/api/oauth/usage".to_owned(),
+                        "Bearer synthetic-access-old".to_owned(),
+                    ),
+                    (
+                        axum::http::Method::GET,
+                        "/api/oauth/profile".to_owned(),
+                        "Bearer synthetic-access-old".to_owned(),
+                    ),
+                ]);
+            }
+            expected.extend([
+                (
+                    axum::http::Method::GET,
+                    "/api/oauth/usage".to_owned(),
+                    "Bearer synthetic-access-new".to_owned(),
+                ),
+                (
+                    axum::http::Method::GET,
+                    "/api/oauth/profile".to_owned(),
+                    "Bearer synthetic-access-new".to_owned(),
+                ),
+            ]);
+            assert_eq!(*requests.lock().unwrap(), expected);
             let views = state.accounts.views().await.unwrap();
             let windows = views[0]["windows"].as_array().unwrap();
             assert_eq!(windows.len(), 2);
@@ -767,10 +865,23 @@ async fn revoked_linked_poll_rereads_cpa_and_never_requires_relogin() {
         );
         denied.chunks[0].0 = Duration::from_millis(100);
         h.usage.state.push(denied);
-        h.usage.state.push(ScriptedResponse::json(
-            StatusCode::OK,
-            r#"{"five_hour":{"utilization":35},"seven_day":{"utilization":73}}"#,
-        ));
+        if newer {
+            h.usage.state.push(ScriptedResponse::json(
+                StatusCode::OK,
+                r#"{"five_hour":{"utilization":35},"seven_day":{"utilization":73}}"#,
+            ));
+            h.usage.state.push(ScriptedResponse::json(
+                StatusCode::OK,
+                json!({
+                    "account": {"uuid": "synthetic-m5"},
+                    "organization": {
+                        "uuid": "synthetic-org",
+                        "rate_limit_tier": "default_claude_max_20x"
+                    }
+                })
+                .to_string(),
+            ));
+        }
         let rotate = async {
             while h.usage.state.requests().is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -786,7 +897,7 @@ async fn revoked_linked_poll_rereads_cpa_and_never_requires_relogin() {
         .unwrap();
         if newer {
             assert_eq!(result.unwrap().health, Health::Ready);
-            assert_eq!(h.usage.state.requests().len(), 2);
+            assert_eq!(h.usage.state.requests().len(), 3);
         } else {
             assert_eq!(result.unwrap_err(), PollError::Unavailable);
             assert!(matches!(
@@ -797,6 +908,20 @@ async fn revoked_linked_poll_rereads_cpa_and_never_requires_relogin() {
                 }
             ));
             assert_eq!(h.usage.state.requests().len(), 1);
+        }
+        let requests = h.usage.state.requests();
+        let mut expected = vec![("/api/oauth/usage", "synthetic-access-old")];
+        if newer {
+            expected.extend([
+                ("/api/oauth/usage", "synthetic-access-new"),
+                ("/api/oauth/profile", "synthetic-access-new"),
+            ]);
+        }
+        assert_eq!(requests.len(), expected.len());
+        for (request, (path, token)) in requests.iter().zip(expected) {
+            assert_eq!(request.method, axum::http::Method::GET);
+            assert_eq!(request.path_and_query, path);
+            assert_eq!(request.headers["authorization"], format!("Bearer {token}"));
         }
         assert!(h.token.state.requests().is_empty());
     }
@@ -985,6 +1110,17 @@ async fn claude_404_invalid_json_and_shape_mismatch_disable_polling_six_hours() 
     ] {
         let h = Harness::new(Provider::Claude, false).await;
         h.usage.state.push(ScriptedResponse::json(status, body));
+        h.usage.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            json!({
+                "account": {"uuid": "synthetic-m5"},
+                "organization": {
+                    "uuid": "synthetic-org",
+                    "rate_limit_tier": "default_claude_max_20x"
+                }
+            })
+            .to_string(),
+        ));
         assert_eq!(
             h.state.quota.poll(&h.id).await.unwrap_err(),
             PollError::Unavailable
@@ -997,7 +1133,18 @@ async fn claude_404_invalid_json_and_shape_mismatch_disable_polling_six_hours() 
             other => panic!("expected six-hour disable, got {other:?}"),
         }
         let requests = h.usage.state.requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
+        for (request, path) in requests
+            .iter()
+            .zip(["/api/oauth/usage", "/api/oauth/profile"])
+        {
+            assert_eq!(request.method, axum::http::Method::GET);
+            assert_eq!(request.path_and_query, path);
+            assert_eq!(
+                request.headers["authorization"],
+                "Bearer synthetic-access-old"
+            );
+        }
         assert_eq!(requests[0].path_and_query, "/api/oauth/usage");
         assert_eq!(requests[0].headers["anthropic-beta"], "oauth-2025-04-20");
         assert_eq!(h.account().health, Health::Ready);

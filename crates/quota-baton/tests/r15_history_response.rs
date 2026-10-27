@@ -208,6 +208,7 @@ async fn actual_history_routes_roundtrip_empty_populated_sparse_and_nullable_fac
             ts:now-ChronoDuration::seconds(1),kind:ActivityKind::Burst,
             provider:Provider::Codex,account:Some(id.clone()),account_to:Some(id.clone()),notable:true,
             data:history::ActivityData{
+                previous_plan:None,new_plan:None,
                 session:Some(session.clone()),sessions:vec![session],
                 window:Some("5h".to_owned().try_into().unwrap()),
                 reset_at:Some(now+ChronoDuration::hours(1)),

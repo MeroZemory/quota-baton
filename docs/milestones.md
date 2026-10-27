@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R17.1 설치 스크립트 보완 집중 관문 완료
-목표: 다운로드 실행과 잠긴 이전 파일이 있는 업그레이드를 끝까지 처리하고 트레이 복구하기
-핵심 지표: R17.1 설치 결함 보완 3/3 (인코딩, 정리·트레이, 실제 클라이언트); 공개 반영은 설계 세션
-사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-27 20:13 KST (레거시 백업 형식 포함 PS5.1/7 각28통과·독립 검수)
+현재 마일스톤: R18 Part 1 남은 관문 (Free 전환·요금제 최신화)
+목표: Claude permission_error 때 요금제를 다시 읽어 Free 계정을 배정에서 빼고, 요금제·구독 시작일(Claude)·이용 기간(Codex)을 최신으로 표시하기
+핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (홈 서버 꺼짐)
+사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 보류 유지(추천). L1 P5 서버 수용은 홈 서버가 켜지면 사용자와 진행
+갱신: 2026-10-28 03:26 KST (연결 토큰 냉각 보완·집중70통과·strict lint 통과)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -179,7 +179,7 @@ The goal stays open while any row in `GOAL.md` is open. Before marking it comple
 
 ## 진전 장부 (source of the "진전 한눈에" block)
 
-Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-interim-report.md` §3 item 1-1). `.sandbox/scripts/status_head.py` renders these tables, plus the done / in progress / remaining count from the `GOAL.md` milestone table, right under every report head. Metric rows are written only when the delivery state can change: a gate pass, a merge or an install (flat results included). Unit progress belongs in the report body, not here, and a unit whose only output is new records is not a unit (GOAL rule). Every metric row has all four cells; side measurements go to the support table. Never edit old rows. When a metric's definition or denominator changes, start a new 계열 name.
+Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-interim-report.md` §3 item 1-1). `.sandbox/scripts/status_head.py` renders these tables, plus the done / in progress / remaining count from the `GOAL.md` milestone table, right under every report head. Metric rows exist only for the two series defined in `GOAL.md` "Outcome series" (B 결정적 수용, C Linux 실제 수용) and are written only when an item of those series is accepted. Rows above 2026-10-28 belong to closed series and stay as history. Unit progress belongs in the report body, not here, and a unit whose only output is new records is not a unit (GOAL rule). Every metric row has all four cells; side measurements go to the support table. Never edit old rows. When a metric's definition or denominator changes, start a new 계열 name.
 
 <!-- metric:begin -->
 | 측정 시각 (KST) | 계열 | 값 | 비고 |
@@ -288,6 +288,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-27 19:49 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | 구현 메인이 사용자 brief의 세 결함을 수용 기준으로 선택; 이전 R17 2/2 종료. 최초 PS5.1/7 각26통과; 병합 전 dev의 일반 IEX/null PSCmdlet 수정 발견으로 텍스트 실행 결합 검증 필요 |
 | 2026-10-27 19:54 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | dev6d9ebf4의 IEX 핫픽스 결합·null WhatIf 보완 뒤 PS5.1/7 각28통과·독립 검수. 원본26개 입력 보존; 공개 main 반영은 설계 세션 |
 | 2026-10-27 20:13 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | 사용자 추가 지시의 레거시 백업 형식 포함. 혼합 형식 최신 쌍·잠긴 이전 파일·제거 소유권 회귀, PS5.1/7 각각28통과·스크립트 독립 검수 |
+| 2026-10-28 02:40 | 결정적 수용 (분모 3: 연속 재개 수용, N6r 실제 재생 수용, N7 통합 예측 수용) | 1/3 | 루트 감사 2026-10-28에 따라 정의를 GOAL.md "Outcome series"에 고정. 연속 재개 10-24 cc12102 수용; N6r·N7은 수용 전. 이전 계열과 비교하지 않음 |
+| 2026-10-28 02:40 | Linux 실제 수용 (분모 1: L1 P5 서버 수용) | 0/1 | 합성 관문 5/5와 GPU 서버 설치는 준비이며 수용이 아님. 홈 서버가 꺼져 있어 대기 |
 <!-- metric:end -->
 
 <!-- support:begin -->

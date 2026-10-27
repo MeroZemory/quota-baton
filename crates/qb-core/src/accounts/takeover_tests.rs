@@ -582,6 +582,216 @@ async fn r6_replace_recovers_terminal_auth_but_preserves_identity_policy_payment
 }
 
 #[tokio::test]
+async fn r18_claude_takeover_merges_free_evidence_and_paid_recovery_with_existing_holds() {
+    use super::super::{Health, HealthReason, HealthSignal, Source, UserState};
+
+    for plan in [None, Some("max_20x")] {
+        for hold in [
+            None,
+            Some(HealthReason::Auth),
+            Some(HealthReason::Payment),
+            Some(HealthReason::Quota),
+        ] {
+            for state in [UserState::Active, UserState::Paused] {
+                let mut f = Fixture::new();
+                let mut account = f.plan().await.account;
+                account.source = Source::Oauth;
+                account.token_meta.expires_at = Some(f.source.now - chrono::Duration::hours(1));
+                account.user_state = state;
+                account.allow_credits = true;
+                if let Some(reason) = hold {
+                    account.apply_health_signal(
+                        HealthSignal::Cooling {
+                            reason,
+                            until: f.source.now + chrono::Duration::hours(1),
+                            scope: "account".into(),
+                        },
+                        f.source.now,
+                    );
+                }
+                account.apply_health_signal(
+                    HealthSignal::PlanObservation {
+                        plan: Some("free".into()),
+                    },
+                    f.source.now,
+                );
+                if hold == Some(HealthReason::Auth) {
+                    account.auth_failures = 3;
+                }
+                let old = f
+                    .store
+                    .save(
+                        &account,
+                        &Tokens {
+                            access_token: "synthetic-old".into(),
+                            refresh_token: "synthetic-old-rt".into(),
+                            id_token: None,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                f.deps.profile = Arc::new(R18Profile {
+                    plan,
+                    failed: false,
+                });
+                let mut request = f.request(Phase::Inspect, None);
+                request.replace = true;
+                let Preparation::Inspect(value) =
+                    prepare(f.store.clone(), f.deps.clone(), request.clone())
+                        .await
+                        .unwrap()
+                else {
+                    panic!("inspect")
+                };
+                request.phase = Phase::Commit;
+                request.inspect_digest = Some(value["inspect_digest"].as_str().unwrap().into());
+                let Preparation::Commit(journal) =
+                    prepare(f.store.clone(), f.deps.clone(), request)
+                        .await
+                        .unwrap()
+                else {
+                    panic!("commit")
+                };
+                let expected = match hold {
+                    Some(HealthReason::Payment | HealthReason::Quota) => old.health.clone(),
+                    _ if plan.is_none() => Health::PlanWithoutClaudeCode,
+                    _ => Health::Ready,
+                };
+                // Check before install/load can perform further normalization.
+                assert_eq!(journal.account.health, expected);
+                let installed = install(&f.store, &f.deps, *journal).unwrap();
+                assert_eq!(installed.account.health, expected);
+                let saved = f.store.load(&installed.account.id).unwrap();
+                assert_eq!(saved.plan.as_deref(), plan.or(Some("free")));
+                assert_eq!(saved.health, expected);
+                assert_eq!(saved.user_state, old.user_state);
+                assert_eq!(saved.identity, old.identity);
+                assert_eq!(saved.label, old.label);
+                assert_eq!(saved.allow_credits, old.allow_credits);
+                assert_eq!(saved.payment_until, old.payment_until);
+                assert_eq!(saved.payment_failures, old.payment_failures);
+                assert_eq!(saved.auth_failures, 0);
+                assert_eq!(
+                    saved.eligible(None),
+                    plan.is_some()
+                        && hold.is_none_or(|h| h == HealthReason::Auth)
+                        && state == UserState::Active
+                );
+            }
+        }
+    }
+}
+
+struct R18Profile {
+    plan: Option<&'static str>,
+    failed: bool,
+}
+
+impl ProfileResolver for R18Profile {
+    fn endpoint(&self) -> &str {
+        "http://127.0.0.1:23456/api/oauth/profile"
+    }
+
+    fn claude<'a>(&'a self, access: &'a str) -> AsyncResult<'a, ProfileIdentity> {
+        Box::pin(async move {
+            if self.failed {
+                return Err(TakeoverError::Unavailable);
+            }
+            let fake = FakeProfile {
+                calls: AtomicUsize::new(0),
+            };
+            let mut profile = fake.claude(access).await?;
+            profile.plan = self.plan.map(str::to_owned);
+            Ok(profile)
+        })
+    }
+}
+
+#[tokio::test]
+async fn r18_claude_takeover_unknown_plan_does_not_preserve_stale_paid_plan() {
+    let mut f = Fixture::new();
+    let mut account = f.plan().await.account;
+    account.source = super::super::Source::Oauth;
+    account.token_meta.expires_at = Some(f.source.now - chrono::Duration::hours(1));
+    account.plan = Some("max_20x".into());
+    f.store
+        .save(
+            &account,
+            &Tokens {
+                access_token: "synthetic-old".into(),
+                refresh_token: "synthetic-old-rt".into(),
+                id_token: None,
+            },
+            None,
+        )
+        .unwrap();
+    f.deps.profile = Arc::new(R18Profile {
+        plan: None,
+        failed: false,
+    });
+    let mut request = f.request(Phase::Inspect, None);
+    request.replace = true;
+    let Preparation::Inspect(value) = prepare(f.store.clone(), f.deps.clone(), request.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("inspect")
+    };
+    request.phase = Phase::Commit;
+    request.inspect_digest = Some(value["inspect_digest"].as_str().unwrap().into());
+    let Preparation::Commit(journal) = prepare(f.store.clone(), f.deps.clone(), request)
+        .await
+        .unwrap()
+    else {
+        panic!("commit")
+    };
+    let installed = install(&f.store, &f.deps, *journal).unwrap();
+    assert_eq!(f.store.load(&installed.account.id).unwrap().plan, None);
+}
+
+#[tokio::test]
+async fn r18_claude_takeover_failed_profile_preserves_free_and_auth_hold() {
+    use super::super::{HealthSignal, Source};
+
+    let mut f = Fixture::new();
+    let mut account = f.plan().await.account;
+    account.source = Source::Oauth;
+    account.token_meta.expires_at = Some(f.source.now - chrono::Duration::hours(1));
+    account.apply_health_signal(
+        HealthSignal::PlanObservation {
+            plan: Some("free".into()),
+        },
+        f.source.now,
+    );
+    account.apply_health_signal(HealthSignal::AuthAfterRefresh, f.source.now);
+    let old = f
+        .store
+        .save(
+            &account,
+            &Tokens {
+                access_token: "synthetic-old".into(),
+                refresh_token: "synthetic-old-rt".into(),
+                id_token: None,
+            },
+            None,
+        )
+        .unwrap();
+    f.deps.profile = Arc::new(R18Profile {
+        plan: None,
+        failed: true,
+    });
+    let mut request = f.request(Phase::Inspect, None);
+    request.replace = true;
+    assert!(matches!(
+        prepare(f.store.clone(), f.deps.clone(), request).await,
+        Err(TakeoverError::Unavailable)
+    ));
+    assert_eq!(f.store.load(&old.id).unwrap(), old);
+    assert!(!old.eligible(None));
+    assert_eq!(f.source.mutations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn r6_owner_unknown_inspects_readonly_and_commit_refuses() {
     let f = Fixture::new();
     f.source.unknown.store(true, Ordering::SeqCst);
