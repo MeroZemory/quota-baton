@@ -1,6 +1,6 @@
 //! Current response aliases reuse core's validated leaves. Archive DTOs retain
 //! their independent compatibility defaults in the parent module.
-use super::{ActivityKind, AttentionCode, SettingAction, WindowName};
+use super::{ActivityKind, AttentionCode, PlanName, SettingAction, WindowName};
 use crate::{
     accounts::Provider,
     dashboard::{AccountId, MoveReason, RequestOutcome, SessionId},
@@ -16,6 +16,7 @@ pub type ActivityData = wire::ActivityData<
     AttentionCode,
     RequestOutcome,
     SettingAction,
+    PlanName,
 >;
 pub type ActivityEvent =
     wire::ActivityEvent<DateTime<Utc>, ActivityKind, Provider, AccountId, ActivityData>;
@@ -24,6 +25,8 @@ pub type ActivityPage = wire::ActivityPage<ActivityEvent>;
 impl From<super::ActivityData> for ActivityData {
     fn from(data: super::ActivityData) -> Self {
         Self {
+            previous_plan: data.previous_plan,
+            new_plan: data.new_plan,
             session: data.session,
             sessions: data.sessions,
             window: data.window,
@@ -73,6 +76,26 @@ impl From<super::ActivityPage> for ActivityPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r18_plan_change_contract_roundtrips_only_recognized_plan_names() {
+        let raw = serde_json::json!({"events":[{"seq":1,"ts":"2030-01-01T00:00:00Z",
+            "kind":"plan_changed","provider":"claude","account":null,"account_to":null,
+            "notable":true,"data":{"previous_plan":"max_20x","new_plan":"free",
+            "count":0,"max_wait_ms":0,"relayed":0,"moved_groups":0,
+            "sessions_truncated":false,"recovered":false}}],"next_seq":2,"truncated":false});
+        let page: ActivityPage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(page).unwrap(), raw);
+        for key in ["previous_plan", "new_plan"] {
+            for invalid in [
+                serde_json::json!("synthetic-secret"),
+                serde_json::Value::Null,
+            ] {
+                let mut bad = raw.clone();
+                bad["events"][0]["data"][key] = invalid;
+                assert!(serde_json::from_value::<ActivityPage>(bad).is_err());
+            }
+        }
+    }
     #[test]
     fn projection_matches_current_archive_serialization_without_changing_restore_defaults() {
         let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();

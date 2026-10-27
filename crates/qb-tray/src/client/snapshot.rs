@@ -196,6 +196,20 @@ impl SnapshotBundleV1 {
             return Err(SnapshotError::Invalid);
         }
         validate_state(&self.state)?;
+        for event in &self.activity.events {
+            for plan in [&event.data.previous_plan, &event.data.new_plan]
+                .into_iter()
+                .flatten()
+            {
+                if serde_json::from_value::<qb_core::dashboard::history::PlanName>(Value::String(
+                    plan.clone(),
+                ))
+                .is_err()
+                {
+                    return Err(SnapshotError::DisallowedField);
+                }
+            }
+        }
         for component in [
             serialize_limited(&self.health, MAX_COMPONENT_BYTES, false),
             serialize_limited(&self.state, MAX_COMPONENT_BYTES, false),
@@ -224,6 +238,7 @@ const HEALTH: &[&str] = &["kind", "reason", "scope", "until", "since"];
 const CREDITS: &[&str] = &["has_credits", "unlimited", "balance", "serving"];
 const QUOTA_COOLING: &[&str] = &["window", "reset_at", "started_at"];
 const REASONS: &[&str] = &[
+    "plan_without_claude_code",
     "quota",
     "rate",
     "auth",
@@ -472,6 +487,55 @@ mod tests {
         let mut bundle: SnapshotBundleV1 = serde_json::from_value(wire_bundle()).unwrap();
         allowlist_state(&mut bundle.state).unwrap();
         bundle
+    }
+
+    #[test]
+    fn r18_snapshot_roundtrip_preserves_free_plan_health_and_plan_change() {
+        let mut wire = wire_bundle();
+        wire["state"]["accounts"][0]["provider"] = json!("claude");
+        wire["state"]["accounts"][0]["plan"] = json!("free");
+        wire["state"]["accounts"][0]["health"] = json!({"kind":"plan_without_claude_code"});
+        wire["state"]["pools"] =
+            json!({"claude":{"eligible":0,"cooling":{"plan_without_claude_code":1}}});
+        wire["activity"]["events"][0]["kind"] = json!("plan_changed");
+        wire["activity"]["events"][0]["provider"] = json!("claude");
+        wire["activity"]["events"][0]["data"] =
+            json!({"previous_plan":"max_20x","new_plan":"free"});
+        let mut original: SnapshotBundleV1 = serde_json::from_value(wire).unwrap();
+        allowlist_state(&mut original.state).unwrap();
+        let restored = decode(&encode(&original).unwrap()).unwrap();
+        assert_eq!(
+            restored.state.accounts[0].health,
+            json!({"kind":"plan_without_claude_code"})
+        );
+        assert_eq!(restored.state.accounts[0].plan.as_deref(), Some("free"));
+        assert_eq!(restored.activity.events[0].kind, "plan_changed");
+        assert_eq!(
+            restored.activity.events[0].data.previous_plan.as_deref(),
+            Some("max_20x")
+        );
+        assert_eq!(
+            restored.activity.events[0].data.new_plan.as_deref(),
+            Some("free")
+        );
+        assert_eq!(
+            restored
+                .state
+                .pools
+                .as_ref()
+                .unwrap()
+                .claude
+                .as_ref()
+                .unwrap()
+                .cooling
+                .as_ref()
+                .unwrap()
+                .get("plan_without_claude_code"),
+            Some(1)
+        );
+        let mut unsafe_plan = restored;
+        unsafe_plan.activity.events[0].data.new_plan = Some("private-unreviewed-plan".into());
+        assert!(encode(&unsafe_plan).is_err());
     }
 
     fn server(wire: &Value) -> (AdminClient, std::thread::JoinHandle<()>) {

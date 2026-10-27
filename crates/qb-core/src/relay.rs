@@ -2855,6 +2855,18 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             &held.prefix,
             request_model.as_deref(),
         );
+        if provider == Provider::Claude && decision.kind == outcome::Kind::Permission {
+            state
+                .observability
+                .record_permission_error(&account.id, &held.prefix);
+            // A one-off profile read diagnoses the denial without holding
+            // failover behind an unresponsive provider for the full poll timeout.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                state.quota.refresh_permission_plan(&account.id),
+            )
+            .await;
+        }
         let failure_evidence = decision.failed_attempt(
             &account,
             session.key.as_deref(),

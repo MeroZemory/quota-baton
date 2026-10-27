@@ -134,6 +134,7 @@ pub enum AdminHealthReason {
 #[cfg_attr(any(test, feature = "contract-tests"), serde(deny_unknown_fields))]
 pub enum AdminHealth {
     Ready {},
+    PlanWithoutClaudeCode {},
     Cooling {
         reason: AdminHealthReason,
         until: String,
@@ -189,7 +190,10 @@ impl<'de> Deserialize<'de> for AdminUnknownHealth {
             .remove("kind")
             .and_then(|value| value.as_str().map(str::to_owned))
             .ok_or_else(|| D::Error::custom("health kind must be a string"))?;
-        if matches!(kind.as_str(), "ready" | "cooling" | "needs_relogin") {
+        if matches!(
+            kind.as_str(),
+            "ready" | "cooling" | "needs_relogin" | "plan_without_claude_code"
+        ) {
             return Err(D::Error::custom("invalid known health state"));
         }
         Ok(Self { kind, fields })

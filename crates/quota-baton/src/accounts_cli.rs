@@ -131,7 +131,7 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
                     translated(&value["source"]["kind"]),
                     translated(&value["source"]["mode"]),
                     translated(&value["user_state"]),
-                    health_label(&value["health"]),
+                    localized_health_label(&value["health"], english),
                     cell(&value["token_meta"]["expires_at"])
                 );
                 let live = forecasts
@@ -179,11 +179,35 @@ pub(crate) fn translated(value: &serde_json::Value) -> String {
 
 pub(crate) fn health_label(value: &serde_json::Value) -> String {
     match value["kind"].as_str() {
+        Some("plan_without_claude_code") => "Free 요금제 · Claude Code 사용 불가".into(),
         Some("ready") => "준비됨".into(),
         Some("cooling") => "대기 중".into(),
         Some("needs_relogin") => "재로그인 필요".into(),
         _ => "알 수 없음".into(),
     }
+}
+
+fn localized_health_label(value: &serde_json::Value, english: bool) -> String {
+    if english && value["kind"] == "plan_without_claude_code" {
+        "Free plan · no Claude Code access".into()
+    } else {
+        health_label(value)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn r18_free_plan_health_label_is_localized_for_list_and_status() {
+    let health = serde_json::json!({"kind":"plan_without_claude_code"});
+    assert_eq!(health_label(&health), "Free 요금제 · Claude Code 사용 불가");
+    assert_eq!(
+        localized_health_label(&health, false),
+        "Free 요금제 · Claude Code 사용 불가"
+    );
+    assert_eq!(
+        localized_health_label(&health, true),
+        "Free plan · no Claude Code access"
+    );
 }
 
 pub(crate) fn cell(value: &serde_json::Value) -> String {
@@ -675,10 +699,15 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             cell(&account["provider"]),
             cell(&account["label"]),
             translated(&account["user_state"]),
-            if account["probe_pending"].as_bool() == Some(true) {
+            if account["probe_pending"].as_bool() == Some(true)
+                && account["health"]["kind"] != "plan_without_claude_code"
+            {
                 "인증 확인 대기".into()
             } else {
-                health_label(&account["health"])
+                localized_health_label(
+                    &account["health"],
+                    config.ui.language == qb_core::config::UiLanguage::En,
+                )
             },
             windows,
             translated(&account["health"]["reason"]),

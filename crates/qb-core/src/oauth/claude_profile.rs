@@ -16,6 +16,13 @@ pub(crate) fn plan(profile: &Value) -> Option<&'static str> {
             "default_claude_max_5x" => Some("max_5x"),
             "default_claude_max_20x" => Some("max_20x"),
             "default_claude_pro" => Some("pro"),
+            // Explicit Free tiers only; unknown/missing fields are not proof
+            // that a subscription ended. Candidate spellings need live schema
+            // confirmation before adding further no-subscription aliases.
+            "default_claude_free" | "free"
+                if profile["account"]["has_claude_max"] != true
+                    && profile["account"]["has_claude_pro"] != true
+                    && !matches!(kind, Some("claude_max" | "claude_pro" | "pro")) => Some("free"),
             _ => {
                 tracing::debug!(tier = %bounded_tier(tier), "Unknown Claude profile tier");
                 None
@@ -23,9 +30,10 @@ pub(crate) fn plan(profile: &Value) -> Option<&'static str> {
         };
     }
     if profile["account"]["has_claude_max"] == true || kind == Some("claude_max") {
-        return None;
+        return Some("max");
     }
     match kind {
+        Some("free" | "claude_free") if profile["account"]["has_claude_pro"] != true => Some("free"),
         Some("claude_pro" | "pro") => Some("pro"),
         None if profile["account"]["has_claude_pro"] == true => Some("pro"),
         Some(other) => {
@@ -106,7 +114,7 @@ mod tests {
             ),
             (
                 json!({"account":{"has_claude_max":true,"has_claude_pro":true}}),
-                None,
+                Some("max"),
             ),
             (
                 json!({"account":{"has_claude_pro":true},"organization":{"rate_limit_tier":"default_claude_max_10x"}}),

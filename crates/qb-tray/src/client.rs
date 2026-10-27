@@ -1045,6 +1045,14 @@ pub fn render_flyout(read: &TrayRead<PresentationSnapshot>) -> String {
                     .health
                     .get("kind")
                     .and_then(serde_json::Value::as_str)
+                    == Some("plan_without_claude_code") =>
+                {
+                    qb_tray::i18n::static_text("Free 요금제 · Claude Code 사용 불가")
+                }
+                _ if account
+                    .health
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
                     == Some("needs_relogin") =>
                 {
                     "다시 로그인"
@@ -2001,6 +2009,80 @@ mod login_contract_tests {
 #[cfg(test)]
 mod r15_account_action_consumer_tests {
     use super::*;
+    #[test]
+    fn r18_plan_without_claude_code_admin_reply_roundtrips_to_client() {
+        let raw = serde_json::json!({"id":"sample-free","provider":"claude","label":"sample-free",
+            "email":"sample-free@example.test","plan":"free","user_state":"active",
+            "health":{"kind":"plan_without_claude_code"},"drain":false,"allow_credits":false});
+        let typed: AccountActionWire =
+            AdminClient::decode_dashboard_object(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), raw);
+        let display = account_reply_presentation(&typed).unwrap();
+        assert_eq!(display.health, raw["health"]);
+        assert_eq!(display.plan.as_deref(), Some("free"));
+    }
+
+    #[test]
+    fn r18_full_admin_state_keeps_free_plan_blocked_through_client_adapter() {
+        let account = serde_json::json!({
+            "outside_used":false,"pool_eligible":false,"takeover_pending":false,
+            "quota_cooling":null,"quota_credit_releasable":false,"observed_at":null,"quota_notice":null,
+            "credits_in_use":false,"usage_forecast":{"as_of":"2030-01-01T00:00:00Z",
+                "observed_at":null,"windows":[],"earliest_window":null,"credit":null,"truncated":false},
+            "has_alternative":false,"id":"sample-free","generation":1,"last_refresh_at":null,
+            "provider":"claude","label":"sample-free","email":"sample-free@example.test","plan":"free",
+            "user_state":"active","source":{"kind":"oauth"},"health":{"kind":"plan_without_claude_code"},
+            "probe_pending":false,"pacing":{"backoff_until":null,"step":0,"release_interval_ms":0,"waiting":0},
+            "windows":[],"credits":null,"last_used_at":null,"bound_sessions":0,"token_expires_at":null,
+            "drain":false,"allow_credits":false,"refresh_attention":false,"active_sessions":0,"spread_threshold":3
+        });
+        let raw = serde_json::json!({"accounts":[account],"pools":{"claude":{"eligible":0}}});
+        let typed: TraySnapshot =
+            AdminClient::decode_dashboard_object(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&typed.accounts[0]).unwrap(),
+            raw["accounts"][0]
+        );
+        let restored: TraySnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&typed).unwrap()).unwrap();
+        let display = restored.presentation().unwrap();
+        assert_eq!(
+            display.accounts[0].health["kind"],
+            "plan_without_claude_code"
+        );
+        assert_eq!(display.accounts[0].plan.as_deref(), Some("free"));
+        let now = "2030-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+            .into();
+        let view = qb_tray::v2::project(&serde_json::to_string(&restored).unwrap(), now).unwrap();
+        assert_eq!(
+            view.sections[0].rows[0].group,
+            qb_tray::v2::Group::NeedsAction
+        );
+        assert_eq!(
+            view.sections[0].rows[0].state,
+            qb_tray::v2::DisplayState::PlanWithoutClaudeCode
+        );
+    }
+
+    #[test]
+    fn r18_live_history_bridge_preserves_plan_change_fields() {
+        let raw = serde_json::json!({"events":[{"seq":1,"ts":"2030-01-01T00:00:00Z",
+            "kind":"plan_changed","provider":"claude","account":"sample-free","account_to":null,
+            "notable":true,"data":{"previous_plan":"max_20x","new_plan":"free"}}],
+            "next_seq":2,"truncated":false});
+        let wire: qb_core::dashboard::history::response::ActivityPage =
+            AdminClient::decode_dashboard_object(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&wire).unwrap(), raw);
+        let display = history::activity(&wire).unwrap();
+        assert_eq!(display.events[0].kind, "plan_changed");
+        assert_eq!(
+            display.events[0].data.previous_plan.as_deref(),
+            Some("max_20x")
+        );
+        assert_eq!(display.events[0].data.new_plan.as_deref(), Some("free"));
+    }
     #[test]
     fn raw_action_and_release_preserve_ack_and_match_existing_display() {
         for released in [false, true] {

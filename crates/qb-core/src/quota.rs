@@ -36,7 +36,7 @@ pub(crate) fn is_complete_snapshot_for_test(provider: Provider, body: &[u8]) -> 
 
 const MAX_BODY: usize = 256 * 1024;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PollError {
     TooSoon { retry_after: u64 },
     Excluded,
@@ -461,6 +461,8 @@ impl UsagePoller {
             .get_mut(id)
             .expect("reserved clock")
             .last = Some(Instant::now());
+        let provider = account.provider;
+        let result = async {
         for attempt in 0..2 {
             let observation_table = self.binding_table();
             let observation_asof = observation_table
@@ -586,6 +588,22 @@ impl UsagePoller {
             return Ok((account, receipt));
         }
         Err(PollError::Unavailable)
+        }.await;
+        // Profile freshness follows every actual usage attempt, even when the
+        // usage endpoint fails. Preserve its reservation/backoff and release
+        // usage slots before waiting for the separate profile lane.
+        drop(probe);
+        drop(reservation);
+        drop(_permit);
+        if provider == Provider::Claude {
+            let profile = self.refresh_permission_plan(id).await;
+            if let (Ok((_, receipt)), Ok(account)) = (&result, profile) {
+                // Claude does not issue the Codex-only observed poll receipt.
+                debug_assert!(receipt.is_none());
+                return Ok((account, None));
+            }
+        }
+        result
     }
     fn scheduled(&self, account: &Account) -> bool {
         if account.user_state == UserState::Disabled
@@ -1294,4 +1312,6 @@ mod tests {
     mod profile_linked_tests;
 
     include!("quota/profile_tests.rs");
+    mod r18_profile_tests;
+    mod r18_relay_tests;
 }

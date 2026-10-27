@@ -48,9 +48,21 @@ pub struct ActivityEvent<Time, Kind, Provider, Account, Data> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "contract-tests"), serde(deny_unknown_fields))]
 #[serde(bound(
-    deserialize = "Time: Deserialize<'de>, Session: Deserialize<'de>, Window: Deserialize<'de>, Reason: Deserialize<'de>, Attention: Deserialize<'de>, Outcome: Deserialize<'de>, Action: Deserialize<'de>"
+    deserialize = "Time: Deserialize<'de>, Session: Deserialize<'de>, Window: Deserialize<'de>, Reason: Deserialize<'de>, Attention: Deserialize<'de>, Outcome: Deserialize<'de>, Action: Deserialize<'de>, Plan: Deserialize<'de>"
 ))]
-pub struct ActivityData<Time, Session, Window, Reason, Attention, Outcome, Action> {
+pub struct ActivityData<Time, Session, Window, Reason, Attention, Outcome, Action, Plan = String> {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub previous_plan: Option<Plan>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub new_plan: Option<Plan>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

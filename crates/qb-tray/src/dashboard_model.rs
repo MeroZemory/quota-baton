@@ -303,6 +303,10 @@ pub struct ActivityEvent {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ActivityData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_plan: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_plan: Option<String>,
     pub window: Option<String>,
     pub reset_at: Option<DateTime<Utc>>,
     pub moved_groups: Option<u64>,
@@ -1512,6 +1516,9 @@ pub fn upsert_activity(events: &mut Vec<ActivityEvent>, incoming: ActivityEvent)
 }
 pub fn reason(word: &str) -> &str {
     match word {
+        "plan_without_claude_code" => {
+            crate::i18n::static_text("Free 요금제 · Claude Code 사용 불가")
+        }
         "quota" => crate::i18n::static_text("한도 도달"),
         "needs_relogin" => crate::i18n::static_text("다시 로그인 필요"),
         "paused" => crate::i18n::static_text("일시정지"),
@@ -1621,6 +1628,35 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
     let mut tone = v2::Tone::Off;
     let mut category = EventFilter::All;
     let (title, body) = match e.kind.as_str() {
+        "plan_changed" => {
+            let title = match (d.previous_plan.as_deref(), d.new_plan.as_deref()) {
+                (Some(previous), Some(new)) => crate::i18n::format(
+                    "요금제 변경: {0} → {1}",
+                    &[
+                        v2::plan_label(&e.provider, Some(previous))
+                            .unwrap_or("—")
+                            .to_owned(),
+                        v2::plan_label(&e.provider, Some(new))
+                            .unwrap_or("—")
+                            .to_owned(),
+                    ],
+                ),
+                _ => crate::i18n::static_text("요금제 변경").into(),
+            };
+            (format!("{p} {a} · {title}"), String::new())
+        }
+        "plan_without_claude_code" => {
+            tag = crate::i18n::static_text("할 일");
+            tone = v2::Tone::Bad;
+            category = EventFilter::Tasks;
+            (
+                format!("{p} {a} · {}", reason("plan_without_claude_code")),
+                crate::i18n::static_text(
+                    "Claude Code를 지원하는 요금제로 변경한 뒤 사용량을 새로고침하세요.",
+                )
+                .into(),
+            )
+        }
         "quota_reached" => {
             category = EventFilter::Moves;
             if d.no_eligible {
@@ -2827,3 +2863,56 @@ mod native_claude_move_label_tests {
 mod sessions_wire;
 
 mod detail_wire;
+
+#[cfg(test)]
+mod r18_plan_ui_tests {
+    use super::*;
+
+    #[test]
+    fn r18_plan_changed_event_localizes_dynamic_plan_names_and_remains_read_only() {
+        let now = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z").unwrap();
+        let clock = Clock {
+            now,
+            day_start: now.with_timezone(&Utc),
+            day_end: now.with_timezone(&Utc) + chrono::Duration::days(1),
+        };
+        let accounts = v2::project(r#"{"accounts":[]}"#, clock.utc().into()).unwrap();
+        let raw = serde_json::json!({"kind":"plan_changed","provider":"claude","account":"sample-free",
+            "data":{"previous_plan":"max_20x","new_plan":"free"}});
+        let event: ActivityEvent = serde_json::from_value(raw).unwrap();
+        let restored: ActivityEvent =
+            serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+        for (language, label, recovery) in [
+            (
+                crate::i18n::UiLanguage::Ko,
+                "요금제 변경: Max 20x → Free",
+                "Claude Code를 지원하는 요금제로 변경한 뒤 사용량을 새로고침하세요.",
+            ),
+            (
+                crate::i18n::UiLanguage::En,
+                "Plan changed: Max 20x → Free",
+                "Upgrade to a plan with Claude Code access, then refresh usage.",
+            ),
+        ] {
+            crate::i18n::with_language(language, || {
+                let row = event_row(&restored, &accounts, &clock).unwrap();
+                assert!(row.title.contains(label), "{}", row.title);
+                assert!(!row.relogin);
+                assert_eq!(row.category, EventFilter::All);
+                let blocked = ActivityEvent {
+                    kind: "plan_without_claude_code".into(),
+                    ..restored.clone()
+                };
+                let blocked = event_row(&blocked, &accounts, &clock).unwrap();
+                assert_eq!(blocked.body, recovery);
+                assert_eq!(blocked.category, EventFilter::Tasks);
+                assert!(!blocked.relogin);
+            });
+        }
+        let sparse = ActivityEvent {
+            data: ActivityData::default(),
+            ..event
+        };
+        assert!(event_row(&sparse, &accounts, &clock).is_some());
+    }
+}
