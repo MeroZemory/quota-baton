@@ -240,10 +240,15 @@ try {
         Assert ($source.Contains('launch-client --client codex --command') -and $source.Contains('%APPDATA%\\npm\\codex.cmd')) 'Codex explicit npm target source policy changed'
         Write-Host 'Source-policy check only: launcher generation and Rust wire were not executed.'
     }
-    Case 'upgrade-locked-retention-keeps-newest-pair-and-cleans-other-generations' {
+    Case 'upgrade-mixed-legacy-retention-keeps-equal-key-newest-pair-and-skips-locked-legacy' {
         $scenario=New-Scenario 'successful'
-        $oldest='200001010000000000000'; $middle='200101010000000000000'
-        foreach ($generation in @($oldest,$middle)) { foreach ($name in @('quota-baton.exe','quota-baton-tray.exe')) { [IO.File]::WriteAllText((Join-Path $scenario.Install ($name+'.old-'+$generation)),'old rollback') } }
+        $oldest='20000101-000000'; $middle='200101010000000000000'; $staleLegacy='20020101-000000'
+        foreach ($generation in @($oldest,$middle,$staleLegacy)) { foreach ($name in @('quota-baton.exe','quota-baton-tray.exe')) { [IO.File]::WriteAllText((Join-Path $scenario.Install ($name+'.old-'+$generation)),'old rollback') } }
+        # Deliberately newer than the install clock: these differently formatted
+        # halves denote the same generation and must remain a complete pair.
+        $newestCore=Join-Path $scenario.Install 'quota-baton.exe.old-20990101-000000'
+        $newestTray=Join-Path $scenario.Install 'quota-baton-tray.exe.old-209901010000000000000'
+        foreach ($path in @($newestCore,$newestTray)) { [IO.File]::WriteAllText($path,'newest mixed-format rollback') }
         $lockedPath=Join-Path $scenario.Install ('quota-baton.exe.old-'+$oldest)
         $script:locked=[IO.File]::Open($lockedPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
         $deleteRefused=$false
@@ -254,16 +259,24 @@ try {
         Assert (Test-Path -LiteralPath $lockedPath) 'Locked rollback removed'
         Assert (-not (Test-Path -LiteralPath (Join-Path $scenario.Install ('quota-baton-tray.exe.old-'+$oldest)))) 'Deletable mate was not removed'
         Assert (@(Get-ChildItem -LiteralPath $scenario.Install -File | Where-Object { $_.Name.EndsWith($middle) }).Count -eq 0) 'Other deletable generation retained'
-        $remaining=@(Get-ChildItem -LiteralPath $scenario.Install -File | Where-Object { $_.Name -match '\.old-\d{21}$' -and $_.FullName -ne $lockedPath })
+        Assert (@(Get-ChildItem -LiteralPath $scenario.Install -File | Where-Object { $_.Name.EndsWith($staleLegacy) }).Count -eq 0) 'Deletable stale legacy generation retained'
+        $remaining=@(Get-ChildItem -LiteralPath $scenario.Install -File | Where-Object { $_.Name -match '\.old-(?:\d{21}|\d{8}-\d{6})$' -and $_.FullName -ne $lockedPath })
         Assert ($remaining.Count -eq 2) 'Newest rollback pair not retained'
-        Assert (($remaining[0].Name -split '\.old-')[1] -eq ($remaining[1].Name -split '\.old-')[1]) 'Retained pair generations differ'
+        Assert (Test-Path -LiteralPath $newestCore) 'Newest legacy core half was deleted'
+        Assert (Test-Path -LiteralPath $newestTray) 'Equivalent newest modern tray half was deleted'
         Assert ($scenario.Events.Contains('cli:status')) 'Retention prevented final setup status'
         Assert ($env:PATH -ceq $scenario.InputPath) 'Parent process PATH was not restored after wire'
         Assert ($output -match [regex]::Escape($realTargets.codex) -and $output -match [regex]::Escape($realTargets.claude)) 'Detection did not report real targets'
         Assert ($output -match 'herdr') 'Wrapper annotation missing'
         Assert (@($scenario.Processes | Where-Object { $_.ExecutablePath -eq $scenario.Tray }).Count -eq 1) 'Upgrade left no tray'
         $locked.Dispose(); $script:locked=$null
+        $legacyTray=Join-Path $scenario.Install 'quota-baton-tray.exe.old-20020101-000000'
+        [IO.File]::WriteAllText($legacyTray,'synthetic draining legacy tray')
+        $scenario.Processes.Add([pscustomobject]@{ProcessId=12;ExecutablePath=$newestCore;CreationDate='legacy-core'})
+        $scenario.Processes.Add([pscustomobject]@{ProcessId=13;ExecutablePath=$legacyTray;CreationDate='legacy-tray'})
+        $scenario.Processes.Add([pscustomobject]@{ProcessId=14;ExecutablePath=$newestTray;CreationDate='modern-tray'})
         Invoke-FixtureScript $uninstaller @{InstallDir=$scenario.Install;Lang='en'}
+        Assert (@($scenario.Processes | Where-Object { $_.ProcessId -in @(12,13,14) }).Count -eq 0) 'Uninstall missed an exact owned legacy/modern rollback process'
         Assert (-not (Test-Path -LiteralPath $scenario.Install)) 'Mock uninstall did not remove fixture install'
         Assert (Test-Path -LiteralPath (Join-Path $env:QB_HOME 'keep.txt')) 'Uninstall removed kept account data'
         Assert ($scenario.Events.Contains('cli:unwire --apply')) 'Unwire was not requested'
