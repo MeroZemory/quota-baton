@@ -78,32 +78,36 @@ Both charts are drawn from quota-baton's own usage history on the author's machi
 
 ## Setup
 
-1. Download the zip from [Releases](https://github.com/MeroZemory/quota-baton/releases) and unpack it, or build it yourself. `quota-baton.exe` is the core and CLI; `quota-baton-tray.exe` is the tray app.
+Run this in PowerShell:
 
-   ```powershell
-   cargo build --release --workspace
-   ```
+```powershell
+irm https://raw.githubusercontent.com/MeroZemory/quota-baton/main/install.ps1 | iex
+```
 
-2. Start the core. The tray can also start it and restart it if it exits.
+The installer:
+- downloads the latest release and checks its SHA-256;
+- installs into `%LOCALAPPDATA%\Programs\quota-baton` and adds that folder to your PATH;
+- finds out which of `codex` and `claude` you have, and shows the `codex-qb` / `claude-qb` commands it will create before it changes anything;
+- starts the tray, and sets it to start at login. The tray keeps the core running.
 
-   ```powershell
-   quota-baton serve
-   ```
+Running it again upgrades in place without dropping open sessions. `uninstall.ps1` in the same place removes everything the installer set up and keeps your accounts unless you pass `-RemoveData`.
 
-3. Log in to each account. This opens the browser for OAuth.
+Then log in to each account. This opens the browser for OAuth; on a machine without a browser, add `--no-browser`.
 
-   ```powershell
-   quota-baton accounts login claude
-   quota-baton accounts login codex
-   ```
+```powershell
+quota-baton accounts login claude
+quota-baton accounts login codex
+```
 
-4. Create the `codex-qb` and `claude-qb` commands. Run it once without `--apply` to see the exact changes first.
+Start sessions with `codex-qb` or `claude-qb`.
 
-   ```powershell
-   quota-baton wire --codex-mode dedicated --claude-mode dedicated --apply
-   ```
+<details><summary>Manual setup</summary>
 
-Start sessions with `codex-qb` or `claude-qb`. `quota-baton unwire --apply` removes everything `wire` created.
+1. Download the zip from [Releases](https://github.com/MeroZemory/quota-baton/releases) and unpack it, or build it with `cargo build --release --workspace`. `quota-baton.exe` is the core and CLI; `quota-baton-tray.exe` is the tray app.
+2. Run `quota-baton wire --apply` to create `codex-qb` and `claude-qb` and to start the tray at login (`--no-autostart` skips that). Run it once without `--apply` to see the exact changes first. `quota-baton unwire --apply` removes everything `wire` created.
+3. Start `quota-baton-tray.exe`; it starts the core and restarts it if it exits.
+
+</details>
 
 Accounts already logged in through another app's Codex or Claude home can be taken over with `quota-baton accounts takeover codex <home>`. quota-baton then owns the refresh token, and the original credential file is renamed so the two apps never refresh the same token.
 
@@ -154,7 +158,7 @@ Settings live in `%LOCALAPPDATA%\quota-baton\config.toml`; set `QB_HOME` to use 
 
 ## Limits
 
-- **Windows only.** The core is portable Rust, but the tray, credential storage and launchers are Windows-specific.
+- **Windows only, for now.** The tray and the launchers are Windows-specific. A headless Linux build of the core (systemd service, per-container keys) is in testing and not released yet.
 - **Two providers, subscriptions only.** Claude subscriptions (Claude Code) and ChatGPT subscriptions (Codex CLI). Pay-per-token API keys are not supported yet; they are planned as a separate pool that never mixes with subscription accounts ([plan](docs/milestones.md#api-key-pools-n12)).
 - **A move costs one uncached turn.** Prompt caches belong to an account and cannot follow a session. Codex also drops hidden reasoning from the old account.
 - **Korean by default.** The tray and dashboard switch to English with `[ui] language = "en"` in `config.toml`. Most CLI messages are still Korean.
