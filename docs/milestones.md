@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R17 로그인 자동 시작·설치 스크립트 집중 관문 완료
-목표: 로그인 때 코어가 준비되도록 tray 자동 시작을 기본으로 하고 설치·업그레이드 명령 제공하기
-핵심 지표: R17 출시 준비 2/2 (자동 시작, 설치·제거 스크립트); 실제 설치·공개는 설계 세션
+현재 마일스톤: R17.1 설치 스크립트 보완 집중 관문 완료
+목표: 다운로드 실행과 잠긴 이전 파일이 있는 업그레이드를 끝까지 처리하고 트레이 복구하기
+핵심 지표: R17.1 설치 결함 보완 3/3 (인코딩, 정리·트레이, 실제 클라이언트); 공개 반영은 설계 세션
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-27 19:14 KST (집중4·registry/CLI13·strict lint·build·읽기 전용 launch check 통과; PS5.1/7 각14개)
+갱신: 2026-10-27 19:49 KST (PS5.1/7 각26통과·독립 검수·읽기 전용 launch check 통과)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (remaining ready work): R17 focused gate complete; merge and hand off installation, then R18 (`impl/plan-change`, user request 2026-10-27), then N6r (`impl/r14-replay`) and N7 calibration on separate branches. N6r and N7 must not merge into dev without explicit owner gate approval. L1 P5 real acceptance stays with the design session and user; any L1 fix brief takes priority. R2 Part B stays held and N12 is not ready.
+**Current S1 order** (remaining ready work): R17.1 script-only focused gate complete; hand off public-main scripts, then resume R18 (`impl/plan-change`, parked uncompiled WIP adb1552), then N6r (`impl/r14-replay`) and N7 calibration on separate branches. N6r and N7 must not merge into dev without explicit owner gate approval. L1 P5 real acceptance stays with the design session and user; any L1 fix brief takes priority. R2 Part B stays held and N12 is not ready.
 
 **Start now in W:** N5m and the N7 backtest.
 
@@ -284,6 +284,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 10:54 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P5 안내 포함 Bookworm 배포 묶음·ELF2.34·Ubuntu24 인증 READY/정상 TERM 관문 완료; 실제 공급자 로그인 0/2·서버 수용은 별도 |
 | 2026-10-25 11:03 | Linux 구현 관문 (분모 5: P0 컴파일, P1 플랫폼, P2 systemd, P3 합성 로그인, P4 칸별 접근) | 5/5 | P5 배포 묶음 GPU 설치 수용·재로드2442/0 동일 PID; Linux LF 속성·archive 집중 관문 통과, 실제 로그인/Incus/재부팅은 별도 |
 | 2026-10-27 19:14 | R17 출시 준비 (분모 2: 자동 시작, 설치·제거 스크립트) | 2/2 | 구현 메인이 사용자 R17 brief의 두 부분을 출시 준비 기준으로 선택; 이전 Linux 구현 5/5 종료. 집중 관문·PS5.1/7 각14개 통과, 실제 설치·공개는 설계 세션 |
+| 2026-10-27 19:49 | R17 출시 준비 (분모 2: 자동 시작, 설치·제거 스크립트) | 2/2 | 설계 세션 v0.6.0 설치·공개 수용: upgrade 연결2102/0·자동 시작 등록·PATH 추가. 최초 실제 결함은 다음 보완 계열로 분리 |
+| 2026-10-27 19:49 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | 구현 메인이 사용자 brief의 세 결함을 수용 기준으로 선택; 이전 R17 2/2 종료. PS5.1/7 각26통과·독립 검수·read-only check0, 공개 main 반영은 설계 세션 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -551,6 +553,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-25 11:03 | L1 P5 배포 GPU 설치 수용 | archive1f277950·바이너리1f317e2f SHA 일치·SHA256SUMS 통과·reload2442/0 동일 PID | 설계 세션 실제 배포 확인 | 새 no-account 로그인 안내 확인; 실제 공급자 완료 로그인0/2·Incus/재부팅 별도 |
 | 2026-10-25 11:03 | Linux LF 배포·checkout | 실제 archive와 기존 배포본2통과·CR3/누락/중복/비정규 거절6·checkout4 LF | packaged unit CR0·LF 규칙 강제 | 1445ee3; L1-LF.md·linux-lf/completion.json. 원래 index LF·working CRLF, renormalize 뒤 blob 동일; Rust 지문 재사용 |
 | 2026-10-27 19:14 | R17 자동 시작·PowerShell 집중 관문 | 초기 cutover143/0/1제외·경계6/0; 보완 집중4/0·registry/CLI13/0·strict CLI lint/build/실제 read-only check0; PS5.1/7 각14/0 | 미완료 재개 opt-out·legacy 상태·외부 명령 보존 독립 검수 보완 | R17-evidence/windows-gate 및 windows-final 입력별 지문·install-smoke/v2; 실제 설치/업그레이드·로그인 미실행 |
+| 2026-10-27 19:49 | R17.1 PowerShell 보완 관문 | PS5.1/7 각각14 smoke+12 upgrade 통과·ASCII/BOM0·ParseInput/ParseFile 동일·실제 잠금 파일 | 잠긴 백업 건너뛰기·오류 뒤 트레이 복구·실제 클라이언트 일치 | R17.1-evidence/harness-runs/summary.json; 네 원본 실패 시도 보존. 프로세스/CLI/사용자 PATH는 모의이며 설치·레지스트리 변경 없음 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
