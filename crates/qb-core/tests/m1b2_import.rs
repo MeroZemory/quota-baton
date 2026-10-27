@@ -132,6 +132,109 @@ fn imported(store: &AccountStore, cpa: &Path, provider: &str, user: Option<&str>
     store.list().unwrap().remove(0)
 }
 
+#[test]
+fn r18_claude_reimport_preserves_free_through_auth_expiry_and_paid_recovery() {
+    use chrono::{Duration, Utc};
+    use qb_core::accounts::{HealthReason, HealthSignal};
+
+    for auth_hold in [false, true] {
+        isolated(|store, cpa, home| {
+            let account = imported(store, cpa, "claude", None);
+            let now = Utc::now();
+            let blocked = store
+                .update_metadata(&account.id, |a| {
+                    a.user_state = UserState::Active;
+                    a.apply_health_signal(
+                        HealthSignal::PlanObservation {
+                            plan: Some("free".into()),
+                        },
+                        now,
+                    );
+                    if auth_hold {
+                        a.apply_health_signal(HealthSignal::AuthAfterRefresh, now);
+                    }
+                })
+                .unwrap();
+            if auth_hold {
+                assert!(matches!(
+                    blocked.health,
+                    Health::Cooling {
+                        reason: HealthReason::Auth,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(blocked.health, Health::PlanWithoutClaudeCode);
+            }
+            write(cpa, "account.json", &fixture("claude", None, 3));
+            let preview = import::preview(home, cpa, &[]).unwrap();
+            assert_eq!(preview[0].plan.as_deref(), Some("free"));
+            assert_eq!(store.load(&account.id).unwrap(), blocked);
+            let rows = import::run(store, cpa, &[], false).unwrap();
+            assert_eq!(rows[0].action, ImportAction::Updated);
+            assert_eq!(rows[0].plan.as_deref(), Some("free"));
+            let saved = store.load(&account.id).unwrap();
+            assert_eq!(saved.plan.as_deref(), Some("free"));
+            assert_eq!(saved.health, blocked.health);
+            assert!(!saved.eligible(None));
+            assert_eq!(
+                store.tokens(&saved).unwrap().access_token,
+                "synthetic-cpa-access-3"
+            );
+
+            let later = now + Duration::days(1);
+            let expired = store
+                .update_metadata(&account.id, |a| {
+                    a.apply_health_signal(HealthSignal::NoChange, later);
+                    a.apply_health_signal(HealthSignal::PlanObservation { plan: None }, later);
+                })
+                .unwrap();
+            assert_eq!(expired.health, Health::PlanWithoutClaudeCode);
+            assert_eq!(expired.plan.as_deref(), Some("free"));
+            assert!(!expired.eligible_at(None, later));
+            assert_eq!(store.load(&account.id).unwrap(), expired);
+
+            let paid = store
+                .update_metadata(&account.id, |a| {
+                    a.apply_health_signal(
+                        HealthSignal::PlanObservation {
+                            plan: Some("max_20x".into()),
+                        },
+                        later,
+                    );
+                })
+                .unwrap();
+            assert_eq!(paid.health, Health::Ready);
+            assert_eq!(paid.plan.as_deref(), Some("max_20x"));
+            assert!(paid.eligible_at(None, later));
+            assert_eq!(store.load(&account.id).unwrap(), paid);
+        });
+    }
+}
+
+#[test]
+fn r18_reimport_does_not_preserve_other_stale_plans() {
+    for (provider, plan) in [
+        ("claude", "max_20x"),
+        ("claude", "future-tier"),
+        ("codex", "free"),
+    ] {
+        isolated(|store, cpa, _| {
+            let account = imported(store, cpa, provider, Some("synthetic-user"));
+            store
+                .update_metadata(&account.id, |a| a.plan = Some(plan.into()))
+                .unwrap();
+            write(
+                cpa,
+                "account.json",
+                &fixture(provider, Some("synthetic-user"), 3),
+            );
+            import::run(store, cpa, &[], false).unwrap();
+            assert_eq!(store.load(&account.id).unwrap().plan, None);
+        });
+    }
+}
+
 fn owned_tokens() -> Tokens {
     Tokens {
         access_token: "synthetic-owned-access".into(),
