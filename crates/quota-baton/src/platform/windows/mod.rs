@@ -1,3 +1,6 @@
+pub(crate) mod autostart;
+#[cfg(test)]
+mod autostart_cli_tests;
 use clap::{Args, Subcommand};
 #[path = "../../catalog_snapshot.rs"]
 pub(crate) mod catalog_snapshot;
@@ -82,8 +85,10 @@ pub enum PlatformCommand {
             help = "같은 전용 파일의 내용 변경을 허용하여 제목 설정을 업그레이드합니다"
         )]
         force: bool,
-        #[arg(long, help = "현재 사용자 트레이 자동 시작을 연결합니다")]
+        #[arg(long, hide = true, conflicts_with = "no_autostart")]
         autostart: bool,
+        #[arg(long, help = "로그인할 때 quota-baton을 자동으로 시작하지 않습니다")]
+        no_autostart: bool,
         #[arg(long, help = "CPA 예약 작업을 삭제하지 않고 비활성화합니다")]
         disable_cpa_tasks: bool,
         #[arg(
@@ -108,6 +113,9 @@ pub struct StatusOptions {
     cutover_report: bool,
 }
 pub(crate) fn status_extra(home: &std::path::Path, options: StatusOptions) -> anyhow::Result<()> {
+    let english =
+        qb_core::config::Config::load(home)?.ui.language == qb_core::config::UiLanguage::En;
+    println_utf8!("{}", autostart::status(english)?);
     let cutover_report = options.cutover_report;
     if cutover_report {
         let report = cutover::report_only(&cutover::CutoverPaths::from_environment(
@@ -192,7 +200,8 @@ pub(crate) async fn run(command: PlatformCommand) -> anyhow::Result<()> {
             claude_mode,
             apply,
             force,
-            autostart,
+            autostart: _,
+            no_autostart,
             disable_cpa_tasks,
             detach_chatgpt_session_homes,
         } => {
@@ -201,7 +210,7 @@ pub(crate) async fn run(command: PlatformCommand) -> anyhow::Result<()> {
                 claude_mode: claude_mode.map(|mode| mode.parse()).transpose()?,
                 data_port: qb_core::config::Config::load(&home)?.server.data_port,
                 force,
-                autostart,
+                autostart: !no_autostart,
                 disable_cpa_tasks,
                 detach_chatgpt_session_homes,
             };

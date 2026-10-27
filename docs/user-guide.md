@@ -6,13 +6,27 @@ quota-baton은 Claude Code와 Codex CLI가 사용할 로컬 프록시입니다. 
 
 ## 설치와 첫 실행
 
-Windows에서 릴리스 바이너리를 준비합니다. 소스에서 빌드하려면 Rust 1.93 환경에서 다음을 실행합니다.
+Windows PowerShell에서 설치 스크립트를 실행할 수 있습니다. 릴리스의 SHA-256을 확인한 뒤 사용자 설치 폴더에 설치하고 연결 변경을 미리 보여 줍니다. 기존 설치도 같은 명령으로 업그레이드합니다.
+
+```powershell
+irm https://raw.githubusercontent.com/MeroZemory/quota-baton/main/install.ps1 | iex
+```
+
+제거할 때는 `uninstall.ps1`을 실행합니다. 연결과 프로그램을 제거하고 계정 데이터는 유지합니다. 계정 데이터까지 삭제하려는 경우에만 저장한 스크립트에 `-RemoveData`를 지정하세요.
+
+```powershell
+irm https://raw.githubusercontent.com/MeroZemory/quota-baton/main/uninstall.ps1 | iex
+```
+
+직접 릴리스 바이너리를 준비할 수도 있습니다. 소스에서 빌드하려면 Rust 1.93 환경에서 다음을 실행합니다.
 
 ```powershell
 cargo build --release --workspace
 ```
 
 `quota-baton.exe`는 코어와 CLI입니다. `quota-baton-tray.exe`는 트레이 프로그램입니다.
+
+`quota-baton wire`로 연결 변경을 미리 확인한 뒤 `quota-baton wire --apply`로 적용합니다. 적용하면 다음 Windows 로그인부터 트레이와 코어가 자동으로 시작됩니다. 원하지 않으면 `--no-autostart`를 붙이세요. 기존 `--autostart`도 계속 사용할 수 있습니다. `quota-baton status`에서 등록 상태와 실행 경로를 확인하며, `quota-baton unwire --apply`는 quota-baton의 자동 시작 등록만 제거합니다.
 
 ### 업그레이드 후 실행
 

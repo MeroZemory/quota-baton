@@ -18,14 +18,11 @@ use std::{
 };
 use toml_edit::DocumentMut;
 use windows::Win32::{
-    Foundation::{ERROR_FILE_NOT_FOUND, HLOCAL, LocalFree},
+    Foundation::{HLOCAL, LocalFree},
     Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
     },
-    System::Registry::{
-        HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, REG_VALUE_TYPE, RegCloseKey,
-        RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    },
+    System::Registry::REG_SZ,
 };
 use windows::core::PCWSTR;
 
@@ -684,7 +681,7 @@ impl Default for WireOptions {
             claude_mode: None,
             data_port: 10200,
             force: false,
-            autostart: false,
+            autostart: true,
             disable_cpa_tasks: false,
             detach_chatgpt_session_homes: false,
         }
@@ -985,105 +982,14 @@ fn tray_autostart_command() -> Result<String> {
     Ok(format!("\"{}\"", exe.display()))
 }
 
-fn registry_wide(value: &str) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    std::ffi::OsStr::new(value)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-fn open_run_key(
-    access: windows::Win32::System::Registry::REG_SAM_FLAGS,
-) -> Result<windows::Win32::System::Registry::HKEY> {
-    let subkey = registry_wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    let mut key = windows::Win32::System::Registry::HKEY::default();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(subkey.as_ptr()),
-            None,
-            access,
-            &mut key,
-        )
-    };
-    if !status.is_ok() {
-        bail!("자동 시작 레지스트리를 열 수 없습니다")
-    }
-    Ok(key)
-}
-
 fn read_autostart() -> Result<(Original, u32)> {
-    let subkey = registry_wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    let name = registry_wide("quota-baton-tray");
-    let mut key = windows::Win32::System::Registry::HKEY::default();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(subkey.as_ptr()),
-            None,
-            KEY_READ,
-            &mut key,
-        )
-    };
-    if status == ERROR_FILE_NOT_FOUND {
-        return Ok((Original::default(), REG_SZ.0));
-    }
-    if !status.is_ok() {
-        bail!("자동 시작 레지스트리를 읽지 못했습니다")
-    }
-    let mut value_type = REG_VALUE_TYPE(0);
-    let mut length = 0u32;
-    let status = unsafe {
-        RegQueryValueExW(
-            key,
-            PCWSTR(name.as_ptr()),
-            None,
-            Some(&mut value_type),
-            None,
-            Some(&mut length),
-        )
-    };
-    if status == ERROR_FILE_NOT_FOUND {
-        unsafe {
-            let _ = RegCloseKey(key);
-        };
-        return Ok((Original::default(), REG_SZ.0));
-    }
-    if !status.is_ok() {
-        unsafe {
-            let _ = RegCloseKey(key);
-        };
-        bail!("자동 시작 값을 읽지 못했습니다")
-    }
-    let mut bytes = vec![0u8; length as usize];
-    let status = unsafe {
-        RegQueryValueExW(
-            key,
-            PCWSTR(name.as_ptr()),
-            None,
-            Some(&mut value_type),
-            Some(bytes.as_mut_ptr()),
-            Some(&mut length),
-        )
-    };
-    unsafe {
-        let _ = RegCloseKey(key);
-    }
-    if !status.is_ok() {
-        bail!("자동 시작 값을 읽지 못했습니다")
-    }
-    let words =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, (length as usize) / 2) };
-    let value = String::from_utf16_lossy(words)
-        .trim_end_matches('\0')
-        .to_owned();
+    let (value, value_type) = crate::platform::autostart::read()?;
     Ok((
         Original {
-            present: true,
-            value: Some(value),
+            present: value.is_some(),
+            value,
         },
-        value_type.0,
+        value_type,
     ))
 }
 
@@ -1113,56 +1019,12 @@ fn set_autostart(action: &OptionalActionJournal) -> Result<()> {
     }) {
         return Ok(());
     }
-    let key = open_run_key(KEY_SET_VALUE)?;
-    let name = registry_wide("quota-baton-tray");
-    let value = registry_wide(&action.after);
-    let value_type = REG_VALUE_TYPE(action.after_type);
-    let status = unsafe {
-        RegSetValueExW(
-            key,
-            PCWSTR(name.as_ptr()),
-            None,
-            value_type,
-            Some(bytemuck_u8(&value)),
-        )
-    };
-    unsafe {
-        let _ = RegCloseKey(key);
-    }
-    if !status.is_ok() {
-        bail!("자동 시작 레지스트리 변경을 거부했습니다")
-    }
-    Ok(())
+    crate::platform::autostart::set(&action.after, action.after_type)
 }
 
-fn restore_autostart(original: &Original, value_type: u32) -> Result<()> {
-    let key = open_run_key(KEY_SET_VALUE)?;
-    let name = registry_wide("quota-baton-tray");
-    let status = if original.present {
-        let value = registry_wide(original.value.as_deref().unwrap_or_default());
-        unsafe {
-            RegSetValueExW(
-                key,
-                PCWSTR(name.as_ptr()),
-                None,
-                REG_VALUE_TYPE(value_type),
-                Some(bytemuck_u8(&value)),
-            )
-        }
-    } else {
-        unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) }
-    };
-    unsafe {
-        let _ = RegCloseKey(key);
-    }
-    if !status.is_ok() {
-        bail!("자동 시작 복구를 거부했습니다")
-    }
+fn restore_autostart(_original: &Original, _value_type: u32) -> Result<()> {
+    crate::platform::autostart::remove_owned(true)?;
     Ok(())
-}
-
-fn bytemuck_u8(words: &[u16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2) }
 }
 
 #[cfg(test)]
@@ -1362,10 +1224,6 @@ fn check_optional_preconditions_with_task_query(
     }
     if options.autostart {
         let _ = read_autostart()?;
-        let key = open_run_key(KEY_SET_VALUE)?;
-        unsafe {
-            let _ = RegCloseKey(key);
-        }
     }
     if options.disable_cpa_tasks {
         for name in ["cliproxyapi-proxy", "cliproxyapi-quota-watch"] {
@@ -1386,7 +1244,36 @@ pub fn wire_with_options(
     apply: bool,
     options: WireOptions,
 ) -> Result<Report> {
-    wire_with_task_query(paths, apply, options, &task_enabled)
+    if options.disable_cpa_tasks {
+        check_cpa_dependency(active_linked_count(&paths.qb_home)?, &options)?;
+    }
+    let before = if options.autostart {
+        Some(read_autostart()?.0)
+    } else {
+        None
+    };
+    let mut report = wire_with_task_query(paths, apply, options, &task_enabled)?;
+    if let Some(before) = before {
+        let desired = tray_autostart_command()?;
+        if before.value.as_deref() == Some(desired.as_str()) {
+            report
+                .summary
+                .push(format!("로그인 자동 시작: 이미 등록됨 · {desired}"));
+        } else {
+            report.summary.push(format!(
+                "로그인 자동 시작: {} → {desired}",
+                before.value.as_deref().unwrap_or("등록 안 됨")
+            ));
+            report.changed.push(
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\quota-baton".into(),
+            );
+        }
+        // Completed dedicated journals can return without replaying optional actions.
+        if apply {
+            crate::platform::autostart::set(&desired, REG_SZ.0)?;
+        }
+    }
+    Ok(report)
 }
 
 fn wire_with_task_query(
@@ -1635,9 +1522,7 @@ fn wire_with_task_query(
         "claude.env.ANTHROPIC_AUTH_TOKEN".into(),
     ];
     if options.autostart {
-        changed.push(
-            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\quota-baton-tray".into(),
-        );
+        changed.push("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\quota-baton".into());
     }
     if options.disable_cpa_tasks {
         changed.extend(
@@ -1854,6 +1739,14 @@ pub fn report_only(paths: &CutoverPaths) -> Report {
 }
 
 pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> {
+    let mut report = unwire_files(paths, apply, force)?;
+    report
+        .summary
+        .extend(crate::platform::autostart::remove_owned(apply)?);
+    Ok(report)
+}
+
+fn unwire_files(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> {
     if !paths.journal().exists() {
         return Ok(Report {
             summary: vec!["요약: 되돌릴 연결 설정이 없습니다".into()],
@@ -1934,14 +1827,6 @@ pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> 
             }
             if current != session.after {
                 bail!("파일이 변경되어 되돌릴 수 없습니다: {}", path.display());
-            }
-        }
-        if let Some(autostart) = &journal.autostart {
-            let current = read_autostart()?.0;
-            if current.value != autostart.before.value
-                && current.value != Some(autostart.after.clone())
-            {
-                bail!("autostart 설정이 변경되어 되돌릴 수 없습니다");
             }
         }
         for task in &journal.cpa_tasks {
@@ -2731,6 +2616,34 @@ fn atomic_bytes_with_counter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r17_preview_shows_foreign_value_and_unwire_only_removes_our_registration() {
+        use crate::platform::autostart;
+        let foreign = "\"C:\\sample-tools\\other.exe\"";
+        autostart::set_fake(Some((foreign.into(), REG_SZ.0)));
+        let (_dir, p) = paths();
+        fs::write(&p.client_key, "synthetic-client-key").unwrap();
+        let preview = wire(&p, false).unwrap();
+        assert!(preview.summary.iter().any(|line| line.contains(foreign)));
+        assert_eq!(autostart::read().unwrap().0.as_deref(), Some(foreign));
+        assert_eq!(autostart::fake_writes(), 0);
+        wire(&p, true).unwrap();
+        assert_eq!(
+            autostart::read().unwrap().0,
+            Some(tray_autostart_command().unwrap())
+        );
+        unwire(&p, true, false).unwrap();
+        assert_eq!(autostart::read().unwrap().0, None);
+        autostart::set_fake(Some((tray_autostart_command().unwrap(), REG_SZ.0)));
+        unwire(&p, false, false).unwrap();
+        assert!(autostart::read().unwrap().0.is_some());
+        unwire(&p, true, false).unwrap();
+        assert_eq!(autostart::read().unwrap().0, None);
+        autostart::set_fake(Some((foreign.into(), REG_SZ.0)));
+        unwire(&p, true, false).unwrap();
+        assert_eq!(autostart::read().unwrap().0.as_deref(), Some(foreign));
+        autostart::set_fake(None);
+    }
     fn tempdir() -> std::io::Result<tempfile::TempDir> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r3-cutover-tests");
         fs::create_dir_all(&root)?;
