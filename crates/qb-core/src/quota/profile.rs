@@ -11,6 +11,10 @@ pub(super) struct ProfileClock {
     pub(super) running: bool,
     recovery_next: Option<Instant>,
     flight: Option<tokio::sync::watch::Receiver<Option<Result<Account, PollError>>>>,
+    #[cfg(test)]
+    pub(super) test_before_permit: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    #[cfg(test)]
+    pub(super) test_follower_joined: Option<Arc<tokio::sync::Notify>>,
 }
 impl ProfileClock {
     fn due(&self, recovery: bool) -> bool {
@@ -109,7 +113,11 @@ impl UsagePoller {
         let permit = if force {
             None
         } else {
-            Some(self.profile_semaphore.try_acquire().map_err(|_| PollError::Unavailable)?)
+            Some(
+                self.profile_semaphore
+                    .try_acquire()
+                    .map_err(|_| PollError::Unavailable)?,
+            )
         };
         let (result, follower) = {
             let mut clocks = self.clocks.lock().unwrap_or_else(|e| e.into_inner());
@@ -117,31 +125,47 @@ impl UsagePoller {
             if clock.running {
                 (None, clock.flight.clone())
             } else {
-            if !force && !clock.due(recovering(&account)) {
-                return Err(PollError::TooSoon {
-                    retry_after: DAY.as_secs(),
-                });
-            }
-            clock.running = true;
-            clock.forced = false;
-            // All ordinary attempts count: token-read errors, 401/5xx, unknown
-            // shape, timeout and cancellation. Only explicit lifecycle hooks
-            // can bypass this deadline; the C9 retry stays within this attempt.
-            clock.next = Some(Instant::now() + DAY);
-            // An untimed entitlement block still needs positive recovery
-            // observations while ineligible and the tray is closed.
-            clock.recovery_next = Some(Instant::now() + Duration::from_secs(self.min_interval));
-            let (sender, receiver) = tokio::sync::watch::channel(None);
-            clock.flight = Some(receiver);
-            (Some(sender), None)
+                if !force && !clock.due(recovering(&account)) {
+                    return Err(PollError::TooSoon {
+                        retry_after: DAY.as_secs(),
+                    });
+                }
+                clock.running = true;
+                clock.forced = false;
+                // All ordinary attempts count: token-read errors, 401/5xx, unknown
+                // shape, timeout and cancellation. Only explicit lifecycle hooks
+                // can bypass this deadline; the C9 retry stays within this attempt.
+                clock.next = Some(Instant::now() + DAY);
+                // An untimed entitlement block still needs positive recovery
+                // observations while ineligible and the tray is closed.
+                clock.recovery_next = Some(Instant::now() + Duration::from_secs(self.min_interval));
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                clock.flight = Some(receiver);
+                (Some(sender), None)
             }
         };
         if let Some(mut follower) = follower {
+            // A forced leader can publish its flight before acquiring the slot.
+            // Joining it must never retain the slot that leader needs.
+            drop(permit);
+            #[cfg(test)]
+            if let Some(joined) = self
+                .clocks
+                .lock()
+                .unwrap()
+                .get_mut(id)
+                .and_then(|clock| clock.profile.test_follower_joined.take())
+            {
+                joined.notify_one();
+            }
             loop {
                 if let Some(result) = follower.borrow_and_update().clone() {
                     return result;
                 }
-                follower.changed().await.map_err(|_| PollError::Unavailable)?;
+                follower
+                    .changed()
+                    .await
+                    .map_err(|_| PollError::Unavailable)?;
             }
         }
         let reservation = ProfileReservation {
@@ -149,9 +173,26 @@ impl UsagePoller {
             id: id.into(),
             result: result.ok_or(PollError::Unavailable)?,
         };
+        #[cfg(test)]
+        {
+            let gate = self
+                .clocks
+                .lock()
+                .unwrap()
+                .get_mut(id)
+                .and_then(|clock| clock.profile.test_before_permit.take());
+            if let Some(gate) = gate {
+                gate.0.notify_one();
+                gate.1.notified().await;
+            }
+        }
         let _permit = match permit {
             Some(permit) => permit,
-            None => self.profile_semaphore.acquire().await.map_err(|_| PollError::Unavailable)?,
+            None => self
+                .profile_semaphore
+                .acquire()
+                .await
+                .map_err(|_| PollError::Unavailable)?,
         };
         let result = self.fetch_profile_request(id).await;
         reservation.result.send_replace(Some(result.clone()));

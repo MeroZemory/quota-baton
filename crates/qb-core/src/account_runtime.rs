@@ -2845,14 +2845,17 @@ impl AccountRuntime {
                         let applied_at = Utc::now();
                         if account.provider == Provider::Codex
                             && let Some(plan) = reported["plan"].as_str()
-                            && crate::dashboard::history::PlanName::try_from(plan.to_owned())
-                                .is_ok()
                         {
                             let previous = account.plan.clone();
+                            // A newly reported unknown tier must not leave the
+                            // previous paid plan looking current. Do not persist
+                            // arbitrary provider text as public plan metadata.
+                            let plan =
+                                crate::dashboard::history::PlanName::try_from(plan.to_owned())
+                                    .ok()
+                                    .map(|plan| plan.as_str().to_owned());
                             account.apply_health_signal(
-                                HealthSignal::PlanObservation {
-                                    plan: Some(plan.to_owned()),
-                                },
+                                crate::accounts::HealthSignal::PlanObservation { plan },
                                 applied_at,
                             );
                             if previous != account.plan {
