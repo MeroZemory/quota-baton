@@ -280,15 +280,17 @@ async fn profile_second_401_exhausts_c9_retry_without_a_second_refresh() {
 }
 
 #[tokio::test]
-async fn profile_is_never_fetched_by_request_unavailable_hook() {
+async fn profile_follows_actual_usage_in_request_unavailable_hook() {
     let f = Fixture::with_provider(1, Provider::Claude).await;
     f.fake.state.push(ScriptedResponse::json(reqwest::StatusCode::OK,
         r#"{"five_hour":{"utilization":10,"resets_at":"2099-01-01T00:00:00Z"}}"#));
+    f.fake.state.push(profile_reply("default_claude_max_20x"));
     f.relay.quota.before_unavailable(Provider::Claude).await;
     let requests = f.fake.state.requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].path_and_query, "/api/oauth/usage");
-    assert!(f.relay.quota.profile_due(&f.account(0)));
+    assert_eq!(requests[1].path_and_query, "/api/oauth/profile");
+    assert!(!f.relay.quota.profile_due(&f.account(0)));
 }
 
 

@@ -4,6 +4,19 @@ use std::{borrow::Cow, cell::Cell};
 pub mod forecast;
 mod strings;
 
+const PLAN_STRINGS: &[(&str, &str)] = &[
+    (
+        "Free 요금제 · Claude Code 사용 불가",
+        "Free plan · no Claude Code access",
+    ),
+    (
+        "Claude Code를 지원하는 요금제로 변경한 뒤 사용량을 새로고침하세요.",
+        "Upgrade to a plan with Claude Code access, then refresh usage.",
+    ),
+    ("요금제 변경: {0} → {1}", "Plan changed: {0} → {1}"),
+    ("요금제 변경", "Plan changed"),
+];
+
 thread_local! { static LANGUAGE: Cell<UiLanguage> = const { Cell::new(UiLanguage::Ko) }; }
 
 pub fn language() -> UiLanguage {
@@ -34,6 +47,7 @@ pub fn text(ko: &str) -> Cow<'_, str> {
             .iter()
             .chain(crate::i18n_shell_strings::STRINGS)
             .chain(crate::i18n_client_strings::STRINGS)
+            .chain(PLAN_STRINGS)
             .find_map(|(key, en)| (*key == ko).then_some(*en))
     {
         return Cow::Borrowed(en);

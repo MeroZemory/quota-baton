@@ -177,6 +177,7 @@ pub enum DisplayState {
     StoreError,
     Payment,
     Permission,
+    PlanWithoutClaudeCode,
     Credits,
     Paused,
     Quota,
@@ -465,7 +466,23 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
                 } else {
                     String::new()
                 };
-                format!(" · {} {}{reset}", s.provider_label, s.verdict.text())
+                let plan_note = raw
+                    .accounts
+                    .iter()
+                    .any(|a| {
+                        a.provider == s.provider
+                            && a.user_state != "disabled"
+                            && a.health.kind == "plan_without_claude_code"
+                    })
+                    .then(|| crate::i18n::static_text("Free 요금제 · Claude Code 사용 불가"));
+                format!(
+                    " · {} {}{reset}{}",
+                    s.provider_label,
+                    s.verdict.text(),
+                    plan_note
+                        .map(|note| format!(" · {note}"))
+                        .unwrap_or_default()
+                )
             })
             .collect::<String>()
     );
@@ -495,7 +512,7 @@ pub fn plan_label(provider: &str, plan: Option<&str>) -> Option<&'static str> {
         ("claude", "max") => Some("Max"),
         ("claude", "max_5x") => Some("Max 5x"),
         ("claude", "max_20x") => Some("Max 20x"),
-        ("codex", "free") => Some("Free"),
+        ("claude" | "codex", "free") => Some("Free"),
         ("codex", "plus") => Some("Plus"),
         ("codex", "team") => Some("Team"),
         ("codex", "business") => Some("Business"),
@@ -566,6 +583,9 @@ fn display_state(a: &Account) -> DisplayState {
     if a.health.kind == "needs_relogin" {
         return DisplayState::Relogin;
     }
+    if a.health.kind == "plan_without_claude_code" {
+        return DisplayState::PlanWithoutClaudeCode;
+    }
     if account_cooling(a) {
         match a.health.reason.as_deref() {
             Some("link_stale") => return DisplayState::LinkStale,
@@ -594,6 +614,11 @@ fn display_state(a: &Account) -> DisplayState {
 fn state_style(s: DisplayState) -> (Group, Option<Chip>) {
     use DisplayState::*;
     let (group, text, tone) = match s {
+        PlanWithoutClaudeCode => (
+            Group::NeedsAction,
+            crate::i18n::static_text("Free 요금제 · Claude Code 사용 불가"),
+            Tone::Bad,
+        ),
         Relogin => (
             Group::NeedsAction,
             crate::i18n::static_text("다시 로그인 필요"),
@@ -891,6 +916,7 @@ pub fn summary_forecast(
                 | DisplayState::StoreError
                 | DisplayState::Payment
                 | DisplayState::Permission
+                | DisplayState::PlanWithoutClaudeCode
                 | DisplayState::Auth
         )
     {
@@ -1126,6 +1152,12 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         .map(|t| local_time(t, now, false));
     use DisplayState::*;
     row.reason = match row.state {
+        PlanWithoutClaudeCode => Some(
+            crate::i18n::static_text(
+                "Claude Code를 지원하는 요금제로 변경한 뒤 사용량을 새로고침하세요.",
+            )
+            .into(),
+        ),
         Relogin => Some(
             if matches!(summary.verdict, Verdict::Available | Verdict::Credits) {
                 serving
@@ -1559,7 +1591,7 @@ fn menu_info(
         sessions_line,
         sessions_tooltip: crowded_threshold.map(|t| crate::i18n::format("분산 기준 {0}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다.", &[t.to_string()])),
         show_refresh_usage: a.user_state != "disabled" && a.health.kind != "needs_relogin",
-        show_relogin: a.source.owned_or_adopted(),
+        show_relogin: a.source.owned_or_adopted() && a.health.kind != "plan_without_claude_code",
         show_release_hold: quota(a)
             && a.credits.as_ref().is_some_and(|c| {
                 qb_core::credits::available(
@@ -1753,6 +1785,49 @@ mod tests {
     }
     fn codex(v: &View) -> &Section {
         &v.sections[1]
+    }
+
+    #[test]
+    fn r18_free_claude_plan_is_blocked_with_upgrade_and_usage_recovery() {
+        for (language, label, recovery) in [
+            (
+                crate::i18n::UiLanguage::Ko,
+                "Free 요금제 · Claude Code 사용 불가",
+                "Claude Code를 지원하는 요금제로 변경한 뒤 사용량을 새로고침하세요.",
+            ),
+            (
+                crate::i18n::UiLanguage::En,
+                "Free plan · no Claude Code access",
+                "Upgrade to a plan with Claude Code access, then refresh usage.",
+            ),
+        ] {
+            crate::i18n::with_language(language, || {
+                let mut account = base("claude-free");
+                account["provider"] = json!("claude");
+                account["plan"] = json!("free");
+                account["pool_eligible"] = json!(false);
+                account["health"] = json!({"kind":"plan_without_claude_code"});
+                let input =
+                    json!({"accounts":[account],"pools":{"claude":{"eligible":0}}}).to_string();
+                let view = project(&input, now().into()).unwrap();
+                let row = &view.sections[0].rows[0];
+                assert_eq!(row.state, DisplayState::PlanWithoutClaudeCode);
+                assert_eq!(row.group, Group::NeedsAction);
+                assert_eq!(row.plan.as_deref(), Some("Free"));
+                assert_eq!(row.chip.as_ref().unwrap().text, label);
+                assert_eq!(row.chip.as_ref().unwrap().tone, Tone::Bad);
+                assert_eq!(row.reason.as_deref(), Some(recovery));
+                assert!(row.menu.show_refresh_usage);
+                assert!(!row.menu.show_relogin);
+                assert!(row.action.is_none());
+                assert_eq!(view.badge, Badge::Attention);
+                assert!(view.tray_tooltip.contains(label));
+                let legacy = crate::parse_state_at(&input, now().into()).unwrap();
+                assert_eq!(legacy[0].health_chip, label);
+                assert_eq!(legacy[0].health_tone, crate::Tone::Critical);
+                assert!(legacy[0].attention);
+            });
+        }
     }
 
     #[test]

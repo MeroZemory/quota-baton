@@ -1110,6 +1110,7 @@ pub fn parse_state_at(json: &str, now: SystemTime) -> serde_json::Result<Vec<Row
             let mut row = row(account, now);
             row.view_input = Some(view_input.clone());
             if account.user_state == "active"
+                && account.health.kind != "plan_without_claude_code"
                 && let Some(notice) = account
                     .quota_notice
                     .as_ref()
@@ -1149,7 +1150,9 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         .pacing
         .backoff_secs
         .is_some_and(|seconds| seconds > 0);
-    let health_tone = if account.probe_pending
+    let health_tone = if account.health.kind == "plan_without_claude_code" {
+        health_tone(account)
+    } else if account.probe_pending
         || account.drain
         || account.refresh_attention
         || pacing
@@ -1265,6 +1268,9 @@ pub fn health_chip(account: &Account, now: SystemTime) -> String {
     if account.user_state == "disabled" {
         return crate::i18n::static_text("비활성").into();
     }
+    if account.health.kind == "plan_without_claude_code" {
+        return crate::i18n::static_text("Free 요금제 · Claude Code 사용 불가").into();
+    }
     if account.user_state == "paused" {
         return crate::i18n::static_text("일시정지").into();
     }
@@ -1339,6 +1345,7 @@ pub fn health_tone(account: &Account) -> Tone {
         "cooling" if account.health.reason.as_deref() == Some("store_error") => Tone::Critical,
         "cooling" => Tone::Warning,
         "needs_relogin" => Tone::Critical,
+        "plan_without_claude_code" => Tone::Critical,
         _ => Tone::Neutral,
     }
 }

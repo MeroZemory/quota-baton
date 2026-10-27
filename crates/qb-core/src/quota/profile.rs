@@ -1,4 +1,4 @@
-//! Read-only Claude plan observations on the existing scheduler, never a relay hook.
+//! Claude plan observations using the existing credential and metadata owners.
 use super::*;
 use crate::oauth::claude_profile;
 
@@ -9,19 +9,34 @@ pub(super) struct ProfileClock {
     pub(super) next: Option<Instant>,
     pub(super) forced: bool,
     pub(super) running: bool,
+    recovery_next: Option<Instant>,
+    flight: Option<tokio::sync::watch::Receiver<Option<Result<Account, PollError>>>>,
 }
 impl ProfileClock {
-    fn due(&self) -> bool {
-        !self.running && (self.forced || self.next.is_none_or(|at| at <= Instant::now()))
+    fn due(&self, recovery: bool) -> bool {
+        !self.running
+            && (self.forced
+                || self.next.is_none_or(|at| at <= Instant::now())
+                || (recovery && self.recovery_next.is_none_or(|at| at <= Instant::now())))
     }
 }
 
 struct ProfileReservation<'a> {
     poller: &'a UsagePoller,
     id: String,
+    result: tokio::sync::watch::Sender<Option<Result<Account, PollError>>>,
 }
 impl Drop for ProfileReservation<'_> {
     fn drop(&mut self) {
+        // Cancellation wakes every coalesced caller with an explicit failure.
+        self.result.send_if_modified(|result| {
+            if result.is_none() {
+                *result = Some(Err(PollError::Unavailable));
+                true
+            } else {
+                false
+            }
+        });
         if let Some(clock) = self
             .poller
             .clocks
@@ -30,6 +45,7 @@ impl Drop for ProfileReservation<'_> {
             .get_mut(&self.id)
         {
             clock.profile.running = false;
+            clock.profile.flight = None;
         }
     }
 }
@@ -38,6 +54,12 @@ fn allowed(account: &Account) -> bool {
     // Profile metadata covers every Claude user state, including disabled.
     // Serving/usage eligibility remains separate; unusable auth is excluded.
     account.provider == Provider::Claude && !matches!(account.health, Health::NeedsRelogin { .. })
+}
+
+fn recovering(account: &Account) -> bool {
+    account.provider == Provider::Claude
+        && (account.health == Health::PlanWithoutClaudeCode
+            || account.plan.as_deref() == Some("free"))
 }
 
 impl UsagePoller {
@@ -63,30 +85,39 @@ impl UsagePoller {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&account.id)
-                .is_none_or(|clock| clock.profile.due())
+                .is_none_or(|clock| clock.profile.due(recovering(account)))
     }
 
     pub(super) async fn fetch_profile(&self, id: &str) -> Result<Account, PollError> {
+        self.fetch_profile_mode(id, false).await
+    }
+
+    /// An actual permission denial (or usage attempt) requires fresh evidence.
+    /// Same-account callers share the in-flight observation, including failure.
+    pub(crate) async fn refresh_permission_plan(&self, id: &str) -> Result<Account, PollError> {
+        self.fetch_profile_mode(id, true).await
+    }
+
+    async fn fetch_profile_mode(&self, id: &str, force: bool) -> Result<Account, PollError> {
         let account = self.load(id).await?;
         if !allowed(&account) {
             return Err(PollError::Excluded);
         }
-        let endpoint = format!("{}/api/oauth/profile", self.bases[0]);
-        #[cfg(any(test, feature = "testkit"))]
-        if !claude_profile::synthetic_endpoint(&endpoint) {
-            return Err(PollError::Unavailable);
-        }
-        // Do not queue profiles behind a slow request and prolong the usage
-        // scheduler tick. A busy slot leaves the account due for the next tick;
-        // it consumes no attempt. Profiles never occupy usage poll slots.
-        let _permit = self
-            .profile_semaphore
-            .try_acquire()
-            .map_err(|_| PollError::Unavailable)?;
-        {
+        // Ordinary background attempts keep the old non-queuing behavior and
+        // daily failure deadline. Forced work reserves BEFORE waiting for the
+        // global slot so concurrent callers cannot enqueue duplicate requests.
+        let permit = if force {
+            None
+        } else {
+            Some(self.profile_semaphore.try_acquire().map_err(|_| PollError::Unavailable)?)
+        };
+        let (result, follower) = {
             let mut clocks = self.clocks.lock().unwrap_or_else(|e| e.into_inner());
             let clock = &mut clocks.entry(id.into()).or_default().profile;
-            if !clock.due() {
+            if clock.running {
+                (None, clock.flight.clone())
+            } else {
+            if !force && !clock.due(recovering(&account)) {
                 return Err(PollError::TooSoon {
                     retry_after: DAY.as_secs(),
                 });
@@ -97,11 +128,46 @@ impl UsagePoller {
             // shape, timeout and cancellation. Only explicit lifecycle hooks
             // can bypass this deadline; the C9 retry stays within this attempt.
             clock.next = Some(Instant::now() + DAY);
+            // An untimed entitlement block still needs positive recovery
+            // observations while ineligible and the tray is closed.
+            clock.recovery_next = Some(Instant::now() + Duration::from_secs(self.min_interval));
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            clock.flight = Some(receiver);
+            (Some(sender), None)
+            }
+        };
+        if let Some(mut follower) = follower {
+            loop {
+                if let Some(result) = follower.borrow_and_update().clone() {
+                    return result;
+                }
+                follower.changed().await.map_err(|_| PollError::Unavailable)?;
+            }
         }
-        let _reservation = ProfileReservation {
+        let reservation = ProfileReservation {
             poller: self,
             id: id.into(),
+            result: result.ok_or(PollError::Unavailable)?,
         };
+        let _permit = match permit {
+            Some(permit) => permit,
+            None => self.profile_semaphore.acquire().await.map_err(|_| PollError::Unavailable)?,
+        };
+        let result = self.fetch_profile_request(id).await;
+        reservation.result.send_replace(Some(result.clone()));
+        result
+    }
+
+    async fn fetch_profile_request(&self, id: &str) -> Result<Account, PollError> {
+        let account = self.load(id).await?;
+        if !allowed(&account) {
+            return Err(PollError::Excluded);
+        }
+        let endpoint = format!("{}/api/oauth/profile", self.bases[0]);
+        #[cfg(any(test, feature = "testkit"))]
+        if !claude_profile::synthetic_endpoint(&endpoint) {
+            return Err(PollError::Unavailable);
+        }
         let gates = self
             .tokens
             .lock()
@@ -184,20 +250,36 @@ impl UsagePoller {
             }
             let plan = claude_profile::plan(&profile).map(str::to_owned);
             let store = self.store.clone();
+            let obs = self.obs.clone();
             let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
             return crate::boxes::spawn_blocking(move || {
                 // This API holds the existing lease/transaction and merges into
                 // current metadata. A late response cannot overwrite a refresh,
                 // adoption or unrelated admin edit made since request dispatch.
-                store.update_metadata_for_token(&account.id, &failed, |current| {
+                let mut previous_change = None;
+                let updated = store.update_metadata_for_token(&account.id, &failed, |current| {
                     if current.generation == account.generation
                         && current.source == account.source
                         && current.identity == account.identity
                         && allowed(current)
                     {
-                        current.plan = plan;
+                        let previous = current.plan.clone();
+                        current.apply_health_signal(
+                            crate::accounts::HealthSignal::PlanObservation { plan },
+                            Utc::now(),
+                        );
+                        if previous != current.plan {
+                            previous_change = Some(previous);
+                        }
                     }
-                })
+                })?;
+                // Persistence and the exact-token/source/generation fence have
+                // succeeded. Emit within this blocking task so cancellation of
+                // the requesting future cannot lose a committed plan change.
+                if let Some(previous) = previous_change {
+                    obs.record_plan_change(&updated, previous.as_deref());
+                }
+                Ok::<_, crate::accounts::StoreError>(updated)
             })
             .await
             .map_err(|_| PollError::Unavailable)?

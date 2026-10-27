@@ -64,6 +64,10 @@ pub enum HealthSignal {
         scope: String,
     },
     Ready,
+    /// Native profile observation; None/unknown is not evidence of paid recovery.
+    PlanObservation {
+        plan: Option<String>,
+    },
     UsageSnapshot {
         snapshot: serde_json::Value,
         model: Option<String>,
@@ -96,10 +100,11 @@ impl Account {
 
     pub fn eligible_at(&self, model: Option<&str>, now: DateTime<Utc>) -> bool {
         self.user_state == UserState::Active
+            && !self.claude_free_plan()
             && self.payment_until.is_none_or(|until| until <= now)
             && match &self.health {
                 Health::Ready => true,
-                Health::NeedsRelogin { .. } => false,
+                Health::NeedsRelogin { .. } | Health::PlanWithoutClaudeCode => false,
                 Health::Cooling { until, scope, .. } => {
                     *until <= now
                         || scope
@@ -107,6 +112,10 @@ impl Account {
                             .is_some_and(|blocked| model.is_none_or(|m| blocked != m))
                 }
             }
+    }
+
+    fn claude_free_plan(&self) -> bool {
+        self.provider == Provider::Claude && self.plan.as_deref() == Some("free")
     }
 
     /// Expire before reading health for a transition, retaining auth probe history.
@@ -144,6 +153,10 @@ impl Account {
                 scope: "account".into(),
             };
         }
+        // Another health reason may temporarily take precedence over the plan hold.
+        if self.health == Health::Ready && self.claude_free_plan() {
+            self.health = Health::PlanWithoutClaudeCode;
+        }
         before
             != (
                 self.health.clone(),
@@ -154,10 +167,11 @@ impl Account {
             )
     }
 
-    /// Returns whether health or persisted auth backoff changed. User state is
+    /// Returns whether plan, health or persisted auth backoff changed. User state is
     /// independent and is never modified by an upstream signal.
     pub fn apply_health_signal(&mut self, signal: HealthSignal, now: DateTime<Utc>) -> bool {
         let before = (
+            self.plan.clone(),
             self.health.clone(),
             self.auth_failures,
             self.payment_failures,
@@ -187,14 +201,42 @@ impl Account {
                 self.quota_cooling = None;
                 self.auth_probe_pending = false;
             }
+            HealthSignal::PlanObservation { plan } => {
+                let eligible = matches!(
+                    plan.as_deref(),
+                    Some("pro" | "max" | "max_5x" | "max_20x" | "team" | "enterprise")
+                );
+                // Preserve known Free evidence across an absent or unknown observation,
+                // including while auth/payment/quota temporarily owns the health slot.
+                if !self.claude_free_plan() || eligible || plan.as_deref() == Some("free") {
+                    self.plan = plan;
+                }
+                if self.provider == Provider::Claude {
+                    if eligible && self.health == Health::PlanWithoutClaudeCode {
+                        self.health = Health::Ready;
+                    } else if self.claude_free_plan()
+                        && matches!(
+                            self.health,
+                            Health::Ready
+                                | Health::Cooling {
+                                    reason: HealthReason::Permission,
+                                    ..
+                                }
+                        )
+                    {
+                        self.health = Health::PlanWithoutClaudeCode;
+                    }
+                }
+            }
             HealthSignal::StaleToken401 | HealthSignal::NoChange => {}
             HealthSignal::ReloginCompleted => {
                 if !matches!(
                     self.health,
-                    Health::Cooling {
-                        reason: HealthReason::Payment,
-                        ..
-                    }
+                    Health::PlanWithoutClaudeCode
+                        | Health::Cooling {
+                            reason: HealthReason::Payment,
+                            ..
+                        }
                 ) {
                     self.health = Health::Ready;
                     self.quota_cooling = None;
@@ -253,6 +295,7 @@ impl Account {
                 if !matches!(
                     self.health,
                     Health::NeedsRelogin { .. }
+                        | Health::PlanWithoutClaudeCode
                         | Health::Cooling {
                             reason: HealthReason::Payment,
                             ..
@@ -303,6 +346,7 @@ impl Account {
         self.expire_health(now);
         before
             != (
+                self.plan.clone(),
                 self.health.clone(),
                 self.auth_failures,
                 self.payment_failures,
@@ -544,6 +588,210 @@ fn timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
         .as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn claude() -> Account {
+        let mut account = super::tests::fixture();
+        account.provider = Provider::Claude;
+        account.identity = super::super::Identity::Claude {
+            account_uuid: "synthetic-plan-change".into(),
+            organization_uuid: None,
+            email: account.email.clone(),
+        };
+        account.id = account.identity.id();
+        account.plan = Some("max_20x".into());
+        account
+    }
+
+    fn observe(account: &mut Account, plan: Option<&str>, now: DateTime<Utc>) -> bool {
+        account.apply_health_signal(
+            HealthSignal::PlanObservation {
+                plan: plan.map(str::to_owned),
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn r18_claude_free_replaces_permission_without_timed_expiry() {
+        let now = Utc::now();
+        let mut account = claude();
+        account.apply_health_signal(
+            HealthSignal::Cooling {
+                reason: HealthReason::Permission,
+                until: now + Duration::hours(6),
+                scope: "account".into(),
+            },
+            now,
+        );
+        assert!(observe(&mut account, Some("free"), now));
+        assert_eq!(account.plan.as_deref(), Some("free"));
+        assert_eq!(account.health, Health::PlanWithoutClaudeCode);
+        assert!(!account.health.expire(now + Duration::days(365)));
+        assert!(!account.expire_health(now + Duration::days(365)));
+        for model in [None, Some("claude-opus")] {
+            assert!(!account.eligible_at(model, now + Duration::days(365)));
+        }
+        assert!(!observe(&mut account, Some("free"), now));
+    }
+
+    #[test]
+    fn r18_snapshot_ready_and_credential_refresh_do_not_heal_free() {
+        let now = Utc::now();
+        let mut account = claude();
+        observe(&mut account, Some("free"), now);
+        for signal in [
+            HealthSignal::Ready,
+            HealthSignal::ReloginCompleted,
+            HealthSignal::NewerLinkedToken,
+            HealthSignal::UsageSnapshot {
+                snapshot: serde_json::json!({"windows":[{"name":"5h","used_pct":0}]}),
+                model: None,
+                projected_allowance: 0.0,
+            },
+        ] {
+            account.apply_health_signal(signal, now);
+            assert_eq!(account.health, Health::PlanWithoutClaudeCode);
+            assert_eq!(account.plan.as_deref(), Some("free"));
+            assert!(!account.eligible_at(None, now));
+        }
+        // Even an older caller assigning Ready cannot bypass native eligibility.
+        account.health = Health::Ready;
+        assert!(!account.eligible_at(None, now));
+        assert!(account.expire_health(now));
+        assert_eq!(account.health, Health::PlanWithoutClaudeCode);
+    }
+
+    #[test]
+    fn r18_each_known_paid_plan_recovers_only_plan_health() {
+        let now = Utc::now();
+        for plan in ["pro", "max", "max_5x", "max_20x", "team", "enterprise"] {
+            let mut account = claude();
+            observe(&mut account, Some("free"), now);
+            assert!(observe(&mut account, Some(plan), now));
+            assert_eq!(account.plan.as_deref(), Some(plan));
+            assert_eq!(account.health, Health::Ready);
+            assert!(account.eligible_at(None, now));
+            assert!(!observe(&mut account, Some(plan), now));
+        }
+    }
+
+    #[test]
+    fn r18_unknown_observations_retain_free_even_under_auth_hold() {
+        let now = Utc::now();
+        for plan in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("future-paid-tier"),
+            Some("max5x"),
+            Some("max20x"),
+            Some("MAX"),
+            Some(" max "),
+            Some("Max_20x"),
+            Some("pro "),
+        ] {
+            let mut account = claude();
+            observe(&mut account, Some("free"), now);
+            assert!(!observe(&mut account, plan, now));
+            assert_eq!(account.health, Health::PlanWithoutClaudeCode);
+            account.apply_health_signal(HealthSignal::AuthAfterRefresh, now);
+            let auth = account.health.clone();
+            assert!(!observe(&mut account, plan, now));
+            assert_eq!(account.health, auth);
+            assert_eq!(account.plan.as_deref(), Some("free"));
+            account.apply_health_signal(HealthSignal::NoChange, now + Duration::days(1));
+            assert_eq!(account.health, Health::PlanWithoutClaudeCode);
+            assert!(!account.eligible_at(None, now + Duration::days(1)));
+        }
+    }
+
+    #[test]
+    fn r18_plan_observations_preserve_auth_payment_quota_and_user_state() {
+        let now = Utc::now();
+        for health in [
+            Health::NeedsRelogin {
+                reason: "synthetic".into(),
+                since: now,
+            },
+            Health::Cooling {
+                reason: HealthReason::Auth,
+                until: now + Duration::hours(1),
+                scope: "account".into(),
+            },
+            Health::Cooling {
+                reason: HealthReason::Payment,
+                until: now + Duration::hours(6),
+                scope: "account".into(),
+            },
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                until: now + Duration::hours(1),
+                scope: "model:claude-opus".into(),
+            },
+        ] {
+            let mut account = claude();
+            account.health = health.clone();
+            account.auth_failures = 2;
+            account.auth_probe_pending = true;
+            account.payment_failures = 3;
+            account.payment_until = Some(now + Duration::hours(6));
+            account.user_state = UserState::Paused;
+            account.drain = true;
+            if matches!(
+                health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+            ) {
+                account.quota_cooling = Some(QuotaCooling {
+                    window: "5h".into(),
+                    reset_at: now + Duration::hours(1),
+                    started_at: now,
+                });
+                account.quota_credit_releasable = true;
+            }
+            let mut expected = account.clone();
+            for plan in ["free", "max_20x"] {
+                assert!(observe(&mut account, Some(plan), now));
+                expected.plan = Some(plan.into());
+                assert_eq!(account, expected);
+                assert!(!account.eligible_at(None, now));
+            }
+        }
+    }
+
+    #[test]
+    fn r18_codex_free_updates_plan_and_remains_eligible() {
+        let now = Utc::now();
+        let mut account = super::tests::fixture();
+        account.plan = Some("plus".into());
+        assert!(observe(&mut account, Some("free"), now));
+        assert_eq!(account.plan.as_deref(), Some("free"));
+        assert_eq!(account.health, Health::Ready);
+        assert!(account.eligible_at(None, now + Duration::days(365)));
+        assert!(!observe(&mut account, Some("free"), now));
+    }
+
+    #[test]
+    fn r18_durable_plan_hold_serializes_exact_kind_and_roundtrips() {
+        let now = Utc::now();
+        let mut account = claude();
+        observe(&mut account, Some("free"), now);
+        let value = serde_json::to_value(&account).unwrap();
+        assert_eq!(
+            value["health"],
+            serde_json::json!({"kind":"plan_without_claude_code"})
+        );
+        let restored: Account = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, account);
+        assert!(!restored.eligible_at(None, now + Duration::days(365)));
+    }
 }
 
 #[cfg(test)]

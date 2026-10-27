@@ -2831,6 +2831,7 @@ impl AccountRuntime {
                 let mut ran = false;
                 let mut candidate = None;
                 let mut readiness = None;
+                let mut plan_change = None;
                 let account = store
                     .update_metadata_with_cause_unlocked(&account_id, cause, |account| {
                         ran = true;
@@ -2842,6 +2843,22 @@ impl AccountRuntime {
                             filter_released_quota(account, &mut health_snapshot, release);
                         }
                         let applied_at = Utc::now();
+                        if account.provider == Provider::Codex
+                            && let Some(plan) = reported["plan"].as_str()
+                            && crate::dashboard::history::PlanName::try_from(plan.to_owned())
+                                .is_ok()
+                        {
+                            let previous = account.plan.clone();
+                            account.apply_health_signal(
+                                HealthSignal::PlanObservation {
+                                    plan: Some(plan.to_owned()),
+                                },
+                                applied_at,
+                            );
+                            if previous != account.plan {
+                                plan_change = Some(previous);
+                            }
+                        }
                         account.apply_health_signal(
                             crate::accounts::HealthSignal::UsageSnapshot {
                                 snapshot: health_snapshot,
@@ -2948,6 +2965,9 @@ impl AccountRuntime {
                 // Native selection can take the inverse Store/bindings order.
                 // Finish persistence, release Store, then publish under mutations.
                 drop(_guard);
+                if let Some(previous) = plan_change {
+                    obs.record_plan_change(&account, previous.as_deref());
+                }
                 if publish_outside {
                     outside_owner.publish();
                 }

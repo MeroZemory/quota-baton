@@ -528,6 +528,56 @@ impl Observability {
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"login","provider":provider,"login_id":login_id,"outcome":status,"account":account_id})));
         self.progress(serde_json::json!({"event":"login_progress","data":{"login_id":login_id,"status":status,"account_id":account_id}}));
     }
+    pub(crate) fn record_plan_change(
+        &self,
+        account: &crate::accounts::Account,
+        previous: Option<&str>,
+    ) {
+        use crate::dashboard::history::{ActivityData, ActivityInput, ActivityKind, PlanName};
+        if previous == account.plan.as_deref() {
+            return;
+        }
+        let plan = |value: Option<&str>| value.and_then(|s| PlanName::try_from(s.to_owned()).ok());
+        self.dashboard.activity(ActivityInput {
+            ts: Utc::now(),
+            kind: ActivityKind::PlanChanged,
+            provider: account.provider,
+            account: account.id.clone().try_into().ok(),
+            account_to: None,
+            notable: true,
+            data: ActivityData {
+                previous_plan: plan(previous),
+                new_plan: plan(account.plan.as_deref()),
+                ..Default::default()
+            },
+        });
+    }
+
+    /// Keep useful upstream diagnosis without copying arbitrary error text.
+    pub(crate) fn record_permission_error(&self, account: &str, body: &[u8]) {
+        let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let error = value
+            .get("error")
+            .or_else(|| value.get("response").and_then(|r| r.get("error")))
+            .unwrap_or(&value);
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let diagnostic = if message.contains("subscription")
+            || message.contains("plan")
+            || message.contains("claude code")
+        {
+            "Upstream denied Claude Code subscription access"
+        } else if message.contains("organization") || message.contains("organisation") {
+            "Upstream denied organization access"
+        } else {
+            "Upstream permission denied"
+        };
+        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(), "event":"permission_denied", "account":account, "error_type":"permission_error", "message":diagnostic})));
+    }
+
     pub fn record_refresh(
         &self,
         account: &str,

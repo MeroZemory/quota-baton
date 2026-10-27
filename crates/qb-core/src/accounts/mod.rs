@@ -204,6 +204,8 @@ pub enum HealthReason {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Health {
     Ready,
+    /// Explicit Claude Free observation; only a known eligible plan heals it.
+    PlanWithoutClaudeCode,
     Cooling {
         reason: HealthReason,
         until: DateTime<Utc>,

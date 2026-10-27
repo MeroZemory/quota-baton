@@ -66,6 +66,7 @@ pub(super) fn source(value: &Source) -> Result<AdminSource, ()> {
 pub(super) fn health(value: &Health) -> AdminHealth {
     match value {
         Health::Ready => AdminHealth::Ready {},
+        Health::PlanWithoutClaudeCode => AdminHealth::PlanWithoutClaudeCode {},
         Health::Cooling {
             reason,
             until,
@@ -106,7 +107,9 @@ pub(crate) fn pools(accounts: &[AdminAccount]) -> qb_proto::admin_pool::AdminPoo
         }
         match &account.health {
             AdminHealth::Ready {} => pool.eligible += 1,
-            AdminHealth::NeedsRelogin { .. } | AdminHealth::Unknown(_) => pool.unavailable += 1,
+            AdminHealth::NeedsRelogin { .. }
+            | AdminHealth::PlanWithoutClaudeCode {}
+            | AdminHealth::Unknown(_) => pool.unavailable += 1,
             AdminHealth::Cooling { reason, .. } => pool.cooling.increment(match reason {
                 AdminHealthReason::Quota => "quota",
                 AdminHealthReason::Rate => "rate",
