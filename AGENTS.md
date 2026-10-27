@@ -2,7 +2,7 @@
 
 The documentation map is in `docs/README.md`. The normative behaviour is in `docs/contract.md`.
 
-## Build hygiene (C: has little free space; D: and E: are full)
+## Build hygiene (C: is the shared system SSD; build output lives on D:)
 
 - **One implementation worktree, ever:** `C:/_projects/SampleUser/quota-baton-impl`.
   - To start a new milestone, switch the branch inside it (`git switch -c impl/<m> dev`).
@@ -16,7 +16,7 @@ The documentation map is in `docs/README.md`. The normative behaviour is in `doc
 - **Debug info.** The workspace `Cargo.toml` sets `[profile.dev] debug = "line-tables-only"` and turns off debug info for dependencies. Do not override it.
 - **Clean up at the end of a milestone.** Run `cargo clean` in the worktree after the milestone report is sent, unless the next milestone starts immediately in the same worktree.
 - **Run a review build in the implementer's worktree only while the implementer is idle.** Use the default target, run `cargo test` / `cargo clippy` sequentially, and do not keep a second copy.
-- Never move build output to D: or E:.
+- **The implementation worktree's `target/` lives on D:** (NVMe SSD; changed 2026-10-28 when D: had ~290 GiB free and the pagefile moved there). `C:/_projects/SampleUser/quota-baton-impl/target` is a directory junction to `D:/_build/quota-baton-impl/target`, so cargo commands and paths stay unchanged. It is still one target with the same 8 GiB cap. Never put build output on E: (HDD). Temporary release worktrees build in their own `target/` and are removed after use, as before.
 - If a cleanup is blocked, report the exact path and size instead of working around it.
 - **Retention of run artifacts.** Verification copies, test binaries, temporary homes, and capture or serve logs under `.sandbox/` are deleted once their milestone is merged. Before deleting, record the result in the milestone report.
   - Keep only what a report or review cites: `.sandbox/reports/<M>.md` with its cited evidence files, `.sandbox/reviews`, `.sandbox/briefs` and `.sandbox/research`.
