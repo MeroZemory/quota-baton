@@ -188,7 +188,7 @@ try {
             $detected[$provider] = [bool]$found
             if ($found) { Say "$provider 발견: $found" "$provider detected: $found" } else { Say "$provider 없음" "$provider not found" }
         }
-        if (-not $PSCmdlet.ShouldProcess($InstallDir, (Message '검증한 quota-baton 설치, 사용자 PATH 추가 및 wire 미리보기' 'Install verified quota-baton, update user PATH and preview wiring'))) {
+        if (-not (($null -eq $PSCmdlet) -or $PSCmdlet.ShouldProcess($InstallDir, (Message '검증한 quota-baton 설치, 사용자 PATH 추가 및 wire 미리보기' 'Install verified quota-baton, update user PATH and preview wiring')))) {
             Say '미리보기: 실행 파일·PATH·wire·프로세스·설정은 변경하지 않았습니다.' 'Dry run: no executable, PATH, wire, process or configuration changes.'
             return
         }
@@ -244,7 +244,10 @@ try {
     $backups = @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object { $_.Name -match '^quota-baton(?:-tray)?\.exe\.old-\d{21}$' })
     $generations = @($backups | ForEach-Object { ($_.Name -split '\.old-')[1] } | Sort-Object -Descending -Unique)
     foreach ($backup in $backups) {
-        if ($generations.Count -gt 0 -and -not $backup.Name.EndsWith($generations[0])) { [IO.File]::Delete($backup.FullName) }
+        if ($generations.Count -gt 0 -and -not $backup.Name.EndsWith($generations[0])) {
+            # A draining previous core can still run from an old file; skip it and retry on the next install.
+            try { [IO.File]::Delete($backup.FullName) } catch { Say "사용 중이라 다음 설치 때 지웁니다: $($backup.Name)" "In use; will be removed next time: $($backup.Name)" }
+        }
     }
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $present = @($userPath -split ';' | Where-Object { [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/') -ieq $InstallDir }).Count -gt 0
