@@ -1,4 +1,4 @@
-﻿# Windows PowerShell 5.1 compatible; the leading param block also supports irm | iex.
+# Windows PowerShell 5.1 compatible; the leading param block also supports irm | iex.
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$Version,

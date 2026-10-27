@@ -1,4 +1,4 @@
-﻿[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\quota-baton'),
     [switch]$RemoveData,
