@@ -132,7 +132,7 @@ The tray flyout shows the same accounts in a smaller view, with pause, credits a
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/ui-flyout-dark.png">
-  <img alt="Tray flyout listing accounts with their 5-hour and weekly remaining usage" src="docs/assets/ui-flyout-light.png">
+  <img alt="Tray flyout listing accounts with their 5-hour and weekly remaining usage" src="docs/assets/ui-flyout-light.png" width="380">
 </picture>
 
 ## Commands

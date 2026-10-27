@@ -364,7 +364,7 @@ try {
                 else { Say "$provider $(Korean 'm33'): $found" "$provider detected: $found" }
             } else { Say "$provider $(Korean 'm36')" "$provider not found" }
         }
-        if (-not $PSCmdlet.ShouldProcess($InstallDir, (Message (Korean 'm37') 'Install verified quota-baton, update user PATH and preview wiring'))) {
+        if (-not (($null -eq $PSCmdlet -and -not $WhatIfPreference) -or ($null -ne $PSCmdlet -and $PSCmdlet.ShouldProcess($InstallDir, (Message (Korean 'm37') 'Install verified quota-baton, update user PATH and preview wiring'))))) {
             Say (Korean 'm38') 'Dry run: no executable, PATH, wire, process or configuration changes.'
             return
         }
