@@ -1,7 +1,7 @@
 ﻿# Pester-free. No release binaries, network, registry writes or real profile writes.
 [CmdletBinding()]
 param(
-    [string]$EvidenceDir = 'C:/_projects/SampleUser/quota-baton/.sandbox/reports/R17-evidence/install-smoke/v2/pwsh'
+    [string]$EvidenceDir = 'C:/_projects/SampleUser/quota-baton/.sandbox/reports/R17.1-evidence/install-smoke/pwsh'
 )
 $ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
@@ -54,7 +54,7 @@ try {
     $env:QB_HOME = Join-Path $env:LOCALAPPDATA 'quota-baton'
     $env:TEMP = Join-Path $fixture 'scratch'
     $env:TMP = $env:TEMP
-    $fake = Join-Path $fixture 'fake-bin'
+    $fake = Join-Path $env:APPDATA 'npm'
     foreach ($path in @($env:QB_HOME, $env:APPDATA, $env:TEMP, $fake)) { [void][IO.Directory]::CreateDirectory($path) }
     $env:PATH = $fake
     foreach ($provider in @('codex', 'claude')) {
@@ -75,24 +75,36 @@ try {
     $install = Join-Path $fixture 'install'
     $userPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
     $profileBefore = Tree $env:USERPROFILE
-    Case 'parse-install-and-uninstall' {
+    Case 'ascii-no-bom-served-text-and-file-parse-identically' {
         foreach ($file in @($installer, $uninstaller)) {
+            $bytes = [IO.File]::ReadAllBytes($file)
+            Assert (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0) "Non-ASCII or BOM bytes: $file"
+            $served = [Text.Encoding]::UTF8.GetString($bytes)
+            Assert (-not $served.StartsWith([string][char]0xfeff, [StringComparison]::Ordinal)) "BOM in served text: $file"
             $tokens = $null; $errors = $null
-            $ast = [Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors)
-            Assert ($errors.Count -eq 0) "Parser errors: $file"
+            $ast = [Management.Automation.Language.Parser]::ParseInput($served, [ref]$tokens, [ref]$errors)
+            Assert ($errors.Count -eq 0) "Served-text parser errors: $file"
             Assert ($null -ne $ast.ParamBlock) "Leading param block missing: $file"
+            $fileTokens = $null; $fileErrors = $null
+            $fileAst = [Management.Automation.Language.Parser]::ParseFile($file, [ref]$fileTokens, [ref]$fileErrors)
+            Assert ($fileErrors.Count -eq 0) "File parser errors: $file"
+            Assert (($tokens.Text -join '|') -ceq ($fileTokens.Text -join '|')) "File and served text tokenize differently: $file"
+            Assert ($fileAst.ParamBlock.Extent.Text -ceq $ast.ParamBlock.Extent.Text) "File/served param block differs: $file"
+            [void][scriptblock]::Create($served)
         }
     }
     Case 'local-whatif-nostart-yes-login-detects-without-execution' {
         $output = (& $installer -ZipPath $smokeState.Zip -InstallDir $install -NoStart -Yes -Login -WhatIf 6>&1 | Out-String -Width 4096)
         Assert ($output -match 'SHA256 verified') 'Checksum not verified'
-        Assert ($output -match 'codex detected:.*fake-bin' -and $output -match 'claude detected:.*fake-bin') "Fake commands not detected: $output"
+        Assert ($output -match 'codex detected:.*npm' -and $output -match 'claude detected:.*npm') "Fake commands not detected: $output"
         Assert ($output -match 'Dry run:') 'Config ui.language was not honored'
         Assert (-not (Test-Path -LiteralPath $install)) 'Dry run created install directory'
     }
     Case 'whatif-without-nostart-and-explicit-korean' {
         $output = (& $installer -LocalZipPath $smokeState.Zip -LocalChecksumPath ($smokeState.Zip + '.sha256') -InstallDir $install -Lang ko -WhatIf 6>&1 | Out-String -Width 4096)
-        Assert ($output -match '미리보기:' -and $output -match 'codex 발견:') 'Lang override or aliases failed'
+        $previewKo = -join (@(0xbbf8, 0xb9ac, 0xbcf4, 0xae30, 0x3a) | ForEach-Object { [char]$_ })
+        $detectedKo = -join (@(0xbc1c, 0xacac, 0x3a) | ForEach-Object { [char]$_ })
+        Assert ($output.Contains($previewKo) -and $output.Contains('codex ' + $detectedKo)) 'Lang override or aliases failed'
     }
     Case 'checksum-mismatch-refused-even-whatif' {
         $bad = Join-Path $fixture 'bad.sha256'
@@ -146,6 +158,8 @@ try {
         $output = (& $installer -ZipPath $smokeState.Zip -InstallDir $install -Lang en -WhatIf 6>&1 | Out-String -Width 4096)
         Assert ($output -match 'codex not found' -and $output -match 'claude not found') 'Missing client detection or explicit English failed'
         [IO.File]::WriteAllText((Join-Path $env:QB_HOME 'config.toml'), "[ui]`nlanguage = 'en'`n")
+        [IO.File]::Move((Join-Path $fake 'codex.hidden'), (Join-Path $fake 'codex.cmd'))
+        [IO.File]::Move((Join-Path $fake 'claude.hidden'), (Join-Path $fake 'claude.cmd'))
     }
     Case 'bootstrap-invoke-expression-whatif' {
         & {
@@ -179,7 +193,7 @@ try {
         # This exercises real setup control flow without PATH/registry/install IO.
         $tokens = $null; $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$tokens, [ref]$errors)
-        foreach ($name in @('Message', 'Fail', 'Say', 'WaitCoreReady', 'EnsureCoreReady', 'CompleteSetup')) {
+        foreach ($name in @('Korean', 'Message', 'Fail', 'Say', 'WaitCoreReady', 'EnsureCoreReady', 'CompleteSetup')) {
             $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
             . ([scriptblock]::Create($definition.Extent.Text))
         }
