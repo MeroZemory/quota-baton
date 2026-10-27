@@ -786,14 +786,24 @@ mod tests {
             Self::with_provider(count, Provider::Codex).await
         }
         async fn with_provider(count: usize, provider: Provider) -> Self {
-            let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join(".sandbox/usage-unit-tests");
+            let base = std::env::var_os("QB_TEST_USAGE_ROOT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join(".sandbox/usage-unit-tests")
+                });
             std::fs::create_dir_all(&base).unwrap();
             let root = tempfile::tempdir_in(base).unwrap();
+            // Match the existing browserless-login fixture: an explicit private
+            // test key backend, without a service credential or source writes.
+            let mut config = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+            std::io::Write::write_all(&mut config, b"[secrets]\nlinux_backend = \"file-0600\"\n")
+                .unwrap();
+            config.persist(root.path().join("config.toml")).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             let store = loop {
                 match AccountStore::acquire(root.path()) {
