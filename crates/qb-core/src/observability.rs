@@ -575,7 +575,13 @@ impl Observability {
         } else {
             "Upstream permission denied"
         };
-        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(), "event":"permission_denied", "account":account, "error_type":"permission_error", "message":diagnostic})));
+        let error_type =
+            if error.get("type").and_then(serde_json::Value::as_str) == Some("permission_error") {
+                "permission_error"
+            } else {
+                "unknown"
+            };
+        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(), "event":"permission_denied", "account":account, "error_type":error_type, "message":diagnostic})));
     }
 
     pub fn record_refresh(

@@ -364,6 +364,15 @@ impl Account {
         if matches!(self.health, Health::NeedsRelogin { .. }) {
             return false;
         }
+        // A later request failure must not replace the diagnosed durable plan hold.
+        if self.health == Health::PlanWithoutClaudeCode
+            && matches!(
+                reason,
+                HealthReason::Permission | HealthReason::Rate | HealthReason::Quota
+            )
+        {
+            return false;
+        }
         let (reason, until, scope, incoming) = match &self.health {
             Health::Cooling {
                 reason: old_reason,
@@ -677,6 +686,91 @@ mod plan_tests {
             assert_eq!(account.health, Health::Ready);
             assert!(account.eligible_at(None, now));
             assert!(!observe(&mut account, Some(plan), now));
+        }
+    }
+
+    #[test]
+    fn r18_free_then_request_cooling_retains_durable_plan_and_paid_recovery() {
+        let now = Utc::now();
+        for reason in [
+            HealthReason::Permission,
+            HealthReason::Rate,
+            HealthReason::Quota,
+        ] {
+            for scope in ["account", "model:claude-opus"] {
+                let mut account = claude();
+                observe(&mut account, Some("free"), now);
+                let expected = account.clone();
+                // Relay observes the Free profile before applying this request signal.
+                assert!(!account.apply_health_signal(
+                    HealthSignal::Cooling {
+                        reason,
+                        until: now + Duration::hours(6),
+                        scope: scope.into(),
+                    },
+                    now,
+                ));
+                assert_eq!(account, expected);
+                let mut restored: Account =
+                    serde_json::from_value(serde_json::to_value(&account).unwrap()).unwrap();
+                assert_eq!(restored.health, Health::PlanWithoutClaudeCode);
+                assert!(!restored.expire_health(now + Duration::days(365)));
+                assert!(!restored.eligible_at(Some("claude-opus"), now));
+                assert!(observe(&mut restored, Some("max_20x"), now));
+                assert_eq!(restored.health, Health::Ready);
+                assert!(restored.eligible_at(Some("claude-opus"), now));
+            }
+        }
+    }
+
+    #[test]
+    fn r18_free_still_allows_auth_and_payment_precedence() {
+        let now = Utc::now();
+        for (signal, reason, minutes) in [
+            (HealthSignal::AuthAfterRefresh, HealthReason::Auth, 15),
+            (
+                HealthSignal::Cooling {
+                    reason: HealthReason::Payment,
+                    until: now + Duration::hours(1),
+                    scope: "account".into(),
+                },
+                HealthReason::Payment,
+                360,
+            ),
+        ] {
+            let mut account = claude();
+            observe(&mut account, Some("free"), now);
+            assert!(account.apply_health_signal(signal, now));
+            assert_eq!(
+                account.health,
+                Health::Cooling {
+                    reason,
+                    until: now + Duration::minutes(minutes),
+                    scope: "account".into(),
+                }
+            );
+            assert_eq!(
+                account.auth_failures,
+                u32::from(reason == HealthReason::Auth)
+            );
+            assert_eq!(account.auth_probe_pending, reason == HealthReason::Auth);
+            assert_eq!(
+                account.payment_failures,
+                u32::from(reason == HealthReason::Payment)
+            );
+            assert_eq!(
+                account.payment_until,
+                (reason == HealthReason::Payment).then_some(now + Duration::minutes(minutes))
+            );
+            let mut expired = account.clone();
+            expired.apply_health_signal(HealthSignal::NoChange, now + Duration::days(1));
+            assert_eq!(expired.health, Health::PlanWithoutClaudeCode);
+            assert!(!expired.eligible_at(None, now + Duration::days(1)));
+            account.user_state = UserState::Paused;
+            let mut expected = account.clone();
+            expected.plan = Some("max_5x".into());
+            assert!(observe(&mut account, Some("max_5x"), now));
+            assert_eq!(account, expected);
         }
     }
 

@@ -463,132 +463,136 @@ impl UsagePoller {
             .last = Some(Instant::now());
         let provider = account.provider;
         let result = async {
-        for attempt in 0..2 {
-            let observation_table = self.binding_table();
-            let observation_asof = observation_table
-                .as_ref()
-                .map(|table| table.begin_usage_observation_for(id));
-            if attempt == 0
-                && placement.is_some()
-                && let (Some(table), Some(asof)) = (&observation_table, observation_asof)
-            {
-                table.note_placement_poll_started(id, asof.sequence);
-            }
-            let path = if account.provider == Provider::Codex {
-                "/backend-api/wham/usage"
-            } else {
-                "/api/oauth/usage"
-            };
-            let mut request = self
-                .client
-                .get(format!("{base}{path}"))
-                .timeout(Duration::from_secs(30))
-                .bearer_auth(&tokens.access_token)
-                .header("Accept", "application/json")
-                .header(
-                    "User-Agent",
-                    concat!("quota-baton/", env!("CARGO_PKG_VERSION")),
-                );
-            if let Identity::Codex { account_id, .. } = &account.identity {
-                request = request.header("ChatGPT-Account-Id", account_id);
-            }
-            if account.provider == Provider::Claude {
-                request = request.header("anthropic-beta", "oauth-2025-04-20");
-            }
-            let wait_origin = self.runtime.capture_poll_origin(id).await;
-            let outside_origin = self.runtime.capture_outside_poll_origin(id);
-            let mut response = request.send().await.map_err(|_| PollError::Unavailable)?;
-            let status = response.status();
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| PollError::Unavailable)? {
-                if body.len() + chunk.len() > MAX_BODY {
+            for attempt in 0..2 {
+                let observation_table = self.binding_table();
+                let observation_asof = observation_table
+                    .as_ref()
+                    .map(|table| table.begin_usage_observation_for(id));
+                if attempt == 0
+                    && placement.is_some()
+                    && let (Some(table), Some(asof)) = (&observation_table, observation_asof)
+                {
+                    table.note_placement_poll_started(id, asof.sequence);
+                }
+                let path = if account.provider == Provider::Codex {
+                    "/backend-api/wham/usage"
+                } else {
+                    "/api/oauth/usage"
+                };
+                let mut request = self
+                    .client
+                    .get(format!("{base}{path}"))
+                    .timeout(Duration::from_secs(30))
+                    .bearer_auth(&tokens.access_token)
+                    .header("Accept", "application/json")
+                    .header(
+                        "User-Agent",
+                        concat!("quota-baton/", env!("CARGO_PKG_VERSION")),
+                    );
+                if let Identity::Codex { account_id, .. } = &account.identity {
+                    request = request.header("ChatGPT-Account-Id", account_id);
+                }
+                if account.provider == Provider::Claude {
+                    request = request.header("anthropic-beta", "oauth-2025-04-20");
+                }
+                let wait_origin = self.runtime.capture_poll_origin(id).await;
+                let outside_origin = self.runtime.capture_outside_poll_origin(id);
+                let mut response = request.send().await.map_err(|_| PollError::Unavailable)?;
+                let status = response.status();
+                let mut body = Vec::new();
+                while let Some(chunk) =
+                    response.chunk().await.map_err(|_| PollError::Unavailable)?
+                {
+                    if body.len() + chunk.len() > MAX_BODY {
+                        return Err(PollError::Unavailable);
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    if let Some((updated, refreshed)) = self
+                        .poll_after_401(&gates, account, &tokens, &body, attempt)
+                        .await?
+                    {
+                        account = updated;
+                        tokens = refreshed;
+                        continue;
+                    }
                     return Err(PollError::Unavailable);
                 }
-                body.extend_from_slice(&chunk);
-            }
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                if let Some((updated, refreshed)) = self
-                    .poll_after_401(&gates, account, &tokens, &body, attempt)
-                    .await?
+                self.obs.capture_poll(account.provider, &body);
+                if account.provider == Provider::Claude && status == reqwest::StatusCode::NOT_FOUND
                 {
-                    account = updated;
-                    tokens = refreshed;
-                    continue;
-                }
-                return Err(PollError::Unavailable);
-            }
-            self.obs.capture_poll(account.provider, &body);
-            if account.provider == Provider::Claude && status == reqwest::StatusCode::NOT_FOUND {
-                reservation.unsupported = true;
-                tracing::warn!(
-                    account = id,
-                    "Claude usage endpoint unavailable; polling disabled for six hours"
-                );
-                return Err(PollError::Unavailable);
-            }
-            if !status.is_success() {
-                return Err(PollError::Unavailable);
-            }
-            let Some(snapshot) = parse::snapshot(account.provider, &body, Utc::now()) else {
-                if account.provider == Provider::Claude {
                     reservation.unsupported = true;
                     tracing::warn!(
                         account = id,
-                        "Claude usage shape unavailable; polling disabled for six hours"
+                        "Claude usage endpoint unavailable; polling disabled for six hours"
                     );
+                    return Err(PollError::Unavailable);
                 }
-                return Err(PollError::Unavailable);
-            };
-            let replace_windows = parse::is_complete_snapshot(account.provider, &body);
-            if let (Some(table), Some(asof)) = (&observation_table, observation_asof) {
-                if replace_windows {
-                    table.replace_usage_windows_asof_token(id, &snapshot, asof);
-                } else {
-                    table.note_usage_observation_asof_token(id, &snapshot, asof);
+                if !status.is_success() {
+                    return Err(PollError::Unavailable);
                 }
-            }
-            let reported = snapshot.clone();
-            let snapshot = self
-                .obs
-                .observe_poll(id, snapshot, replace_windows)
-                .ok_or(PollError::Unavailable)?;
-            if probe.is_some() {
-                self.runtime
-                    .poll_probe_success(id)
-                    .await
-                    .map_err(|_| PollError::Unavailable)?;
-            }
-            let (account, receipt) =
-                if capture_receipt && account.provider == Provider::Codex && replace_windows {
+                let Some(snapshot) = parse::snapshot(account.provider, &body, Utc::now()) else {
+                    if account.provider == Provider::Claude {
+                        reservation.unsupported = true;
+                        tracing::warn!(
+                            account = id,
+                            "Claude usage shape unavailable; polling disabled for six hours"
+                        );
+                    }
+                    return Err(PollError::Unavailable);
+                };
+                let replace_windows = parse::is_complete_snapshot(account.provider, &body);
+                if let (Some(table), Some(asof)) = (&observation_table, observation_asof) {
+                    if replace_windows {
+                        table.replace_usage_windows_asof_token(id, &snapshot, asof);
+                    } else {
+                        table.note_usage_observation_asof_token(id, &snapshot, asof);
+                    }
+                }
+                let reported = snapshot.clone();
+                let snapshot = self
+                    .obs
+                    .observe_poll(id, snapshot, replace_windows)
+                    .ok_or(PollError::Unavailable)?;
+                if probe.is_some() {
                     self.runtime
-                        .apply_polled_quota_snapshot_observed(
-                            id,
-                            snapshot,
-                            &reported,
-                            wait_origin,
-                            outside_origin,
-                        )
-                        .await
-                        .map_err(|_| PollError::Unavailable)?
-                } else {
-                    let account = self
-                        .runtime
-                        .apply_polled_quota_snapshot(
-                            id,
-                            snapshot,
-                            &reported,
-                            wait_origin,
-                            outside_origin,
-                        )
+                        .poll_probe_success(id)
                         .await
                         .map_err(|_| PollError::Unavailable)?;
-                    (account, None)
-                };
-            reservation.succeeded = true;
-            return Ok((account, receipt));
+                }
+                let (account, receipt) =
+                    if capture_receipt && account.provider == Provider::Codex && replace_windows {
+                        self.runtime
+                            .apply_polled_quota_snapshot_observed(
+                                id,
+                                snapshot,
+                                &reported,
+                                wait_origin,
+                                outside_origin,
+                            )
+                            .await
+                            .map_err(|_| PollError::Unavailable)?
+                    } else {
+                        let account = self
+                            .runtime
+                            .apply_polled_quota_snapshot(
+                                id,
+                                snapshot,
+                                &reported,
+                                wait_origin,
+                                outside_origin,
+                            )
+                            .await
+                            .map_err(|_| PollError::Unavailable)?;
+                        (account, None)
+                    };
+                reservation.succeeded = true;
+                return Ok((account, receipt));
+            }
+            Err(PollError::Unavailable)
         }
-        Err(PollError::Unavailable)
-        }.await;
+        .await;
         // Profile freshness follows every actual usage attempt, even when the
         // usage endpoint fails. Preserve its reservation/backoff and release
         // usage slots before waiting for the separate profile lane.

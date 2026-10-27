@@ -7,6 +7,7 @@ pub enum HealthKind {
     Ready,
     Cooling,
     NeedsRelogin,
+    PlanWithoutClaudeCode,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 pub enum Reason {
@@ -64,6 +65,13 @@ pub fn account(
 ) -> Option<AccountFacts> {
     let (health, reason, scope, until, since) = match &a.health {
         Health::Ready => (HealthKind::Ready, None, Scope::Account, None, None),
+        Health::PlanWithoutClaudeCode => (
+            HealthKind::PlanWithoutClaudeCode,
+            None,
+            Scope::Account,
+            None,
+            None,
+        ),
         Health::NeedsRelogin { since, .. } => (
             HealthKind::NeedsRelogin,
             None,
