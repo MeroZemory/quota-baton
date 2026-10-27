@@ -33,7 +33,7 @@ foreach ($path in @($InstallDir, $dataDir)) {
     }
 }
 if (-not $RemoveData -and ($dataDir -eq $InstallDir -or $dataDir.StartsWith($InstallDir + '\', [StringComparison]::OrdinalIgnoreCase))) { Fail '설치 경로 안에 보존할 계정 데이터가 있어 제거하지 않았습니다.' 'Data is inside InstallDir; refusing to remove kept data.' }
-if (-not $PSCmdlet.ShouldProcess($InstallDir, (Message 'unwire, 설치된 PID 종료, 설치 폴더 및 사용자 PATH 항목 제거' 'Unwire, stop exact installed PIDs, remove installation and its user PATH entry'))) { return }
+if (-not (($null -eq $PSCmdlet) -or $PSCmdlet.ShouldProcess($InstallDir, (Message 'unwire, 설치된 PID 종료, 설치 폴더 및 사용자 PATH 항목 제거' 'Unwire, stop exact installed PIDs, remove installation and its user PATH entry')))) { return }
 $exe = Join-Path $InstallDir 'quota-baton.exe'
 if (Test-Path -LiteralPath $InstallDir) {
     if (-not (Test-Path -LiteralPath $exe)) { Fail '설치된 quota-baton.exe가 없어 unwire를 실행하지 못했습니다. 설치 폴더를 보존했습니다.' 'Cannot unwire: installed quota-baton.exe is missing; installation retained.' }
@@ -59,6 +59,6 @@ $entries = @($userPath -split ';')
 $kept = @($entries | Where-Object { [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/') -ine $InstallDir })
 if ($kept.Count -ne $entries.Count) { [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User') }
 if ($RemoveData) {
-    if ($PSCmdlet.ShouldProcess($dataDir, (Message 'quota-baton 계정 데이터 제거' 'Remove quota-baton account data')) -and (Test-Path -LiteralPath $dataDir)) { Remove-Item -LiteralPath $dataDir -Recurse -Force }
+    if ((($null -eq $PSCmdlet) -or $PSCmdlet.ShouldProcess($dataDir, (Message 'quota-baton 계정 데이터 제거' 'Remove quota-baton account data'))) -and (Test-Path -LiteralPath $dataDir)) { Remove-Item -LiteralPath $dataDir -Recurse -Force }
 } else { Say "계정 데이터 유지: $dataDir" "Account data kept: $dataDir" }
 Say '제거 완료.' 'Uninstall complete.'
