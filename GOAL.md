@@ -91,7 +91,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R15 | 완료(N8): 공유 중첩 admin 계약·실제 응답 왕복·정적 guard·라우팅 속성. b492eda 최종 보완; 원본 기본16실패 원인별 집중 복구, 전체 기능3899/0/36제외·코어1310/0/1제외·기본/전체 strict lint·build/read-only check 통과. 실제 core→AdminClient→tray KO/EN HWND10 및 추가PNG2 직접 검수. 설치 S2; 지문 R15-evidence/delivery-fingerprint.json |
 | L1 | 구현 P0–P4 관문 완료·P4 설치 3217fb2 수용·P5 배포 준비 관문 완료: D31, brief `.sandbox/briefs/L1-linux-headless.md`. 안내 포함 소스53aeb9a의 Bookworm Rust1.93.1 배포본(최대 GLIBC2.34), Ubuntu24/systemd255 인증 READY·정상 TERM·포트 닫힘·Linux strict 통과. 배포 묶음과 원본 실패·집중 보완은 `.sandbox/reports/L1-P5.md`. 실제 공급자 완료 로그인 0/2·실제 Incus 칸·철회·업그레이드·재부팅·공유 계정 외부 사용 감지는 P5 실제 수용으로 남음. GPU 배포 수용(reload2442/0 동일 PID); LF 속성·packaged unit CR 거절 관문1445ee3 완료. N6r·N7 각 브랜치 보류 |
 | R17 | 완료·v0.6.0 설치/공개 수용: install.ps1 upgrade 연결2102/0·자동 시작 등록·PATH 추가. 최초 실제 설치 결함은 R17.1에서 보완 |
-| R17.1 | 완료: ASCII/BOM 없는 설치·제거 스크립트, 잠긴 백업 정리 보류·finally 트레이 복구, 실제 클라이언트 탐지·wire 환경 일치. PS5.1/7 각26통과·독립 검수 통과·read-only launch check0. 보고서 `.sandbox/reports/R17.1.md`; 공개 main 반영은 설계 세션 |
+| R17.1 | 완료: ASCII/BOM 없는 설치·제거 스크립트, 잠긴 백업 정리 보류·finally 트레이 복구, 실제 클라이언트 탐지·wire 환경 일치. PS5.1/7 각28통과·독립 검수 통과·read-only launch check0. 보고서 `.sandbox/reports/R17.1.md`; 공개 main 반영은 설계 세션 |
 | R18 | 진행 중: R17.1 우선 수정 동안 impl/plan-change의 adb1552에 WIP 보관(미컴파일); 이후 재개. 요금제 변경 감지·linked poll 최신화·구독일 조사. brief `R18-plan-change.md`; 날짜 필드/날짜만 조사하고 수동 갱신일 구현 전 결과 보고. `impl/plan-change`에서 구현 |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |

@@ -97,12 +97,28 @@ function Read-Host { throw 'Unexpected prompt' }
 function Invoke-RestMethod { throw 'Unexpected network request' }
 function Invoke-WebRequest { throw 'Unexpected download' }
 
-function Invoke-FixtureScript([string]$path, [hashtable]$parameters) {
+function Invoke-FixtureScript([string]$path, [hashtable]$parameters, [switch]$PlainIex, [bool]$IexWhatIf=$false) {
     $text = [IO.File]::ReadAllText($path)
     $tokens=$null; $errors=$null
     $ast = [Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
     Assert ($errors.Count -eq 0) 'Script parse failed before AST substitution'
     $edits = New-Object 'System.Collections.Generic.List[object]'
+    if ($PlainIex) {
+        # IEX has no argument binding: substitute fixture parameter defaults only.
+        # Keep the complete CmdletBinding/param source and the real workflow.
+        foreach ($parameter in $ast.ParamBlock.Parameters) {
+            $name=$parameter.Name.VariablePath.UserPath
+            if (-not $parameters.ContainsKey($name)) { continue }
+            $value='$__iexFixtureParameters[''' + $name + ''']'
+            if ($parameter.DefaultValue) {
+                $edits.Add([pscustomobject]@{Start=$parameter.DefaultValue.Extent.StartOffset;End=$parameter.DefaultValue.Extent.EndOffset;Text=$value})
+            } else {
+                $edits.Add([pscustomobject]@{Start=$parameter.Extent.StartOffset;End=$parameter.Extent.EndOffset;Text=($parameter.Extent.Text+' = '+$value)})
+            }
+        }
+        $assertNull="`nif (`$null -ne `$PSCmdlet) { throw 'IEX unexpectedly inherited PSCmdlet' }; `$scenario.Events.Add('plain-iex-null')`n"
+        $edits.Add([pscustomobject]@{Start=$ast.ParamBlock.Extent.EndOffset;End=$ast.ParamBlock.Extent.EndOffset;Text=$assertNull})
+    }
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ReadHealth' }, $true)) {
         $replacement = 'function ReadHealth { MockHealth }'
         $edits.Add([pscustomobject]@{ Start=$definition.Extent.StartOffset; End=$definition.Extent.EndOffset; Text=$replacement })
@@ -128,7 +144,14 @@ function Invoke-FixtureScript([string]$path, [hashtable]$parameters) {
     foreach ($edit in @($edits | Sort-Object Start -Descending)) { $text=$text.Remove($edit.Start, $edit.End-$edit.Start).Insert($edit.Start, $edit.Text) }
     Assert ($text -notmatch '\[Environment\]::(?:Get|Set)EnvironmentVariable\([^\r\n]*[''\"]User[''\"]') 'Unmocked user PATH access'
     $scenario.Events.Add('invoke:' + (Split-Path $path -Leaf))
-    & ([scriptblock]::Create($text)) @parameters
+    if ($PlainIex) {
+        $__iexFixtureParameters=$parameters
+        $PSCmdlet=$null
+        $WhatIfPreference=$IexWhatIf
+        Invoke-Expression $text
+    } else {
+        & ([scriptblock]::Create($text)) @parameters
+    }
 }
 
 function New-Scenario([string]$name, [string]$failure='') {
@@ -289,6 +312,30 @@ try {
         Assert $failed 'Wire failure injection did not execute'
         Assert ($env:PATH -ceq $scenario.InputPath) 'Wire failure leaked process PATH change'
         Assert (@($scenario.Processes | Where-Object { $_.ExecutablePath -eq $scenario.Tray }).Count -ge 1) 'Wire failure left no tray'
+    }
+    Case 'full-plain-iex-null-pscmdlet-install-and-uninstall' {
+        $scenario=New-Scenario 'plain-iex'
+        Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en'} -PlainIex
+        Assert ($scenario.Events.Contains('plain-iex-null')) 'IEX null PSCmdlet context not verified'
+        Assert ($scenario.Events.Contains('cli:status')) 'Plain IEX installer did not complete full mock setup'
+        Assert (([IO.File]::ReadAllText($scenario.Exe)) -eq 'new:quota-baton.exe') 'Plain IEX did not install fixture payload'
+        Invoke-FixtureScript $uninstaller @{InstallDir=$scenario.Install;RemoveData=$true;Lang='en'} -PlainIex
+        Assert (@($scenario.Events | Where-Object { $_ -eq 'plain-iex-null' }).Count -eq 2) 'Uninstall did not execute with null PSCmdlet'
+        Assert ($scenario.Events.Contains('cli:unwire --apply')) 'Plain IEX did not request mocked unwire'
+        Assert (-not (Test-Path -LiteralPath $scenario.Install)) 'Plain IEX uninstall did not remove synthetic install'
+        Assert (-not (Test-Path -LiteralPath $env:QB_HOME)) 'Plain IEX RemoveData null guard did not remove synthetic data'
+        [void][IO.Directory]::CreateDirectory($env:QB_HOME)
+        [IO.File]::WriteAllText((Join-Path $env:QB_HOME 'keep.txt'),'synthetic-account-data')
+    }
+    Case 'plain-iex-null-pscmdlet-whatif-has-no-install-uninstall-or-data-effects' {
+        $scenario=New-Scenario 'plain-iex-whatif'
+        Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en'} -PlainIex -IexWhatIf $true
+        Invoke-FixtureScript $uninstaller @{InstallDir=$scenario.Install;RemoveData=$true;Lang='en'} -PlainIex -IexWhatIf $true
+        Assert (@($scenario.Events | Where-Object { $_ -eq 'plain-iex-null' }).Count -eq 2) 'WhatIf null context not verified for both scripts'
+        Assert (@($scenario.Events | Where-Object { $_ -match '^(cli:|start:|stop:|user-path)' }).Count -eq 0) 'Null PSCmdlet WhatIf caused workflow side effects'
+        Assert (([IO.File]::ReadAllText($scenario.Exe)) -eq 'old:quota-baton.exe') 'WhatIf changed fixture core'
+        Assert (([IO.File]::ReadAllText($scenario.Tray)) -eq 'old:quota-baton-tray.exe') 'WhatIf changed fixture tray'
+        Assert (Test-Path -LiteralPath (Join-Path $env:QB_HOME 'keep.txt')) 'WhatIf removed synthetic account data'
     }
     foreach ($extensionCase in @('absent','empty','no-exe','reordered')) {
         Case ('wire-environment-restore-' + $extensionCase) {

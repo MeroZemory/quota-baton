@@ -55,7 +55,7 @@ foreach ($path in @($InstallDir, $dataDir)) {
     }
 }
 if (-not $RemoveData -and ($dataDir -eq $InstallDir -or $dataDir.StartsWith($InstallDir + '\', [StringComparison]::OrdinalIgnoreCase))) { Fail (Korean 'm3') 'Data is inside InstallDir; refusing to remove kept data.' }
-if (-not $PSCmdlet.ShouldProcess($InstallDir, (Message (Korean 'm4') 'Unwire, stop exact installed PIDs, remove installation and its user PATH entry'))) { return }
+if (-not (($null -eq $PSCmdlet -and -not $WhatIfPreference) -or ($null -ne $PSCmdlet -and $PSCmdlet.ShouldProcess($InstallDir, (Message (Korean 'm4') 'Unwire, stop exact installed PIDs, remove installation and its user PATH entry'))))) { return }
 $exe = Join-Path $InstallDir 'quota-baton.exe'
 if (Test-Path -LiteralPath $InstallDir) {
     if (-not (Test-Path -LiteralPath $exe)) { Fail (Korean 'm5') 'Cannot unwire: installed quota-baton.exe is missing; installation retained.' }
@@ -85,6 +85,6 @@ $entries = @($userPath -split ';')
 $kept = @($entries | Where-Object { [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/') -ine $InstallDir })
 if ($kept.Count -ne $entries.Count) { [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User') }
 if ($RemoveData) {
-    if ($PSCmdlet.ShouldProcess($dataDir, (Message (Korean 'm13') 'Remove quota-baton account data')) -and (Test-Path -LiteralPath $dataDir)) { Remove-Item -LiteralPath $dataDir -Recurse -Force }
+    if ((($null -eq $PSCmdlet -and -not $WhatIfPreference) -or ($null -ne $PSCmdlet -and $PSCmdlet.ShouldProcess($dataDir, (Message (Korean 'm13') 'Remove quota-baton account data')))) -and (Test-Path -LiteralPath $dataDir)) { Remove-Item -LiteralPath $dataDir -Recurse -Force }
 } else { Say "$(Korean 'm14') $(Korean 'm15') $(Korean 'm16'): $dataDir" "Account data kept: $dataDir" }
 Say (Korean 'm17') 'Uninstall complete.'
