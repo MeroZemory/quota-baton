@@ -27,7 +27,7 @@ async fn permission_request(f: &Fixture, free: bool) {
             "organization":{"uuid":"synthetic-organization","organization_type":"claude_free","rate_limit_tier":"default_claude_free"}
         }).to_string())
     } else { profile_reply("default_claude_max_20x") });
-    let servers = crate::http::spawn_with_routes(
+    let mut servers = crate::http::spawn_with_routes(
         &config,
         crate::local_secrets::LocalSecrets {
             client_key: "synthetic-client-key".into(),
@@ -45,8 +45,8 @@ async fn permission_request(f: &Fixture, free: bool) {
         .send().await;
     servers.shutdown();
     let _ = result.unwrap().bytes().await.unwrap();
-    servers.data_task.await.unwrap().unwrap();
-    servers.admin_task.await.unwrap().unwrap();
+    (&mut servers.data_task).await.unwrap().unwrap();
+    (&mut servers.admin_task).await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -334,6 +334,14 @@ fn execute(
             account.generation = old.generation;
             account.user_state = old.user_state;
             account.label = old.label.clone();
+            // A credential-only Claude import supplies no plan evidence. Keep
+            // known Free evidence even when auth temporarily owns the health slot.
+            if account.provider == Provider::Claude
+                && account.plan.is_none()
+                && old.plan.as_deref() == Some("free")
+            {
+                account.plan = old.plan.clone();
+            }
             account.health = old.health.clone();
             account.auth_failures = old.auth_failures;
             account.payment_failures = old.payment_failures;
