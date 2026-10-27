@@ -2349,6 +2349,14 @@ pub(super) fn wire(
             }
             if apply {
                 validate_resume_inputs(paths, &options, &old)?;
+                // An explicit opt-out also applies to optional actions saved
+                // before an interrupted install. Keep all other recovery state.
+                if !options.autostart
+                    && old.install_completed != Some(true)
+                    && old.autostart.take().is_some()
+                {
+                    atomic_json(&paths.journal(), &old)?;
+                }
                 // Keep the old observation through all existing install checks
                 // and recovery writes. Failed/interrupted resumes must still
                 // detect the update and show its notice on the next retry.
@@ -3060,10 +3068,6 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
     }
     if !m.optional_restored {
         if let Some(a) = &m.autostart {
-            let current = read_autostart()?.0;
-            if current.value != a.before.value && current.value != Some(a.after.clone()) && !force {
-                bail!("autostart 설정이 변경되었습니다. journal을 보존합니다");
-            }
             restore_autostart(&a.before, a.before_type)?;
         }
         for task in &m.tasks {
@@ -3095,6 +3099,80 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r17_incomplete_wire_resume_honors_current_autostart_opt_out() {
+        use crate::platform::autostart;
+        autostart::set_fake(None);
+        let (_dir, p) = fixture();
+        let options = opts(Some(CodexMode::Dedicated));
+        INTERRUPT.with(|slot| {
+            *slot.borrow_mut() = Some((p.codex_qb_home.join("config.toml"), "after-publish"));
+        });
+        assert!(wire_with_options(&p, true, options).is_err());
+        let pending = manifest(&p);
+        assert_ne!(pending.install_completed, Some(true));
+        assert!(pending.autostart.is_some());
+        let tasks = serde_json::to_value(&pending.tasks).unwrap();
+        let foreign = "\"C:\\sample-tools\\another-tray.exe\"";
+        autostart::set_fake(Some((foreign.into(), REG_SZ.0)));
+        let opt_out = WireOptions {
+            autostart: false,
+            ..options
+        };
+        let journal = fs::read(p.journal()).unwrap();
+        wire_with_options(&p, false, opt_out).unwrap();
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        wire_with_options(&p, true, opt_out).unwrap();
+        let completed = manifest(&p);
+        assert_eq!(completed.install_completed, Some(true));
+        assert!(completed.autostart.is_none());
+        assert_eq!(serde_json::to_value(&completed.tasks).unwrap(), tasks);
+        assert_eq!(autostart::read().unwrap().0.as_deref(), Some(foreign));
+        assert_eq!(autostart::fake_writes(), 0);
+        autostart::set_fake(None);
+    }
+    #[test]
+    fn r17_completed_wire_registers_by_default_and_opt_out_preserves_foreign_value() {
+        use crate::platform::autostart;
+        autostart::set_fake(None);
+        let (_dir, p) = fixture();
+        let options = opts(Some(CodexMode::Dedicated));
+        let preview = wire_with_options(&p, false, options).unwrap();
+        assert!(
+            preview
+                .summary
+                .iter()
+                .any(|s| s.contains("로그인 자동 시작"))
+        );
+        assert_eq!(autostart::read().unwrap().0, None);
+        assert_eq!(autostart::fake_writes(), 0);
+        wire_with_options(&p, true, options).unwrap();
+        assert_eq!(
+            autostart::read().unwrap().0,
+            Some(tray_autostart_command().unwrap())
+        );
+        let writes = autostart::fake_writes();
+        wire_with_options(&p, true, options).unwrap();
+        assert_eq!(autostart::fake_writes(), writes);
+        autostart::set_fake(None);
+        wire_with_options(&p, true, options).unwrap();
+        assert_eq!(
+            autostart::read().unwrap().0,
+            Some(tray_autostart_command().unwrap())
+        );
+        let foreign = "\"C:\\sample-tools\\another-tray.exe\"";
+        autostart::set_fake(Some((foreign.into(), REG_SZ.0)));
+        let opt_out = WireOptions {
+            autostart: false,
+            ..options
+        };
+        wire_with_options(&p, true, opt_out).unwrap();
+        assert_eq!(autostart::read().unwrap().0.as_deref(), Some(foreign));
+        assert_eq!(autostart::fake_writes(), 0);
+        super::super::unwire(&p, true, false).unwrap();
+        assert_eq!(autostart::read().unwrap().0.as_deref(), Some(foreign));
+        autostart::set_fake(None);
+    }
     // Synthetic only; the coordinator runs Cargo for this independently owned task.
     fn r12_remove_image_home(p: &CutoverPaths) {
         let mut m = manifest(p);
