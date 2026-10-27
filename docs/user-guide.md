@@ -8,6 +8,8 @@ quota-baton은 Claude Code와 Codex CLI가 사용할 로컬 프록시입니다. 
 
 Windows PowerShell에서 설치 스크립트를 실행할 수 있습니다. 릴리스의 SHA-256을 확인한 뒤 사용자 설치 폴더에 설치하고 연결 변경을 미리 보여 줍니다. 기존 설치도 같은 명령으로 업그레이드합니다.
 
+업그레이드 중 사용 중인 이전 실행 파일은 남겨 두었다가 다음 설치 때 정리합니다. 클라이언트 탐지는 래퍼를 구분해 실제 실행 경로를 표시합니다. 트레이를 멈춘 뒤 설치가 실패해도 다시 시작을 시도하고 설치 상태를 알려 줍니다.
+
 ```powershell
 irm https://raw.githubusercontent.com/MeroZemory/quota-baton/main/install.ps1 | iex
 ```
