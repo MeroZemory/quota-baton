@@ -123,7 +123,11 @@ pub(super) async fn exchange(
         provider: params.provider,
         label: String::new(),
         email,
-        plan_observed_at: plan.as_ref().map(|_| now),
+        plan_observed_at: if params.provider == Provider::Codex {
+            plan.as_ref().map(|_| now)
+        } else {
+            None
+        },
         plan,
         subscription,
         identity,
