@@ -315,6 +315,30 @@ fn validate_state(state: &TraySnapshot) -> Result<(), SnapshotError> {
         }
     }
     for account in &state.accounts {
+        if let Some(subscription) = &account.subscription {
+            use qb_proto::AdminSubscription;
+            let dates: Vec<&str> = match (subscription, account.provider.as_str()) {
+                (AdminSubscription::Claude { created_at }, "claude") => vec![created_at],
+                (
+                    AdminSubscription::Codex {
+                        active_start,
+                        active_until,
+                        last_checked,
+                    },
+                    "codex",
+                ) => [active_start, active_until, last_checked]
+                    .into_iter()
+                    .filter_map(|s| s.as_deref())
+                    .collect(),
+                _ => return Err(SnapshotError::Invalid),
+            };
+            if dates
+                .iter()
+                .any(|date| DateTime::parse_from_rfc3339(date).is_err())
+            {
+                return Err(SnapshotError::Invalid);
+            }
+        }
         text_fields(&account.health, HEALTH)?;
         if let Some(credits) = &account.credits
             && let Some(fields) = object_fields(credits, CREDITS)?
@@ -487,6 +511,69 @@ mod tests {
         let mut bundle: SnapshotBundleV1 = serde_json::from_value(wire_bundle()).unwrap();
         allowlist_state(&mut bundle.state).unwrap();
         bundle
+    }
+
+    #[tokio::test]
+    async fn r18_subscription_facts_survive_capture_archive_and_projection() {
+        for (provider, subscription) in [
+            (
+                "claude",
+                json!({"provider":"claude","created_at":"2026-10-07T00:00:00Z"}),
+            ),
+            (
+                "codex",
+                json!({"provider":"codex","active_start":"2026-10-11T00:00:00Z",
+                "active_until":"2026-11-11T00:00:00Z","last_checked":"2026-10-01T00:00:00Z"}),
+            ),
+        ] {
+            let mut wire = wire_bundle();
+            wire["state"]["accounts"][0]["provider"] = json!(provider);
+            wire["state"]["accounts"][0]["subscription"] = subscription.clone();
+            let (client, worker) = server(&wire);
+            let captured = capture(&client).await.unwrap();
+            worker.join().unwrap();
+            let restored = decode(&encode(&captured).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored.state.accounts[0].subscription).unwrap(),
+                subscription
+            );
+            let now = DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z").unwrap();
+            let projected = restored.project(now.to_utc().into()).unwrap();
+            let row = projected
+                .accounts
+                .sections
+                .iter()
+                .flat_map(|s| &s.rows)
+                .next()
+                .unwrap();
+            assert!(!row.subscription_lines.is_empty());
+        }
+    }
+
+    #[test]
+    fn r18_snapshot_subscription_validation_rejects_invalid_dates_and_foreign_provider() {
+        let original: Value = serde_json::from_slice(&encode(&bundle()).unwrap()).unwrap();
+        for subscription in [
+            json!({"provider":"claude","created_at":"2026-10-07T00:00:00Z"}),
+            json!({"provider":"codex","active_until":"private-unreviewed-value"}),
+            json!({"provider":"codex","active_start":"2026-02-30T00:00:00Z"}),
+            json!({"provider":"codex","last_checked":"2026-10-28"}),
+            json!({"provider":"codex","native_checked":true}),
+        ] {
+            let mut wire = original.clone();
+            wire["state"]["accounts"][0]["subscription"] = subscription;
+            assert!(decode(&serde_json::to_vec(&wire).unwrap()).is_err());
+        }
+        let mut wire = original;
+        wire["state"]["accounts"][0]["subscription"] = json!({"provider":"codex"});
+        let mut valid = decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert!(valid.state.accounts[0].subscription.is_some());
+        valid.state.accounts[0].subscription = Some(qb_proto::AdminSubscription::Codex {
+            active_start: None,
+            active_until: Some("invalid".into()),
+            last_checked: None,
+        });
+        assert!(encode(&valid).is_err());
     }
 
     #[test]

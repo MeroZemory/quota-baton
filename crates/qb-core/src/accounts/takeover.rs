@@ -495,6 +495,8 @@ fn finish_prepare(
     } else {
         Account {
             schema: 1,
+            subscription: None,
+            plan_observed_at: None,
             id: profile.identity.id(),
             provider: request.provider,
             label: String::new(),

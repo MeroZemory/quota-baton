@@ -4331,6 +4331,8 @@ mod tests {
         Candidate {
             account: Account {
                 schema: 1,
+                subscription: None,
+                plan_observed_at: None,
                 id: id.into(),
                 provider: Provider::Claude,
                 label: id.into(),

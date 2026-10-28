@@ -5,6 +5,63 @@ fn view(state: &mut DashboardState) -> m::DashboardView {
 }
 
 #[test]
+fn r18_subscription_facts_are_read_only_measured_card_lines_on_both_dashboard_tabs() {
+    for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+        crate::i18n::with_language(language, || {
+            let clock = fixtures::clock();
+            let wire = serde_json::json!({"accounts":[{
+                "id":"cx-a","provider":"codex","label":"Synthetic date card","plan":"plus",
+                "user_state":"active","health":{"kind":"ready"},"pool_eligible":true,
+                "subscription":{"provider":"codex","active_start":null,
+                    "active_until":"2026-10-20T23:30:00Z","last_checked":"2026-10-01T00:00:00Z"}
+            }]});
+            let mut data = fixtures::snapshot();
+            data.accounts = v2::project(&wire.to_string(), clock.utc().into()).unwrap();
+            data.sessions.sessions.retain(|s| s.account == "cx-a");
+            for tab in [Tab::Overview, Tab::Usage] {
+                let mut state = DashboardState {
+                    tab,
+                    grouped: true,
+                    range: Range::All,
+                    ..Default::default()
+                };
+                let mut v = m::project(&data, &mut state, &clock);
+                // Keep the account card in the viewport rather than below provider charts.
+                v.provider_usage.clear();
+                let lines = &v.groups[0].subscription_lines;
+                assert_eq!(lines.len(), 3);
+                assert!(
+                    lines[0].ends_with("10/21"),
+                    "dashboard dates follow its clock offset"
+                );
+                assert_eq!(v.usage[0].subscription_lines, *lines);
+                for size in [[1024., 640.], [1320., 960.]] {
+                    let scene = Scene::build(&v, &state, size, &Metrics::default());
+                    let nodes: Vec<_> = scene
+                        .accessibility
+                        .iter()
+                        .filter(|n| n.key.contains(":subscription:"))
+                        .collect();
+                    assert_eq!(nodes.len(), lines.len());
+                    for (line, node) in lines.iter().zip(&nodes) {
+                        assert_eq!(&node.name, line);
+                        assert_eq!(node.role, Role::Text);
+                        assert!(node.target.is_none());
+                        assert!(node.rect.left >= 0. && node.rect.right <= size[0]);
+                        assert!(scene.draw.iter().any(|d| matches!(d,
+                            Draw::Text { measure, rect, color: Color::Secondary, .. }
+                            if &measure.text == line && *rect == node.rect)));
+                    }
+                    for pair in nodes.windows(2) {
+                        assert!(pair[0].rect.bottom < pair[1].rect.top);
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
 fn r14_move_cost_is_accessible_on_overview_and_usage_at_minimum_size() {
     for tab in [Tab::Overview, Tab::Usage] {
         let mut state = DashboardState {

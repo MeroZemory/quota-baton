@@ -1,5 +1,69 @@
 use super::*;
 
+#[tokio::test]
+async fn r18_subscription_creation_uses_existing_fenced_profile_and_preserves_absence() {
+    let f = Fixture::with_provider(1, Provider::Claude).await;
+    let id = &f.ids[0];
+    let created_at = chrono::DateTime::parse_from_rfc3339("2026-04-07T02:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    f.fake.state.push(ScriptedResponse::json(reqwest::StatusCode::OK, json!({
+        "account":{"uuid":"synthetic-claude-0","has_claude_max":true},
+        "organization":{"uuid":"synthetic-organization","rate_limit_tier":"default_claude_max_5x",
+            "subscription_created_at":"2026-04-07T02:00:00Z"}
+    }).to_string()));
+    let account = f.relay.quota.refresh_permission_plan(id).await.unwrap();
+    assert_eq!(
+        account.subscription,
+        Some(crate::accounts::SubscriptionMetadata::Claude { created_at })
+    );
+    assert_eq!(f.account(0).subscription, account.subscription);
+    f.fake.state.push(profile_reply("default_claude_max_5x"));
+    let next = f.relay.quota.refresh_permission_plan(id).await.unwrap();
+    assert_eq!(next.subscription, account.subscription);
+    assert_eq!(f.fake.state.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn r18_subscription_end_poll_due_is_per_exact_endpoint_and_respects_disabled() {
+    let f = Fixture::new(1).await;
+    let mut account = f.account(0);
+    let until = Utc::now() - chrono::Duration::minutes(1);
+    // A fresh usage snapshot and closed tray must not postpone the end check.
+    f.relay
+        .quota
+        .obs
+        .observe_poll(
+            &account.id,
+            json!({"observed_at":Utc::now(),"windows":[],"source":"poll"}),
+            true,
+        )
+        .unwrap();
+    account.subscription = Some(crate::accounts::SubscriptionMetadata::Codex {
+        active_start: None,
+        active_until: Some(until),
+        last_checked: None,
+        end_plan_checked_for: None,
+    });
+    assert!(f.relay.quota.scheduled(&account));
+    if let Some(crate::accounts::SubscriptionMetadata::Codex {
+        end_plan_checked_for,
+        ..
+    }) = &mut account.subscription
+    {
+        *end_plan_checked_for = Some(until);
+    }
+    assert!(!f.relay.quota.scheduled(&account));
+    if let Some(crate::accounts::SubscriptionMetadata::Codex { active_until, .. }) =
+        &mut account.subscription
+    {
+        *active_until = Some(until - chrono::Duration::days(1));
+    }
+    assert!(f.relay.quota.scheduled(&account));
+    account.user_state = UserState::Disabled;
+    assert!(!f.relay.quota.scheduled(&account));
+}
+
 async fn bounded<T>(work: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), work)
         .await

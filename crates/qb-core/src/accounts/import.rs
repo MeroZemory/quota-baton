@@ -118,6 +118,8 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
     };
     let account = Account {
         schema: 1,
+        subscription: None,
+        plan_observed_at: None,
         id: identity.id(),
         provider: identity.provider(),
         label,

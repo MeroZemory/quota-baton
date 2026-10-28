@@ -1261,6 +1261,8 @@ mod publication_tests {
         };
         let account = crate::accounts::Account {
             schema: 1,
+            subscription: None,
+            plan_observed_at: None,
             id: identity.id(),
             provider: Provider::Codex,
             label: "Synthetic publication account".into(),

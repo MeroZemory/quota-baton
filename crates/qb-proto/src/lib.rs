@@ -19,7 +19,7 @@ pub mod admin_sessions;
 pub mod admin_sse;
 pub mod admin_state;
 pub mod admin_takeover;
-pub use admin_account::AdminAccount;
+pub use admin_account::{AdminAccount, AdminSubscription};
 pub mod admin_warning;
 pub mod history_response;
 pub mod native_reset;

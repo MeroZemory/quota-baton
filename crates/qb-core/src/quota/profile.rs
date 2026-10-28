@@ -298,6 +298,7 @@ impl UsagePoller {
                 return Err(PollError::Unavailable);
             }
             let plan = claude_profile::plan(&profile).map(str::to_owned);
+            let subscription = crate::accounts::subscription::from_claude_profile(&profile);
             let store = self.store.clone();
             let obs = self.obs.clone();
             let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
@@ -313,10 +314,14 @@ impl UsagePoller {
                         && allowed(current)
                     {
                         let previous = current.plan.clone();
+                        if subscription.is_some() {
+                            current.subscription = subscription;
+                        }
                         current.apply_health_signal(
                             crate::accounts::HealthSignal::PlanObservation { plan },
                             Utc::now(),
                         );
+                        current.plan_observed_at = Some(Utc::now());
                         if previous != current.plan {
                             previous_change = Some(previous);
                         }

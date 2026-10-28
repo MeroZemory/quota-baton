@@ -3,7 +3,8 @@
 use super::*;
 
 fn body(primary: u64, secondary: u64, reset: i64) -> serde_json::Value {
-    json!({"rate_limit": {
+    json!({"plan_type":"plus","rate_limit": {
+        "limit_reached": primary >= 100 || secondary >= 100,
         "primary_window": {"used_percent": primary, "limit_window_seconds": 18000,
             "reset_at": reset},
         "secondary_window": {"used_percent": secondary, "limit_window_seconds": 604800,

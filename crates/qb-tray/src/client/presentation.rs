@@ -47,6 +47,8 @@ pub struct PresentationAccount {
     pub email: Option<String>,
     #[serde(default)]
     pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<qb_proto::AdminSubscription>,
     #[serde(default)]
     pub user_state: String,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]

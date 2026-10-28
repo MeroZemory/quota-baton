@@ -964,6 +964,26 @@ pub struct QuotaObservation {
     pub(crate) quota_until: Option<DateTime<Utc>>,
 }
 
+/// Captured before sending the usage request; never serialized or persisted.
+pub(crate) struct PollUsageReport {
+    pub account: Account,
+    pub access_token: zeroize::Zeroizing<String>,
+    pub started_at: DateTime<Utc>,
+    pub snapshot: Value,
+    pub complete: bool,
+}
+
+#[derive(Clone, Default)]
+struct UsageWindowHistory {
+    generation: u64,
+    missing: BTreeMap<String, u8>,
+    pending_plan_change: bool,
+}
+
+#[cfg(test)]
+#[path = "account_runtime/r18_usage_tests.rs"]
+mod r18_usage_tests;
+
 pub struct AccountRuntime {
     pub store: Arc<AccountStore>,
     outside_owner: Arc<outside_owner::OutsideOwner>,
@@ -973,6 +993,7 @@ pub struct AccountRuntime {
     limits: Mutex<BTreeMap<String, LimitResponse>>,
     probes: Arc<Mutex<BTreeSet<String>>>,
     released_quota: Arc<Mutex<BTreeMap<String, ReleasedQuota>>>,
+    usage_window_history: Arc<Mutex<BTreeMap<String, UsageWindowHistory>>>,
     volatile: Arc<Mutex<BTreeMap<String, Health>>>,
     selection_owner: selection::SelectionOwner,
     inflight: Arc<Mutex<BTreeMap<String, usize>>>,
@@ -1131,6 +1152,10 @@ impl AccountRuntime {
     pub fn new(store: Arc<AccountStore>, obs: Arc<Observability>, _allowance: f64) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         obs.set_events(events.clone());
+        let plan_writer = obs.clone();
+        store.set_plan_observer(Arc::new(move |account, previous| {
+            plan_writer.record_plan_change(account, previous);
+        }));
         let writer = obs.clone();
         let changes = events.clone();
         let quota_notices = Arc::new(Mutex::new(QuotaNotices::new()));
@@ -1178,6 +1203,7 @@ impl AccountRuntime {
             limits: Mutex::new(BTreeMap::new()),
             probes: Arc::new(Mutex::new(BTreeSet::new())),
             released_quota: Arc::new(Mutex::new(BTreeMap::new())),
+            usage_window_history: Arc::new(Mutex::new(BTreeMap::new())),
             volatile: Arc::new(Mutex::new(BTreeMap::new())),
             selection_owner: selection::SelectionOwner::default(),
             inflight: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2406,7 +2432,14 @@ impl AccountRuntime {
                     },
                     label: a.label.clone(),
                     email: a.email.clone(),
-                    plan: quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),
+                    plan: if a.provider == Provider::Codex {
+                        a.plan
+                            .clone()
+                            .or_else(|| quota["plan"].as_str().map(str::to_owned))
+                    } else {
+                        quota["plan"].as_str().map(str::to_owned).or(a.plan.clone())
+                    },
+                    subscription: admin_view::subscription(a.subscription.as_ref()),
                     user_state: match a.user_state {
                         UserState::Active => AdminUserState::Active,
                         UserState::Paused => AdminUserState::Paused,
@@ -2632,11 +2665,12 @@ impl AccountRuntime {
                 model,
                 (origin, publication),
                 None,
+                None,
             )
             .await
             .ok();
         let (account, pending) = match applied {
-            Some((account, pending)) => (
+            Some((account, pending, _, _)) => (
                 Some(account),
                 pending.and_then(|receipt| match receipt {
                     wait_owner::ReportReceipt::Http(pending) => Some(pending),
@@ -2768,11 +2802,50 @@ impl AccountRuntime {
             model,
             (origin, wait_owner::ReportPublication::Immediate),
             None,
+            None,
         )
         .await
-        .map(|(account, _)| account)
+        .map(|(account, _, _, _)| account)
     }
 
+    /// Apply the raw poll, plan and end-date acknowledgement in one token-fenced
+    /// native transaction. Callers must not merge this report into the cache first.
+    pub(crate) async fn apply_polled_usage_report(
+        &self,
+        report: PollUsageReport,
+        wait_origin: Option<ReportOrigin>,
+        outside_origin: Option<outside_owner::PollOrigin>,
+        capture_receipt: bool,
+    ) -> Result<(Account, Option<ObservedUsagePoll>, Option<Value>), ()> {
+        let id = report.account.id.clone();
+        let snapshot = report.snapshot.clone();
+        let publication = if capture_receipt && report.complete {
+            wait_owner::ReportPublication::ImmediatePollReceipt
+        } else {
+            wait_owner::ReportPublication::Immediate
+        };
+        self.apply_quota_snapshot_reported_inner(
+            &id,
+            snapshot.clone(),
+            &snapshot,
+            None,
+            (wait_origin, publication),
+            Some(outside_owner::PollApplication {
+                origin: outside_origin,
+            }),
+            Some(report),
+        )
+        .await
+        .map(|(account, receipt, snapshot, quota_applied)| {
+            let receipt = receipt.and_then(|receipt| match receipt {
+                wait_owner::ReportReceipt::Poll(receipt) => Some(receipt),
+                wait_owner::ReportReceipt::Http(_) => None,
+            });
+            (account, receipt, quota_applied.then_some(snapshot))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn apply_quota_snapshot_reported_inner(
         &self,
         id: &str,
@@ -2781,7 +2854,8 @@ impl AccountRuntime {
         model: Option<&str>,
         publication: (Option<ReportOrigin>, wait_owner::ReportPublication),
         outside: Option<outside_owner::PollApplication>,
-    ) -> Result<(Account, Option<wait_owner::ReportReceipt>), ()> {
+        poll: Option<PollUsageReport>,
+    ) -> Result<(Account, Option<wait_owner::ReportReceipt>, Value, bool), ()> {
         let (origin, publication) = publication;
         let reported = reported.clone();
         let store = self.store.clone();
@@ -2795,16 +2869,132 @@ impl AccountRuntime {
         let outside_inflight = self.inflight.clone();
         let probes = self.probes.clone();
         let volatile = self.volatile.clone();
-        let (account, snapshot, pending) =
+        let usage_window_history = self.usage_window_history.clone();
+        let events = self.events.clone();
+        let (account, snapshot, pending, quota_applied) =
             crate::boxes::spawn_blocking(move || -> Result<_, ()> {
                 let _guard = store.transaction().map_err(|_| ())?;
+                let mut snapshot = snapshot;
+                let mut removed_windows = BTreeSet::new();
+                let mut history_update = None;
+                if let Some(report) = &poll {
+                    let current = store.read_account_unlocked(&account_id).map_err(|_| ())?;
+                    let tokens = store.tokens_unlocked(&current).map_err(|_| ())?;
+                    let time = |value: &Value| value.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
+                    let previous = obs.quota_snapshot(&account_id);
+                    // Receipt time cannot make an old credential/request newer.
+                    if store.writes_stopped()
+                        || current.provider != Provider::Codex
+                        || current.source != report.account.source
+                        || current.identity != report.account.identity
+                        || current.token_meta != report.account.token_meta
+                        || tokens.access_token != *report.access_token
+                        || current.plan_observed_at.is_some_and(|at| at >= report.started_at)
+                        || report.started_at > Utc::now()
+                    {
+                        return Err(());
+                    }
+                    // A label/header mutation can invalidate quota provenance
+                    // without invalidating this token's descriptive plan result.
+                    // Keep all receipt, inventory and probe effects on the strict
+                    // lane; never accept or rebase this already captured origin.
+                    if current.generation != report.account.generation
+                        || previous.as_ref().and_then(|value| time(&value["observed_at"]))
+                            .is_some_and(|at| at >= report.started_at)
+                    {
+                        let plan = reported["plan"].as_str().filter(|plan| matches!(
+                            *plan, "free" | "plus" | "pro" | "prolite" | "promax" | "team" | "business" | "enterprise" | "edu" | "go" | "max"
+                        )).ok_or(())?;
+                        let previous_plan = current.plan.clone();
+                        let mut ran = false;
+                        let account = store.update_metadata_with_cause_unlocked(
+                            &account_id,
+                            crate::accounts::MetadataCause::Mutation(crate::accounts::MetadataMutation::Ordinary),
+                            |account| {
+                                ran = true;
+                                // Merge only descriptive fields into the actual
+                                // current record. Keep ordinary native expiry,
+                                // all settings and every independent hold.
+                                account.plan = Some(plan.to_owned());
+                                account.plan_observed_at = Some(report.started_at);
+                                if let Some(subscription) = account.subscription.as_mut()
+                                    && let crate::accounts::SubscriptionMetadata::Codex { active_until: Some(until), .. } = subscription
+                                {
+                                    let until = *until;
+                                    subscription.mark_codex_end_checked(until, report.started_at);
+                                }
+                            },
+                        ).map_err(|_| ())?;
+                        if !ran {
+                            return Err(());
+                        }
+                        if previous_plan != account.plan {
+                            obs.record_plan_change(&account, previous_plan.as_deref());
+                        }
+                        return Ok((account, snapshot, None, false));
+                    }
+                    let mut history = usage_window_history.lock().map_err(|_| ())?
+                        .get(&account_id).cloned().unwrap_or_default();
+                    if history.generation != current.generation {
+                        history = UsageWindowHistory { generation: current.generation, ..Default::default() };
+                    }
+                    let observed_plan = reported["plan"].as_str();
+                    history.pending_plan_change |= observed_plan.is_some_and(|plan| {
+                        current.plan.as_deref().is_some_and(|old| old != plan)
+                            || previous.as_ref().and_then(|value| value["plan"].as_str()).is_some_and(|old| old != plan)
+                    });
+                    // A partial observation never proves absence or advances a run
+                    // of complete omissions. A remembered plan change waits for a
+                    // complete report rather than discarding a partial window.
+                    if !report.complete {
+                        history.missing.clear();
+                    }
+                    if report.complete {
+                        let windows = snapshot["windows"].as_array_mut().ok_or(())?;
+                        let mut inventory = previous.as_ref()
+                            .and_then(|value| value["windows"].as_array()).cloned().unwrap_or_default();
+                        // Usage cache publication can outlive a failed metadata
+                        // write. The durable causing window remains absence
+                        // evidence on retry even when it is no longer cached.
+                        let native_cause = current.quota_cooling.as_ref().filter(|cause| {
+                            !inventory.iter().any(|window| window["name"] == cause.window)
+                        });
+                        if let Some(cause) = native_cause {
+                            inventory.push(json!({"name":cause.window,"observed_at":cause.started_at}));
+                        }
+                        history.missing.retain(|name, _| inventory.iter().any(|window| window["name"] == name.as_str()));
+                        for old in &inventory {
+                            let Some(name) = old["name"].as_str() else { continue };
+                            if windows.iter().any(|window| window["name"] == name) {
+                                history.missing.remove(name);
+                                continue;
+                            }
+                            let count = history.missing.entry(name.to_owned()).or_default();
+                            *count = count.saturating_add(1);
+                            if (history.pending_plan_change || *count >= 2)
+                                && time(&old["observed_at"]).is_none_or(|at| at < report.started_at)
+                            {
+                                removed_windows.insert(name.to_owned());
+                            } else if native_cause.is_none_or(|cause| cause.window != name) {
+                                // Only real cached usage is retained. A durable
+                                // cause supplies identity, never invented usage.
+                                windows.push(old.clone());
+                            }
+                        }
+                        history.pending_plan_change = false;
+                    }
+                    // Force the root timestamp to the captured send time even if a
+                    // caller accidentally supplied a response-completion timestamp.
+                    snapshot["observed_at"] = json!(report.started_at);
+                    snapshot = obs.observe_poll(&account_id, snapshot, report.complete).ok_or(())?;
+                    history_update = Some(history);
+                }
                 // Consume the pre-send ordinal before classification, even for a
                 // partial or nonqualifying raw report. Never capture on receipt.
                 let mut application =
                     origin.and_then(|origin| wait_owner.accept(&account_id, origin));
                 let report_model = model.clone();
                 let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
-                let mut snapshot = snapshot;
                 let mut model = model;
                 if let Some(current) = obs.quota_snapshot(&account_id)
                     && let Some((new, incoming)) =
@@ -2832,10 +3022,10 @@ impl AccountRuntime {
                 let mut candidate = None;
                 let mut readiness = None;
                 let mut plan_change = None;
+                let mut removed_quota_hold = false;
                 let account = store
                     .update_metadata_with_cause_unlocked(&account_id, cause, |account| {
                         ran = true;
-                        let before = attributed.then(|| account.clone());
                         let mut health_snapshot = snapshot.clone();
                         if let Ok(released) = released_quota.lock()
                             && let Some(release) = released.get(&account_id)
@@ -2844,23 +3034,46 @@ impl AccountRuntime {
                         }
                         let applied_at = Utc::now();
                         if account.provider == Provider::Codex
-                            && let Some(plan) = reported["plan"].as_str()
+                            && let Some(observed_at) = poll.as_ref().map(|report| report.started_at)
+                            && account.plan_observed_at.is_none_or(|old| observed_at > old)
+                            && let Some(plan) = reported["plan"].as_str().filter(|plan| matches!(
+                                *plan, "free" | "plus" | "pro" | "prolite" | "promax" | "team" | "business" | "enterprise" | "edu" | "go" | "max"
+                            ))
                         {
                             let previous = account.plan.clone();
-                            // A newly reported unknown tier must not leave the
-                            // previous paid plan looking current. Do not persist
-                            // arbitrary provider text as public plan metadata.
-                            let plan =
-                                crate::dashboard::history::PlanName::try_from(plan.to_owned())
-                                    .ok()
-                                    .map(|plan| plan.as_str().to_owned());
                             account.apply_health_signal(
-                                crate::accounts::HealthSignal::PlanObservation { plan },
+                                crate::accounts::HealthSignal::PlanObservation { plan: Some(plan.to_owned()) },
                                 applied_at,
                             );
+                            account.plan_observed_at = Some(observed_at);
+                            if let Some(subscription) = account.subscription.as_mut()
+                                && let crate::accounts::SubscriptionMetadata::Codex { active_until: Some(until), .. } = subscription
+                            {
+                                let until = *until;
+                                subscription.mark_codex_end_checked(until, observed_at);
+                            }
                             if previous != account.plan {
                                 plan_change = Some(previous);
                             }
+                        }
+                        // Descriptive facts were fenced above. The proof must
+                        // reproduce the quota reducer alone, with those same
+                        // facts on both sides of its exact native comparison.
+                        let before = attributed.then(|| account.clone());
+                        // Only a native quota hold whose recorded causing window
+                        // disappeared may be reconsidered. Stronger health and
+                        // independent request-rejection evidence remain intact.
+                        if account.quota_cooling.as_ref().is_some_and(|cause| {
+                            removed_windows.contains(&cause.window)
+                                && poll.as_ref().is_some_and(|report| report.started_at > cause.started_at)
+                        }) && matches!(account.health, Health::Cooling { reason: HealthReason::Quota, .. })
+                            && health_snapshot["signals"]["unified_status"] != "rejected"
+                            && health_snapshot["signals"]["limit_reached"] != true
+                        {
+                            account.health = Health::Ready;
+                            account.quota_cooling = None;
+                            account.quota_credit_releasable = false;
+                            removed_quota_hold = true;
                         }
                         account.apply_health_signal(
                             crate::accounts::HealthSignal::UsageSnapshot {
@@ -2888,6 +3101,12 @@ impl AccountRuntime {
                         }
                     })
                     .map_err(|_| ())?;
+                if ran && !store.writes_stopped() && let Some(mut history) = history_update {
+                    // Metadata writes advance the native generation too. Retain
+                    // a committed omission run across our own successful write.
+                    history.generation = account.generation;
+                    usage_window_history.lock().map_err(|_| ())?.insert(account_id.clone(), history);
+                }
                 // Stopped updates may return Ok without running the reducer. The
                 // registry also rejects an independently expired/released permit.
                 let pending = if ran
@@ -2971,17 +3190,25 @@ impl AccountRuntime {
                 if let Some(previous) = plan_change {
                     obs.record_plan_change(&account, previous.as_deref());
                 }
+                if removed_quota_hold && account.health == Health::Ready {
+                    tracing::info!(account = %account_id, reason = "window_gone_after_plan_change", "Quota window removed by complete usage report");
+                    let _ = events.send(json!({"event":"quota_hold_cleared","data":{
+                        "id":account_id,"reason":"window_gone_after_plan_change"
+                    }}));
+                }
                 if publish_outside {
                     outside_owner.publish();
                 }
-                Ok((account, snapshot, pending))
+                Ok((account, snapshot, pending, true))
             })
             .await
             .map_err(|_| ())??;
-        let _ = self
-            .events
-            .send(json!({"event":"quota_updated","data":{"id":id,"snapshot":snapshot}}));
-        Ok((account, pending))
+        if quota_applied {
+            let _ = self
+                .events
+                .send(json!({"event":"quota_updated","data":{"id":id,"snapshot":snapshot}}));
+        }
+        Ok((account, pending, snapshot, quota_applied))
     }
 
     pub fn cache_limit(&self, id: &str, status: StatusCode, headers: &HeaderMap, raw: &[u8]) {

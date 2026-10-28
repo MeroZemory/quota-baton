@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R18 Part 1 관문 통과 · Part 2 공급자 날짜 사실
+현재 마일스톤: R18 Part 2/3 저장·창 교체 최종 관문
 목표: Claude permission_error 때 요금제를 다시 읽어 Free 계정을 배정에서 빼고, 요금제·구독 시작일(Claude)·이용 기간(Codex)을 최신으로 표시하기
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (홈 서버 꺼짐)
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 보류 유지(추천). L1 P5 서버 수용은 홈 서버가 켜지면 사용자와 진행
-갱신: 2026-10-28 16:21 KST (Part 1 Windows/Linux·한영 실제 경로 관문 통과)
+갱신: 2026-10-28 18:21 KST (날짜·Pro 창 교체 집중 관문 통과; 최종 관문 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.

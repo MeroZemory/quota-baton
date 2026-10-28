@@ -115,6 +115,8 @@ mod tests {
             label: "synthetic-runtime-selection".into(),
             email: "runtime-selection@example.invalid".into(),
             plan: None,
+            plan_observed_at: None,
+            subscription: None,
             identity,
             source: Source::Oauth,
             user_state: UserState::Active,

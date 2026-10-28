@@ -215,6 +215,16 @@ impl Renderer {
             .iter()
             .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
         {
+            for line in &row.subscription_lines {
+                let mut s = style(12., false, 16.);
+                s.wrap = Wrap::KeepAll;
+                let lines = self
+                    .text
+                    .layout(line, bounds(r(0., 0., 328., 65536.)), s)?
+                    .metrics
+                    .total_lines;
+                p.subtitle_lines.insert(line.clone(), lines.max(1));
+            }
             if let Some(note) = &row.outside_note {
                 let mut s = style(12., false, 16.);
                 s.wrap = Wrap::KeepAll;
@@ -897,6 +907,11 @@ impl Renderer {
             let mut s = style(12., false, 16.);
             s.wrap = Wrap::KeepAll;
             self.text(target, rect, note, s, p.secondary, alpha)?;
+        }
+        for (line, rect) in row.subscription_lines.iter().zip(&b.subscription) {
+            let mut s = style(12., false, 16.);
+            s.wrap = Wrap::KeepAll;
+            self.text(target, *rect, line, s, p.secondary, alpha)?;
         }
         if let (Some(chip), Some(rect)) = (&row.chip, b.chip) {
             let (bg, fg) = p.chip(chip.tone);

@@ -22,6 +22,27 @@ pub(super) fn time(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }
 
+pub(super) fn subscription(
+    value: Option<&crate::accounts::SubscriptionMetadata>,
+) -> Option<qb_proto::AdminSubscription> {
+    use crate::accounts::SubscriptionMetadata;
+    value.map(|value| match value {
+        SubscriptionMetadata::Claude { created_at } => qb_proto::AdminSubscription::Claude {
+            created_at: time(*created_at),
+        },
+        SubscriptionMetadata::Codex {
+            active_start,
+            active_until,
+            last_checked,
+            ..
+        } => qb_proto::AdminSubscription::Codex {
+            active_start: active_start.map(time),
+            active_until: active_until.map(time),
+            last_checked: last_checked.map(time),
+        },
+    })
+}
+
 /// Reuse the authoritative generic forecast schema when changing its timestamp
 /// parameter. This is a typed leaf conversion, never an account/key-map builder.
 pub(super) fn wire<T: serde::Serialize, U: serde::de::DeserializeOwned>(
@@ -129,6 +150,27 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn r18_subscription_wire_omits_the_native_end_check_marker() {
+        let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let native = crate::accounts::SubscriptionMetadata::Codex {
+            active_start: None,
+            active_until: Some(at),
+            last_checked: Some(at),
+            end_plan_checked_for: Some(at),
+        };
+        let value = serde_json::to_value(subscription(Some(&native))).unwrap();
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["active_until"], time(at));
+        assert_eq!(value["last_checked"], time(at));
+        assert!(value.get("end_plan_checked_for").is_none());
+        assert!(subscription(None).is_none());
+        let claude = crate::accounts::SubscriptionMetadata::Claude { created_at: at };
+        let value = serde_json::to_value(subscription(Some(&claude))).unwrap();
+        assert_eq!(value["created_at"], time(at));
+        assert!(value.get("active_until").is_none());
+    }
+
     fn account() -> AdminAccount {
         let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         AdminAccount {
@@ -156,6 +198,7 @@ mod tests {
             label: "sample-acct".into(),
             email: "sample-acct@example.test".into(),
             plan: None,
+            subscription: None,
             user_state: AdminUserState::Active,
             source: AdminSource::Oauth,
             health: AdminHealth::Ready {},

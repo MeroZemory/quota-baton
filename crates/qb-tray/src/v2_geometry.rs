@@ -212,6 +212,7 @@ pub struct RowBox {
     pub name: Rect,
     pub plan: Option<Rect>,
     pub outside_note: Option<Rect>,
+    pub subscription: Vec<Rect>,
     pub chip: Option<Rect>,
     pub usage: Option<Rect>,
     pub usage_lines: Vec<UsageLineBox>,
@@ -827,11 +828,13 @@ fn ordered<'a>(
 pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
     if disabled_slot {
         return 44.
+            + subscription_height(row, &Presentation::default())
             + outside_note_height(row, &Presentation::default())
             + if row.reason.is_some() { 24. } else { 0. };
     }
     let action = row.action.as_ref().map(|a| a.kind);
-    44. + outside_note_height(row, &Presentation::default())
+    44. + subscription_height(row, &Presentation::default())
+        + outside_note_height(row, &Presentation::default())
         + forecast_height(row, &Presentation::default())
         + row
             .usage
@@ -862,6 +865,12 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
             0.
         }
 }
+fn subscription_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
+    row.subscription_lines
+        .iter()
+        .map(|text| 6. + paragraph_height(p, text, 328.))
+        .sum()
+}
 fn outside_note_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
     row.outside_note
         .as_ref()
@@ -876,6 +885,8 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
     let enabled = p.core_ok && !p.pending_ids.contains(&row.raw.id);
     let height = row_height(row, disabled_slot) + outside_note_height(row, p)
         - outside_note_height(row, &Presentation::default())
+        + subscription_height(row, p)
+        - subscription_height(row, &Presentation::default())
         + if disabled_slot {
             0.
         } else {
@@ -933,6 +944,17 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         )
     });
     let mut next = line1.bottom;
+    let subscription = row
+        .subscription_lines
+        .iter()
+        .map(|text| {
+            next += 6.;
+            let height = paragraph_height(p, text, 328.);
+            let bounds = r(16., next, 344., next + height);
+            next += height;
+            bounds
+        })
+        .collect();
     let outside_note = row.outside_note.as_ref().map(|text| {
         next += 6.;
         let height = paragraph_height(p, text, 328.);
@@ -1091,6 +1113,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         name,
         plan,
         outside_note,
+        subscription,
         chip,
         usage,
         usage_lines,
@@ -1802,6 +1825,9 @@ fn shift_row(row: &mut RowBox, dy: f32) {
     {
         shift(rect, dy);
     }
+    for rect in &mut row.subscription {
+        shift(rect, dy);
+    }
     for line in &mut row.usage_lines {
         shift(&mut line.line, dy);
         if let Some(reset) = &mut line.reset {
@@ -1859,6 +1885,55 @@ mod tests {
     }
     fn ready_view() -> v2::View {
         view(vec![account("a")], 1)
+    }
+    #[test]
+    fn r18_subscription_lines_expand_native_cards_with_measured_wrapping() {
+        for disabled_slot in [false, true] {
+            let mut wire = account("date-card");
+            if disabled_slot {
+                wire["user_state"] = json!("disabled");
+            }
+            wire["outside_used"] = json!(true);
+            let baseline = view(vec![wire.clone()], 1);
+            wire["subscription"] = json!({"provider":"codex","active_until":"2026-10-20T12:00:00Z",
+                "last_checked":"2026-10-01T00:00:00Z"});
+            let projected = view(vec![wire], 1);
+            let section = &projected.sections[1];
+            let before_section = &baseline.sections[1];
+            let (row, before) = if disabled_slot {
+                (&section.disabled_rows[0], &before_section.disabled_rows[0])
+            } else {
+                (&section.rows[0], &before_section.rows[0])
+            };
+            assert!(!row.subscription_lines.is_empty());
+            let mut presentation = Presentation::default();
+            // Real native text measurements can wrap the English notice.
+            for line in &row.subscription_lines {
+                presentation.subtitle_lines.insert(line.clone(), 2);
+            }
+            let boxes = row_box(row, disabled_slot, 100., &presentation);
+            let old = row_box(before, disabled_slot, 100., &presentation);
+            assert_eq!(
+                boxes.rect.bottom - old.rect.bottom,
+                row.subscription_lines.len() as f32 * 38.
+            );
+            assert_eq!(boxes.subscription.len(), row.subscription_lines.len());
+            for rect in &boxes.subscription {
+                assert!(inside(*rect, boxes.rect));
+                assert!(rect.top >= boxes.line1.bottom);
+            }
+            for pair in boxes.subscription.windows(2) {
+                assert!(pair[0].bottom < pair[1].top);
+            }
+            assert!(boxes.subscription.last().unwrap().bottom < boxes.outside_note.unwrap().top);
+            if let Some(usage) = boxes.usage {
+                assert!(boxes.outside_note.unwrap().bottom < usage.top);
+            }
+            assert_eq!(boxes.more, old.more);
+            let mut shifted = boxes.clone();
+            shift_row(&mut shifted, 17.);
+            assert_eq!(shifted.subscription[0].top, boxes.subscription[0].top + 17.);
+        }
     }
     fn inside(inner: Rect, outer: Rect) -> bool {
         inner.left >= outer.left

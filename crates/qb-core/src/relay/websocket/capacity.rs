@@ -722,6 +722,8 @@ mod tests {
         };
         let a = crate::accounts::Account {
             schema: 1,
+            subscription: None,
+            plan_observed_at: None,
             id: identity.id(),
             provider: Provider::Codex,
             label: "synthetic".into(),

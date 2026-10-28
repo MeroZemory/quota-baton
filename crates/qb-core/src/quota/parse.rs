@@ -23,7 +23,17 @@ fn plan(value: &Value) -> Option<&str> {
     value.as_str().filter(|s| {
         matches!(
             *s,
-            "free" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu" | "go" | "max"
+            "free"
+                | "plus"
+                | "pro"
+                | "prolite"
+                | "promax"
+                | "team"
+                | "business"
+                | "enterprise"
+                | "edu"
+                | "go"
+                | "max"
         )
     })
 }
@@ -160,21 +170,37 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
     )
 }
 
-/// A Codex usage response is complete only when both provider window slots
-/// were present. Some responses are intentionally partial and must retain the
-/// other known window until a complete snapshot arrives.
+/// Only an explicit provider window-set report can prove absence. Both slots
+/// must be present: null means absent, whereas omitted/partial fields are no news.
+/// Slot names never imply durations or a particular plan's window inventory.
 pub(super) fn is_complete_snapshot(provider: Provider, body: &[u8]) -> bool {
     let Ok(root) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
     match provider {
         Provider::Codex => {
-            root["rate_limit"]["primary_window"].is_object()
-                && root["rate_limit"]["secondary_window"].is_object()
+            let rate = &root["rate_limit"];
+            plan(&root["plan_type"]).is_some()
+                && rate["limit_reached"].is_boolean()
+                && ["primary_window", "secondary_window"].iter().all(|slot| {
+                    rate.get(*slot).is_some_and(|value| {
+                        value.is_null()
+                            || (value.is_object()
+                                && value["limit_window_seconds"]
+                                    .as_u64()
+                                    .is_some_and(|n| n > 0)
+                                && number(&value["used_percent"]).is_some()
+                                && reset(value, Utc::now()).is_some())
+                    })
+                })
         }
         Provider::Claude => true,
     }
 }
+
+#[cfg(test)]
+#[path = "parse/r18_complete_tests.rs"]
+mod r18_complete_tests;
 
 #[cfg(any(test, all(feature = "shape-capture", debug_assertions)))]
 fn usage_scalar(provider: Provider, path: &[&str], value: &Value) -> Option<Value> {

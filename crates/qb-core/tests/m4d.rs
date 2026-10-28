@@ -35,6 +35,8 @@ impl FixtureRate for BindingTable {
 fn account(id: &str) -> Account {
     Account {
         schema: 1,
+        subscription: None,
+        plan_observed_at: None,
         id: id.into(),
         provider: Provider::Codex,
         label: id.into(),

@@ -1535,6 +1535,10 @@ mod r6_takeover_tests {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/r15_admin_account_fixture.rs"]
+mod r18_account_fixture;
+
+#[cfg(test)]
 mod r7_dashboard_client_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1568,6 +1572,67 @@ mod r7_dashboard_client_tests {
         });
         (AdminClient::new(port, "synthetic-r7-admin").unwrap(), task)
     }
+    #[tokio::test]
+    async fn r18_subscription_survives_real_client_and_derived_card_projection() {
+        use serde_json::json;
+        for (provider, subscription) in [
+            (
+                "claude",
+                json!({"provider":"claude","created_at":"2026-10-07T00:00:00Z"}),
+            ),
+            (
+                "codex",
+                json!({"provider":"codex","active_start":"2026-10-11T00:00:00Z",
+                "active_until":"2026-11-11T00:00:00Z","last_checked":"2026-10-20T00:00:00Z"}),
+            ),
+        ] {
+            let mut account = r18_account_fixture::account(
+                "sample-date",
+                provider,
+                r18_account_fixture::measuring_forecast(),
+            );
+            account["subscription"] = subscription.clone();
+            let body = json!({"accounts":[account]}).to_string();
+            let (client, task) = fake(&body, None).await;
+            let raw = client.snapshot().await.unwrap();
+            task.await.unwrap();
+            assert_eq!(
+                serde_json::to_value(&raw.accounts[0].subscription).unwrap(),
+                subscription
+            );
+            let presentation = raw.presentation().unwrap();
+            assert_eq!(
+                presentation.accounts[0].subscription,
+                raw.accounts[0].subscription
+            );
+            let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00+09:00").unwrap();
+            let cards =
+                qb_tray::v2::project(&serde_json::to_string(&presentation).unwrap(), now.into())
+                    .unwrap();
+            let row = cards.sections.iter().flat_map(|s| &s.rows).next().unwrap();
+            assert!(!row.subscription_lines.is_empty());
+            assert!(row.raw.pool_eligible.unwrap());
+            assert_eq!(row.state, qb_tray::v2::DisplayState::Ready);
+            assert_eq!(
+                serde_json::to_value(&raw.accounts[0].subscription).unwrap(),
+                subscription
+            );
+            let data = qb_tray::dashboard_model::DashboardSnapshot::new(cards);
+            let clock = qb_tray::dashboard_model::Clock {
+                now,
+                day_start: now.to_utc() - chrono::Duration::hours(12),
+                day_end: now.to_utc() + chrono::Duration::hours(12),
+            };
+            let view = qb_tray::dashboard_model::project(
+                &data,
+                &mut qb_tray::state::DashboardState::default(),
+                &clock,
+            );
+            assert!(!view.groups[0].subscription_lines.is_empty());
+            assert!(!view.usage[0].subscription_lines.is_empty());
+        }
+    }
+
     fn detail_body(id: &str) -> String {
         let mut value: serde_json::Value = serde_json::from_str(r#"{"id":"123456abcdef","provider":"codex","client":{"kind":"codex_cli","product":"synthetic","version":"1"},"label":{"text":"synthetic-folder","source":"claude_project","best_effort":true},"account":"cx-000001","first_seen_at":"2026-10-24T00:00:00Z","bound_since":"2026-10-24T00:00:00Z","last_used_at":"2026-10-24T00:00:00Z","active":true,"inflight":{"requests":2,"oldest_started_at":"2026-10-24T00:00:00Z","ws_open":1,"ws_response_in_flight":true},"inflight_known":false,"pacing_wait":{"waiting":2,"since":"2026-10-24T00:00:00Z"},"routing":{"action_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","on_5h_limit":"move","mode":"recover"},"quota_wait":{"waiting":1,"reset_at":"2026-10-24T00:00:00Z"},"quota_wait_known":true,"model":"synthetic","subagents_today":1,"requests_today":5,"failures_today":2,"rate_wait_today":{"count":1,"total_ms":9},"moves_today":[{"at":"2026-10-24T00:00:00Z","from":"cl-000002","to":"cx-000001","reason":"reset_hold_timeout","next_turn_cache":"miss"}],"first_account_today":"cl-000002","marked_for_move":true,"counters_complete":false,"truncated":true,"subagents_known":false,"moves_known":false,"metadata_truncated":true,"original_short_id":"12345678","recent_requests":[{"ts":"2026-10-24T00:00:00Z","outcome":"relayed_rate429","status":429,"ttfb_ms":3,"dur_ms":17,"rate_wait_ms":10,"rate_retries":4294967295,"failover":{"from":"cl-000002","to":"cx-000001"}},{"ts":"2026-10-24T00:00:00Z","outcome":"ok","status":200,"ttfb_ms":1,"dur_ms":4,"rate_wait_ms":0,"rate_retries":0,"failover":null}],"timeline":[{"at":"2026-10-24T00:00:00Z","kind":"placed","account":"cl-000002","from":null,"reason":"new","next_turn_cache":null},{"at":"2026-10-24T00:00:00Z","kind":"move","account":"cx-000001","from":"cl-000002","reason":"reset_hold_timeout","next_turn_cache":"hit"}],"recent_requests_known":false,"timeline_known":false}"#).unwrap();
         value["id"] = serde_json::json!(id);

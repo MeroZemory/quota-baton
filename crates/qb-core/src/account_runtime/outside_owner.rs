@@ -446,9 +446,10 @@ impl super::AccountRuntime {
             Some(PollApplication {
                 origin: outside_origin,
             }),
+            None,
         )
         .await
-        .map(|(account, receipt)| {
+        .map(|(account, receipt, _, _)| {
             (
                 account,
                 receipt.and_then(|receipt| match receipt {
@@ -477,9 +478,10 @@ impl super::AccountRuntime {
             Some(PollApplication {
                 origin: outside_origin,
             }),
+            None,
         )
         .await
-        .map(|(account, _)| account)
+        .map(|(account, _, _, _)| account)
     }
 }
 
@@ -643,7 +645,8 @@ mod tests {
                 "reset_after_seconds":seconds-elapsed})
         };
         json!({"plan_type":if secondary.is_some() {"plus"} else {"free"},
-            "rate_limit":{"primary_window":window(seconds,pct),
+            "rate_limit":{"limit_reached":pct >= 100. || secondary.is_some_and(|(_, used)| used >= 100.),
+                "primary_window":window(seconds,pct),
                 "secondary_window":secondary.map(|(seconds,pct)|window(seconds,pct))}})
     }
 
