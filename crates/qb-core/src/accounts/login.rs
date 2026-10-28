@@ -194,6 +194,9 @@ pub fn save(
         next.user_state = old.user_state;
         next.drain = old.drain;
         next.allow_credits = old.allow_credits;
+        if next.provider == super::Provider::Claude && next.subscription.is_none() {
+            next.subscription = old.subscription.clone();
+        }
         next.health = old.health.clone();
         next.quota_cooling = old.quota_cooling.clone();
         next.quota_credit_releasable = old.quota_credit_releasable;

@@ -13,6 +13,8 @@ pub mod login;
 #[cfg(windows)]
 pub(crate) mod shared_profile;
 mod store;
+pub(crate) mod subscription;
+pub use subscription::SubscriptionMetadata;
 #[cfg(all(windows, not(feature = "testkit")))]
 pub(crate) mod takeover;
 mod takeover_receipt;
@@ -257,6 +259,12 @@ pub struct Account {
     pub label: String,
     pub email: String,
     pub plan: Option<String>,
+    /// Local observation ordering; distinct from provider subscription dates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_observed_at: Option<DateTime<Utc>>,
+    /// Descriptive provider facts, never entitlement or authentication evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<SubscriptionMetadata>,
     pub identity: Identity,
     pub source: Source,
     pub user_state: UserState,

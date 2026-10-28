@@ -345,6 +345,8 @@ impl Live {
             let store = AccountStore::acquire(&home).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             let account = Account {
                 schema: 1,
+                subscription: None,
+                plan_observed_at: None,
                 id: id.clone(),
                 provider: Provider::Codex,
                 label: "synthetic R1 live".into(),

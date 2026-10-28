@@ -102,6 +102,8 @@ impl TryFrom<String> for PlanName {
                 | "go"
                 | "plus"
                 | "pro"
+                | "prolite"
+                | "promax"
                 | "max"
                 | "max_5x"
                 | "max_20x"

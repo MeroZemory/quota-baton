@@ -45,6 +45,8 @@ pub struct AdminAccount {
     pub email: String,
     #[serde(deserialize_with = "required_nullable")]
     pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<AdminSubscription>,
     pub user_state: AdminUserState,
     pub source: AdminSource,
     pub health: AdminHealth,
@@ -70,6 +72,20 @@ pub struct AdminAccount {
 pub enum AdminProvider {
     Claude,
     Codex,
+}
+
+/// Provider-observed date facts only; never billing estimates or eligibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "lowercase", deny_unknown_fields)]
+pub enum AdminSubscription {
+    Claude {
+        created_at: String,
+    },
+    Codex {
+        active_start: Option<String>,
+        active_until: Option<String>,
+        last_checked: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +410,40 @@ mod tests {
             "last_used_at":null,"bound_sessions":4,"token_expires_at":null,"drain":false,
             "allow_credits":true,"refresh_attention":true,"active_sessions":2,"spread_threshold":3
         })
+    }
+
+    #[test]
+    fn r18_subscription_is_additive_typed_and_omits_native_bookkeeping() {
+        let legacy: AdminAccount = serde_json::from_value(wire()).unwrap();
+        assert!(legacy.subscription.is_none());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("subscription")
+                .is_none()
+        );
+        for subscription in [
+            json!({"provider":"claude","created_at":"2026-10-07T00:00:00Z"}),
+            json!({"provider":"codex","active_start":"2026-10-11T00:00:00Z",
+                "active_until":"2026-11-11T00:00:00Z","last_checked":null}),
+            json!({"provider":"codex","active_start":null,"active_until":null,"last_checked":null}),
+        ] {
+            let mut input = wire();
+            input["subscription"] = subscription.clone();
+            let decoded: AdminAccount = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), input);
+            let mut invalid = subscription;
+            invalid["native_checked"] = json!(true);
+            assert!(serde_json::from_value::<AdminSubscription>(invalid).is_err());
+        }
+        for invalid in [
+            json!({"provider":"claude"}),
+            json!({"provider":"claude","created_at":null}),
+            json!({"provider":"codex","active_until":17}),
+            json!({"provider":"other","created_at":"2026-10-07T00:00:00Z"}),
+        ] {
+            assert!(serde_json::from_value::<AdminSubscription>(invalid).is_err());
+        }
     }
 
     #[test]

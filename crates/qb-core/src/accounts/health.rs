@@ -944,6 +944,8 @@ pub(crate) mod tests {
         };
         Account {
             schema: 1,
+            subscription: None,
+            plan_observed_at: None,
             id: identity.id(),
             provider: Provider::Codex,
             label: "fixture".into(),

@@ -318,7 +318,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1169,
+        "line": 1194,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state,\"plan\":account.plan,\"generation\":account.generation}})",
         "field": "",
@@ -332,7 +332,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1360,
+        "line": 1386,
         "rule": "admin-json",
         "snippet": "json!({\"action\":\"credits\",\"window\":window,\r\n                \"reset_at\":reset_at,\"next_account\":null,\"earliest_account\":null,\"observed_at\":Utc::now(),\"model_limited\":false})",
         "field": "",
@@ -346,7 +346,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1710,
+        "line": 1736,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":id,\"refresh_attention\":attention}})",
         "field": "",
@@ -360,7 +360,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1774,
+        "line": 1800,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state}})",
         "field": "",
@@ -374,7 +374,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 1846,
+        "line": 1872,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":account.id,\"health\":account.health,\"user_state\":account.user_state}})",
         "field": "",
@@ -388,7 +388,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2293,
+        "line": 2319,
         "rule": "admin-json",
         "snippet": "json!(earliest.as_ref().map(|(_, reset)| *reset))",
         "field": "",
@@ -402,7 +402,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2294,
+        "line": 2320,
         "rule": "admin-json",
         "snippet": "json!(earliest.map(|(id, _)| id))",
         "field": "",
@@ -416,7 +416,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2295,
+        "line": 2321,
         "rule": "admin-json",
         "snippet": "json!(accounts.iter().any(|other| other.provider\r\n                    == a.provider\r\n                    && other.user_state == UserState::Active\r\n                    && !other.drain\r\n                    && crate::relay::notices::model_quota_applies(other, model)))",
         "field": "",
@@ -430,7 +430,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2307,
+        "line": 2333,
         "rule": "admin-json",
         "snippet": "json!(now)",
         "field": "",
@@ -444,7 +444,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2983,
+        "line": 3209,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_updated\",\"data\":{\"id\":id,\"snapshot\":snapshot}})",
         "field": "",
@@ -458,7 +458,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3105,
+        "line": 3332,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: bound account is cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -472,7 +472,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3107,
+        "line": 3334,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: bound account is cooling\"}})",
         "field": "",
@@ -486,7 +486,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3173,
+        "line": 3400,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: all accounts are cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -500,7 +500,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3175,
+        "line": 3402,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: all accounts are cooling\"}})",
         "field": "",
@@ -514,7 +514,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3185,
+        "line": 3412,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"invalid_request_error\",\"message\":format!(\"quota-baton: no usable {0} account — run quota-baton accounts login {0} --no-browser\",provider.as_str())}})",
         "field": "",
@@ -528,7 +528,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4043,
+        "line": 4270,
         "rule": "admin-json",
         "snippet": "json!(\"quota_notice\")",
         "field": "",
@@ -542,7 +542,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4044,
+        "line": 4271,
         "rule": "admin-json",
         "snippet": "json!(account.id)",
         "field": "",
@@ -556,7 +556,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4045,
+        "line": 4272,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\",\"data\":data})",
         "field": "",
@@ -570,7 +570,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4082,
+        "line": 4309,
         "rule": "admin-json",
         "snippet": "json!([\r\n        account.health,\r\n        account.user_state,\r\n        account.drain,\r\n        account.allow_credits,\r\n        account.quota_cooling,\r\n        account.payment_until\r\n    ])",
         "field": "",
@@ -612,7 +612,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/accounts/takeover.rs",
-        "line": 678,
+        "line": 680,
         "rule": "admin-json",
         "snippet": "json!({\"id\":journal.account.id,\r\n        \"renamed_to\":(journal.retired && !journal.keep_source).then_some(&journal.destination),\"refresh\":journal.result})",
         "field": "",
@@ -1326,7 +1326,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/admin_account.rs",
-        "line": 107,
+        "line": 123,
         "rule": "serde-default",
         "snippet": "default",
         "field": "organization_uuid",
@@ -1340,7 +1340,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/admin_account.rs",
-        "line": 143,
+        "line": 159,
         "rule": "serde-default",
         "snippet": "default",
         "field": "probe_pending",
@@ -1686,6 +1686,62 @@
       },
       "count": 1,
       "reason": "R18 additive plan_changed event member in typed ActivityData: absence remains None for existing events/backward compatibility and serialization omits None. The concrete validated Plan is retained when present; present() rejects explicit null. No plan value or event classification is fabricated."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_account.rs",
+        "line": 48,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "subscription",
+        "field_type": "Option<AdminSubscription>",
+        "owner": "struct:AdminAccount",
+        "attribute": "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+      },
+      "count": 1,
+      "reason": "R18 additive provider-observed subscription dates: omitted metadata from earlier servers/archives stays None; only the separate typed provider facts are accepted, and native end-check bookkeeping is never a wire member. Existing required account keys remain required."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2963,
+        "rule": "admin-json",
+        "snippet": "json!({\"name\":cause.window,\"observed_at\":cause.started_at})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "R18 internal reconciliation inventory only: native persisted quota_cooling window and its native started_at retain causality after a failed metadata save; this tiny object is never a fabricated usage window, admin response or provider observation."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2988,
+        "rule": "admin-json",
+        "snippet": "json!(report.started_at)",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "R18 internal observation timestamp only: the pre-send native UTC instant is serialized into the accepted quota snapshot for freshness ordering. No response shape or client-supplied timestamp is constructed here."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 3195,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"quota_hold_cleared\",\"data\":{\n                        \"id\":account_id,\"reason\":\"window_gone_after_plan_change\"\n                    }})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "R18 fixed native quota-hold-cleared notification after successful metadata commit: the existing bounded account ID and constant window_gone_after_plan_change reason are broadcast; no upstream payload or arbitrary text is emitted."
     }
   ]
 }

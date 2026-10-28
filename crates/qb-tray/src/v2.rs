@@ -43,6 +43,7 @@ pub struct Account {
     pub label: Option<String>,
     pub email: Option<String>,
     pub plan: Option<String>,
+    pub subscription: Option<qb_proto::AdminSubscription>,
     pub user_state: String,
     pub health: Health,
     pub windows: Vec<Window>,
@@ -262,6 +263,7 @@ pub struct AccountRow {
     pub raw: Account,
     pub name: String,
     pub plan: Option<String>,
+    pub subscription_lines: Vec<String>,
     pub outside_note: Option<String>,
     pub plan_tooltip: Option<String>,
     pub name_tooltip: Option<String>,
@@ -508,7 +510,9 @@ pub fn provider_label(provider: &str) -> &str {
 }
 pub fn plan_label(provider: &str, plan: Option<&str>) -> Option<&'static str> {
     match (provider, plan?) {
-        ("claude", "pro") | ("codex", "pro") => Some("Pro"),
+        ("claude", "pro") | ("codex", "prolite") => Some("Pro"),
+        ("codex", "pro") => Some("Pro (More)"),
+        ("codex", "promax") => Some("Pro (Max)"),
         ("claude", "max") => Some("Max"),
         ("claude", "max_5x") => Some("Max 5x"),
         ("claude", "max_20x") => Some("Max 20x"),
@@ -806,6 +810,62 @@ fn binding(a: &Account, windows: &[WindowMetric], now: DateTime<Utc>) -> Option<
         })
         .cloned()
 }
+/// The caller supplies its established display timezone (local tray or dashboard clock).
+/// Observations remain informational even after the recorded period has ended.
+pub fn subscription_lines(a: &Account, now: DateTime<chrono::FixedOffset>) -> Vec<String> {
+    use qb_proto::AdminSubscription;
+    let english = crate::i18n::language() == crate::i18n::UiLanguage::En;
+    let date = |at: DateTime<Utc>| at.with_timezone(now.offset()).format("%m/%d").to_string();
+    let mut lines = Vec::new();
+    match (&a.subscription, a.provider.as_str()) {
+        (Some(AdminSubscription::Claude { created_at }), "claude") => {
+            if let Some(at) = timestamp(created_at) {
+                lines.push(if english {
+                    format!("subscribed since {}", date(at))
+                } else {
+                    format!("구독 시작 {}", date(at))
+                });
+            }
+        }
+        (
+            Some(AdminSubscription::Codex {
+                active_until,
+                last_checked,
+                ..
+            }),
+            "codex",
+        ) => {
+            if let Some(until) = active_until.as_deref().and_then(timestamp) {
+                lines.push(if english {
+                    format!("access until {}", date(until))
+                } else {
+                    format!("이용 기간 ~{}", date(until))
+                });
+                let remaining = until.signed_duration_since(now);
+                if remaining > chrono::Duration::zero() && remaining <= chrono::Duration::days(3) {
+                    lines.push(if english {
+                        "Recorded access period ends within 3 days".into()
+                    } else {
+                        "기록된 이용 기간이 3일 이내에 끝나요".into()
+                    });
+                }
+            }
+            if let Some(checked) = last_checked.as_deref().and_then(timestamp) {
+                let age = now.signed_duration_since(checked);
+                if age > chrono::Duration::days(7) {
+                    lines.push(if english {
+                        format!("last checked {} days ago", age.num_days())
+                    } else {
+                        format!("마지막 확인 {}일 전", age.num_days())
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    lines
+}
+
 fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
     let state = display_state(a);
     let (group, chip) = state_style(state);
@@ -868,6 +928,7 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         name_tooltip: nonempty(a.email.as_deref()).map(clean),
         name,
         plan,
+        subscription_lines: subscription_lines(a, now.with_timezone(&Local).fixed_offset()),
         outside_note: a
             .outside_used
             .then(|| crate::i18n::static_text("qb 밖에서도 사용 중").to_owned()),
@@ -1334,6 +1395,7 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
     row.accessible_name = [
         Some(row.name.clone()),
         row.plan.clone(),
+        Some(row.subscription_lines.join(", ")).filter(|s| !s.is_empty()),
         row.outside_note.clone(),
         row.chip.as_ref().map(|c| c.text.clone()),
         usage_accessibility,
@@ -1776,6 +1838,90 @@ mod tests {
     fn base(id: &str) -> Value {
         json!({"id":id,"provider":"codex","email":format!("{id}@example.test"),"user_state":"active","health":{"kind":"ready"},"source":{"kind":"oauth"},"pool_eligible":true})
     }
+
+    #[test]
+    fn r18_subscription_dates_use_display_offset_and_exact_fact_labels() {
+        use crate::i18n::{UiLanguage, with_language};
+        let now = DateTime::parse_from_rfc3339("2026-11-09T12:00:00+09:00").unwrap();
+        for (language, claude, codex) in [
+            (UiLanguage::Ko, "구독 시작 10/07", "이용 기간 ~11/11"),
+            (
+                UiLanguage::En,
+                "subscribed since 10/07",
+                "access until 11/11",
+            ),
+        ] {
+            with_language(language, || {
+                let mut a: Account = serde_json::from_value(base("dates")).unwrap();
+                a.provider = "claude".into();
+                a.subscription = Some(qb_proto::AdminSubscription::Claude {
+                    created_at: "2026-10-06T23:30:00Z".into(),
+                });
+                assert_eq!(subscription_lines(&a, now), vec![claude]);
+                // A different established display offset yields the previous calendar date.
+                assert!(subscription_lines(&a, now.to_utc().fixed_offset())[0].ends_with("10/06"));
+                a.provider = "codex".into();
+                a.subscription = Some(qb_proto::AdminSubscription::Codex {
+                    active_start: None,
+                    active_until: Some("2026-11-10T23:30:00Z".into()),
+                    last_checked: None,
+                });
+                let lines = subscription_lines(&a, now);
+                assert_eq!(lines[0], codex);
+                assert_eq!(lines.len(), 2);
+                a.provider = "claude".into();
+                assert!(
+                    subscription_lines(&a, now).is_empty(),
+                    "foreign provider facts are never displayed"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn r18_codex_freshness_and_period_note_boundaries_are_informational() {
+        let now = DateTime::parse_from_rfc3339("2026-11-08T12:00:00Z").unwrap();
+        let original = base("dates");
+        let baseline = view(vec![original.clone()], 1);
+        let before = &codex(&baseline).rows[0];
+        for seconds_until in [-1, 0, 1, 3 * 86400, 3 * 86400 + 1] {
+            for seconds_since_check in [-1, 0, 7 * 86400, 7 * 86400 + 1, 8 * 86400] {
+                let mut input = original.clone();
+                input["subscription"] = json!({"provider":"codex","active_start":null,
+                    "active_until":(now + chrono::Duration::seconds(seconds_until)).to_rfc3339(),
+                    "last_checked":(now - chrono::Duration::seconds(seconds_since_check)).to_rfc3339()});
+                let a: Account = serde_json::from_value(input.clone()).unwrap();
+                let lines = subscription_lines(&a, now);
+                assert_eq!(
+                    lines.len(),
+                    1 + usize::from(seconds_until > 0 && seconds_until <= 3 * 86400)
+                        + usize::from(seconds_since_check > 7 * 86400)
+                );
+                let projected = view(vec![input], 1);
+                let after = &codex(&projected).rows[0];
+                assert_eq!(after.state, before.state);
+                assert_eq!(after.group, before.group);
+                assert_eq!(after.raw.pool_eligible, before.raw.pool_eligible);
+                assert_eq!(
+                    after.action.as_ref().map(|a| a.kind),
+                    before.action.as_ref().map(|a| a.kind)
+                );
+                assert_eq!(
+                    projected.summaries[1].verdict,
+                    baseline.summaries[1].verdict
+                );
+            }
+        }
+        for subscription in [
+            json!({"provider":"codex","active_start":null,"active_until":null,"last_checked":null}),
+            json!({"provider":"codex","active_until":"bad-date","last_checked":"bad-date"}),
+        ] {
+            let mut input = original.clone();
+            input["subscription"] = subscription;
+            let a: Account = serde_json::from_value(input).unwrap();
+            assert!(subscription_lines(&a, now).is_empty());
+        }
+    }
     fn view(accounts: Vec<Value>, eligible: u64) -> View {
         project(
             &json!({"accounts":accounts,"pools":{"codex":{"eligible":eligible}}}).to_string(),
@@ -1920,7 +2066,9 @@ mod tests {
             ("claude", "max_20x", "Max 20x"),
             ("codex", "free", "Free"),
             ("codex", "plus", "Plus"),
-            ("codex", "pro", "Pro"),
+            ("codex", "pro", "Pro (More)"),
+            ("codex", "prolite", "Pro"),
+            ("codex", "promax", "Pro (Max)"),
             ("codex", "team", "Team"),
             ("codex", "business", "Business"),
             ("codex", "enterprise", "Enterprise"),

@@ -48,7 +48,7 @@ pub(super) async fn exchange(
     {
         return Err(LoginError::ExchangeFailed);
     }
-    let (identity, email, plan) = match params.provider {
+    let (identity, email, plan, subscription) = match params.provider {
         Provider::Claude => {
             let response = client
                 .get(&params.profile)
@@ -73,6 +73,7 @@ pub(super) async fn exchange(
                 },
                 email,
                 super::claude_profile::plan(&profile).map(str::to_owned),
+                crate::accounts::subscription::from_claude_profile(&profile),
             )
         }
         Provider::Codex => {
@@ -106,6 +107,7 @@ pub(super) async fn exchange(
                 },
                 email,
                 plan,
+                None,
             )
         }
     };
@@ -121,7 +123,9 @@ pub(super) async fn exchange(
         provider: params.provider,
         label: String::new(),
         email,
+        plan_observed_at: plan.as_ref().map(|_| now),
         plan,
+        subscription,
         identity,
         source: Source::Oauth,
         user_state: UserState::Active,

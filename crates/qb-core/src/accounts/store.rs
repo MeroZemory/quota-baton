@@ -60,6 +60,7 @@ pub struct AccountStore {
     protector: crypto::SecretProtector,
     gate: Mutex<()>,
     observer: Mutex<Option<AccountObserver>>,
+    plan_observer: Mutex<Option<PlanObserver>>,
     pre_mutation: Mutex<Option<PreMutationHook>>,
     selection: Arc<selection::SelectionOwner>,
     lease: Mutex<Option<Lease>>,
@@ -67,6 +68,7 @@ pub struct AccountStore {
 }
 
 pub type AccountObserver = Arc<dyn Fn(&Account, &Health) + Send + Sync>;
+pub(crate) type PlanObserver = Arc<dyn Fn(&Account, Option<&str>) + Send + Sync>;
 
 /// Internal revocation notification, never permission to publish a proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +181,7 @@ impl AccountStore {
             protector,
             gate: Mutex::new(()),
             observer: Mutex::new(None),
+            plan_observer: Mutex::new(None),
             pre_mutation: Mutex::new(None),
             selection: Arc::new(selection::SelectionOwner::default()),
             lease: Mutex::new(Some(lease)),
@@ -234,6 +237,11 @@ impl AccountStore {
             .observer
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(observer);
+    }
+
+    /// Credential-derived plan changes only; usage retains its committed hook.
+    pub(crate) fn set_plan_observer(&self, observer: PlanObserver) {
+        *self.plan_observer.lock().unwrap_or_else(|e| e.into_inner()) = Some(observer);
     }
 
     /// Caller holds transaction(), before any runtime producer is published.
@@ -794,6 +802,25 @@ impl AccountStore {
         {
             return Err(StoreError::CredentialHealthChange);
         }
+        // Both caller and normalized credential-only projections above must
+        // remain exact. Only now derive native facts from supplied credentials.
+        let mut plan_changed = false;
+        if let Some((subscription, plan)) = Self::codex_token_observation(&updated, tokens) {
+            // A reused ID token is not a fresh plan observation. Failure to read
+            // the prior token cannot establish novelty; it never fails refresh.
+            let reused = old.as_ref().is_some_and(|old| {
+                self.protector
+                    .decrypt(&old.account.id, &old.secret_dpapi_b64)
+                    .map_or(true, |stored| stored.id_token == tokens.id_token)
+            });
+            plan_changed = Self::apply_codex_observation(
+                &mut updated,
+                old.as_ref().map(|old| &old.account),
+                subscription,
+                plan,
+                reused,
+            );
+        }
         let record = Record {
             account: updated.clone(),
             secret_dpapi_b64: self.protector.encrypt(&updated.id, tokens)?,
@@ -807,7 +834,125 @@ impl AccountStore {
                 .map(|old| &old.account.health)
                 .unwrap_or(&Health::Ready),
         );
+        if plan_changed {
+            let observer = self
+                .plan_observer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(observer) = observer {
+                observer(
+                    &updated,
+                    old.as_ref().and_then(|old| old.account.plan.as_deref()),
+                );
+            }
+        }
         Ok(updated)
+    }
+
+    // Claims describe a proven account/user; they never authorize requests.
+    // A missing/malformed/mismatched token is bounded absence, not an auth error.
+    fn codex_token_observation(
+        account: &Account,
+        tokens: &Tokens,
+    ) -> Option<(Option<super::SubscriptionMetadata>, Option<String>)> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let super::Identity::Codex {
+            account_id,
+            user_id: Some(user_id),
+            ..
+        } = &account.identity
+        else {
+            return None;
+        };
+        if account.provider != super::Provider::Codex || account_id.is_empty() || user_id.is_empty()
+        {
+            return None;
+        }
+        let token = tokens
+            .id_token
+            .as_deref()
+            .filter(|token| token.len() <= 256 * 1024)?;
+        let mut parts = token.split('.');
+        let header = parts.next()?;
+        let payload = parts.next()?;
+        let signature = parts.next()?;
+        if header.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some()
+        {
+            return None;
+        }
+        let payload = zeroize::Zeroizing::new(URL_SAFE_NO_PAD.decode(payload).ok()?);
+        let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+        let auth = &claims["https://api.openai.com/auth"];
+        if auth["chatgpt_account_id"].as_str()? != account_id
+            || auth["chatgpt_user_id"].as_str()? != user_id
+        {
+            return None;
+        }
+        let plan = auth["chatgpt_plan_type"]
+            .as_str()
+            .filter(|plan| {
+                matches!(
+                    *plan,
+                    "free"
+                        | "plus"
+                        | "pro"
+                        | "prolite"
+                        | "promax"
+                        | "team"
+                        | "business"
+                        | "enterprise"
+                        | "edu"
+                        | "go"
+                        | "max"
+                )
+            })
+            .map(str::to_owned);
+        Some((super::subscription::from_codex_auth(auth), plan))
+    }
+
+    fn apply_codex_observation(
+        updated: &mut Account,
+        previous: Option<&Account>,
+        subscription: Option<super::SubscriptionMetadata>,
+        plan: Option<String>,
+        reused: bool,
+    ) -> bool {
+        if let Some(subscription) = subscription {
+            updated.subscription = Some(
+                subscription.with_previous_codex(
+                    previous
+                        .and_then(|old| old.subscription.as_ref())
+                        .or(updated.subscription.as_ref()),
+                ),
+            );
+        }
+        // Full login/import saves can carry an earlier plan too. Preserve the
+        // committed observation unless this exact supplied token proves newer.
+        if let Some(previous) = previous {
+            updated.plan = previous.plan.clone();
+            updated.plan_observed_at = previous.plan_observed_at;
+        }
+        if reused || updated.token_meta.refresh_uncertain {
+            return false;
+        }
+        let Some(observed_at) = updated.token_meta.last_refresh_at else {
+            return false;
+        };
+        let Some(plan) = plan else {
+            return false;
+        };
+        if updated
+            .plan_observed_at
+            .is_some_and(|prior| observed_at <= prior)
+        {
+            return false;
+        }
+        let changed =
+            previous.is_some_and(|previous| previous.plan.as_deref() != Some(plan.as_str()));
+        updated.plan = Some(plan);
+        updated.plan_observed_at = Some(observed_at);
+        changed
     }
 
     fn credential_metadata_matches(before: &Account, after: &Account) -> bool {
@@ -843,6 +988,10 @@ impl AccountStore {
         if account.schema != 1
             || account.id != account.identity.id()
             || account.provider != account.identity.provider()
+            || account
+                .subscription
+                .as_ref()
+                .is_some_and(|s| s.provider() != account.provider)
             || matches!(&account.health, super::Health::Cooling { scope, .. }
                 if scope != "account" && scope.strip_prefix("model:").is_none_or(|model| model.is_empty()))
         {
@@ -1296,6 +1445,308 @@ mod tests {
     use super::*;
     use chrono::{Duration, Utc};
 
+    fn r18_codex_account() -> Account {
+        let mut account = super::super::health::tests::fixture();
+        if let super::super::Identity::Codex { user_id, .. } = &mut account.identity {
+            *user_id = Some("synthetic-r18-user".into());
+        }
+        account.id = account.identity.id();
+        account
+    }
+
+    fn r18_claims(plan: &str, until: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chatgpt_account_id": "synthetic-hardening", "chatgpt_user_id": "synthetic-r18-user",
+            "chatgpt_plan_type": plan,
+            "chatgpt_subscription_active_start": "2026-10-01T00:00:00Z",
+            "chatgpt_subscription_active_until": until,
+            "chatgpt_subscription_last_checked": "2026-10-22T00:00:00Z"
+        })
+    }
+
+    fn r18_tokens(auth: serde_json::Value) -> Tokens {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"https://api.openai.com/auth": auth})).unwrap();
+        Tokens {
+            access_token: "synthetic-r18-access".into(),
+            refresh_token: "synthetic-r18-refresh".into(),
+            id_token: Some(format!(
+                "e30.{}.synthetic-signature",
+                URL_SAFE_NO_PAD.encode(payload)
+            )),
+        }
+    }
+
+    #[test]
+    fn r18_old_account_omits_optional_native_fields_without_migration() {
+        let account = r18_codex_account();
+        let raw = serde_json::to_value(&account).unwrap();
+        assert!(raw.get("subscription").is_none());
+        assert!(raw.get("plan_observed_at").is_none());
+        let restored: Account = serde_json::from_value(raw).unwrap();
+        assert_eq!(restored, account);
+        assert!(restored.subscription.is_none());
+        assert!(restored.plan_observed_at.is_none());
+    }
+
+    #[test]
+    fn r18_codex_claims_require_exact_workspace_and_user_and_known_plan() {
+        let account = r18_codex_account();
+        let claims = r18_claims("plus", "2026-11-01T00:00:00Z");
+        let (subscription, plan) =
+            AccountStore::codex_token_observation(&account, &r18_tokens(claims.clone())).unwrap();
+        assert_eq!(plan.as_deref(), Some("plus"));
+        for tier in ["pro", "prolite", "promax"] {
+            let (_, plan) = AccountStore::codex_token_observation(
+                &account,
+                &r18_tokens(r18_claims(tier, "2026-11-01T00:00:00Z")),
+            )
+            .unwrap();
+            assert_eq!(plan.as_deref(), Some(tier));
+        }
+        assert!(matches!(
+            subscription,
+            Some(super::super::SubscriptionMetadata::Codex {
+                active_until: Some(_),
+                ..
+            })
+        ));
+        for key in ["chatgpt_account_id", "chatgpt_user_id"] {
+            let mut mismatch = claims.clone();
+            mismatch[key] = serde_json::json!("synthetic-other");
+            assert!(
+                AccountStore::codex_token_observation(&account, &r18_tokens(mismatch)).is_none()
+            );
+        }
+        let mut legacy = account.clone();
+        if let super::super::Identity::Codex { user_id, .. } = &mut legacy.identity {
+            *user_id = None;
+        }
+        assert!(AccountStore::codex_token_observation(&legacy, &r18_tokens(claims)).is_none());
+        let mut unknown = r18_claims("private-arbitrary-plan", "invalid-date");
+        unknown["chatgpt_subscription_active_start"] = serde_json::Value::Null;
+        unknown["chatgpt_subscription_last_checked"] = serde_json::json!(42);
+        assert_eq!(
+            AccountStore::codex_token_observation(&account, &r18_tokens(unknown)),
+            Some((None, None))
+        );
+        for raw in [None, Some("bad"), Some("a.b.c.d"), Some("e30.@@.signature")] {
+            let mut tokens = r18_tokens(serde_json::json!({}));
+            tokens.id_token = raw.map(str::to_owned);
+            assert!(AccountStore::codex_token_observation(&account, &tokens).is_none());
+        }
+    }
+
+    #[test]
+    fn r18_credential_projection_still_refuses_caller_subscription_plan_and_timestamp_edits() {
+        let before = r18_codex_account();
+        let date = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for field in 0..3 {
+            let mut caller = before.clone();
+            match field {
+                0 => {
+                    caller.subscription = super::super::subscription::from_codex_auth(&r18_claims(
+                        "plus",
+                        "2026-11-01T00:00:00Z",
+                    ))
+                }
+                1 => caller.plan = Some("plus".into()),
+                _ => caller.plan_observed_at = Some(date),
+            }
+            assert!(!AccountStore::credential_metadata_matches(&before, &caller));
+        }
+        let mut mismatched = before;
+        mismatched.subscription =
+            Some(super::super::SubscriptionMetadata::Claude { created_at: date });
+        assert!(matches!(
+            AccountStore::validate(&mismatched),
+            Err(StoreError::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn r18_token_plan_observation_must_be_strictly_newer_and_not_reused() {
+        let observed = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut previous = r18_codex_account();
+        previous.plan = Some("plus".into());
+        previous.plan_observed_at = Some(observed);
+        for (delta, reused, expected) in [
+            (-1, false, false),
+            (0, false, false),
+            (1, true, false),
+            (1, false, true),
+        ] {
+            let mut next = previous.clone();
+            next.token_meta.last_refresh_at = Some(observed + Duration::seconds(delta));
+            assert_eq!(
+                AccountStore::apply_codex_observation(
+                    &mut next,
+                    Some(&previous),
+                    None,
+                    Some("pro".into()),
+                    reused
+                ),
+                expected
+            );
+            assert_eq!(
+                next.plan.as_deref(),
+                Some(if expected { "pro" } else { "plus" })
+            );
+            assert_eq!(
+                next.plan_observed_at,
+                Some(if expected {
+                    observed + Duration::seconds(delta)
+                } else {
+                    observed
+                })
+            );
+        }
+        for (known_plan, timestamp, uncertain) in [
+            (None, Some(observed + Duration::seconds(1)), false),
+            (Some("pro".into()), None, false),
+            (
+                Some("pro".into()),
+                Some(observed + Duration::seconds(1)),
+                true,
+            ),
+        ] {
+            let mut next = previous.clone();
+            next.token_meta.last_refresh_at = timestamp;
+            next.token_meta.refresh_uncertain = uncertain;
+            assert!(!AccountStore::apply_codex_observation(
+                &mut next,
+                Some(&previous),
+                None,
+                known_plan,
+                false
+            ));
+            assert_eq!(next.plan, previous.plan);
+            assert_eq!(next.plan_observed_at, previous.plan_observed_at);
+        }
+    }
+
+    #[test]
+    fn r18_credential_dates_and_plan_commit_atomically_without_broadening_guards() {
+        let base = std::env::var_os("QB_TEST_USAGE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r18-store-tests")
+            });
+        fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let mut config = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        std::io::Write::write_all(&mut config, b"[secrets]\nlinux_backend = \"file-0600\"\n")
+            .unwrap();
+        config.persist(root.path().join("config.toml")).unwrap();
+        let store = AccountStore::acquire(root.path()).unwrap();
+        let mut account = r18_codex_account();
+        let observed = Utc::now() - Duration::hours(3);
+        account.token_meta.last_refresh_at = Some(observed);
+        account.token_meta.expires_at = Some(Utc::now() + Duration::days(1));
+        let first_token = r18_tokens(r18_claims("pro", "2026-11-01T00:00:00Z"));
+        let saved = store.save(&account, &first_token, None).unwrap();
+        assert_eq!(saved.plan.as_deref(), Some("pro"));
+        assert_eq!(saved.plan_observed_at, Some(observed));
+        let until = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let usage = store
+            .update_metadata(&saved.id, |a| {
+                a.plan = Some("plus".into());
+                a.plan_observed_at = Some(observed + Duration::hours(1));
+                assert!(
+                    a.subscription
+                        .as_mut()
+                        .unwrap()
+                        .mark_codex_end_checked(until, until)
+                );
+            })
+            .unwrap();
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&changes);
+        store.set_plan_observer(Arc::new(move |account, previous| {
+            output
+                .lock()
+                .unwrap()
+                .push((previous.map(str::to_owned), account.plan.clone()));
+        }));
+        let mut refresh = usage.clone();
+        refresh.token_meta.last_refresh_at = Some(observed + Duration::hours(2));
+        let reused = store
+            .save_credentials(&refresh, &first_token, refresh.generation)
+            .unwrap();
+        assert_eq!(reused.plan, usage.plan);
+        assert_eq!(reused.plan_observed_at, usage.plan_observed_at);
+        assert_eq!(reused.subscription, usage.subscription);
+        assert!(changes.lock().unwrap().is_empty());
+
+        let second_token = r18_tokens(r18_claims("pro", "2026-12-01T00:00:00Z"));
+        let mut caller = reused.clone();
+        caller.token_meta.last_refresh_at = Some(observed + Duration::hours(3));
+        let mut forged = caller.clone();
+        forged.subscription = None;
+        assert!(matches!(
+            store.save_credentials(&forged, &second_token, forged.generation),
+            Err(StoreError::InvalidData)
+        ));
+        assert_eq!(store.read(&caller.id).unwrap().account, reused);
+        assert!(changes.lock().unwrap().is_empty());
+        let changed = store
+            .save_credentials(&caller, &second_token, caller.generation)
+            .unwrap();
+        assert_eq!(changed.plan.as_deref(), Some("pro"));
+        assert_eq!(changed.plan_observed_at, caller.token_meta.last_refresh_at);
+        assert!(matches!(
+            changed.subscription,
+            Some(super::super::SubscriptionMetadata::Codex {
+                end_plan_checked_for: None,
+                ..
+            })
+        ));
+        assert_eq!(store.read(&changed.id).unwrap().account, changed);
+        assert_eq!(
+            changes.lock().unwrap().as_slice(),
+            &[(Some("plus".into()), Some("pro".into()))]
+        );
+        assert!(matches!(
+            store.save_credentials(&caller, &first_token, caller.generation),
+            Err(StoreError::GenerationConflict { .. })
+        ));
+        assert_eq!(changes.lock().unwrap().len(), 1);
+
+        let mut same_plan_claims = r18_claims("pro", "2026-12-01T00:00:00Z");
+        same_plan_claims["chatgpt_subscription_last_checked"] =
+            serde_json::json!("2026-10-23T00:00:00Z");
+        let same_plan_token = r18_tokens(same_plan_claims);
+        let mut same_plan = changed.clone();
+        same_plan.token_meta.last_refresh_at = Some(observed + Duration::hours(4));
+        let same_plan = store
+            .save_credentials(&same_plan, &same_plan_token, same_plan.generation)
+            .unwrap();
+        assert_eq!(
+            same_plan.plan_observed_at,
+            Some(observed + Duration::hours(4))
+        );
+        assert_eq!(changes.lock().unwrap().len(), 1);
+
+        // A valid newer provider observation cannot publish through a failed save.
+        store.stop_writes();
+        let mut failed = same_plan.clone();
+        failed.token_meta.last_refresh_at = Some(observed + Duration::hours(5));
+        assert!(
+            store
+                .save_credentials(&failed, &first_token, failed.generation)
+                .is_err()
+        );
+        assert_eq!(store.read(&failed.id).unwrap().account, same_plan);
+        assert_eq!(changes.lock().unwrap().len(), 1);
+    }
+
     // No credentials or native secret operations are needed for these failed
     // store transitions. Runtime authority/persistence tests remain integration work.
     fn n5a_hook_store() -> (tempfile::TempDir, AccountStore, Arc<Mutex<Vec<String>>>) {
@@ -1313,6 +1764,7 @@ mod tests {
             protector: crypto::account_secret_protector(root.path()).unwrap(),
             gate: Mutex::new(()),
             observer: Mutex::new(None),
+            plan_observer: Mutex::new(None),
             pre_mutation: Mutex::new(None),
             selection: Arc::new(selection::SelectionOwner::default()),
             lease: Mutex::new(None),

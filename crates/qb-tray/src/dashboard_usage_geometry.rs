@@ -59,6 +59,11 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         .map(|tile| {
             288. + english_window_extra(tile)
                 + tile
+                    .subscription_lines
+                    .iter()
+                    .map(|line| b.measured_height(line, (tw - 24.).max(1.), 12., false) + 4.)
+                    .sum::<f32>()
+                + tile
                     .forecast_lines
                     .iter()
                     .map(|line| {
@@ -826,6 +831,20 @@ fn usage_tile(
         provider_summary: None,
     });
     let mut forecast_y = r.top + 288.;
+    for (index, line) in t.subscription_lines.iter().enumerate() {
+        let h = b.measured_height(line, (width(r) - 24.).max(1.), 12., false);
+        let bounds = rect(r.left + 12., forecast_y, (width(r) - 24.).max(1.), h);
+        b.text(bounds, line, 12., false, Color::Secondary, true);
+        b.semantic(
+            format!("chart:{}:subscription:{index}", t.id),
+            Some(chartkey.clone()),
+            Role::Text,
+            line.clone(),
+            bounds,
+            None,
+        );
+        forecast_y += h + 4.;
+    }
     for (index, line) in t.forecast_lines.iter().enumerate() {
         let h = b.measured_height(line, (width(r) - 24.).max(1.), 12., t.forecast_warning);
         let bounds = rect(r.left + 12., forecast_y, (width(r) - 24.).max(1.), h);

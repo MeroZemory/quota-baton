@@ -129,6 +129,8 @@ fn account(slot: usize, now: DateTime<Utc>) -> Account {
     });
     Account {
         schema: 1,
+        subscription: None,
+        plan_observed_at: None,
         id: identity.id(),
         provider: identity.provider(),
         label: format!("R7 synthetic {:02}", slot + 1),

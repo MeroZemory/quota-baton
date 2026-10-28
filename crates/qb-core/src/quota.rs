@@ -497,6 +497,7 @@ impl UsagePoller {
                 }
                 let wait_origin = self.runtime.capture_poll_origin(id).await;
                 let outside_origin = self.runtime.capture_outside_poll_origin(id);
+                let usage_started_at = Utc::now();
                 let mut response = request.send().await.map_err(|_| PollError::Unavailable)?;
                 let status = response.status();
                 let mut body = Vec::new();
@@ -532,7 +533,8 @@ impl UsagePoller {
                 if !status.is_success() {
                     return Err(PollError::Unavailable);
                 }
-                let Some(snapshot) = parse::snapshot(account.provider, &body, Utc::now()) else {
+                let Some(mut snapshot) = parse::snapshot(account.provider, &body, Utc::now())
+                else {
                     if account.provider == Provider::Claude {
                         reservation.unsupported = true;
                         tracing::warn!(
@@ -543,6 +545,56 @@ impl UsagePoller {
                     return Err(PollError::Unavailable);
                 };
                 let replace_windows = parse::is_complete_snapshot(account.provider, &body);
+                if account.provider == Provider::Codex {
+                    // Observation ordering uses dispatch time. Relative reset
+                    // delays keep the parser's receipt-time base, so network
+                    // latency cannot move a recovery deadline earlier.
+                    snapshot["observed_at"] = serde_json::json!(usage_started_at);
+                    if let Some(windows) = snapshot["windows"].as_array_mut() {
+                        for window in windows {
+                            if !window["observed_at"].is_null() {
+                                window["observed_at"] = serde_json::json!(usage_started_at);
+                            }
+                        }
+                    }
+                    let reported = snapshot.clone();
+                    let (mut updated, receipt, reconciled) = self
+                        .runtime
+                        .apply_polled_usage_report(
+                            crate::account_runtime::PollUsageReport {
+                                account: account.clone(),
+                                access_token: zeroize::Zeroizing::new(tokens.access_token.clone()),
+                                started_at: usage_started_at,
+                                snapshot,
+                                complete: replace_windows,
+                            },
+                            wait_origin,
+                            outside_origin,
+                            capture_receipt,
+                        )
+                        .await
+                        .map_err(|_| PollError::Unavailable)?;
+                    // Descriptive-only observations must not publish quota
+                    // inventory or complete a probe on an invalidated origin.
+                    if let Some(reconciled) = reconciled {
+                        if let (Some(table), Some(asof)) = (&observation_table, observation_asof) {
+                            if replace_windows {
+                                table.replace_usage_windows_asof_token(id, &reconciled, asof);
+                            } else {
+                                table.note_usage_observation_asof_token(id, &reported, asof);
+                            }
+                        }
+                        if probe.is_some() {
+                            self.runtime
+                                .poll_probe_success(id)
+                                .await
+                                .map_err(|_| PollError::Unavailable)?;
+                            updated = self.load(id).await?;
+                        }
+                    }
+                    reservation.succeeded = true;
+                    return Ok((updated, receipt));
+                }
                 if let (Some(table), Some(asof)) = (&observation_table, observation_asof) {
                     if replace_windows {
                         table.replace_usage_windows_asof_token(id, &snapshot, asof);
@@ -639,7 +691,15 @@ impl UsagePoller {
             .is_none_or(|at| (Utc::now() - at.with_timezone(&Utc)).num_seconds() > 600);
         let candidate = account.user_state == UserState::Active
             && (account.eligible(None) || matches!(account.health, Health::Cooling { .. }));
-        hourly || (stale && (candidate || self.tray_open()))
+        let subscription_end_due = account.provider == Provider::Codex
+            && account.user_state == UserState::Active
+            && matches!(
+                account.subscription.as_ref(),
+                Some(crate::accounts::SubscriptionMetadata::Codex {
+                    active_until: Some(until), end_plan_checked_for, ..
+                }) if *until <= Utc::now() && end_plan_checked_for.as_ref() != Some(until)
+            );
+        hourly || subscription_end_due || (stale && (candidate || self.tray_open()))
     }
     pub async fn tick(&self) {
         let store = self.store.clone();

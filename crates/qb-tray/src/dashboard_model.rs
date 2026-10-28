@@ -548,6 +548,7 @@ pub struct AccountGroup {
     pub provider: String,
     pub name: String,
     pub plan: String,
+    pub subscription_lines: Vec<String>,
     pub outside_used: bool,
     pub chip: String,
     pub tone: v2::Tone,
@@ -625,6 +626,7 @@ pub struct UsageTile {
     pub provider: String,
     pub name: String,
     pub plan: String,
+    pub subscription_lines: Vec<String>,
     pub chip: String,
     pub tone: v2::Tone,
     pub windows: Vec<AccountUsageWindow>,
@@ -1314,6 +1316,7 @@ pub fn project(
             crate::i18n::static_text("새 세션 배정 가능").into()
         };
         groups.push(AccountGroup {
+            subscription_lines: v2::subscription_lines(&a.raw, clock.now),
             id: a.raw.id.clone(),
             provider: a.raw.provider.clone(),
             name: folder(&a.name),
@@ -2604,6 +2607,7 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 })
                 .unwrap_or_default();
             UsageTile {
+                subscription_lines: v2::subscription_lines(&a.raw, clock.now),
                 id: a.raw.id.clone(),
                 provider: a.raw.provider.clone(),
                 name: folder(&a.name),
