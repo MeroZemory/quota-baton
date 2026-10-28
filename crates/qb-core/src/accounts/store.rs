@@ -804,23 +804,27 @@ impl AccountStore {
         }
         // Both caller and normalized credential-only projections above must
         // remain exact. Only now derive native facts from supplied credentials.
-        let mut plan_changed = false;
-        if let Some((subscription, plan)) = Self::codex_token_observation(&updated, tokens) {
+        let plan_changed = if updated.provider == super::Provider::Codex {
+            let observation = Self::codex_token_observation(&updated, tokens);
             // A reused ID token is not a fresh plan observation. Failure to read
             // the prior token cannot establish novelty; it never fails refresh.
-            let reused = old.as_ref().is_some_and(|old| {
-                self.protector
-                    .decrypt(&old.account.id, &old.secret_dpapi_b64)
-                    .map_or(true, |stored| stored.id_token == tokens.id_token)
-            });
-            plan_changed = Self::apply_codex_observation(
+            let reused = observation.is_some()
+                && old.as_ref().is_some_and(|old| {
+                    self.protector
+                        .decrypt(&old.account.id, &old.secret_dpapi_b64)
+                        .map_or(true, |stored| stored.id_token == tokens.id_token)
+                });
+            let (subscription, plan) = observation.unwrap_or((None, None));
+            Self::apply_codex_observation(
                 &mut updated,
                 old.as_ref().map(|old| &old.account),
                 subscription,
                 plan,
                 reused,
-            );
-        }
+            )
+        } else {
+            false
+        };
         let record = Record {
             account: updated.clone(),
             secret_dpapi_b64: self.protector.encrypt(&updated.id, tokens)?,
@@ -918,21 +922,21 @@ impl AccountStore {
         plan: Option<String>,
         reused: bool,
     ) -> bool {
-        if let Some(subscription) = subscription {
-            updated.subscription = Some(
-                subscription.with_previous_codex(
-                    previous
-                        .and_then(|old| old.subscription.as_ref())
-                        .or(updated.subscription.as_ref()),
-                ),
-            );
-        }
+        let previous_subscription = previous
+            .and_then(|old| old.subscription.as_ref())
+            .or(updated.subscription.as_ref());
+        updated.subscription = match subscription {
+            Some(subscription) => Some(subscription.with_previous_codex(previous_subscription)),
+            None => previous_subscription.cloned(),
+        };
         // Full login/import saves can carry an earlier plan too. Preserve the
         // committed observation unless this exact supplied token proves newer.
-        if let Some(previous) = previous {
+        if let Some(previous) = previous.filter(|old| old.plan_observed_at.is_some()) {
             updated.plan = previous.plan.clone();
-            updated.plan_observed_at = previous.plan_observed_at;
         }
+        // An incoming OAuth stamp is not the persisted baseline. In particular,
+        // it must not tie and suppress this supplied token's fresh observation.
+        updated.plan_observed_at = previous.and_then(|old| old.plan_observed_at);
         if reused || updated.token_meta.refresh_uncertain {
             return false;
         }
@@ -1476,6 +1480,114 @@ mod tests {
                 URL_SAFE_NO_PAD.encode(payload)
             )),
         }
+    }
+
+    fn r18_fullsave_store() -> (tempfile::TempDir, AccountStore) {
+        let base = std::env::var_os("QB_TEST_USAGE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r18-store-tests")
+            });
+        fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let mut config = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        std::io::Write::write_all(&mut config, b"[secrets]\nlinux_backend = \"file-0600\"\n")
+            .unwrap();
+        config.persist(root.path().join("config.toml")).unwrap();
+        let store = AccountStore::acquire(root.path()).unwrap();
+        (root, store)
+    }
+
+    #[test]
+    fn r18_fullsave_absent_observations_preserve_dates_and_only_stamped_plans() {
+        for verified in [false, true] {
+            for token_kind in 0..4 {
+                let (_root, store) = r18_fullsave_store();
+                let mut account = r18_codex_account();
+                let observed = Utc::now() - Duration::hours(3);
+                account.token_meta.last_refresh_at = Some(observed);
+                account.token_meta.expires_at = Some(Utc::now() + Duration::days(1));
+                let tokens = r18_tokens(r18_claims("pro", "2026-11-01T00:00:00Z"));
+                let saved = store.save(&account, &tokens, None).unwrap();
+                let until = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let prior = store
+                    .update_metadata(&saved.id, |a| {
+                        a.plan = Some(if verified { "pro" } else { "free" }.into());
+                        a.plan_observed_at = verified.then_some(observed);
+                        assert!(
+                            a.subscription
+                                .as_mut()
+                                .unwrap()
+                                .mark_codex_end_checked(until, until)
+                        );
+                    })
+                    .unwrap();
+                let mut incoming = prior.clone();
+                incoming.plan = None;
+                incoming.subscription = None;
+                incoming.token_meta.last_refresh_at = Some(observed + Duration::hours(1));
+                let mut absent = r18_tokens(serde_json::json!({
+                    "chatgpt_account_id": "synthetic-hardening",
+                    "chatgpt_user_id": "synthetic-r18-user"
+                }));
+                match token_kind {
+                    0 => absent.id_token = None,
+                    1 => absent.id_token = Some("synthetic-malformed-token".into()),
+                    2 => {} // Matching identity, but no plan/date claims.
+                    _ => {
+                        absent = r18_tokens(serde_json::json!({
+                            "chatgpt_account_id": "synthetic-other-workspace",
+                            "chatgpt_user_id": "synthetic-r18-user"
+                        }))
+                    }
+                }
+                let updated = store
+                    .save(&incoming, &absent, Some(incoming.generation))
+                    .unwrap();
+                assert_eq!(updated.subscription, prior.subscription);
+                assert_eq!(updated.plan.as_deref(), verified.then_some("pro"));
+                assert_eq!(updated.plan_observed_at, prior.plan_observed_at);
+                assert_eq!(store.read(&updated.id).unwrap().account, updated);
+            }
+        }
+    }
+
+    #[test]
+    fn r18_fullsave_oauth_stamp_does_not_suppress_fresh_token_plan() {
+        let (_root, store) = r18_fullsave_store();
+        let mut account = r18_codex_account();
+        let observed = Utc::now() - Duration::hours(2);
+        account.plan = Some("plus".into());
+        account.plan_observed_at = Some(observed);
+        account.token_meta.last_refresh_at = Some(observed);
+        account.token_meta.expires_at = Some(Utc::now() + Duration::days(1));
+        let token = r18_tokens(r18_claims("pro", "2026-11-01T00:00:00Z"));
+        let initial = store.save(&account, &token, None).unwrap();
+        assert_eq!(initial.plan.as_deref(), Some("pro"));
+        assert_eq!(initial.plan_observed_at, Some(observed));
+
+        let legacy = store
+            .update_metadata(&initial.id, |a| {
+                a.plan = Some("free".into());
+                a.plan_observed_at = None;
+            })
+            .unwrap();
+        let mut incoming = legacy.clone();
+        incoming.plan = Some("plus".into());
+        incoming.plan_observed_at = Some(observed + Duration::hours(1));
+        incoming.token_meta.last_refresh_at = incoming.plan_observed_at;
+        let fresh = r18_tokens(r18_claims("promax", "2026-12-01T00:00:00Z"));
+        let updated = store
+            .save(&incoming, &fresh, Some(incoming.generation))
+            .unwrap();
+        assert_eq!(updated.plan.as_deref(), Some("promax"));
+        assert_eq!(
+            updated.plan_observed_at,
+            incoming.token_meta.last_refresh_at
+        );
+        assert_eq!(store.read(&updated.id).unwrap().account, updated);
     }
 
     #[test]

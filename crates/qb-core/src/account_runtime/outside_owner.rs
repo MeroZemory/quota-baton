@@ -859,13 +859,13 @@ mod tests {
         for (window, offset, pct) in [(0, 2, 0.), (1, 1, 0.), (2, 1, 0.)] {
             let at = now(window, offset);
             assert!(
-                !apply_wire(&runtime, &id, codex_wire(at, seconds, pct, None), at).await,
-                "Free evidence must not change quota merge completeness"
+                apply_wire(&runtime, &id, codex_wire(at, seconds, pct, None), at).await,
+                "an explicit null secondary completes the Free window inventory"
             );
         }
         assert!(!runtime.outside_used(&id));
         let at = now(2, 2);
-        assert!(!apply_wire(&runtime, &id, codex_wire(at, seconds, 3., None), at).await);
+        assert!(apply_wire(&runtime, &id, codex_wire(at, seconds, 3., None), at).await);
         assert!(
             runtime.outside_used(&id),
             "a numeric Free 30d window must detect a rise despite null secondary"
@@ -875,11 +875,11 @@ mod tests {
         assert_eq!(snapshot["windows"][0]["name"], "43200m");
         for offset in [1, 8] {
             let at = now(3, offset);
-            assert!(!apply_wire(&runtime, &id, codex_wire(at, seconds, 0., None), at).await);
+            assert!(apply_wire(&runtime, &id, codex_wire(at, seconds, 0., None), at).await);
             assert!(runtime.outside_used(&id));
         }
         let at = now(4, 1);
-        assert!(!apply_wire(&runtime, &id, codex_wire(at, seconds, 0., None), at).await);
+        assert!(apply_wire(&runtime, &id, codex_wire(at, seconds, 0., None), at).await);
         assert!(
             !runtime.outside_used(&id),
             "a full own-free observed Free window must permit durable recovery"

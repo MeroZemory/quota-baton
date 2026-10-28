@@ -321,7 +321,6 @@ impl UsagePoller {
                             crate::accounts::HealthSignal::PlanObservation { plan },
                             Utc::now(),
                         );
-                        current.plan_observed_at = Some(Utc::now());
                         if previous != current.plan {
                             previous_change = Some(previous);
                         }

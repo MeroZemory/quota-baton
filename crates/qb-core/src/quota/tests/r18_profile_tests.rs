@@ -21,6 +21,7 @@ async fn r18_subscription_creation_uses_existing_fenced_profile_and_preserves_ab
     f.fake.state.push(profile_reply("default_claude_max_5x"));
     let next = f.relay.quota.refresh_permission_plan(id).await.unwrap();
     assert_eq!(next.subscription, account.subscription);
+    assert_eq!(next.generation, account.generation);
     assert_eq!(f.fake.state.requests().len(), 2);
 }
 
