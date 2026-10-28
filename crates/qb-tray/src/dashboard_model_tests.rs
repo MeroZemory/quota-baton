@@ -227,13 +227,24 @@ fn r7_defaults_counts_grouping_tray_order_and_unknowns() {
                 .unwrap()
     );
     assert!(!view.groups.iter().any(|g| g.id == "cx-disabled"));
-    assert!(
-        view.groups
-            .iter()
-            .find(|g| g.id == "cl-login")
-            .unwrap()
-            .relogin
+    assert!(!view.groups.iter().any(|g| g.id == "cl-login"));
+    let login = view
+        .excluded_rows
+        .iter()
+        .find(|row| row.raw.id == "cl-login")
+        .unwrap();
+    assert_eq!(login.raw.health.kind, "needs_relogin");
+    assert_eq!(
+        login.excluded_reason,
+        Some(crate::i18n::static_text("다시 로그인 필요"))
     );
+    assert!(login.menu.show_relogin);
+    assert!(
+        view.excluded_rows
+            .iter()
+            .any(|row| row.raw.id == "cx-disabled")
+    );
+    assert_eq!(view.excluded_rows.len(), 2);
     assert!(view.flat.iter().all(|r| r.model == "—"));
     assert!(view.flat[0].activity.contains("0:42"));
 }
@@ -261,12 +272,19 @@ fn r7_range_boundaries_provider_search_and_group_empty_reason() {
     assert_eq!(project(&data, &mut state, &now).session_count, 10);
     state.range = Range::All;
     assert_eq!(project(&data, &mut state, &now).session_count, 12);
-    let g = project(&data, &mut state, &now)
-        .groups
-        .into_iter()
-        .find(|g| g.id == "cl-login")
+    let view = project(&data, &mut state, &now);
+    assert!(!view.groups.iter().any(|g| g.id == "cl-login"));
+    let login = view
+        .excluded_rows
+        .iter()
+        .find(|row| row.raw.id == "cl-login")
         .unwrap();
-    assert!(g.no_sessions.contains("새 세션을 배정하지 않습니다"));
+    assert_eq!(
+        login.excluded_reason,
+        Some(crate::i18n::static_text("다시 로그인 필요"))
+    );
+    assert!(login.usage.is_none() && login.forecast_lines.is_empty());
+    assert_eq!(view.flat.len(), 12);
 }
 #[test]
 fn r7_all_flat_columns_sort_and_frozen_rows_update_without_jump() {
@@ -1003,9 +1021,18 @@ fn r10_relogin_stale_windows_have_observation_time_and_paused_metadata() {
         {"id":"paused","provider":"codex","user_state":"paused","health":{"kind":"ready"},"windows":[{"name":"5h","used_pct":100}]}
     ]));
     let view = project(&data, &mut DashboardState::default(), &clock());
-    let login = view.groups.iter().find(|g| g.id == "login").unwrap();
-    assert!(!login.relogin_reason.is_empty());
-    assert!(!login.paused);
+    assert!(view.groups.is_empty());
+    let login = view
+        .excluded_rows
+        .iter()
+        .find(|row| row.raw.id == "login")
+        .unwrap();
+    assert_eq!(
+        login.excluded_reason,
+        Some(crate::i18n::static_text("다시 로그인 필요"))
+    );
+    assert_eq!(login.raw.user_state, "active");
+    assert!(login.windows.is_empty());
     let tile = view.usage.iter().find(|t| t.id == "login").unwrap();
     assert!(tile.unconfirmed);
     assert_eq!(tile.last_observed, Some(at("2026-10-19T05:00:00Z")));
@@ -1025,11 +1052,20 @@ fn r10_relogin_stale_windows_have_observation_time_and_paused_metadata() {
         r10_fact(&detail, "남은 양"),
         "확인 불가 · 14:00 기준 5시간 90% · 주간 80%"
     );
-    let paused = view.groups.iter().find(|g| g.id == "paused").unwrap();
-    assert!(paused.paused);
-    assert_eq!(paused.windows[0].remaining_pct, 0);
-    assert!(view.usage.iter().find(|t| t.id == "paused").unwrap().paused);
-    assert!(paused.no_sessions.ends_with("새 세션을 배정하지 않습니다"));
+    let paused = view
+        .excluded_rows
+        .iter()
+        .find(|row| row.raw.id == "paused")
+        .unwrap();
+    assert_eq!(paused.raw.user_state, "paused");
+    assert_eq!(
+        paused.excluded_reason,
+        Some(crate::i18n::static_text("일시 중지"))
+    );
+    assert!(paused.windows.is_empty());
+    let tile = view.usage.iter().find(|t| t.id == "paused").unwrap();
+    assert!(tile.paused);
+    assert_eq!(tile.windows[0].remaining_pct, 0);
 }
 
 #[test]
@@ -1186,14 +1222,17 @@ fn r10_empty_group_ready_reason_and_client_sort_are_explicit() {
             .no_sessions
             .ends_with("새 세션 배정 가능")
     );
-    assert!(
-        view.groups
-            .iter()
-            .find(|g| g.id == "cl-login")
-            .unwrap()
-            .no_sessions
-            .ends_with("새 세션을 배정하지 않습니다")
+    assert!(!view.groups.iter().any(|g| g.id == "cl-login"));
+    let login = view
+        .excluded_rows
+        .iter()
+        .find(|row| row.raw.id == "cl-login")
+        .unwrap();
+    assert_eq!(
+        login.excluded_reason,
+        Some(crate::i18n::static_text("다시 로그인 필요"))
     );
+    assert!(login.windows.is_empty() && login.forecast_lines.is_empty());
     assert!(
         view.groups
             .iter()
@@ -1585,4 +1624,57 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
         ..Default::default()
     };
     super::detail_view(d, accounts, clock, expired, &state)
+}
+
+#[test]
+fn r19_compact_session_detail_preserves_window_only_observation_plan_and_health() {
+    let data = r10_accounts(serde_json::json!([{
+        "id":"login","provider":"claude","label":"Retained plan","plan":"pro",
+        "user_state":"active","source":{"kind":"oauth"},
+        "health":{"kind":"needs_relogin"},
+        "windows":[
+            {"name":"5h","used_pct":10,"observed_at":"2026-10-19T05:00:00Z"},
+            {"name":"7d","used_pct":20,"observed_at":"2026-10-20T05:00:00Z"}
+        ]
+    }]));
+    let compact = account_rows(&data.accounts)
+        .into_iter()
+        .find(|a| a.raw.id == "login")
+        .unwrap();
+    assert!(compact.windows.is_empty() && compact.usage.is_none());
+    let raw_before = format!("{:?}", compact.raw);
+    let detail = detail_view(
+        &SessionDetail {
+            session: Session {
+                account: "login".into(),
+                provider: "claude".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &data.accounts,
+        &clock(),
+        false,
+    );
+    assert_eq!(r10_fact(&detail, "계정"), "Retained plan · Pro");
+    assert_eq!(
+        r10_fact(&detail, "남은 양"),
+        "확인 불가 · 14:00 기준 5시간 90% · 주간 80%"
+    );
+    assert_eq!(
+        usage_tiles(&data, &clock())[0].last_observed,
+        Some(at("2026-10-19T05:00:00Z"))
+    );
+    let row = session_row(
+        &Session {
+            account: "login".into(),
+            provider: "claude".into(),
+            ..Default::default()
+        },
+        &data.accounts,
+        &clock(),
+        None,
+    );
+    assert_eq!(row.account_chip.as_ref().unwrap().text, "다시 로그인 필요");
+    assert_eq!(format!("{:?}", compact.raw), raw_before);
 }

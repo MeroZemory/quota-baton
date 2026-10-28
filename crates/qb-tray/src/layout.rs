@@ -680,11 +680,10 @@ pub fn account_menu_metadata(row: &Row) -> [String; 3] {
             .unwrap_or_else(|| crate::i18n::static_text("확인 불가").into())
     };
     [
-        match row.source.as_str() {
-            "linked" => crate::i18n::static_text("CPA 갱신").into(),
-            "oauth" | "adopted" => crate::i18n::static_text("직접 갱신").into(),
-            _ => crate::i18n::static_text("갱신 방식 확인 불가").into(),
-        },
+        qb_core::accounts::refresh_owner::RefreshSource::from_parts(&row.source, None)
+            .refresh_owner()
+            .refresh_label(crate::i18n::language() == crate::i18n::UiLanguage::En)
+            .into(),
         crate::i18n::format(
             "만료 {0}",
             &[(time(row.token_expires_at.as_deref())).to_string()],
@@ -2154,11 +2153,23 @@ mod tests {
         assert_eq!(row_height(&rows[3]), 92.0);
         assert_eq!(row_height(&rows[4]), 116.0);
         assert_eq!(row_height(&rows[5]), 92.0);
-        // Provider paragraphs and one compact forecast per active row add
-        // 186 DIPs to this measured fixture; disabled disclosure remains 44 each.
+        // R19 keeps the four main accounts and hides one re-login plus two
+        // disabled accounts behind one 28-DIP disclosure. Legacy Row geometry
+        // above remains unchanged; the measured native fixture is now 793 DIPs.
         let collapsed = native_render::content_height(&rows, false);
-        assert_eq!(collapsed, 744.0 + 186.0);
-        assert_eq!(native_render::content_height(&rows, true) - collapsed, 88.0);
+        let view = v2::project(FIXTURE, SystemTime::now()).unwrap();
+        let group = view
+            .sections
+            .iter()
+            .find(|section| section.provider == v2::EXCLUDED_GROUP_KEY)
+            .unwrap();
+        assert_eq!(group.disabled_rows.len(), 3);
+        assert!(!group.auto_expand_recommended);
+        assert_eq!(collapsed, 793.0);
+        assert_eq!(
+            native_render::content_height(&rows, true) - collapsed,
+            3. * 44.
+        );
         let mut pacing = rows.clone();
         pacing[3].health_tone = Tone::Warning;
         pacing[3].health_chip = "속도 조절 중 · 10초".into();

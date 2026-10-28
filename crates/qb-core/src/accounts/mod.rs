@@ -10,6 +10,7 @@ pub mod import;
 mod lease;
 pub mod linked;
 pub mod login;
+pub mod refresh_owner;
 #[cfg(windows)]
 pub(crate) mod shared_profile;
 mod store;
