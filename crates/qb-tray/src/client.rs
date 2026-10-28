@@ -1536,7 +1536,7 @@ mod r6_takeover_tests {
 
 #[cfg(test)]
 #[path = "../tests/support/r15_admin_account_fixture.rs"]
-mod r18_account_fixture;
+pub(crate) mod r18_account_fixture;
 
 #[cfg(test)]
 mod r7_dashboard_client_tests {
