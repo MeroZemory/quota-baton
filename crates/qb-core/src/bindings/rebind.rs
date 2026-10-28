@@ -260,18 +260,23 @@ impl BindingTable {
         permit: Option<move_guard::Permit>,
         authorize: impl FnOnce(&str) -> Result<()>,
     ) -> std::result::Result<Rebound<'a>, RebindError> {
+        decision_tape::rebind_enter(self);
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if self.rebind_source(&d, cx.provider, cx.key).as_deref() != cx.from {
+            decision_tape::check(self, decision_tape::Check::RebindSource, false);
             return Err(RebindError::Evidence);
         }
+        decision_tape::check(self, decision_tape::Check::RebindSource, true);
         let expected_guard = cx
             .key
             .map(group)
             .map(|key| launch::ownership_group(&d, key).to_owned())
             .unwrap_or_else(|| format!("unidentified:{}", cx.provider.as_str()));
         if cx.guard_key != expected_guard {
+            decision_tape::check(self, decision_tape::Check::RebindGuard, false);
             return Err(RebindError::Evidence);
         }
+        decision_tape::check(self, decision_tape::Check::RebindGuard, true);
         let budget_from = self.rebind_budget_source(&d, cx.provider, cx.key, cx.account);
         let moving = budget_from
             .as_deref()
@@ -292,11 +297,15 @@ impl BindingTable {
                 reason.valid(&cx, source, &self.policies, launch::policy_key(&d, cx.key))
             }))
         {
+            decision_tape::check(self, decision_tape::Check::RebindEvidence, false);
             return Err(RebindError::Evidence);
         }
+        decision_tape::check(self, decision_tape::Check::RebindEvidence, true);
         if !moving && permit.is_some() {
+            decision_tape::check(self, decision_tape::Check::RebindPermit, false);
             return Err(RebindError::Evidence);
         }
+        decision_tape::check(self, decision_tape::Check::RebindPermit, true);
         let label = if moving
             && permit
                 .as_ref()
@@ -309,7 +318,9 @@ impl BindingTable {
             cx.label
         };
         drop(d);
-        authorize(label).map_err(|_| RebindError::Policy)?;
+        let authorization = authorize(label);
+        decision_tape::check(self, decision_tape::Check::Authorize, authorization.is_ok());
+        authorization.map_err(|_| RebindError::Policy)?;
         let committed = self.commit_move(
             permit,
             cx.account,
@@ -334,6 +345,7 @@ impl BindingTable {
             label,
             committed.as_ref(),
         );
+        decision_tape::rebind_complete(self, &moves);
         Ok(Rebound { data: d, moves })
     }
     fn commit_move(
