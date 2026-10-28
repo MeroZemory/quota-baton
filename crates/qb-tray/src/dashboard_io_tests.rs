@@ -1,6 +1,5 @@
 use super::*;
-#[path = "../tests/support/r15_admin_account_fixture.rs"]
-mod admin_fixture;
+use crate::client::r18_account_fixture as admin_fixture;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

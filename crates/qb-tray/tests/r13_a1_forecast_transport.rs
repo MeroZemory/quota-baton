@@ -5,14 +5,13 @@ mod client;
 #[path = "support/r13_usage_forecast_fixture.rs"]
 mod fixture;
 
+use client::r18_account_fixture as admin_fixture;
 use qb_tray::{
     dashboard_model as m,
     geometry::{Draw, Metrics, Scene},
     state::{DashboardState, Tab},
     v2,
 };
-#[path = "support/r15_admin_account_fixture.rs"]
-mod admin_fixture;
 
 use serde_json::json;
 
