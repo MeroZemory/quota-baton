@@ -1932,12 +1932,20 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
             .sum::<f32>()
             + 8.
     };
+    let excluded_height = if v.excluded_rows.is_empty() {
+        0.
+    } else {
+        28. + v.excluded_rows.len() as f32 * 44. + 8.
+    };
+    let content = content + excluded_height;
     let (old, offset) = b.begin_region(ScrollRegion::Table, viewport, content, s.table_offset);
     let mut ry = viewport.top - offset;
     match &v.empty {
         m::EmptyState::NoSessions(title) => {
             let cx = viewport.left + width(viewport) / 2.;
-            ry += ((height(viewport) - empty_height) / 2.).max(0.);
+            if v.excluded_rows.is_empty() {
+                ry += ((height(viewport) - empty_height) / 2.).max(0.);
+            }
             let left = cx - empty_width / 2.;
             b.fill(rect(cx - 24., ry, 48., 48.), Color::Footer, 24.);
             b.text_face(
@@ -2242,6 +2250,73 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                     ry += row_height;
                 }
             }
+        }
+    }
+    if !v.excluded_rows.is_empty() {
+        let mut y = viewport.top - offset + content - excluded_height;
+        b.text(
+            rect(viewport.left + 16., y + 6., width(viewport) - 32., 16.),
+            crate::i18n::format("배정 안 함 ({0})", &[v.excluded_rows.len().to_string()]),
+            12.,
+            true,
+            Color::Secondary,
+            false,
+        );
+        y += 28.;
+        for row in &v.excluded_rows {
+            let left = viewport.left + 16.;
+            let right = viewport.right - 16.;
+            let menu_width = 28.;
+            let reason_width = b
+                .measured_width(v2::compact_reason(row), 12., false)
+                .min((width(viewport) * 0.48).min(280.));
+            let reason_left = right - menu_width - 8. - reason_width;
+            let plan_width = b
+                .measured_width(row.plan.as_deref().unwrap_or_default(), 12., false)
+                .min(80.);
+            let name_right = (reason_left - plan_width - 20.).max(left);
+            b.text(
+                rect(left, y + 13., (name_right - left).max(0.), 18.),
+                row.name.clone(),
+                13.,
+                false,
+                Color::Text,
+                false,
+            );
+            b.text(
+                rect(name_right + 6., y + 14., plan_width, 16.),
+                row.plan.clone().unwrap_or_default(),
+                12.,
+                false,
+                Color::Secondary,
+                false,
+            );
+            b.text(
+                rect(reason_left, y + 14., reason_width, 16.),
+                v2::compact_reason(row),
+                12.,
+                false,
+                Color::Secondary,
+                false,
+            );
+            let key = format!("excluded:{}", row.raw.id);
+            b.semantic(
+                key,
+                Some("sessions:table".into()),
+                Role::Text,
+                row.accessible_name.clone(),
+                rect(left, y, (right - left - menu_width - 4.).max(0.), 44.),
+                None,
+            );
+            b.control(
+                rect(right - menu_width, y + 10., menu_width, 24.),
+                "⋯",
+                Target::OpenTrayAccount(row.raw.id.clone()),
+                Role::Button,
+                false,
+                None,
+            );
+            y += 44.;
         }
     }
     b.end_region(old);

@@ -357,7 +357,24 @@ mod tests {
             // summary to two measured lines, including its 6px trailing gap.
             76.
         );
-        assert_eq!(list.rect.bottom, 419. + 76.);
+        assert_eq!(list.sections.len(), 1);
+        let group = &list.sections[0];
+        assert_eq!(group.provider, v2::EXCLUDED_GROUP_KEY);
+        assert!(group.disabled_rows.is_empty() && !group.expanded);
+        assert_eq!(g::h(group.disclosure.unwrap()), 28.);
+        assert_eq!(
+            list.rect.bottom,
+            list.header.rect.bottom + 28. + 8. + g::FOOTER
+        );
+        let (_, _, expanded) = prepared(&rows, false, SystemTime::now(), true, true, None).unwrap();
+        assert_eq!(expanded.sections[0].disabled_rows.len(), 2);
+        assert!(
+            expanded.sections[0]
+                .disabled_rows
+                .iter()
+                .all(|row| g::h(row.rect) == 44. && row.compact_reason.is_some())
+        );
+        assert_eq!(expanded.rect.bottom - list.rect.bottom, 2. * 44.);
         assert_eq!(state_height(&rows, false, Some("login:claude")), 337. + 76.);
         let (_, _, scene) = prepared(
             &rows,

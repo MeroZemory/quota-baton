@@ -8,9 +8,8 @@ use std::time::SystemTime;
 pub fn account_row<'a>(view: &'a v2::View, provider: &str, id: &str) -> Option<&'a v2::AccountRow> {
     view.sections
         .iter()
-        .filter(|s| s.provider == provider)
         .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
-        .find(|r| r.raw.id == id)
+        .find(|r| r.raw.provider == provider && r.raw.id == id)
 }
 
 pub fn time(at: DateTime<Utc>, now: SystemTime) -> String {
@@ -108,8 +107,9 @@ pub fn quota_message(
                 let disabled = view
                     .sections
                     .iter()
-                    .find(|s| s.provider == provider)
-                    .map_or(0, |s| s.disabled_rows.len());
+                    .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                    .filter(|row| row.raw.provider == provider && row.raw.user_state == "disabled")
+                    .count();
                 if disabled > 0 {
                     crate::i18n::format(
                         "꺼진 계정 {0}개를 켜면 이어서 처리할 수 있습니다.",
@@ -260,6 +260,44 @@ mod tests {
             earliest_account: Some("a".into()),
             observed_at: "2026-10-18T11:00:00Z".parse().unwrap(),
         }
+    }
+    #[test]
+    fn r19_excluded_group_keeps_exact_provider_notice_lookup_and_disabled_recovery() {
+        let mut login = account("sample-login");
+        login["health"] = json!({"kind":"needs_relogin"});
+        let mut other = login.clone();
+        other["provider"] = json!("claude");
+        other["id"] = json!("sample-other");
+        let mut off = account("sample-off");
+        off["user_state"] = json!("disabled");
+        let v = view(vec![account("a"), login, other, off]);
+        let group = v
+            .sections
+            .iter()
+            .find(|s| s.provider == v2::EXCLUDED_GROUP_KEY)
+            .unwrap();
+        assert_eq!(group.disabled_rows.len(), 3);
+        assert!(account_row(&v, "codex", "sample-login").is_some());
+        assert!(account_row(&v, "claude", "sample-login").is_none());
+        assert!(account_row(&v, "claude", "sample-other").is_some());
+        assert!(
+            account_message(
+                &v,
+                "codex",
+                "sample-login",
+                AccountKind::Relogin,
+                true,
+                now()
+            )
+            .is_some()
+        );
+        let message =
+            quota_message(&v, "codex", "a", &context(QuotaAction::Exhausted), now()).unwrap();
+        assert!(
+            message
+                .text
+                .ends_with("꺼진 계정 1개를 켜면 이어서 처리할 수 있습니다.")
+        );
     }
     #[test]
     fn exhausted_offer_priority_disabled_errors_and_aggregate_title() {

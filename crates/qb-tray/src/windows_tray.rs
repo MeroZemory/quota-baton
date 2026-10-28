@@ -1,3 +1,7 @@
+#[cfg(feature = "testkit")]
+#[path = "flyout_perf.rs"]
+mod flyout_perf;
+
 use crate::{
     notices::{self, Controller},
     tray_icon::{pixels::Badge, win_icon::NotifyIcon},
@@ -36,7 +40,7 @@ use windows::{
         Graphics::{
             Direct2D::{
                 Common::D2D_SIZE_U, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
+                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1CreateFactory,
                 ID2D1Factory, ID2D1HwndRenderTarget,
             },
@@ -602,12 +606,52 @@ fn presentation(
     for section in &mut view.sections {
         for row in section.rows.iter_mut().chain(&mut section.disabled_rows) {
             if let Some(error) = session.error(&row.raw.id, elapsed()) {
-                row.reason = Some(error.into());
+                apply_row_error(row, error);
                 errors.insert(row.raw.id.clone());
             }
         }
     }
     (p, errors)
+}
+fn apply_row_error(row: &mut v2::AccountRow, error: &'static str) {
+    row.reason = Some(error.into());
+    if row.excluded_reason.is_some() {
+        row.excluded_reason = Some(error);
+    }
+}
+#[cfg(test)]
+#[test]
+fn r19_compact_action_failure_stays_visible_without_changing_the_account_or_row_height() {
+    let mut view = v2::project(
+        r#"{"accounts":[{"id":"sample-acct","provider":"codex","plan":"plus","source":{"kind":"oauth"},"user_state":"paused","health":{"kind":"ready"}}]}"#,
+        SystemTime::UNIX_EPOCH,
+    ).unwrap();
+    let row = &mut view.sections.last_mut().unwrap().disabled_rows[0];
+    let raw_before = format!("{:?}", row.raw);
+    let identity_before = row.menu.identity_line.clone();
+    let error = "요청을 처리하지 못했습니다";
+    apply_row_error(row, error);
+    assert_eq!(format!("{:?}", row.raw), raw_before);
+    assert_eq!(row.menu.identity_line, identity_before);
+    assert!(excluded_tooltip(row).unwrap().contains(error));
+    let scene = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            expanded: [(v2::EXCLUDED_GROUP_KEY.into(), true)].into(),
+            ..Default::default()
+        },
+        800.,
+    );
+    let compact = scene.row("sample-acct").unwrap();
+    assert_eq!(geometry::h(compact.rect), 44.);
+    assert_eq!(compact.compact_reason.as_ref().unwrap().text, error);
+    assert!(compact.usage.is_none() && compact.forecast.is_none());
+    assert!(
+        focus_tooltip(&view, &scene, Some(&HitTarget::Row("sample-acct".into())))
+            .unwrap()
+            .0
+            .contains(error)
+    );
 }
 fn scene_cap(hwnd: HWND) -> f32 {
     unsafe { work_area(hwnd) }.map_or(800., |r| {
@@ -667,6 +711,36 @@ fn disclosure_intent(scene: &geometry::Scene, provider: &str) -> Option<bool> {
         .find(|section| section.provider == provider)
         .map(|section| !section.expanded)
 }
+fn set_disclosure(provider: &str, expanded: bool) {
+    session()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_expanded(provider, expanded);
+    if provider != v2::EXCLUDED_GROUP_KEY {
+        return;
+    }
+    // Only a user's explicit choice reaches this helper. Revealing an account
+    // from the dashboard changes expansion in memory without saving it.
+    let accepted = WORKER.get().is_some_and(|worker| {
+        worker.submit(async move {
+            let result = qb_core::home().and_then(|home| {
+                crate::tray_preferences::save(
+                    &home,
+                    crate::tray_preferences::Preferences {
+                        excluded_expanded: expanded,
+                    },
+                )
+                .map_err(Into::into)
+            });
+            if result.is_err() {
+                tracing::warn!(event = "tray_preferences_save_failed");
+            }
+        })
+    });
+    if !accepted && !FIXTURE_MODE.load(Ordering::Relaxed) {
+        tracing::warn!(event = "tray_preferences_save_unavailable");
+    }
+}
 fn drain_intent(view: &v2::View, id: &str) -> Option<bool> {
     row_view(view, id).map(|row| !row.raw.drain)
 }
@@ -708,8 +782,18 @@ fn measured_scene(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let core_ok = model().lock().unwrap_or_else(|e| e.into_inner()).2;
+    #[cfg(feature = "testkit")]
+    let perf_project = flyout_perf::start();
     let mut view = projected();
+    #[cfg(feature = "testkit")]
+    flyout_perf::phase("project_us", perf_project);
+    #[cfg(feature = "testkit")]
+    let perf_presentation = flyout_perf::start();
     let (mut p, errors) = presentation(&mut view, state.as_deref(), core_ok);
+    #[cfg(feature = "testkit")]
+    flyout_perf::phase("presentation_us", perf_presentation);
+    #[cfg(feature = "testkit")]
+    let perf_renderer = flyout_perf::start();
     let dark = DARK.load(Ordering::Acquire);
     let renderer = VISIBLE_RENDERER.with(|slot| -> Result<Rc<Renderer>> {
         if let Some((theme, renderer)) = slot.borrow().as_ref()
@@ -731,13 +815,25 @@ fn measured_scene(
     })?;
     #[cfg(all(debug_assertions, feature = "testkit"))]
     let created = started.elapsed().as_millis();
+    #[cfg(feature = "testkit")]
+    let perf_measure = {
+        flyout_perf::phase("renderer_us", perf_renderer);
+        if flyout_perf::enabled() {
+            renderer.begin_flyout_phase_stats();
+        }
+        flyout_perf::start()
+    };
     renderer.measure(&view, &mut p)?;
+    #[cfg(feature = "testkit")]
+    flyout_perf::phase("measure_us", perf_measure);
     #[cfg(all(debug_assertions, feature = "testkit"))]
     FRAME_TIMINGS.with(|t| {
         let mut t = t.borrow_mut();
         t.insert("renderer_create", created);
         t.insert("measure", started.elapsed().as_millis() - created);
     });
+    #[cfg(feature = "testkit")]
+    let perf_geometry = flyout_perf::start();
     let mut scene = geometry::Scene::build(&view, p.clone(), scene_cap(hwnd));
     let reveal = INPUT.with(|i| {
         let mut i = i.borrow_mut();
@@ -762,6 +858,8 @@ fn measured_scene(
         let pending = session().lock().unwrap_or_else(|e| e.into_inner());
         pending_toggle_labels(&mut scene, &pending);
     }
+    #[cfg(feature = "testkit")]
+    flyout_perf::phase("geometry_us", perf_geometry);
     Ok((renderer, view, scene, errors))
 }
 fn toggle_key(action: &MenuAction) -> Option<&'static str> {
@@ -917,6 +1015,8 @@ fn submit_job(job: impl std::future::Future<Output = ()> + Send + 'static) -> bo
 }
 
 fn paint_window(hwnd: HWND) -> Result<()> {
+    #[cfg(feature = "testkit")]
+    flyout_perf::begin_frame();
     #[cfg(all(debug_assertions, feature = "testkit"))]
     let started = Instant::now();
     sync_login_animation(hwnd, unsafe { IsWindowVisible(hwnd).as_bool() });
@@ -930,6 +1030,8 @@ fn paint_window(hwnd: HWND) -> Result<()> {
     };
     let revision = REVISION.load(Ordering::Acquire);
     let (renderer, view, scene, errors) = measured_scene(hwnd)?;
+    #[cfg(feature = "testkit")]
+    let perf_target = flyout_perf::start();
     unsafe {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client)?;
@@ -960,7 +1062,8 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             let hwnd_properties = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd,
                 pixelSize: pixels,
-                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+                // Present without blocking the UI thread on display refresh.
+                presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY,
             };
             let target = factory.CreateHwndRenderTarget(&properties, &hwnd_properties)?;
             #[cfg(all(debug_assertions, feature = "testkit"))]
@@ -975,6 +1078,8 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             t.borrow_mut()
                 .insert("target", target_started.elapsed().as_millis());
         });
+        #[cfg(feature = "testkit")]
+        flyout_perf::phase("target_us", perf_target);
         let offset = scene.offset;
         target.SetTransform(&Matrix3x2::identity());
         INPUT.with(|i| {
@@ -1059,6 +1164,8 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         #[cfg(all(debug_assertions, feature = "testkit"))]
         let draw_started = Instant::now();
         let core_note = (!scene.core_ok).then(|| i18n::text("코어 상태를 읽지 못했습니다"));
+        #[cfg(feature = "testkit")]
+        let perf_draw = flyout_perf::start();
         let result = renderer.paint(
             &target,
             &view,
@@ -1082,8 +1189,12 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             t.borrow_mut()
                 .insert("draw", draw_started.elapsed().as_millis());
         });
+        #[cfg(feature = "testkit")]
+        flyout_perf::phase("draw_us", perf_draw);
         match result {
             Ok(()) => {
+                #[cfg(feature = "testkit")]
+                flyout_perf::end_draw();
                 let epoch = FRAME_EPOCH.fetch_add(1, Ordering::AcqRel);
                 assert!(epoch > 0 && epoch <= isize::MAX as usize);
                 let mut frame = PaintedFrame {
@@ -1101,8 +1212,29 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                     actions: Vec::new(),
                     elements: Vec::new(),
                 };
+                #[cfg(feature = "testkit")]
+                let perf_uia = flyout_perf::start();
                 publish_accessibility(hwnd, &mut frame);
+                #[cfg(feature = "testkit")]
+                flyout_perf::phase("uia_us", perf_uia);
+                #[cfg(feature = "testkit")]
+                let perf_publish = flyout_perf::start();
                 PAINTED.with(|slot| *slot.borrow_mut() = Some(frame));
+                #[cfg(feature = "testkit")]
+                {
+                    flyout_perf::phase("frame_store_us", perf_publish);
+                    VIEWPORT.with(|v| {
+                        let v = v.borrow();
+                        flyout_perf::publish(
+                            epoch,
+                            offset,
+                            v.max_offset(),
+                            dpi,
+                            (pixels.width, pixels.height),
+                            renderer.flyout_phase_stats(),
+                        );
+                    });
+                }
             }
             Err(error) => {
                 PAINTED.with(|slot| *slot.borrow_mut() = None);
@@ -1776,10 +1908,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
             let Some(requested) = disclosure_intent(&frame.scene, &provider) else {
                 return;
             };
-            session()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_expanded(&provider, requested);
+            set_disclosure(&provider, requested);
         }
         HitTarget::DismissOverlay => {
             dismiss_overlay();
@@ -1896,6 +2025,15 @@ fn tooltip_ready(since: Option<Instant>) -> bool {
 fn contains(r: qb_tray::Rect, x: f32, y: f32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
+fn excluded_tooltip(row: &v2::AccountRow) -> Option<String> {
+    row.excluded_reason.map(|reason| {
+        [Some(row.name.as_str()), row.plan.as_deref(), Some(reason)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
+    })
+}
 fn tooltip_content(
     view: &v2::View,
     scene: &geometry::Scene,
@@ -1936,6 +2074,12 @@ fn tooltip_content(
         let Some(row) = row_view(view, &boxrow.id) else {
             continue;
         };
+        if boxrow.compact_reason.is_some()
+            && contains(boxrow.rect, x, y)
+            && let Some(text) = excluded_tooltip(row)
+        {
+            return Some((text, boxrow.rect));
+        }
         for (rect, text) in [
             (boxrow.chip, row.chip_tooltip.clone()),
             (
@@ -1970,6 +2114,9 @@ fn focus_tooltip(
         return None;
     };
     let row = row_view(view, id)?;
+    if let Some(text) = excluded_tooltip(row) {
+        return Some((text, scene.row(id)?.rect));
+    }
     let mut text = row
         .usage
         .as_ref()
@@ -2224,10 +2371,7 @@ fn keyboard(hwnd: HWND, key: u32) -> bool {
     if let Some(HitTarget::Disclosure(provider)) = &current
         && matches!(key, 0x25 | 0x27)
     {
-        session()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_expanded(provider, key == 0x27);
+        set_disclosure(provider, key == 0x27);
         unsafe {
             resize_flyout(hwnd);
         }
@@ -2702,6 +2846,8 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_MOUSEWHEEL if IsWindowVisible(hwnd).as_bool() => {
+            #[cfg(feature = "testkit")]
+            let perf_received = flyout_perf::start();
             let delta = ((wparam.0 >> 16) as u16 as i16) as f32;
             if let Some(frame) = painted_frame(hwnd) {
                 if let Some(popup) = frame.scene.popup {
@@ -2722,6 +2868,11 @@ unsafe extern "system" fn window_proc(
                     VIEWPORT.with(|slot| slot.borrow_mut().wheel_delta(delta, 72.));
                 }
             }
+            #[cfg(feature = "testkit")]
+            VIEWPORT.with(|v| {
+                let v = v.borrow();
+                flyout_perf::wheel(perf_received, delta, v.offset, v.max_offset());
+            });
             redraw_now(hwnd);
             LRESULT(0)
         }
@@ -3019,6 +3170,8 @@ pub fn run(
     now: SystemTime,
 ) -> Result<()> {
     let _apartment = UiApartment::enter()?;
+    #[cfg(feature = "testkit")]
+    flyout_perf::init()?;
     SUPERVISE_ENABLED.store(supervise, Ordering::Relaxed);
     STARTED.get_or_init(Instant::now);
     DARK.store(false, Ordering::Release);
@@ -3228,7 +3381,7 @@ mod tests {
     }
     #[test]
     fn full_scene_row_button_precedence_and_offline_settings_use_the_same_targets() {
-        let view=v2::project(r#"{"version":"test","pools":{"codex":{"eligible":0}},"accounts":[{"id":"native-test","provider":"codex","user_state":"disabled","email":"test@example.invalid"}]}"#,SystemTime::now()).unwrap();
+        let view=v2::project(r#"{"version":"test","pools":{"codex":{"eligible":0}},"accounts":[{"id":"native-test","provider":"codex","user_state":"active","email":"sample@example.invalid","source":{"kind":"oauth"},"health":{"kind":"cooling","reason":"quota","scope":"account","until":"2099-01-01T00:00:00Z"},"quota_credit_releasable":true,"credits":{"has_credits":true,"balance":12}}]}"#,SystemTime::now()).unwrap();
         let scene = geometry::Scene::build(&view, geometry::Presentation::default(), 900.);
         let row = scene.row("native-test").unwrap();
         assert_eq!(
@@ -3236,6 +3389,13 @@ mod tests {
             Some(&HitTarget::Row("native-test".into()))
         );
         let b = row.button.as_ref().unwrap();
+        assert_eq!(
+            b.target,
+            HitTarget::Inline {
+                id: "native-test".into(),
+                action: v2::ActionKind::AllowCredits
+            }
+        );
         assert_eq!(
             scene.hit_test(
                 (b.hit.left + b.hit.right) / 2.,
@@ -3363,14 +3523,20 @@ mod tests {
         );
     }
     #[test]
-    fn disclosure_click_inverts_the_painted_auto_default_without_a_manual_entry() {
+    fn disclosure_click_inverts_the_painted_collapsed_default_without_a_manual_entry() {
         let view = v2::project(r#"{"pools":{"codex":{"eligible":0}},"accounts":[{"id":"off","provider":"codex","user_state":"disabled"}]}"#, SystemTime::now()).unwrap();
         let scene = geometry::Scene::build(&view, geometry::Presentation::default(), 900.);
-        assert_eq!(disclosure_intent(&scene, "codex"), Some(false));
+        assert_eq!(
+            disclosure_intent(&scene, v2::EXCLUDED_GROUP_KEY),
+            Some(true)
+        );
         let mut p = geometry::Presentation::default();
-        p.expanded.insert("codex".into(), false);
+        p.expanded.insert(v2::EXCLUDED_GROUP_KEY.into(), true);
         let scene = geometry::Scene::build(&view, p, 900.);
-        assert_eq!(disclosure_intent(&scene, "codex"), Some(true));
+        assert_eq!(
+            disclosure_intent(&scene, v2::EXCLUDED_GROUP_KEY),
+            Some(false)
+        );
         assert_eq!(disclosure_intent(&scene, "missing"), None);
     }
     #[test]
@@ -3446,7 +3612,7 @@ mod tests {
         )
         .unwrap();
         let scene = geometry::Scene::build(&view, geometry::Presentation::default(), 400.);
-        let target = HitTarget::Disclosure("codex".into());
+        let target = HitTarget::Disclosure(v2::EXCLUDED_GROUP_KEY.into());
         let rect = reveal_bounds(&scene, &target).unwrap();
         assert!(rect.top >= scene.list.bottom);
         let scene = geometry::Scene::build(

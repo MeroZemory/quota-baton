@@ -534,3 +534,35 @@ This appendix makes the unchanged old-spec references self-contained. V2 tokens,
 - Inner ring: 1 DIP focus-inner, centred on the control rect inflated by0.5, radius r+0.5.
 - Outer ring: 2 DIP focus-outer, centred on the rect inflated by2, radius r+2.
 - V2 rows use their x4–356 hover rectangle; v2 keyboard order is §12.
+
+## 19. R19 amendment: ownership and accounts not used for placement
+
+User direction, 2026-10-29. This section supersedes the paused/full-row and
+per-provider disabled-disclosure rules in §6 where they conflict.
+
+Account origin and token refresher are separate facts. CPA-linked accounts use
+`CPA 갱신` / `CPA refresh`. OAuth, adopted CPA and takeover accounts use
+`직접 갱신` / `Direct refresh`; qb owns their token refresh. CLI account lists
+and status name both the origin and the refresher explicitly. Unknown source
+modes must not claim an owner.
+
+After all provider main lists, show one `배정 안 함 (n)` / `Not used (n)` group
+for paused or disabled accounts, accounts needing re-login, Claude Free and the
+durable `plan_without_claude_code` state. Temporary cooling stays in the main
+list. Codex Free, absent plan/usage information and an unavailable pool alone
+do not prove an exclusion. Removed accounts disappear with the core snapshot;
+do not retain a stale account or invent an entitlement failure from missing data.
+Provider summaries count the original accounts before display grouping.
+
+Each excluded row is 44 DIP high: one line for name, plan and reason, with its
+account menu. It has no usage meter, forecast or session list. Allocate reason
+space before the name; hover and keyboard focus expose the full name and reason.
+An action failure remains visible in this same line. Menu actions and paid-credit
+confirmation retain their existing availability and complete explanation.
+
+The tray group starts collapsed, even when every account is excluded. Remember
+explicit mouse/keyboard disclosure choices per user; disk reads and writes run
+on the tray worker. Programmatic account reveal does not overwrite that choice.
+The dashboard overview shows the same compact accounts after its main account
+groups. A recovered account returns to the main list immediately, while relative
+ordering within each list remains stable during an open flyout.

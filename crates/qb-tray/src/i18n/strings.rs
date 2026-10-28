@@ -107,7 +107,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("5분 안에 활동", "Active within 5 minutes"),
     ("5시간", "5 hours"),
     ("5시간 한도", "5-hour limit"),
-    ("CPA 갱신", "Integration refresh"),
+    ("CPA 갱신", "CPA refresh"),
     ("CPA 갱신 멈춤", "CPA refresh stopped"),
     (
         "CPA 계정을 가져오려면 명령줄에서",
@@ -117,7 +117,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "CPA가 이 계정의 토큰을 갱신하지 않습니다. CPA 실행을 확인하거나 계정 인수를 고려하세요.",
         "CPA is not refreshing this account. Check CPA or consider adopting the account.",
     ),
-    ("CPA가 토큰 갱신", "Integration refreshes tokens"),
+    ("CPA가 토큰 갱신", "CPA refreshes tokens"),
     (
         "CPA가 토큰을 갱신하지 않습니다. CPA 실행을 확인하세요.",
         "The integration is not refreshing tokens. Check that it is running.",
