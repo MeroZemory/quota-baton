@@ -218,7 +218,7 @@ async fn two_account_permission_failover(late_successor: bool) {
     ));
     f.fake.state.push(ScriptedResponse::json(reqwest::StatusCode::OK, json!({
         "account":{"uuid":"synthetic-claude-0","has_claude_pro":false,"has_claude_max":false},
-        "organization":{"uuid":"synthetic-organization","organization_type":"claude_free","rate_limit_tier":"default_claude_free"}
+        "organization":{"uuid":"synthetic-organization","organization_type":"claude_free","rate_limit_tier":"synthetic_unknown_tier"}
     }).to_string()));
     if !late_successor {
         f.fake.state.push(ScriptedResponse::json(

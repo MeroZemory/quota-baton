@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R18 Part 1 Linux·한영 실제 경로 관문
+현재 마일스톤: R18 Part 1 관문 통과 · Part 2 공급자 날짜 사실
 목표: Claude permission_error 때 요금제를 다시 읽어 Free 계정을 배정에서 빼고, 요금제·구독 시작일(Claude)·이용 기간(Codex)을 최신으로 표시하기
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (홈 서버 꺼짐)
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 보류 유지(추천). L1 P5 서버 수용은 홈 서버가 켜지면 사용자와 진행
-갱신: 2026-10-28 04:16 KST (Windows 전체/코어 관문·Linux fixture 보완 통과)
+갱신: 2026-10-28 16:21 KST (Part 1 Windows/Linux·한영 실제 경로 관문 통과)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (remaining ready work): R17.1 script-only focused gate complete; hand off public-main scripts, then resume R18 (`impl/plan-change`, parked uncompiled WIP adb1552), then N6r (`impl/r14-replay`) and N7 calibration on separate branches. N6r and N7 must not merge into dev without explicit owner gate approval. L1 P5 real acceptance stays with the design session and user; any L1 fix brief takes priority. R2 Part B stays held and N12 is not ready.
+**Current S1 order** (remaining ready work): R17.1 complete; R18 Part 1 gate passed on `impl/plan-change`, continue Part 2 provider-date facts, then N6r (`impl/r14-replay`) and N7 calibration on separate branches. N6r and N7 must not merge into dev without explicit owner gate approval. L1 P5 real acceptance stays with the design session and user; any L1 fix brief takes priority. R2 Part B stays held and N12 is not ready.
 
 **Start now in W:** N5m and the N7 backtest.
 
