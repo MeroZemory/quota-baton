@@ -557,7 +557,20 @@ e2e!(
                             Err(error) => failures.push(error.to_string()),
                         }
                     }
-                    Ok(response) => failures.push(format!("HTTP {}", response.status())),
+                    Ok(response) => {
+                        let status = response.status();
+                        let kind = response
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|body| body["error"]["type"].as_str().map(str::to_owned))
+                            .filter(|kind| {
+                                kind.len() <= 64
+                                    && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                            })
+                            .unwrap_or_else(|| "unclassified".into());
+                        failures.push(format!("HTTP {status}; error_type={kind}"));
+                    }
                     Err(error) => failures.push(error.to_string()),
                 }
             }
