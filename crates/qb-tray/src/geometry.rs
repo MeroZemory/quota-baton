@@ -3220,16 +3220,37 @@ fn session(
                 }
             }
             _ => {
-                let text = match key {
+                let mut text = match key {
                     SortKey::Model => &row.model,
                     SortKey::Start => &row.start,
                     SortKey::LastActivity => &row.activity,
                     SortKey::Requests => &row.requests,
                     _ => &row.memo,
+                }
+                .clone();
+                let text_rect = if matches!(key, SortKey::Start | SortKey::LastActivity) {
+                    rect(cr.left, cr.top, (width(cr) - 8.).max(0.), height(cr))
+                } else {
+                    cr
                 };
+                if *key == SortKey::Start && b.measured_width(&text, 13., false) > width(text_rect)
+                {
+                    b.tooltip(text_rect, text.clone());
+                    if let Some(at) = row.first_seen {
+                        let local = at.with_timezone(clock.now.offset());
+                        let pattern = if local.date_naive() == clock.now.date_naive() {
+                            "%H:%M"
+                        } else if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                            "%b %-d"
+                        } else {
+                            "%-m/%-d"
+                        };
+                        text = local.format(pattern).to_string();
+                    }
+                }
                 b.text(
-                    cr,
-                    text.clone(),
+                    text_rect,
+                    text,
                     if *key == SortKey::Memo { 12. } else { 13. },
                     false,
                     if *key == SortKey::Memo

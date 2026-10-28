@@ -981,3 +981,5 @@ A static test enforces this, and both targets are checked at every gate.
 - The core survives a reboot.
 - A browserless login works for each provider.
 - Concurrent use of a shared account with the PC is detected as outside use.
+
+**D29 amendment 5 (design owner, 2026-10-29; blind Opus max + Fable xhigh panel after the GOAL stagnation rule fired).** The minimum recorder could never feed a replay. It captured only account and collection events, and it stopped at its cap on 10-23. Its consumer was built for six days without a producer. Replay acceptance now rests on a **decision tape** recorded at the router's selection entries, with identity and power checks (GOAL "Outcome series" item 2). Data-fed gates need their producer installed first, and an end-to-end run on 1 h of real capture on day one. The N7 pooled-forecast acceptance is pre-registered in account-equivalents (p90 <= 0.20 at 1 h, <= 0.40 at 3 h, >= 100 origins over >= 7 days, not worse than persistence) and waits for live forecast logs. Brief: `.sandbox/briefs/N6r-decision-tape.md`.
