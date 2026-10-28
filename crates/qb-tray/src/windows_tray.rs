@@ -40,7 +40,7 @@ use windows::{
         Graphics::{
             Direct2D::{
                 Common::D2D_SIZE_U, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
+                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1CreateFactory,
                 ID2D1Factory, ID2D1HwndRenderTarget,
             },
@@ -1062,7 +1062,8 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             let hwnd_properties = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd,
                 pixelSize: pixels,
-                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+                // Present without blocking the UI thread on display refresh.
+                presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY,
             };
             let target = factory.CreateHwndRenderTarget(&properties, &hwnd_properties)?;
             #[cfg(all(debug_assertions, feature = "testkit"))]

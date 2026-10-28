@@ -106,7 +106,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R17 | 완료·v0.6.0 설치/공개 수용: install.ps1 upgrade 연결2102/0·자동 시작 등록·PATH 추가. 최초 실제 설치 결함은 R17.1에서 보완 |
 | R17.1 | 완료: ASCII/BOM 없는 설치·제거 스크립트, 잠긴 백업 정리 보류·finally 트레이 복구, 실제 클라이언트 탐지·wire 환경 일치. PS5.1/7 각28통과·레거시 백업 혼합 형식 재관문 각28통과·독립 검수 통과·read-only launch check0. 보고서 `.sandbox/reports/R17.1.md`; 공개 main 반영은 설계 세션 |
 | R18 | 설치 수용: dev1e8a4be·2026-10-28 20:25 KST·takeover1505/0·일반 Codex/Claude 실행 확인. Part 1 Free 계정 배정 제외, Part 2 공급자 날짜 사실, Part 3 최신 요금제와 제거된 창 반영 수용. 원본 실패와 집중 보완의 입력별 증거는 .sandbox/reports/R18.md. N6r/N7은 별도 브랜치·미병합 유지 |
-| R19 | 진행 중: `impl/r19`, 갱신 주체 공통 표시·휠 응답 선측정·배정 제외 계정의 하단 간결 표시. N6r `1fac000`과 N7은 각 브랜치에 보존·dev 미병합. 관문과 실제 core/AdminClient 경로 한영 화면 확인 뒤 R19만 self-merge; 설치는 설계 세션. brief `R19-tray-polish.md` |
+| R19 | 구현·관문 완료, 설치는 설계 세션: 갱신 주체 공통 표시·배정 제외 계정의 하단 44px 간결 행·접기 기억. 휠 선측정 최대30.373ms → 최종3.005ms(연속 입력3.694ms), 각72개 입력 누락0; 핸들러→제출 측정이며 물리 화면 지연 아님. tray902·allfeature4151·단독Core1476·집중bin15·Linux strict·실제 core/AdminClient 한영6PNG 검수 완료. 원본 실패와 집중 보완·UIA null 제한 보존. 보고서 `.sandbox/reports/R19.md`. N6r/N7 각 브랜치·미병합 유지 |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
