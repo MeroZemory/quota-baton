@@ -781,6 +781,16 @@ The tray writes `state/ui.json` atomically with schema and geometry only: positi
  "bytes_in":812345,"bytes_out":91234,"attempts":1,"outcome":"ok","upstream_error_code":null}
 ```
 
+### Plan observations and provider date facts
+
+Claude permission denials trigger a fresh, identity/token-fenced profile read. A confirmed Free organization without paid evidence produces durable `plan_without_claude_code`, not a six-hour retry. Recognized paid evidence can clear that entitlement hold; independent authentication, payment and user-state restrictions remain. Credential-only observations cannot erase confirmed Free evidence. Plan changes publish a bounded, typed event after persistence.
+
+Codex usage `plan_type` and refreshed ID-token `chatgpt_plan_type` are descriptive plan observations. The newest fenced observation wins; reusing an unchanged older ID token cannot overwrite a newer usage observation. Codex Free is not automatically ineligible. Preserve explicit `pro`, `prolite` and `promax` categories, with the official names `Pro (More)`, `Pro` and `Pro (Max)`. These names do not establish a numeric multiplier. A busy account's newer quota headers or ordinary metadata edits may prevent quota replacement without preventing a valid newer plan/date update. That descriptive-only path cannot publish binding windows, complete a probe or mint a resume receipt.
+
+A destructive Codex inventory replacement currently requires a known plan, boolean `rate_limit.limit_reached`, and explicit `primary_window` and `secondary_window` keys. Each slot must be null or contain numeric usage, a positive duration and a valid reset. An omitted field or malformed window is partial evidence. A newer complete inventory removes absent windows on a plan change, or after two consecutive complete omissions; partial reports interrupt that omission run. Preserve the native causing-window evidence across a failed metadata write. Only the quota hold attributed to a removed window may clear with `window_gone_after_plan_change`; stronger holds and independent rejections survive. Descriptive metadata is held equal on both sides of the unchanged exact quota-proof classifier.
+
+Subscription dates are optional provider facts, never billing anchors or eligibility evidence. Claude displays only `organization.subscription_created_at`, without a monthly estimate, advance renewal note or manual setting. Codex stores the literal active-start, active-until and last-checked claims from a matching ID token; local refresh time must not replace provider last-checked. Display the end date, last-checked age when older than seven days, and an informational note only during the three days before the end. After an endpoint passes, obtain one successfully committed plan observation per exact endpoint using the existing poll/backoff path. A pre-end request held across the boundary does not discharge that check. The durable acknowledgement is not an admin/snapshot presentation field; old records without date facts remain valid.
+
 ## C13. Acceptance
 
 See [architecture §16.3](architecture.md#163-acceptance-criteria) (A1–A5). Every row of C5 and C6 MUST have a `qb-testkit` test before M4a/M4b are accepted.
