@@ -15,6 +15,10 @@ use windows::{
     core::PCWSTR,
 };
 
+pub(crate) fn prepare_observation_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+
 pub(crate) fn atomic_write_account(
     dir: &Path,
     destination: &Path,

@@ -369,6 +369,8 @@ impl RelayState {
     pub fn start_memory_guard(&self) -> tokio::task::JoinHandle<()> {
         let guard = self.memory_guard.clone();
         let obs = self.observability.clone();
+        let accounts = self.accounts.clone();
+        let bindings = self.bindings.clone();
         crate::boxes::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -381,6 +383,28 @@ impl RelayState {
                     }
                     crate::guard::MemoryGuardTransition::Off => obs.record_guard("guard_off"),
                     crate::guard::MemoryGuardTransition::Unchanged => {}
+                }
+                if let Some(log) = obs.forecast_log()
+                    && log.due(chrono::Utc::now())
+                {
+                    match accounts.typed_views_with_bindings(&bindings).await {
+                        Ok(views) => {
+                            let result = crate::boxes::spawn_blocking(move || {
+                                log.sample(chrono::Utc::now(), &views)
+                            })
+                            .await;
+                            if !matches!(result, Ok(Ok(()))) {
+                                tracing::warn!(
+                                    code = "forecast_log_sample_failed",
+                                    "Forecast log sample unavailable"
+                                );
+                            }
+                        }
+                        Err(()) => tracing::warn!(
+                            code = "forecast_log_views_failed",
+                            "Forecast log input snapshot unavailable"
+                        ),
+                    }
                 }
             }
         })
@@ -697,7 +721,7 @@ impl RelayState {
         );
         accounts.set_poller(&quota);
         // The lease is held and account expiry/reconciliation precedes affinity restore.
-        store.list()?;
+        let initial_accounts = store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
         accounts.attach_outside_bindings(bindings.clone());
         observability.configure_move_notice(
@@ -721,6 +745,46 @@ impl RelayState {
             bindings.set_account_threshold(id, settings.spread_threshold);
         }
         observability.configure_replay(store.home(), &config.routing_replay)?;
+        for account in &initial_accounts {
+            observability.forecast_account(account);
+        }
+        if let Some(producer) = observability.replay() {
+            let witness = (|| -> anyhow::Result<()> {
+                use crate::observability::replay_recorder::{Event, Fingerprint, Owner};
+                use sha2::{Digest, Sha256};
+                let image = bindings.decision_tape_initial_image()?;
+                // Hash metadata in memory; no account values, identities, source paths
+                // or credentials are exported by this startup witness.
+                let bytes = serde_json::to_vec(&(&image, &initial_accounts))?;
+                let digest = Fingerprint(Sha256::digest(bytes).into());
+                anyhow::ensure!(
+                    producer
+                        .record(
+                            Owner::Bindings,
+                            None,
+                            Event::InitialWitness {
+                                component: Owner::Bindings,
+                                revision: image.revision,
+                                cursor: 0,
+                                rows: image.bindings_rows,
+                                digest,
+                            }
+                        )
+                        .is_some(),
+                    "initial decision witness was not accepted"
+                );
+                Ok(())
+            })();
+            if witness.is_err() {
+                producer.producer_failed();
+                tracing::warn!(
+                    code = "decision_tape_initial_witness_failed",
+                    "Decision tape startup state is incomplete"
+                );
+            }
+            bindings
+                .set_decision_recorder(Arc::new(move |record| producer.record_decision(record)));
+        }
         Ok(Self {
             accounts,
             quota,

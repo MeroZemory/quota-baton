@@ -21,6 +21,9 @@ pub(crate) fn atomic_write_binding(path: &Path, bytes: &[u8]) -> io::Result<()> 
 pub(crate) fn atomic_write_observation(path: &Path, bytes: &[u8]) -> io::Result<()> {
     replace(path, bytes)
 }
+pub(crate) fn prepare_observation_directory(path: &Path) -> io::Result<()> {
+    private_fs::prepare_private_directory(path).map(drop)
+}
 pub(crate) fn read_takeover_bytes(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
     match read_private_bytes(path, 4 * 1024 * 1024) {
         Ok(bytes) => Ok(Some(bytes)),

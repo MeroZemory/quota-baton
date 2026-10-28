@@ -1,4 +1,7 @@
 use crate::accounts::Provider;
+pub mod decision_comparison;
+pub mod decision_reader;
+pub(crate) mod forecast_log;
 mod replay_projection;
 pub mod replay_recorder;
 mod replay_runtime;
@@ -250,6 +253,7 @@ enum Command {
 }
 
 pub struct Observability {
+    forecast_log: std::sync::Mutex<Option<Arc<forecast_log::ForecastLog>>>,
     replay: std::sync::Mutex<Option<Arc<replay_runtime::Runtime>>>,
     dashboard: Arc<crate::dashboard::runtime::Runtime>,
     accounting: std::sync::Mutex<reread_accounting::Registry>,
@@ -288,8 +292,25 @@ impl Observability {
         }
         let mut slot = self.replay.lock().unwrap_or_else(|e| e.into_inner());
         anyhow::ensure!(slot.is_none(), "routing_replay_already_configured");
-        match replay_runtime::Runtime::start(
-            &home.join("state/routing-replay"),
+        match forecast_log::ForecastLog::open(home) {
+            Ok(log) => {
+                if let Ok(status) = log.status() {
+                    tracing::info!(
+                        code = "forecast_log_open",
+                        origins = status.origins,
+                        losses = status.losses,
+                        "Forecast log restored"
+                    );
+                }
+                *self.forecast_log.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(log))
+            }
+            Err(_) => tracing::warn!(
+                code = "forecast_log_start_failed",
+                "Optional forecast log unavailable"
+            ),
+        }
+        match replay_runtime::Runtime::start_tape(
+            &home.join("state/decision-tape-v4"),
             config.disk_limit_mib,
         ) {
             Ok(runtime) => *slot = Some(Arc::new(runtime)),
@@ -303,8 +324,34 @@ impl Observability {
 
     /// Blocking close for drain or normal process shutdown; call off the async worker.
     pub fn shutdown_replay(&self) {
+        if let Some(log) = self.forecast_log()
+            && log.close().is_err()
+        {
+            tracing::warn!(
+                code = "forecast_log_close_failed",
+                "Forecast log was not cleanly closed"
+            );
+        }
         if let Some(runtime) = self.replay() {
             runtime.shutdown();
+        }
+    }
+
+    pub(crate) fn forecast_log(&self) -> Option<Arc<forecast_log::ForecastLog>> {
+        self.forecast_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn forecast_account(&self, account: &crate::accounts::Account) {
+        if let Some(log) = self.forecast_log()
+            && log.observe_account(account).is_err()
+        {
+            tracing::warn!(
+                code = "forecast_log_account_refused",
+                "Forecast cohort observation refused"
+            );
         }
     }
 
@@ -728,6 +775,7 @@ impl Observability {
             .name("qb-observability".into())
             .spawn(move || run(home, state, rx, worker_dropped, worker_dashboard))?;
         Ok(Self {
+            forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard,
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
@@ -1186,6 +1234,7 @@ impl Observability {
     }
 
     pub(crate) fn record_account(&self, account: &crate::accounts::Account) {
+        self.forecast_account(account);
         self.replay_account(account, None, None);
         self.dashboard.account_changed(account);
         // Only canonical subscription names enter the account ledger.
@@ -2444,6 +2493,7 @@ mod tests {
     fn retained_burst_is_bounded_fresh_and_expires_without_persistence() {
         let (tx, rx) = mpsc::sync_channel(16);
         let obs = Observability {
+            forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
@@ -2491,6 +2541,7 @@ mod tests {
         // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
+            forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
@@ -2631,6 +2682,7 @@ mod tests {
             let _ = done_tx.send(drained);
         });
         let obs = Observability {
+            forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
