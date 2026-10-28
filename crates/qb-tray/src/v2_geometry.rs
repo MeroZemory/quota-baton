@@ -18,7 +18,7 @@ pub struct FrozenSection {
     pub disabled_rows: Vec<String>,
 }
 /// Capture/update this in the caller at open or when appending newly seen IDs.
-/// Preserve these vectors for the open lifetime, including original membership.
+/// Preserve relative order while current model membership determines the section.
 pub fn capture_order(view: &v2::View) -> BTreeMap<String, FrozenSection> {
     view.sections
         .iter()
@@ -222,6 +222,8 @@ pub struct RowBox {
     pub bar_fill: Option<Rect>,
     pub credits: Option<Rect>,
     pub reason: Option<Rect>,
+    /// One-line compact copy. Main paint must use this instead of the full row path.
+    pub compact_reason: Option<InfoLine>,
     pub button: Option<ButtonBox>,
 }
 #[derive(Debug, Clone)]
@@ -346,6 +348,41 @@ impl Scene {
                     disabled_rows: disabled.iter().map(|r| r.raw.id.clone()).collect(),
                 },
             );
+            if main.is_empty() && disabled.is_empty() && section.empty_message.is_none() {
+                continue;
+            }
+            if section.provider == v2::EXCLUDED_GROUP_KEY {
+                let start = y;
+                let disclosure = r(16., y, 344., y + 28.);
+                y += 28.;
+                let expanded = p
+                    .expanded
+                    .get(v2::EXCLUDED_GROUP_KEY)
+                    .copied()
+                    .unwrap_or(false);
+                let mut boxes = Vec::new();
+                if expanded {
+                    for row in disabled {
+                        let box_ = row_box(row, true, y, &p);
+                        y = box_.rect.bottom;
+                        boxes.push(box_);
+                    }
+                }
+                sections.push(SectionBox {
+                    provider: section.provider.clone(),
+                    rect: r(0., start, WIDTH, y),
+                    label: r(16., start, 344., start),
+                    rows: Vec::new(),
+                    disabled_rows: boxes,
+                    dividers: Vec::new(),
+                    disclosure: Some(disclosure),
+                    hint: None,
+                    expanded,
+                    empty_message: None,
+                    add_button: None,
+                });
+                continue;
+            }
             let start = y;
             let label = r(0., y, WIDTH, y + 32.);
             y += 32.;
@@ -815,7 +852,7 @@ fn ordered<'a>(
     }
     for row in all {
         if seen.insert(row.raw.id.clone()) {
-            if row.raw.user_state == "disabled" {
+            if section.provider == v2::EXCLUDED_GROUP_KEY || row.raw.user_state == "disabled" {
                 disabled.push(row)
             } else {
                 main.push(row)
@@ -826,6 +863,9 @@ fn ordered<'a>(
 }
 
 pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
+    if row.excluded_reason.is_some() {
+        return 44.;
+    }
     if disabled_slot {
         return 44.
             + subscription_height(row, &Presentation::default())
@@ -882,6 +922,48 @@ fn forecast_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
         .map_or(0., |text| 6. + paragraph_height(p, text, 328.))
 }
 fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) -> RowBox {
+    if let Some(reason) = row.excluded_reason {
+        // Allocate reason space first; long identities trim instead of displacing the menu.
+        let visible_reason = v2::compact_reason(row);
+        let plan_width = row
+            .plan
+            .as_deref()
+            .map(|plan| advance(p, plan, 12, false).min(60.));
+        let reason_width =
+            advance(p, visible_reason, 12, false).min(304. - 48. - 14. - plan_width.unwrap_or(0.));
+        let reason_left = 320. - reason_width;
+        let name_right = (reason_left - 8. - plan_width.map_or(0., |w| w + 6.)).max(16.);
+        let plan = plan_width.map(|w| r(name_right + 6., y + 14., name_right + 6. + w, y + 30.));
+        return RowBox {
+            id: row.raw.id.clone(),
+            provider: row.raw.provider.clone(),
+            disabled_slot: true,
+            rect: r(0., y, WIDTH, y + 44.),
+            hover: r(4., y, 356., y + 44.),
+            line1: r(16., y + 10., 352., y + 34.),
+            more: r(324., y + 10., 352., y + 34.),
+            name: r(16., y + 13., name_right, y + 31.),
+            plan,
+            compact_reason: Some(InfoLine {
+                rect: r(reason_left, y + 14., 320., y + 30.),
+                text: visible_reason.into(),
+                emphasized: false,
+                tooltip: Some(reason.into()),
+            }),
+            outside_note: None,
+            subscription: Vec::new(),
+            chip: None,
+            usage: None,
+            usage_lines: Vec::new(),
+            forecast: None,
+            reset: None,
+            bar: None,
+            bar_fill: None,
+            credits: None,
+            reason: None,
+            button: None,
+        };
+    }
     let enabled = p.core_ok && !p.pending_ids.contains(&row.raw.id);
     let height = row_height(row, disabled_slot) + outside_note_height(row, p)
         - outside_note_height(row, &Presentation::default())
@@ -1124,6 +1206,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         credits,
         reason,
         button: inline,
+        compact_reason: None,
     }
 }
 
@@ -1825,6 +1908,9 @@ fn shift_row(row: &mut RowBox, dy: f32) {
     {
         shift(rect, dy);
     }
+    if let Some(reason) = &mut row.compact_reason {
+        shift(&mut reason.rect, dy);
+    }
     for rect in &mut row.subscription {
         shift(rect, dy);
     }
@@ -1888,31 +1974,99 @@ mod tests {
     }
     #[test]
     fn r18_subscription_lines_expand_native_cards_with_measured_wrapping() {
-        for disabled_slot in [false, true] {
+        for state in ["active", "disabled", "relogin"] {
+            let excluded = state != "active";
             let mut wire = account("date-card");
-            if disabled_slot {
+            if state == "disabled" {
                 wire["user_state"] = json!("disabled");
+            } else if state == "relogin" {
+                wire["health"] = json!({"kind":"needs_relogin"});
             }
+            wire["pool_eligible"] = json!(!excluded);
+            wire["windows"] =
+                json!([{"name":"5h","used_pct":25,"reset_at":"2099-01-01T00:00:00Z"}]);
             wire["outside_used"] = json!(true);
-            let baseline = view(vec![wire.clone()], 1);
+            let baseline = view(vec![wire.clone()], u64::from(!excluded));
             wire["subscription"] = json!({"provider":"codex","active_until":"2026-10-20T12:00:00Z",
                 "last_checked":"2026-10-01T00:00:00Z"});
-            let projected = view(vec![wire], 1);
-            let section = &projected.sections[1];
-            let before_section = &baseline.sections[1];
-            let (row, before) = if disabled_slot {
-                (&section.disabled_rows[0], &before_section.disabled_rows[0])
-            } else {
-                (&section.rows[0], &before_section.rows[0])
+            let projected = view(vec![wire], u64::from(!excluded));
+            let row = find_row(&projected, "date-card").unwrap();
+            let before = find_row(&baseline, "date-card").unwrap();
+            let now: chrono::DateTime<chrono::Utc> =
+                (UNIX_EPOCH + Duration::from_secs(1_792_324_500)).into();
+            let detail = v2::detailed_row(row, now);
+            let Some(qb_proto::AdminSubscription::Codex {
+                active_until,
+                last_checked,
+                ..
+            }) = &row.raw.subscription
+            else {
+                panic!("native Codex subscription facts must remain in compact raw metadata");
             };
+            assert_eq!(active_until.as_deref(), Some("2026-10-20T12:00:00Z"));
+            assert_eq!(last_checked.as_deref(), Some("2026-10-01T00:00:00Z"));
+            assert!(!detail.subscription_lines.is_empty());
+            assert_eq!(
+                detail.subscription_lines,
+                v2::subscription_lines(&row.raw, now.with_timezone(&chrono::Local).fixed_offset())
+            );
+            // Actual Usage projection rebuilds relogin details; disabled accounts
+            // remain omitted from that tab under its existing contract.
+            let clock = crate::dashboard_model::Clock {
+                now: now.with_timezone(&chrono::Local).fixed_offset(),
+                day_start: now - chrono::Duration::days(1),
+                day_end: now + chrono::Duration::days(1),
+            };
+            let dashboard = crate::dashboard_model::project(
+                &crate::dashboard_model::DashboardSnapshot::new(projected.clone()),
+                &mut crate::state::DashboardState::default(),
+                &clock,
+            );
+            let usage = dashboard.usage.iter().find(|tile| tile.id == "date-card");
+            if state == "disabled" {
+                assert!(usage.is_none());
+            } else {
+                assert_eq!(usage.unwrap().subscription_lines, detail.subscription_lines);
+            }
+            if excluded {
+                assert!(row.subscription_lines.is_empty());
+                assert!(
+                    Scene::build(&projected, Presentation::default(), 1000.)
+                        .row("date-card")
+                        .is_none()
+                );
+                let mut p = Presentation::default();
+                p.expanded.insert(v2::EXCLUDED_GROUP_KEY.into(), true);
+                let open = Scene::build(&projected, p.clone(), 1000.);
+                let old = Scene::build(&baseline, p, 1000.);
+                let boxes = open.row("date-card").unwrap();
+                assert_eq!(h(boxes.rect), 44.);
+                assert_eq!(h(boxes.rect), h(old.row("date-card").unwrap().rect));
+                assert!(
+                    boxes.subscription.is_empty() && boxes.usage.is_none() && boxes.bar.is_none()
+                );
+                assert!(boxes.button.is_none() && boxes.outside_note.is_none());
+                assert!(inside(
+                    boxes.compact_reason.as_ref().unwrap().rect,
+                    boxes.rect
+                ));
+                let mut shifted = boxes.clone();
+                shift_row(&mut shifted, 17.);
+                assert_eq!(
+                    shifted.compact_reason.as_ref().unwrap().rect.top,
+                    boxes.compact_reason.as_ref().unwrap().rect.top + 17.
+                );
+                assert_eq!(shifted.more.top, boxes.more.top + 17.);
+                continue;
+            }
             assert!(!row.subscription_lines.is_empty());
             let mut presentation = Presentation::default();
             // Real native text measurements can wrap the English notice.
             for line in &row.subscription_lines {
                 presentation.subtitle_lines.insert(line.clone(), 2);
             }
-            let boxes = row_box(row, disabled_slot, 100., &presentation);
-            let old = row_box(before, disabled_slot, 100., &presentation);
+            let boxes = row_box(row, false, 100., &presentation);
+            let old = row_box(before, false, 100., &presentation);
             assert_eq!(
                 boxes.rect.bottom - old.rect.bottom,
                 row.subscription_lines.len() as f32 * 38.
@@ -2096,13 +2250,46 @@ mod tests {
         assert_eq!(h(row.bar.unwrap()), 4.);
         assert_eq!(row.bar.unwrap().top - row.usage.unwrap().bottom, 4.);
         let v = view(vec![relogin()], 0);
-        let scene = Scene::build(&v, Presentation::default(), 1000.);
+        assert!(
+            Scene::build(&v, Presentation::default(), 1000.)
+                .row("a")
+                .is_none()
+        );
+        let mut p = Presentation::default();
+        p.expanded.insert(v2::EXCLUDED_GROUP_KEY.into(), true);
+        let scene = Scene::build(&v, p, 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 98.);
+        assert_eq!(h(row.rect), 44.);
         assert!(row.usage.is_none());
-        assert_eq!(h(row.reason.unwrap()), 16.);
-        assert_eq!(h(row.button.as_ref().unwrap().visual), 24.);
+        assert!(row.button.is_none() && row.reason.is_none() && row.subscription.is_empty());
+        let reason = row.compact_reason.as_ref().unwrap();
+        assert_eq!(h(reason.rect), 16.);
+        assert_eq!(reason.text, "다시 로그인 필요");
+        assert!(inside(reason.rect, row.rect));
+        assert!(inside(row.more, row.rect));
+        assert!(
+            row_parts(find_row(&v, "a").unwrap(), true)
+                .iter()
+                .any(|part| matches!(
+                    part,
+                    Part::Item(
+                        _,
+                        _,
+                        _,
+                        _,
+                        Target::Menu {
+                            action: MenuAction::Relogin,
+                            ..
+                        },
+                        true
+                    )
+                ))
+        );
         let v = view(vec![credits()], 0);
+        assert_eq!(
+            find_row(&v, "a").unwrap().action.as_ref().unwrap().kind,
+            v2::ActionKind::AllowCredits
+        );
         let scene = Scene::build(&v, Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
         assert_eq!(h(row.rect), 126.);
@@ -2147,10 +2334,21 @@ mod tests {
     }
     #[test]
     fn whole_row_and_button_share_exact_targets_with_button_precedence() {
-        let v = view(vec![relogin()], 0);
+        let v = view(vec![credits()], 0);
+        assert_eq!(
+            find_row(&v, "a").unwrap().action.as_ref().unwrap().kind,
+            v2::ActionKind::AllowCredits
+        );
         let scene = Scene::build(&v, Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
         let b = row.button.as_ref().unwrap();
+        assert_eq!(
+            b.target,
+            Target::Inline {
+                id: "a".into(),
+                action: v2::ActionKind::AllowCredits
+            }
+        );
         let (x, y) = center(b.visual);
         assert_eq!(scene.hit_test(x, y), Some(&b.target));
         assert_eq!(h(b.hit), 32.);
@@ -2234,30 +2432,28 @@ mod tests {
         );
     }
     #[test]
-    fn section_disclosure_hint_disabled44_and_manual_override() {
+    fn global_disclosure_is_collapsed_without_hint_and_compact_when_open() {
         let v = view(vec![disabled("off")], 0);
         let scene = Scene::build(&v, Presentation::default(), 1000.);
-        let s = &scene.sections[1];
-        assert_eq!(h(s.label), 32.);
-        assert_eq!(h(s.disclosure.unwrap()), 32.);
-        assert_eq!(h(s.hint.unwrap()), 20.);
-        assert_eq!(h(scene.row("off").unwrap().rect), 44.);
-        let mut p = Presentation::default();
-        p.expanded.insert("codex".into(), false);
-        let closed = Scene::build(&v, p, 1000.);
-        let s = &closed.sections[1];
-        assert!(!s.expanded);
-        assert!(s.disabled_rows.is_empty());
-        assert!(s.hint.is_none());
-        assert!(s.disclosure.is_some());
+        let s = scene.sections.last().unwrap();
+        assert_eq!(s.provider, v2::EXCLUDED_GROUP_KEY);
+        assert_eq!(h(s.label), 0.);
+        assert_eq!(h(s.disclosure.unwrap()), 28.);
+        assert!(s.hint.is_none() && s.disabled_rows.is_empty());
         let (x, y) = center(s.disclosure.unwrap());
         assert_eq!(
-            closed.hit_test(x, y),
-            Some(&Target::Disclosure("codex".into()))
+            scene.hit_test(x, y),
+            Some(&Target::Disclosure(v2::EXCLUDED_GROUP_KEY.into()))
         );
+        let mut p = Presentation::default();
+        p.expanded.insert(v2::EXCLUDED_GROUP_KEY.into(), true);
+        let open = Scene::build(&v, p, 1000.);
+        let row = open.row("off").unwrap();
+        assert_eq!(h(row.rect), 44.);
+        assert!(row.compact_reason.is_some() && row.button.is_none());
     }
     #[test]
-    fn frozen_order_and_new_ids_append_without_membership_movement() {
+    fn frozen_relative_order_appends_new_ids_and_recovers_group_membership() {
         let opened = view(vec![account("b"), account("a"), disabled("off")], 2);
         let mut p = Presentation {
             frozen: capture_order(&opened),
@@ -2275,13 +2471,12 @@ mod tests {
                 .iter()
                 .map(|r| r.id.as_str())
                 .collect::<Vec<_>>(),
-            ["a", "b", "00-new"]
+            ["a", "b", "00-new", "off"]
         );
         let off = scene.row("off").unwrap();
-        assert!(off.disabled_slot);
-        assert_eq!(h(off.rect), 44.);
+        assert!(!off.disabled_slot);
         assert!(off.button.is_none());
-        assert!(off.usage.is_none());
+        assert!(off.usage.is_some());
         p.frozen = scene.resolved_order.clone();
         let mut new = account("00-new");
         new["label"] = json!("zz");
@@ -2302,7 +2497,7 @@ mod tests {
                 .iter()
                 .map(|r| r.id.as_str())
                 .collect::<Vec<_>>(),
-            ["a", "b", "00-new", "01-next"]
+            ["a", "b", "00-new", "off", "01-next"]
         );
     }
     #[test]
@@ -2405,13 +2600,47 @@ mod tests {
             .flat_map(|section| &mut section.disabled_rows)
             .next()
             .unwrap();
-        row.reason = Some("실패했습니다. 다시 시도하세요.".into());
-        let scene = Scene::build(&v, Presentation::default(), 1000.);
+        // Match windows_tray::apply_row_error: the global compact row keeps
+        // the error as its one-line reason, with Enable retained in its menu.
+        let error = "실패했습니다. 다시 시도하세요.";
+        row.reason = Some(error.into());
+        row.excluded_reason = Some(error);
+        assert!(
+            Scene::build(&v, Presentation::default(), 1000.)
+                .row("off")
+                .is_none()
+        );
+        let mut p = Presentation::default();
+        p.expanded.insert(v2::EXCLUDED_GROUP_KEY.into(), true);
+        let scene = Scene::build(&v, p.clone(), 1000.);
         let row = scene.row("off").unwrap();
-        assert_eq!(h(row.rect), 68.);
-        assert!(inside(row.reason.unwrap(), row.rect));
-        assert!(inside(row.button.as_ref().unwrap().visual, row.rect));
-        assert!(row.reason.unwrap().top > row.line1.bottom);
+        assert_eq!(h(row.rect), 44.);
+        assert!(row.button.is_none() && row.reason.is_none() && row.usage.is_none());
+        let reason = row.compact_reason.as_ref().unwrap();
+        assert!(inside(reason.rect, row.rect));
+        assert_eq!(reason.text, error);
+        assert_eq!(reason.tooltip.as_deref(), Some(error));
+        assert!(reason.rect.top >= row.line1.top && reason.rect.bottom <= row.line1.bottom);
+        assert!(reason.rect.right < row.more.left);
+        p.overlay = Overlay::RowMenu("off".into());
+        let menu = Scene::build(&v, p, 1000.);
+        let enable = menu
+            .popup
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| {
+                item.target
+                    == Target::Menu {
+                        id: Some("off".into()),
+                        action: MenuAction::Enable,
+                    }
+            })
+            .unwrap();
+        assert!(enable.enabled && inside(enable.label, enable.rect));
+        let (x, y) = center(enable.rect);
+        assert_eq!(menu.hit_test(x, y), Some(&enable.target));
     }
     #[test]
     fn quit_subtitles_grow_from_measured_keep_all_lines() {
@@ -2503,7 +2732,11 @@ mod tests {
     }
     #[test]
     fn disconnected_and_pending_actions_absorb_hits() {
-        let v = view(vec![relogin()], 0);
+        let v = view(vec![credits()], 0);
+        assert_eq!(
+            find_row(&v, "a").unwrap().action.as_ref().unwrap().kind,
+            v2::ActionKind::AllowCredits
+        );
         let scene = Scene::build(
             &v,
             Presentation {
@@ -2536,10 +2769,12 @@ mod tests {
     }
     #[test]
     fn measured_width_is_shared_by_visual_and_hit() {
-        let v = view(vec![relogin()], 0);
+        let v = view(vec![credits()], 0);
+        let action = find_row(&v, "a").unwrap().action.as_ref().unwrap();
+        assert_eq!(action.kind, v2::ActionKind::AllowCredits);
         let mut p = Presentation::default();
         p.text_widths
-            .insert(text_key("다시 로그인", 12, true), 101.);
+            .insert(text_key(action.label, 12, action.accent), 101.);
         let scene = Scene::build(&v, p, 1000.);
         let b = scene.row("a").unwrap().button.as_ref().unwrap();
         assert_eq!(b.visual.right - b.visual.left, 121.);

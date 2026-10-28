@@ -103,6 +103,13 @@ impl Session {
         let current = slots(view);
         let ids: BTreeSet<_> = current.iter().map(|slot| slot.id.clone()).collect();
         self.slots.retain(|slot| ids.contains(slot.id.as_str()));
+        // Freeze relative order, not placement membership: recovery is visible immediately.
+        for slot in &mut self.slots {
+            if let Some(next) = current.iter().find(|next| next.id == slot.id) {
+                slot.provider.clone_from(&next.provider);
+                slot.disabled_on_open = next.disabled_on_open;
+            }
+        }
         for slot in current {
             if !self.slots.iter().any(|old| old.id == slot.id) {
                 self.slots.push(slot);
@@ -119,6 +126,14 @@ impl Session {
         self.pending_actions
             .retain(|id, _| ids.contains(id.as_str()));
         self.errors.retain(|id, _| ids.contains(id.as_str()));
+    }
+    /// A late worker load must never replace a choice made on the UI thread.
+    pub fn restore_excluded_preference(&mut self, expanded: bool) -> bool {
+        if self.manual_expansion.contains_key(v2::EXCLUDED_GROUP_KEY) {
+            return false;
+        }
+        self.set_expanded(v2::EXCLUDED_GROUP_KEY, expanded);
+        true
     }
     pub fn set_expanded(&mut self, provider: &str, expanded: bool) {
         self.manual_expansion.insert(provider.into(), expanded);
@@ -242,32 +257,32 @@ mod tests {
         assert!(s.complete(&off, false, Duration::ZERO));
     }
     #[test]
-    fn late_first_snapshot_initializes_expansion_and_keeps_manual_choice() {
+    fn late_first_snapshot_initializes_global_collapse_and_keeps_manual_choice() {
         let empty = v2::project("{}", std::time::SystemTime::now()).unwrap();
         let mut session = Session::default();
         session.show(&empty);
-        assert!(session.expansion.is_empty());
         let blocked = view(false, true);
         session.update(&blocked);
-        assert_eq!(session.expansion.get("codex"), Some(&true));
-        session.set_expanded("codex", false);
+        assert_eq!(session.expansion.get(v2::EXCLUDED_GROUP_KEY), Some(&false));
+        session.set_expanded(v2::EXCLUDED_GROUP_KEY, true);
         session.update(&blocked);
-        assert_eq!(session.expansion.get("codex"), Some(&false));
+        assert_eq!(session.expansion.get(v2::EXCLUDED_GROUP_KEY), Some(&true));
         assert!(!session.slots.is_empty());
     }
     #[test]
-    fn update_keeps_disabled_slot_and_manual_expansion_until_next_open() {
+    fn recovery_updates_membership_immediately_and_keeps_manual_expansion() {
         let mut s = Session::default();
         s.show(&view(false, true));
         assert!(s.slots[0].disabled_on_open);
-        s.set_expanded("codex", false);
+        s.set_expanded(v2::EXCLUDED_GROUP_KEY, false);
         s.update(&view(false, false));
-        assert!(s.slots[0].disabled_on_open);
-        assert!(!s.expansion["codex"]);
+        assert!(!s.slots[0].disabled_on_open);
+        assert_eq!(s.slots[0].provider, "codex");
+        assert!(!s.expansion[v2::EXCLUDED_GROUP_KEY]);
         s.hide();
         s.show(&view(false, false));
         assert!(!s.slots[0].disabled_on_open);
-        assert!(!s.expansion["codex"]);
+        assert_eq!(s.manual_expansion.get(v2::EXCLUDED_GROUP_KEY), Some(&false));
     }
     #[test]
     fn stale_completion_does_not_clear_a_new_ticket_and_failure_expires_after_ten_seconds() {

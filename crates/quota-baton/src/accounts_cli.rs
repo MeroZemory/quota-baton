@@ -118,22 +118,9 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
                 .as_ref()
                 .map(|state| cli_account_rows(&state.accounts))
                 .transpose()?;
-            println_utf8!(
-                "계정 ID\t제공자\t이메일\t요금제\t출처\t연결 방식\t사용 상태\t계정 상태\t만료 시각"
-            );
+            println_utf8!("{}", account_list_header(english));
             for value in accounts {
-                println_utf8!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    cell(&value["id"]),
-                    cell(&value["provider"]),
-                    cell(&value["email"]),
-                    cell(&value["plan"]),
-                    translated(&value["source"]["kind"]),
-                    translated(&value["source"]["mode"]),
-                    translated(&value["user_state"]),
-                    localized_health_label(&value["health"], english),
-                    cell(&value["token_meta"]["expires_at"])
-                );
+                println_utf8!("{}", account_list_row(&value, english));
                 let live = forecasts
                     .as_ref()
                     .and_then(|rows| rows.iter().find(|row| row["id"] == value["id"]));
@@ -149,6 +136,42 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         }
     }
     Ok(())
+}
+
+fn refresh_source(account: &serde_json::Value) -> qb_core::accounts::refresh_owner::RefreshSource {
+    use qb_core::accounts::refresh_owner::RefreshSource;
+    let source = &account["source"];
+    RefreshSource::from_parts(
+        source["kind"]
+            .as_str()
+            .or_else(|| source.as_str())
+            .unwrap_or(""),
+        source["mode"].as_str(),
+    )
+}
+
+fn account_list_header(english: bool) -> &'static str {
+    if english {
+        "Account ID\tProvider\tEmail\tPlan\tOrigin\tRefresher\tUser state\tAccount state\tExpires at"
+    } else {
+        "계정 ID\t제공자\t이메일\t요금제\t출처\t갱신 주체\t사용 상태\t계정 상태\t만료 시각"
+    }
+}
+
+fn account_list_row(account: &serde_json::Value, english: bool) -> String {
+    let source = refresh_source(account);
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        cell(&account["id"]),
+        cell(&account["provider"]),
+        cell(&account["email"]),
+        cell(&account["plan"]),
+        source.origin_label(english),
+        source.refresh_owner().label(english),
+        translated(&account["user_state"]),
+        localized_health_label(&account["health"], english),
+        cell(&account["token_meta"]["expires_at"])
+    )
 }
 
 pub(crate) fn translated(value: &serde_json::Value) -> String {
@@ -596,6 +619,7 @@ pub(crate) fn status_heading(home: &Path, running: bool) -> anyhow::Result<Vec<S
 }
 
 pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
+    let english = config.ui.language == qb_core::config::UiLanguage::En;
     let (running, accounts) = if let Some(accounts) = live_account_views(home, config).await? {
         (true, accounts)
     } else {
@@ -617,7 +641,7 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
                 serde_json::json!({
                     "id": account.id, "provider": account.provider, "label": account.label,
                     "email": account.email, "plan": account.plan, "user_state": account.user_state,
-                    "health": account.health, "windows": snapshot["windows"],
+                    "health": account.health, "source": account.source, "windows": snapshot["windows"],
                     "probe_pending": probe_pending
                 })
             }).collect())
@@ -665,14 +689,7 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>()
         .join("\t");
-    println_utf8!(
-        "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태{}\t상태 이유\t대기 종료",
-        if columns.is_empty() {
-            String::new()
-        } else {
-            format!("\t{columns}")
-        }
-    );
+    println_utf8!("{}", status_account_header(&columns, english));
     let now = std::time::SystemTime::now();
     for account in accounts {
         let window = |name: &str| {
@@ -693,31 +710,160 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
                 )
             })
             .collect::<String>();
-        println_utf8!(
-            "{}\t{}\t{}\t{}\t{}{}\t{}\t{}",
-            cell(&account["id"]),
-            cell(&account["provider"]),
-            cell(&account["label"]),
-            translated(&account["user_state"]),
-            if account["probe_pending"].as_bool() == Some(true)
-                && account["health"]["kind"] != "plan_without_claude_code"
-            {
-                "인증 확인 대기".into()
-            } else {
-                localized_health_label(
-                    &account["health"],
-                    config.ui.language == qb_core::config::UiLanguage::En,
-                )
-            },
-            windows,
-            translated(&account["health"]["reason"]),
-            cell(&account["health"]["until"])
-        );
+        println_utf8!("{}", status_account_row(&account, &windows, english));
         for line in forecast_lines(Some(&account), running) {
             println_utf8!("  {line}");
         }
     }
     Ok(())
+}
+
+fn status_account_header(columns: &str, english: bool) -> String {
+    let (heading, tail) = if english {
+        (
+            "Account ID\tProvider\tLabel\tOrigin\tRefresher\tUser state\tAccount state",
+            "Reason\tUntil",
+        )
+    } else {
+        (
+            "계정 ID\t제공자\t라벨\t출처\t갱신 주체\t사용 상태\t계정 상태",
+            "상태 이유\t대기 종료",
+        )
+    };
+    format!(
+        "{heading}{}\t{tail}",
+        if columns.is_empty() {
+            String::new()
+        } else {
+            format!("\t{columns}")
+        }
+    )
+}
+
+fn status_account_row(account: &serde_json::Value, windows: &str, english: bool) -> String {
+    let source = refresh_source(account);
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}{}\t{}\t{}",
+        cell(&account["id"]),
+        cell(&account["provider"]),
+        cell(&account["label"]),
+        source.origin_label(english),
+        source.refresh_owner().label(english),
+        translated(&account["user_state"]),
+        if account["probe_pending"].as_bool() == Some(true)
+            && account["health"]["kind"] != "plan_without_claude_code"
+        {
+            "인증 확인 대기".into()
+        } else {
+            localized_health_label(&account["health"], english)
+        },
+        windows,
+        translated(&account["health"]["reason"]),
+        cell(&account["health"]["until"])
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn r19_list_and_status_show_origin_and_actual_refresher_in_both_languages() {
+    use serde_json::json;
+    for (source, ko, en, owner) in [
+        (json!("owned"), "직접 로그인", "Direct sign-in", "qb"),
+        (
+            json!({"kind":"oauth","mode":"future","future":true}),
+            "직접 로그인",
+            "Direct sign-in",
+            "qb",
+        ),
+        (
+            json!({"kind":"takeover","mode":"future","future":true}),
+            "다른 앱에서 인수",
+            "Taken over from another app",
+            "qb",
+        ),
+        (
+            json!({"kind":"oauth","mode":"owned","future":true}),
+            "직접 로그인",
+            "Direct sign-in",
+            "qb",
+        ),
+        (
+            json!({"kind":"oauth"}),
+            "직접 로그인",
+            "Direct sign-in",
+            "qb",
+        ),
+        (
+            json!({"kind":"takeover"}),
+            "다른 앱에서 인수",
+            "Taken over from another app",
+            "qb",
+        ),
+        (
+            json!({"kind":"cpa","mode":"linked"}),
+            "CPA 연결",
+            "Linked to CPA",
+            "CPA",
+        ),
+        (
+            json!({"kind":"cpa","mode":"adopted"}),
+            "CPA에서 인수",
+            "Adopted from CPA",
+            "qb",
+        ),
+    ] {
+        let account = json!({
+            "id":"cx-synthetic", "provider":"codex", "email":"synthetic@example.invalid",
+            "label":"synthetic", "source":source, "user_state":"active", "health":{"kind":"ready"}
+        });
+        for (english, origin) in [(false, ko), (true, en)] {
+            let list = account_list_row(&account, english);
+            let status = status_account_row(&account, "\t50%\t2026-10-30T00:00:00Z", english);
+            let list_cells: Vec<_> = list.split('\t').collect();
+            let status_cells: Vec<_> = status.split('\t').collect();
+            assert_eq!(&list_cells[4..6], &[origin, owner]);
+            assert_eq!(&status_cells[3..5], &[origin, owner]);
+            assert_eq!(
+                list_cells.len(),
+                account_list_header(english).split('\t').count()
+            );
+            assert_eq!(
+                status_cells.len(),
+                status_account_header("remaining\treset", english)
+                    .split('\t')
+                    .count()
+            );
+            assert_eq!(&status_cells[7..9], &["50%", "2026-10-30T00:00:00Z"]);
+        }
+    }
+    assert!(account_list_header(false).contains("갱신 주체"));
+    assert!(account_list_header(true).contains("Origin\tRefresher"));
+    assert!(status_account_header("", false).contains("출처\t갱신 주체"));
+    assert!(status_account_header("", true).contains("Origin\tRefresher"));
+}
+
+#[cfg(test)]
+#[test]
+fn r19_ambiguous_sources_stay_unknown_in_list_and_status() {
+    for source in [
+        serde_json::json!({"kind":"cpa"}),
+        serde_json::json!({"kind":"cpa","mode":"future"}),
+        serde_json::Value::Null,
+    ] {
+        let account = serde_json::json!({"source":source});
+        for (english, unknown) in [(false, "알 수 없음"), (true, "Unknown")] {
+            let list = account_list_row(&account, english);
+            let status = status_account_row(&account, "", english);
+            assert_eq!(
+                &list.split('\t').collect::<Vec<_>>()[4..6],
+                &[unknown, unknown]
+            );
+            assert_eq!(
+                &status.split('\t').collect::<Vec<_>>()[3..5],
+                &[unknown, unknown]
+            );
+        }
+    }
 }
 
 pub(crate) type CliAccountState<Account = qb_proto::AdminAccount> = qb_proto::AdminState<

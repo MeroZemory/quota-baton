@@ -8,6 +8,38 @@ use std::{collections::BTreeMap, time::SystemTime};
 
 mod provider_forecast;
 
+/// Reserved display group; never a provider or an account identifier.
+pub const EXCLUDED_GROUP_KEY: &str = "__excluded";
+
+/// Explicit native facts only. Missing plan/usage and temporary cooling are not exclusions.
+pub fn exclusion_reason(account: &Account) -> Option<&'static str> {
+    let reason = if account.user_state == "disabled" {
+        "사용 안 함"
+    } else if account.user_state == "paused" {
+        "일시 중지"
+    } else if (account.provider == "claude" && account.plan.as_deref() == Some("free"))
+        || account.health.kind == "plan_without_claude_code"
+    {
+        "Free 요금제 · Claude Code 사용 불가"
+    } else if account.health.kind == "needs_relogin" {
+        "다시 로그인 필요"
+    } else {
+        // Unknown entitlement has no native variant; removed accounts leave the snapshot.
+        return None;
+    };
+    Some(crate::i18n::static_text(reason))
+}
+
+/// Single-line copy; the plan and accessible name retain the full Free explanation.
+pub fn compact_reason(row: &AccountRow) -> &'static str {
+    let reason = row.excluded_reason.unwrap_or_default();
+    if reason == crate::i18n::static_text("Free 요금제 · Claude Code 사용 불가") {
+        crate::i18n::static_text("Claude Code 사용 불가")
+    } else {
+        reason
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -142,13 +174,24 @@ pub struct SourceObject {
     pub extra: Map<String, Value>,
 }
 impl Source {
+    fn refresh_owner(&self) -> qb_core::accounts::refresh_owner::RefreshOwner {
+        use qb_core::accounts::refresh_owner::{RefreshOwner, RefreshSource};
+        match self {
+            Self::Object(source)
+                if matches!(source.kind.as_str(), "oauth" | "takeover" | "cpa") =>
+            {
+                RefreshSource::from_parts(&source.kind, source.mode.as_deref()).refresh_owner()
+            }
+            Self::Object(_) => RefreshOwner::Unknown,
+            Self::Legacy(source) => RefreshSource::from_parts(source, None).refresh_owner(),
+            Self::Other(_) => RefreshOwner::Unknown,
+        }
+    }
     pub fn linked(&self) -> bool {
-        matches!(self, Self::Object(s) if s.mode.as_deref() == Some("linked"))
-            || matches!(self, Self::Legacy(s) if s == "linked")
+        self.refresh_owner() == qb_core::accounts::refresh_owner::RefreshOwner::Cpa
     }
     pub fn owned_or_adopted(&self) -> bool {
-        matches!(self, Self::Object(s) if matches!(s.kind.as_str(), "oauth" | "takeover") || s.mode.as_deref() == Some("adopted"))
-            || matches!(self, Self::Legacy(s) if matches!(s.as_str(), "oauth" | "owned" | "adopted" | "takeover"))
+        self.refresh_owner() == qb_core::accounts::refresh_owner::RefreshOwner::QuotaBaton
     }
 }
 
@@ -260,6 +303,8 @@ pub struct Section {
 }
 #[derive(Debug, Clone)]
 pub struct AccountRow {
+    /// Compact bottom-group copy; raw facts and menu capabilities are retained.
+    pub excluded_reason: Option<&'static str>,
     pub raw: Account,
     pub name: String,
     pub plan: Option<String>,
@@ -375,6 +420,7 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
     let now = DateTime::<Utc>::from(now);
     let mut sections = Vec::new();
     let mut summaries = Vec::new();
+    let mut excluded_rows = Vec::new();
     for provider in ["claude", "codex"] {
         let accounts: Vec<_> = raw
             .accounts
@@ -426,9 +472,13 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.raw.id.cmp(&b.raw.id))
         });
-        let (disabled_rows, rows): (Vec<_>, Vec<_>) =
-            rows.into_iter().partition(|r| r.group == Group::Disabled);
-        let disabled_count = disabled_rows.len();
+        // Summaries and actions above see every native account before display partitioning.
+        let (excluded, rows): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|row| row.excluded_reason.is_some());
+        excluded_rows.extend(excluded.into_iter().map(compact_row));
+        let disabled_rows = Vec::new();
+        let disabled_count = 0;
         sections.push(Section {
             provider: provider.into(),
             label: provider_label(provider).into(),
@@ -448,6 +498,26 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
             }),
         });
         summaries.push(summary);
+    }
+    if !excluded_rows.is_empty() {
+        excluded_rows.sort_by(|a, b| {
+            a.raw
+                .provider
+                .cmp(&b.raw.provider)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.raw.id.cmp(&b.raw.id))
+        });
+        let label = crate::i18n::format("배정 안 함 ({0})", &[excluded_rows.len().to_string()]);
+        sections.push(Section {
+            provider: EXCLUDED_GROUP_KEY.into(),
+            label: label.clone(),
+            rows: Vec::new(),
+            disabled_rows: excluded_rows,
+            auto_expand_recommended: false,
+            disclosure: Some(label),
+            expansion_hint: None,
+            empty_message: None,
+        });
     }
     let empty = raw.accounts.is_empty();
     let blocked = summaries.iter().any(|s| s.verdict == Verdict::Unavailable);
@@ -921,6 +991,7 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         },
     );
     AccountRow {
+        excluded_reason: exclusion_reason(a),
         raw: a.clone(),
         plan_tooltip: plan
             .as_ref()
@@ -953,6 +1024,32 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
 /// model scope. Hidden/blocked rows retain their original detail in the tooltip.
 /// Account-scoped, health-filtered estimates shared by provider summaries in
 /// the tray and CLI. Hidden or missing estimates remain cold, never inferred.
+/// Remove card-only content, keeping the full native facts exclusively for menus.
+fn compact_row(mut row: AccountRow) -> AccountRow {
+    row.usage = None;
+    row.windows.clear();
+    row.subscription_lines.clear();
+    row.outside_note = None;
+    row.forecast_lines.clear();
+    row.forecast_tooltip.clear();
+    row.forecast_warning = false;
+    row.credits = None;
+    row.accessible_name = [
+        row.name.as_str(),
+        row.plan.as_deref().unwrap_or_default(),
+        row.excluded_reason.unwrap_or_default(),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    row
+}
+
+pub(crate) fn detailed_row(row: &AccountRow, now: DateTime<Utc>) -> AccountRow {
+    project_row(&row.raw, row.name.clone(), now)
+}
+
 pub fn summary_forecast(
     a: &Account,
     now: DateTime<Utc>,
@@ -1932,6 +2029,13 @@ mod tests {
     fn codex(v: &View) -> &Section {
         &v.sections[1]
     }
+    fn actual_row<'a>(view: &'a View, id: &str) -> &'a AccountRow {
+        view.sections
+            .iter()
+            .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+            .find(|row| row.raw.id == id)
+            .unwrap()
+    }
 
     #[test]
     fn r18_free_claude_plan_is_blocked_with_upgrade_and_usage_recovery() {
@@ -1956,7 +2060,7 @@ mod tests {
                 let input =
                     json!({"accounts":[account],"pools":{"claude":{"eligible":0}}}).to_string();
                 let view = project(&input, now().into()).unwrap();
-                let row = &view.sections[0].rows[0];
+                let row = actual_row(&view, "claude-free");
                 assert_eq!(row.state, DisplayState::PlanWithoutClaudeCode);
                 assert_eq!(row.group, Group::NeedsAction);
                 assert_eq!(row.plan.as_deref(), Some("Free"));
@@ -1990,13 +2094,16 @@ mod tests {
         ] {
             for allow_credits in [false, true] {
                 let mut a = base("a");
+                // A supported native Codex entitlement; no fabricated Free-plan block.
+                a["plan"] = json!("plus");
+                a["pool_eligible"] = json!(false);
                 a["health"] = json!({"kind":"cooling","reason":"quota","scope":"account"});
                 a["credits"] = credits.clone();
                 a["allow_credits"] = json!(allow_credits);
                 // Old hard holds must remain available for an explicit operator probe.
                 a["quota_credit_releasable"] = json!(false);
                 assert_eq!(
-                    codex(&view(vec![a.clone()], 0)).rows[0]
+                    actual_row(&view(vec![a.clone()], 0), "a")
                         .menu
                         .show_release_hold,
                     expected
@@ -2008,10 +2115,15 @@ mod tests {
                     json!({"kind":"cooling","reason":"quota","scope":"model"}),
                 ] {
                     a["health"] = health;
-                    assert!(
-                        !codex(&view(vec![a.clone()], 0)).rows[0]
-                            .menu
-                            .show_release_hold
+                    let projected = view(vec![a.clone()], 0);
+                    let row = actual_row(&projected, "a");
+                    assert_eq!(row.raw.provider, "codex");
+                    assert_eq!(row.raw.plan.as_deref(), Some("plus"));
+                    assert_eq!(row.raw.health.kind, a["health"]["kind"].as_str().unwrap());
+                    assert!(!row.menu.show_release_hold);
+                    assert_eq!(
+                        row.excluded_reason.is_some(),
+                        row.raw.health.kind == "needs_relogin"
                     );
                 }
             }
@@ -2269,7 +2381,7 @@ mod tests {
             a["credits_in_use"] = json!(true);
             a["health"] = json!({"kind":"cooling","reason":reason,"scope":"account"});
             let v = view(vec![a], 0);
-            let r = &codex(&v).rows[0];
+            let r = actual_row(&v, "a");
             assert_eq!(r.state, state);
             assert_eq!(r.chip.as_ref().unwrap().tone, tone);
             assert_eq!(r.action.as_ref().map(|a| a.kind), button);
@@ -2280,13 +2392,13 @@ mod tests {
         a["credits_in_use"] = json!(true);
         a["user_state"] = json!("paused");
         let v = view(vec![a.clone()], 0);
-        let r = &codex(&v).rows[0];
+        let r = actual_row(&v, "a");
         assert_eq!(r.state, DisplayState::Relogin);
         assert!(r.usage.is_none());
         assert_eq!(r.action.as_ref().unwrap().kind, ActionKind::Relogin);
         a["source"] = json!({"kind":"cpa","mode":"linked"});
         let v = view(vec![a], 0);
-        assert!(codex(&v).rows[0].action.is_none());
+        assert!(actual_row(&v, "a").action.is_none());
         for (user, credits, reason, sessions, drain, state, tone) in [
             (
                 "paused",
@@ -2351,7 +2463,7 @@ mod tests {
             a["drain"] = json!(drain);
             a["health"] = json!({"kind":"cooling","reason":reason,"scope":"account"});
             let v = view(vec![a], 1);
-            let r = &codex(&v).rows[0];
+            let r = actual_row(&v, "a");
             assert_eq!(r.state, state);
             assert_eq!(r.chip.as_ref().map(|c| c.tone), tone);
         }
@@ -2522,30 +2634,26 @@ mod tests {
         assert_eq!(group_number("-1234.5"), "-1,234.5");
     }
     #[test]
-    fn disabled_and_paused_expansion_and_usage() {
+    fn disabled_and_paused_are_compact_and_default_collapsed_with_raw_usage_retained() {
         let mut a = base("a");
         a["user_state"] = json!("disabled");
         a["health"] = json!({"kind":"needs_relogin"});
         a["windows"] = json!([window("5h", 40., "2026-10-21T20:00:00Z")]);
-        let v = view(vec![a.clone()], 0);
-        let s = codex(&v);
-        assert_eq!(summary(&v).verdict, Verdict::Off);
-        assert!(s.rows.is_empty());
-        assert!(s.auto_expand_recommended);
-        assert!(s.expansion_hint.is_some());
-        assert!(s.disabled_rows[0].usage.is_none());
-        assert!(s.disabled_rows[0].action.as_ref().unwrap().accent);
-        assert_eq!(summary(&v).todo, 0);
-        let v = view(vec![a.clone(), base("b")], 1);
-        assert!(!codex(&v).auto_expand_recommended);
-        assert!(!codex(&v).disabled_rows[0].action.as_ref().unwrap().accent);
-        a["user_state"] = json!("paused");
-        a["health"] = json!({"kind":"ready"});
-        let v = view(vec![a], 0);
-        assert_eq!(
-            codex(&v).rows[0].usage.as_ref().unwrap().lines[0].bar_tone,
-            BarTone::Paused
-        );
+        for user in ["disabled", "paused"] {
+            a["user_state"] = json!(user);
+            let v = view(vec![a.clone()], 0);
+            assert_eq!(summary(&v).verdict, Verdict::Off);
+            assert!(codex(&v).rows.is_empty() && codex(&v).disabled_rows.is_empty());
+            let section = v.sections.last().unwrap();
+            assert_eq!(section.provider, EXCLUDED_GROUP_KEY);
+            assert!(!section.auto_expand_recommended && section.expansion_hint.is_none());
+            let row = &section.disabled_rows[0];
+            assert!(row.usage.is_none() && row.windows.is_empty());
+            assert!(row.forecast_lines.is_empty() && row.subscription_lines.is_empty());
+            assert_eq!(row.raw.windows.len(), 1);
+            assert!(row.excluded_reason.is_some());
+            assert_eq!(summary(&v).todo, if user == "disabled" { 0 } else { 1 });
+        }
     }
     #[test]
     fn group_order_waiting_deadline_and_names() {
@@ -2581,8 +2689,7 @@ mod tests {
                 .map(|r| r.raw.id.as_str())
                 .collect::<Vec<_>>(),
             [
-                "z-inuse", "b-action", "a-ready", "z-ready", "z-sooner", "a-later", "no-time",
-                "p-paused"
+                "z-inuse", "a-ready", "z-ready", "z-sooner", "a-later", "no-time"
             ]
         );
     }
@@ -2599,16 +2706,21 @@ mod tests {
         assert_eq!(summary(&v).detail, "b 외 1개 사용 중");
         assert_eq!(summary(&v).todo, 1);
         assert!(
-            codex(&v)
-                .rows
-                .iter()
-                .find(|r| r.raw.id == "c")
-                .unwrap()
+            actual_row(&v, "c")
                 .reason
                 .as_ref()
                 .unwrap()
                 .contains("b가 처리")
         );
+        let excluded = v
+            .sections
+            .iter()
+            .find(|s| s.provider == EXCLUDED_GROUP_KEY)
+            .unwrap();
+        assert_eq!(excluded.disabled_rows.len(), 1);
+        assert_eq!(excluded.disabled_rows[0].raw.id, "c");
+        assert_eq!(excluded.disabled_rows[0].state, DisplayState::Relogin);
+        assert!(codex(&v).rows.iter().all(|r| r.raw.id != "c"));
         let v = view(vec![base("a")], 1);
         assert_eq!(summary(&v).detail, "계정 1개 준비됨");
         let v = view(vec![c.clone()], 0);
@@ -2791,10 +2903,52 @@ mod n10_outside_usage_tests {
                     );
                     assert_eq!(before.plan, after.plan);
                     assert!(before.outside_note.is_none());
-                    assert_eq!(after.outside_note.as_deref(), Some(note));
-                    assert!(after.accessible_name.contains(note));
+                    let compact = user_state != "active" || health == "needs_relogin";
+                    assert_eq!(after.excluded_reason.is_some(), compact);
+                    assert_eq!(after.outside_note.as_deref(), (!compact).then_some(note));
+                    assert_eq!(after.accessible_name.contains(note), !compact);
+                    assert_eq!(after.raw.health.kind, health);
+                    assert_eq!(after.raw.user_state, user_state);
+                    assert_eq!(after.raw.credits_in_use, Some(credits));
+                    assert!(
+                        matches!(&after.raw.source, Source::Object(source) if source.kind == "cpa" && source.mode.as_deref() == Some("adopted"))
+                    );
+                    // This is the actual detail restoration used by dashboard Usage.
+                    let detail = detailed_row(
+                        &after,
+                        timestamp("2026-10-23T00:00:00Z")
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    );
+                    assert_eq!(detail.outside_note.as_deref(), Some(note));
+                    assert!(detail.raw.outside_used);
+                    assert_eq!(detail.raw.health.kind, after.raw.health.kind);
+                    assert_eq!(detail.raw.credits_in_use, after.raw.credits_in_use);
+                    let before_detail = detailed_row(
+                        &before,
+                        timestamp("2026-10-23T00:00:00Z")
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    );
+                    assert_eq!(
+                        before_detail.credits.as_ref().map(|c| &c.text),
+                        detail.credits.as_ref().map(|c| &c.text)
+                    );
+                    assert_eq!(before_detail.menu.identity_line, detail.menu.identity_line);
+                    assert_eq!(
+                        before_detail.menu.show_release_hold,
+                        detail.menu.show_release_hold
+                    );
+                    assert_eq!(
+                        before_detail.menu.show_refresh_usage,
+                        detail.menu.show_refresh_usage
+                    );
+                    assert_eq!(before_detail.menu.show_relogin, detail.menu.show_relogin);
                     let mut presentation = crate::v2_geometry::Presentation::default();
                     presentation.expanded.insert("codex".into(), true);
+                    presentation
+                        .expanded
+                        .insert(EXCLUDED_GROUP_KEY.into(), true);
                     let scene = crate::v2_geometry::Scene::build(&marked, presentation, 800.);
                     let row_box = scene
                         .sections
@@ -2811,15 +2965,33 @@ mod n10_outside_usage_tests {
                     if let Some(chip) = row_box.chip {
                         assert!(row_box.plan.unwrap().right <= chip.left);
                     }
-                    let secondary = row_box.outside_note.unwrap();
-                    assert!(secondary.top >= row_box.line1.bottom);
-                    assert!(secondary.bottom <= row_box.rect.bottom);
-                    assert!(row_box.usage.is_none_or(|r| r.top >= secondary.bottom));
-                    assert!(row_box.reason.is_none_or(|r| r.top >= secondary.bottom));
-                    assert!(
-                        secondary.left >= row_box.rect.left
-                            && secondary.right <= row_box.rect.right
-                    );
+                    if compact {
+                        assert_eq!(row_box.rect.bottom - row_box.rect.top, 44.);
+                        assert!(row_box.compact_reason.is_some());
+                        assert!(row_box.outside_note.is_none());
+                        assert!(row_box.usage.is_none() && row_box.credits.is_none());
+                        assert!(row_box.button.is_none());
+                        assert!(
+                            marked
+                                .sections
+                                .iter()
+                                .find(|s| s.provider == EXCLUDED_GROUP_KEY)
+                                .unwrap()
+                                .disabled_rows
+                                .iter()
+                                .any(|r| r.raw.id == after.raw.id)
+                        );
+                    } else {
+                        let secondary = row_box.outside_note.unwrap();
+                        assert!(secondary.top >= row_box.line1.bottom);
+                        assert!(secondary.bottom <= row_box.rect.bottom);
+                        assert!(row_box.usage.is_none_or(|r| r.top >= secondary.bottom));
+                        assert!(row_box.reason.is_none_or(|r| r.top >= secondary.bottom));
+                        assert!(
+                            secondary.left >= row_box.rect.left
+                                && secondary.right <= row_box.rect.right
+                        );
+                    }
                 }
             });
         }
@@ -2848,3 +3020,7 @@ mod r16_localization_tests {
         assert_eq!(window_label("5h"), "5시간");
     }
 }
+
+#[cfg(test)]
+#[path = "v2/r19_excluded_tests.rs"]
+mod r19_excluded_tests;

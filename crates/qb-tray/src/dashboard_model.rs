@@ -674,6 +674,8 @@ pub struct DashboardView {
     pub move_cost_lines: Option<[String; 2]>,
     pub provider_counts: [usize; 3],
     pub groups: Vec<AccountGroup>,
+    /// One compact bottom group in overview; session/usage data remains elsewhere.
+    pub excluded_rows: Vec<v2::AccountRow>,
     pub flat: Vec<SessionRow>,
     pub events: Vec<EventRow>,
     pub recent: Vec<EventRow>,
@@ -1256,6 +1258,7 @@ pub fn project(
     flat.sort_by(|a, b| compare_rows(a, b, state.sort, state.descending));
     state.table_freeze.apply(&mut flat, |r| r.id.clone());
     let mut groups = vec![];
+    let mut excluded_rows = Vec::new();
     for a in account_rows(&snapshot.accounts).into_iter().filter(|a| {
         state.provider.matches(&a.raw.provider)
             && state
@@ -1263,6 +1266,16 @@ pub fn project(
                 .as_deref()
                 .is_none_or(|id| id == a.raw.id)
     }) {
+        if a.excluded_reason.is_some() {
+            if needle.is_empty()
+                || format!("{} {}", a.name, a.raw.email.as_deref().unwrap_or_default())
+                    .to_lowercase()
+                    .contains(&needle)
+            {
+                excluded_rows.push(a.clone());
+            }
+            continue;
+        }
         let holds = a.raw.bound_sessions > 0 || all.iter().any(|s| s.account == a.raw.id);
         if a.raw.user_state == "disabled" && !holds {
             continue;
@@ -1492,6 +1505,7 @@ pub fn project(
             .map(|cost| cost.lines_at(*clock.now.offset())),
         provider_counts,
         groups,
+        excluded_rows,
         flat,
         events,
         recent,
@@ -2148,6 +2162,12 @@ fn detail_view(
     let account = account_rows(accounts)
         .into_iter()
         .find(|a| a.raw.id == s.account);
+    // Compact overview rows omit WindowMetrics, not their native observations.
+    // Session details retain the historical values and observation timestamps.
+    let detailed = account
+        .filter(|a| a.excluded_reason.is_some())
+        .map(|a| v2::detailed_row(a, clock.utc()));
+    let account = detailed.as_ref().or(account);
     let account_text = account
         .map(|a| format!("{} · {}", folder(&a.name), a.plan.as_deref().unwrap_or("—")))
         .unwrap_or_else(unknown);
@@ -2527,6 +2547,8 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
         .into_iter()
         .filter(|a| a.raw.user_state != "disabled")
         .map(|a| {
+            let detail = a.excluded_reason.map(|_| v2::detailed_row(a, clock.utc()));
+            let a = detail.as_ref().unwrap_or(a);
             let history = snapshot.usage.accounts.iter().find(|h| h.id == a.raw.id);
             let mut series = vec![];
             if let Some(h) = history {

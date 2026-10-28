@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R18 Part 2/3 집중 관문 완료·dev 병합
-목표: Claude permission_error 때 요금제를 다시 읽어 Free 계정을 배정에서 빼고, 요금제·구독 시작일(Claude)·이용 기간(Codex)을 최신으로 표시하기
-핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (홈 서버 꺼짐)
-사용자 대기: L1 P5 서버 수용은 새 에이전트 서버가 준비되면 사용자와 진행 (R2 Part B는 2026-10-29 수동 인수로 완료)
-갱신: 2026-10-28 20:19 KST (양 OS·날짜 화면 검수 완료; 원본 takeover400·Codex probe_failed 제한 보존)
+현재 마일스톤: R19 구현·관문 완료·설치 대기; 다음 N6r 단일 epoch 쌍대 판정
+목표: 갱신 주체·간결 계정 표시와 휠 응답 개선을 설치에 넘기고, 고정 참조와 export로 N6r을 실행하기
+핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
+사용자 대기: 없음
+갱신: 2026-10-29 03:53 KST (R18 설치·R2 완료; R19 실제 한영6PNG·측정 통과, N7 진단은 수용 기준 미달)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -120,7 +120,7 @@ Nothing else orders work. Among ready nodes, the Codex main picks by importance:
 4. small fixes;
 5. structure.
 
-Long waits and work that needs no build run as background lanes (W) with one completion signal. Minor items are not parallelized; usage limits apply. User-set safety and authorization rules are unchanged, and R2 Part B stays held.
+Long waits and work that needs no build run as background lanes (W) with one completion signal. Minor items are not parallelized; usage limits apply. User-set safety and authorization rules are unchanged. R2 Part B is closed by the user's manual adoption procedure (0e29393).
 
 | Node | Lane | Inputs (real data only) | Start | Pass signal |
 |---|---|---|---|---|
@@ -143,11 +143,11 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N8 R15 compiled admin contract | completed gate; S2 install | none | `impl/r15`, brief R15-contract.md | shared nested responses, round trips, static guard, routing properties; qualified full matrix and real-path KO/EN captures passed |
 | N9 README final and v0.2.0 release | S2 and design | N1 and N2 installed | design session | public export scan clean, release assets built from the export |
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
-| Held | R2 Part B (retire-cpa) | user decision | — | — |
+| R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order** (remaining ready work): R17.1 complete; R18 Part 1 gate passed on `impl/plan-change`, continue Part 2 provider-date facts, then N6r (`impl/r14-replay`) and N7 calibration on separate branches. N6r and N7 must not merge into dev without explicit owner gate approval. L1 P5 real acceptance stays with the design session and user; any L1 fix brief takes priority. R2 Part B stays held and N12 is not ready.
+**Current S1 order**: R19 implementation gate complete; resume N6r (impl/r14-replay) with reference 1e8a4be and .sandbox/exports/n6r-frozen-20261029/ fixed. The next N6r unit executes one epoch through both routers and ends with paired counters, coverage/loss and a margin-zero verdict before extending to >=24 h; otherwise the owner runs the stagnation review before more N6r work. N7 runs its real-export backtest independently in W during long checks; its code stays on its own branch. N6r/N7 do not merge into dev without explicit owner gate approval. Build-free Linux/capture work runs as soon as its actual inputs exist, outside the Windows Cargo queue. L1 P5 real acceptance stays with the owner/user; L1 fix briefs take priority. R2 Part B is closed and N12 remains unready.
 
-**Start now in W:** N5m and the N7 backtest.
+**W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
 **No polling.** Nobody polls a running job or a pane in a loop. Every wait has the next ready node from this table.
 
@@ -559,6 +559,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-27 19:14 | R17 자동 시작·PowerShell 집중 관문 | 초기 cutover143/0/1제외·경계6/0; 보완 집중4/0·registry/CLI13/0·strict CLI lint/build/실제 read-only check0; PS5.1/7 각14/0 | 미완료 재개 opt-out·legacy 상태·외부 명령 보존 독립 검수 보완 | R17-evidence/windows-gate 및 windows-final 입력별 지문·install-smoke/v2; 실제 설치/업그레이드·로그인 미실행 |
 | 2026-10-27 19:49 | R17.1 PowerShell 보완 관문 | PS5.1/7 각각14 smoke+12 upgrade 통과·ASCII/BOM0·ParseInput/ParseFile 동일·실제 잠금 파일 | 잠긴 백업 건너뛰기·오류 뒤 트레이 복구·실제 클라이언트 일치 | R17.1-evidence/harness-runs/summary.json; 네 원본 실패 시도 보존. 프로세스/CLI/사용자 PATH는 모의이며 설치·레지스트리 변경 없음 |
 | 2026-10-27 19:54 | R17.1 dev 결합 텍스트 실행 | PS5.1/7 각각28통과·일반 IEX/null PSCmdlet 설치/제거·WhatIf 무변경 | 배포된 one-liner 실행 형태에서도 제어 흐름 확인 | final-gate.json·attempt-06; 원본 attempt-05 보존. 891바이트 합성 폴더 삭제는 자동 승인 정책 거절로 경로 기록 |
+| 2026-10-29 03:53 | R19 갱신 주체·간결 계정 관문 | tray902/0/20제외·allfeature4151/0/36제외·단독Core1476/0/1제외·집중bin15/0·양 OS strict·실제 한영6PNG | native owner와 표시 일치·본문1/제외3·44px 간결 행 | R19.md; 원본 기본전체3740/2의 CLI 기대값2/0 보완, 원본tray25실패 보존; en 펼침 UIA heading=null은 PNG 확인과 함께 제한 기록; 설치 미실행 |
+| 2026-10-29 03:53 | R19 휠 반영 시간 | 고정9계정·각72입력/64측정; 최대30.373→3.005ms, 최종 연속3.694ms; layout/format 생성0·누락0 | 핸들러→EndDraw/상태 공개 각16ms 미만 | R19-evidence/flyout-perf/present-immediately-qualification.json; 캐시만 적용한16.625ms 실패 보존. OS queue·물리 화면 완료 제외; queued 외부 관측 상한172.173ms는 16ms 종단 수용 아님 |
+| 2026-10-29 03:53 | N7 W 1회 실제 export 진단 | 동epoch Claude1h n2 p90 3.50–5.50pp·3h/Codex0; pooled 1h/3h 오차 산출 불가 | 동결 prep의 실험 기준5/10pp 및 계정/창20표본 | R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md; 보조 cross-restart n9/n6 p90 21.07–22.07/65.22–66.22pp, 재시작 교차·관측 공백 제한; 모델/표시 수용 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
@@ -566,7 +569,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
 | Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
-| 보류 작업 재개 범위 | N6r·N7 각 브랜치 보존·미병합 | 설계 세션의 재개 지시와 해당 실제 입력 수용 | 임의 재개하지 않고 서버 수용 뒤 다음 ready node 확인 |
+| N6r 단일 epoch 판정 | 참조1e8a4be·고정 export, N6r/N7 각 브랜치 미병합 | 두 라우터 실제 실행·paired counters·coverage/loss·margin-zero verdict | 준비 묶음을 늘리지 않고 한 epoch를 끝까지 실행; 판정 전 24h 확장 금지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

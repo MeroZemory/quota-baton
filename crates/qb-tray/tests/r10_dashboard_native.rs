@@ -61,7 +61,37 @@ fn r10_chip_cases_really_render_account_chips_instead_of_the_empty_screen() {
         let mut ui = DashboardState::default();
         let view = model::project(&snapshot, &mut ui, &fixture::clock());
         assert!(matches!(view.empty, model::EmptyState::None));
-        assert_eq!(view.groups.len(), 11);
+        let main: std::collections::BTreeSet<_> =
+            view.groups.iter().map(|g| g.id.as_str()).collect();
+        let excluded: std::collections::BTreeSet<_> = view
+            .excluded_rows
+            .iter()
+            .map(|row| row.raw.id.as_str())
+            .collect();
+        assert_eq!(
+            main,
+            [
+                "cx-use",
+                "cx-link",
+                "cx-store",
+                "cx-payment",
+                "cx-permission",
+                "cx-credits",
+                "cx-limit",
+                "cx-auth",
+                "cx-drain"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(excluded, ["cx-relogin", "cx-paused"].into_iter().collect());
+        assert!(main.is_disjoint(&excluded));
+        assert_eq!(view.groups.len() + view.excluded_rows.len(), 11);
+        assert!(
+            view.excluded_rows
+                .iter()
+                .all(|row| row.usage.is_none() && row.forecast_lines.is_empty())
+        );
         assert!(
             view.groups
                 .iter()

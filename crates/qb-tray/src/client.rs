@@ -2121,14 +2121,30 @@ mod r15_account_action_consumer_tests {
             .unwrap()
             .into();
         let view = qb_tray::v2::project(&serde_json::to_string(&restored).unwrap(), now).unwrap();
-        assert_eq!(
-            view.sections[0].rows[0].group,
-            qb_tray::v2::Group::NeedsAction
+        assert!(
+            view.sections
+                .iter()
+                .filter(|s| s.provider == "claude")
+                .all(|s| s.rows.is_empty() && s.disabled_rows.is_empty())
         );
-        assert_eq!(
-            view.sections[0].rows[0].state,
-            qb_tray::v2::DisplayState::PlanWithoutClaudeCode
-        );
+        let excluded = view
+            .sections
+            .iter()
+            .find(|s| s.provider == qb_tray::v2::EXCLUDED_GROUP_KEY)
+            .unwrap();
+        assert!(excluded.rows.is_empty());
+        assert_eq!(excluded.disabled_rows.len(), 1);
+        let row = &excluded.disabled_rows[0];
+        assert_eq!(row.raw.id, "sample-free");
+        assert_eq!(row.raw.provider, "claude");
+        assert_eq!(row.raw.plan.as_deref(), Some("free"));
+        assert_eq!(row.raw.health.kind, "plan_without_claude_code");
+        assert_eq!(row.group, qb_tray::v2::Group::NeedsAction);
+        assert_eq!(row.state, qb_tray::v2::DisplayState::PlanWithoutClaudeCode);
+        assert!(row.excluded_reason.is_some());
+        assert!(row.menu.show_refresh_usage);
+        assert!(!row.menu.show_relogin);
+        assert!(row.action.is_none());
     }
 
     #[test]
