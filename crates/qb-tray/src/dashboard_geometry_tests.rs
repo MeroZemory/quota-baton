@@ -346,12 +346,19 @@ fn r10_linked_relogin_headers_show_the_reason_instead_of_retained_meters() {
             table_offset: offset,
             ..Default::default()
         };
-        let v = m::project(&data, &mut state, &fixtures::clock());
-        let group = &v.groups[0];
-        assert!(!group.relogin, "linked accounts have no own-login action");
+        let mut v = m::project(&data, &mut state, &fixtures::clock());
+        v.provider_usage.clear(); // Isolate the account section; provider chart tests remain separate.
+        assert!(v.groups.is_empty());
+        let row = &v.excluded_rows[0];
         assert!(
-            !group.windows.is_empty(),
-            "regression requires retained stale observations"
+            !row.menu.show_relogin,
+            "linked accounts have no own-login action"
+        );
+        assert_eq!(row.raw.windows[0].used_pct, Some(10.));
+        assert!(row.windows.is_empty());
+        assert_eq!(
+            v.usage[0].windows[0].remaining_pct, 90,
+            "historical usage is retained outside the compact card"
         );
         let scene = Scene::build(&v, &state, [1024., 640.], &Metrics::default());
         let text: Vec<_> = scene
@@ -362,26 +369,26 @@ fn r10_linked_relogin_headers_show_the_reason_instead_of_retained_meters() {
                 _ => None,
             })
             .collect();
-        assert!(text.contains(&group.relogin_reason.as_str()));
+        assert!(text.contains(&row.excluded_reason.unwrap()));
         assert!(!text.contains(&"90% 남음"));
-        let group_node = scene
+        let node = scene
             .accessibility
             .iter()
-            .find(|n| n.key == "group:cl-a")
+            .find(|n| n.key == "excluded:cl-a")
             .unwrap();
-        assert!(group_node.name.contains(&group.relogin_reason));
-        assert!(!group_node.name.contains("90% 남음"));
-        if offset > 0. {
-            assert!(
-                text.iter().any(|t| t.starts_with("Claude · ")),
-                "must exercise the pinned header"
-            );
-        }
+        assert!(node.name.contains(row.excluded_reason.unwrap()));
+        assert!(!node.name.contains("90% 남음"));
         assert!(
-            !scene
+            scene.session_rows.is_empty(),
+            "only the excluded account card loses its session children"
+        );
+        assert_eq!(v.flat.len(), data.sessions.sessions.len());
+        assert!(
+            scene
                 .targets
                 .iter()
-                .any(|t| matches!(t.target, Target::OpenTrayAccount(_)))
+                .any(|hit| matches!(&hit.target,Target::OpenTrayAccount(id) if id=="cl-a")),
+            "the compact row retains its menu, not an own-login action"
         );
     }
 }
@@ -1265,8 +1272,18 @@ fn r10_empty_guidance_wraps_four_inline_mono_chips_with_the_complete_sentences()
 fn r7_no_sessions_block_is_centered_with_measured_text_and_no_column_header() {
     let mut data = fixtures::snapshot();
     data.sessions.sessions.clear();
+    data.accounts = v2::project(
+        &serde_json::json!({"accounts":[{
+            "id":"cx-a","provider":"codex","plan":"plus","user_state":"active",
+            "health":{"kind":"ready"},"source":{"kind":"oauth"}
+        }]})
+        .to_string(),
+        fixtures::clock().utc().into(),
+    )
+    .unwrap();
     let mut state = DashboardState::default();
     let v = m::project(&data, &mut state, &fixtures::clock());
+    assert!(v.excluded_rows.is_empty());
     for size in [[1320., 960.], [1024., 640.]] {
         let scene = Scene::build(&v, &state, size, &Metrics::default());
         let viewport = scene
@@ -1692,5 +1709,47 @@ fn r101_unknown_counter_notice_is_once_in_reserved_bottom_row() {
                 assert!(node.target.is_none() && !node.hidden);
             }
         }
+    }
+}
+
+#[test]
+fn r19_empty_guidance_and_global_excluded_rows_have_separate_nonoverlapping_geometry() {
+    let mut data = fixtures::snapshot();
+    data.sessions.sessions.clear();
+    let mut state = DashboardState::default();
+    let mut v = m::project(&data, &mut state, &fixtures::clock());
+    v.provider_usage.clear();
+    assert_eq!(v.excluded_rows.len(), 2);
+    for size in [[1320., 1600.], [1024., 1600.]] {
+        let scene = Scene::build(&v, &state, size, &Metrics::default());
+        let button = scene
+            .targets
+            .iter()
+            .find(|h| h.target == Target::Today)
+            .unwrap();
+        let label = crate::i18n::format("배정 안 함 ({0})", &[v.excluded_rows.len().to_string()]);
+        let heading = scene
+            .draw
+            .iter()
+            .find_map(|d| match d {
+                Draw::Text { rect, measure, .. } if measure.text == label => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            button.rect.bottom <= heading.top,
+            "empty guidance must end before the global group"
+        );
+        let rows: Vec<_> = scene
+            .accessibility
+            .iter()
+            .filter(|n| n.key.starts_with("excluded:"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|n| n.rect.top >= heading.bottom));
+        let mut ordered: Vec<_> = rows.iter().map(|n| n.rect).collect();
+        ordered.sort_by(|a, b| a.top.total_cmp(&b.top));
+        assert!(ordered[0].bottom <= ordered[1].top);
+        assert!(scene.session_rows.is_empty());
     }
 }

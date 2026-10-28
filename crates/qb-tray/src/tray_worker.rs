@@ -87,6 +87,17 @@ impl Worker {
         // refresh latch exists that could strand future updates after a spawn failure.
         let thread = std::thread::Builder::new().name("quota-baton-tray-io".into()).spawn(move || {
             qb_tray::i18n::set_language(language);
+            if let Ok(home) = qb_core::home() {
+                let preferences = crate::tray_preferences::load(&home);
+                let mut session = super::session().lock().unwrap_or_else(|e| e.into_inner());
+                // A late startup read must never replace a choice already made
+                // by the user while this worker was starting.
+                if session.restore_excluded_preference(preferences.excluded_expanded) {
+                    drop(session);
+                    super::invalidate_model();
+                    post(hwnd, super::STATE_CHANGED);
+                }
+            }
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(_) => { unavailable(hwnd); return; }

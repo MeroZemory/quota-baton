@@ -96,6 +96,18 @@ impl Renderer {
         self.text.clear_target_resources();
     }
 
+    /// Diagnostic counters for the actual flyout renderer; preserves its caches.
+    #[cfg(feature = "testkit")]
+    pub fn begin_flyout_phase_stats(&self) {
+        self.text.set_phase_stats_enabled(true);
+        self.text.reset_phase_stats();
+    }
+
+    #[cfg(feature = "testkit")]
+    pub fn flyout_phase_stats(&self) -> crate::v2_text::TextPhaseStats {
+        self.text.phase_stats()
+    }
+
     pub(crate) fn dashboard_text(&self) -> &Text {
         &self.text
     }
@@ -136,12 +148,11 @@ impl Renderer {
     fn width(&self, text: &str, size: u8, bold: bool) -> Result<f32> {
         Ok(self
             .text
-            .layout(
+            .measure(
                 text,
                 bounds(r(0., 0., 65536., 32.)),
                 style(size as f32, bold, 32.),
             )?
-            .metrics
             .natural_width)
     }
     // Keep R5's Korean keep-all layout; split only overlong tokens such as paths
@@ -179,12 +190,11 @@ impl Renderer {
             s.wrap = Wrap::KeepAll;
             p.credits_body_lines = self
                 .text
-                .layout(
+                .measure(
                     &self.takeover_wrap(body)?,
                     bounds(r(0., 0., 288., 65536.)),
                     s,
                 )?
-                .metrics
                 .total_lines
                 .max(1);
         }
@@ -194,8 +204,7 @@ impl Renderer {
             text_style.wrap = Wrap::KeepAll;
             let lines = self
                 .text
-                .layout(detail, bounds(r(0., 0., 266., 4096.)), text_style)?
-                .metrics
+                .measure(detail, bounds(r(0., 0., 266., 4096.)), text_style)?
                 .total_lines;
             p.subtitle_lines.insert(detail.into(), lines);
         }
@@ -204,8 +213,7 @@ impl Renderer {
             s.wrap = Wrap::KeepAll;
             let lines = self
                 .text
-                .layout(&summary.forecast_line, bounds(r(0., 0., 312., 65536.)), s)?
-                .metrics
+                .measure(&summary.forecast_line, bounds(r(0., 0., 312., 65536.)), s)?
                 .total_lines;
             p.subtitle_lines
                 .insert(summary.forecast_line.clone(), lines.max(1));
@@ -215,13 +223,38 @@ impl Renderer {
             .iter()
             .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
         {
+            // The menu can open a paid-credit confirmation even for a compact
+            // account. Its consent text must be measured before list-only work.
+            if let Some(confirm) = &row.menu.credits_enable_confirmation {
+                let mut s = style(13., false, 20.);
+                s.wrap = Wrap::KeepAll;
+                let count = self
+                    .text
+                    .measure(&confirm.body, bounds(r(0., 0., 288., 4096.)), s)?
+                    .total_lines;
+                if matches!(&p.overlay,g::Overlay::CreditsConfirm(id) if id==&row.raw.id) {
+                    p.credits_body_lines = count;
+                }
+            }
+            if row.excluded_reason.is_some() {
+                for (text, size) in [
+                    (row.name.as_str(), 13),
+                    (row.plan.as_deref().unwrap_or(""), 12),
+                    (v2::compact_reason(row), 12),
+                ] {
+                    p.text_widths.insert(
+                        g::text_key(text, size, false),
+                        self.width(text, size, false)?,
+                    );
+                }
+                continue;
+            }
             for line in &row.subscription_lines {
                 let mut s = style(12., false, 16.);
                 s.wrap = Wrap::KeepAll;
                 let lines = self
                     .text
-                    .layout(line, bounds(r(0., 0., 328., 65536.)), s)?
-                    .metrics
+                    .measure(line, bounds(r(0., 0., 328., 65536.)), s)?
                     .total_lines;
                 p.subtitle_lines.insert(line.clone(), lines.max(1));
             }
@@ -230,8 +263,7 @@ impl Renderer {
                 s.wrap = Wrap::KeepAll;
                 let lines = self
                     .text
-                    .layout(note, bounds(r(0., 0., 328., 65536.)), s)?
-                    .metrics
+                    .measure(note, bounds(r(0., 0., 328., 65536.)), s)?
                     .total_lines;
                 p.subtitle_lines.insert(note.clone(), lines.max(1));
             }
@@ -240,8 +272,7 @@ impl Renderer {
                 s.wrap = Wrap::KeepAll;
                 let lines = self
                     .text
-                    .layout(line, bounds(r(0., 0., 328., 65536.)), s)?
-                    .metrics
+                    .measure(line, bounds(r(0., 0., 328., 65536.)), s)?
                     .total_lines;
                 p.subtitle_lines.insert(line.clone(), lines.max(1));
             }
@@ -282,18 +313,6 @@ impl Renderer {
                 for (size, bold) in [(12, false), (12, true), (13, false), (13, true)] {
                     p.text_widths
                         .insert(g::text_key(text, size, bold), self.width(text, size, bold)?);
-                }
-            }
-            if let Some(confirm) = &row.menu.credits_enable_confirmation {
-                let mut s = style(13., false, 20.);
-                s.wrap = Wrap::KeepAll;
-                let count = self
-                    .text
-                    .layout(&confirm.body, bounds(r(0., 0., 288., 4096.)), s)?
-                    .metrics
-                    .total_lines;
-                if matches!(&p.overlay,g::Overlay::CreditsConfirm(id) if id==&row.raw.id) {
-                    p.credits_body_lines = count;
                 }
             }
         }
@@ -506,8 +525,7 @@ impl Renderer {
         s.wrap = Wrap::KeepAll;
         let measured = self
             .text
-            .layout(text, bounds(r(0., 0., width - 20., 4096.)), s)?
-            .metrics;
+            .measure(text, bounds(r(0., 0., width - 20., 4096.)), s)?;
         let height =
             (measured.required_height + 16.).min((scene.bottom - scene.top - 16.).max(16.));
         let top = if anchor.bottom + 14. + height <= scene.bottom - 8. {
@@ -789,14 +807,16 @@ impl Renderer {
                 .sections
                 .iter()
                 .find(|s| s.provider == section.provider);
-            self.text(
-                target,
-                r(16., section.label.top + 12., 328., 16.),
-                v2::provider_label(&section.provider),
-                style(12., true, 16.),
-                p.secondary,
-                alpha,
-            )?;
+            if section.provider != v2::EXCLUDED_GROUP_KEY {
+                self.text(
+                    target,
+                    r(16., section.label.top + 12., 328., 16.),
+                    v2::provider_label(&section.provider),
+                    style(12., true, 16.),
+                    p.secondary,
+                    alpha,
+                )?;
+            }
             for divider in &section.dividers {
                 self.fill(target, *divider, p.divider, alpha, 0.)?;
             }
@@ -889,7 +909,7 @@ impl Renderer {
             target,
             b.name,
             &row.name,
-            style(13., !disabled, 18.),
+            style(13., !disabled && b.compact_reason.is_none(), 18.),
             if disabled { p.secondary } else { p.text },
             alpha,
         )?;
@@ -902,6 +922,21 @@ impl Renderer {
                 p.secondary,
                 alpha,
             )?;
+        }
+        if let Some(reason) = &b.compact_reason {
+            self.text(
+                target,
+                reason.rect,
+                &reason.text,
+                style(12., false, 16.),
+                if o.errors.contains(&row.raw.id) {
+                    p.bad
+                } else {
+                    p.secondary
+                },
+                alpha,
+            )?;
+            return self.icon(target, b.more, "\u{e712}", 16., p.secondary, alpha);
         }
         if let (Some(note), Some(rect)) = (&row.outside_note, b.outside_note) {
             let mut s = style(12., false, 16.);
@@ -1727,6 +1762,9 @@ mod n10_outside_note_render_tests {
                         .unwrap();
                     let mut presentation = g::Presentation::default();
                     presentation.expanded.insert("codex".into(), true);
+                    presentation
+                        .expanded
+                        .insert(v2::EXCLUDED_GROUP_KEY.into(), true);
                     renderer.measure(&view, &mut presentation)?;
                     let scene = g::Scene::build(&view, presentation, 800.);
                     let boxes = scene
@@ -1744,24 +1782,48 @@ mod n10_outside_note_render_tests {
                     if let Some(chip) = boxes.chip {
                         assert!(boxes.plan.unwrap().right <= chip.left);
                     }
+                    assert!(row.raw.outside_used);
+                    assert_eq!(row.raw.credits_in_use, Some(true));
+                    assert!(row.raw.allow_credits);
+                    assert!(
+                        matches!(&row.raw.source, v2::Source::Object(source) if source.kind == "cpa" && source.mode.as_deref() == Some("adopted"))
+                    );
                     if user_state == "disabled" {
-                        assert!(boxes.button.is_some());
+                        assert!(row.excluded_reason.is_some());
+                        assert_eq!(
+                            row.action.as_ref().map(|a| a.kind),
+                            Some(v2::ActionKind::Enable)
+                        );
+                        assert_eq!(boxes.rect.bottom - boxes.rect.top, 44.);
+                        assert!(boxes.compact_reason.is_some());
+                        assert!(boxes.button.is_none());
+                        assert!(boxes.outside_note.is_none());
+                        assert!(row.outside_note.is_none());
+                        let detail = v2::detailed_row(
+                            row,
+                            chrono::DateTime::<chrono::Utc>::from(SystemTime::UNIX_EPOCH),
+                        );
+                        assert_eq!(
+                            detail.outside_note.as_deref(),
+                            Some(crate::i18n::static_text("qb 밖에서도 사용 중"))
+                        );
+                    } else {
+                        let note = boxes.outside_note.unwrap();
+                        assert!(note.left >= 0. && note.right <= 360.);
+                        assert!(note.top >= boxes.line1.bottom && note.bottom <= boxes.rect.bottom);
+                        let mut text_style = style(12., false, 16.);
+                        text_style.wrap = Wrap::KeepAll;
+                        let metrics = renderer
+                            .text
+                            .layout(
+                                row.outside_note.as_deref().unwrap(),
+                                bounds(note),
+                                text_style,
+                            )?
+                            .metrics;
+                        assert!(!metrics.trimmed);
+                        assert!(metrics.required_height <= note.bottom - note.top + 0.1);
                     }
-                    let note = boxes.outside_note.unwrap();
-                    assert!(note.left >= 0. && note.right <= 360.);
-                    assert!(note.top >= boxes.line1.bottom && note.bottom <= boxes.rect.bottom);
-                    let mut text_style = style(12., false, 16.);
-                    text_style.wrap = Wrap::KeepAll;
-                    let metrics = renderer
-                        .text
-                        .layout(
-                            row.outside_note.as_deref().unwrap(),
-                            bounds(note),
-                            text_style,
-                        )?
-                        .metrics;
-                    assert!(!metrics.trimmed);
-                    assert!(metrics.required_height <= note.bottom - note.top + 0.1);
                     let bitmap = unsafe {
                         wic.CreateBitmap(
                             360,
@@ -1822,17 +1884,323 @@ mod n10_outside_note_render_tests {
                     let mut without_note = row.clone();
                     without_note.outside_note = None;
                     let baseline = paint(&without_note)?;
-                    let changed =
-                        (note.top.ceil() as usize..note.bottom.floor() as usize).any(|y| {
-                            let start = (y * 360 + note.left as usize) * 4;
-                            let end = (y * 360 + note.right as usize) * 4;
-                            marked[start..end] != baseline[start..end]
-                        });
-                    assert!(
-                        changed,
-                        "localized outside-use note must actually be drawn by the row renderer"
-                    );
+                    if let Some(note) = boxes.outside_note {
+                        let changed =
+                            (note.top.ceil() as usize..note.bottom.floor() as usize).any(|y| {
+                                let start = (y * 360 + note.left as usize) * 4;
+                                let end = (y * 360 + note.right as usize) * 4;
+                                marked[start..end] != baseline[start..end]
+                            });
+                        assert!(
+                            changed,
+                            "localized outside-use note must actually be drawn by the row renderer"
+                        );
+                    } else {
+                        assert_eq!(
+                            marked, baseline,
+                            "compact row has no outside-use note paint"
+                        );
+                        let mut injected_note = row.clone();
+                        injected_note.outside_note =
+                            Some(crate::i18n::static_text("qb 밖에서도 사용 중").into());
+                        assert_eq!(
+                            paint(&injected_note)?,
+                            baseline,
+                            "compact paint must suppress detail-only note even if present"
+                        );
+                    }
                 }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "testkit"))]
+mod r19_immutable_metrics_tests {
+    use super::*;
+
+    fn nine_account_view() -> v2::View {
+        let accounts: Vec<_> = (0..9).map(|i| serde_json::json!({
+            "id":format!("r19-metrics-{i}"),
+            "provider":if i < 5 { "claude" } else { "codex" },
+            "email":format!("synthetic-{i}@example.invalid"),
+            "label":format!("Synthetic 계정 {i}"),
+            "plan":if i < 5 { "max_20x" } else { "plus" },
+            "user_state":"active", "health":{"kind":"ready"},
+            "source":{"kind":"oauth"}, "outside_used":true,
+            "pool_eligible":true, "eligible_for_new_session":true,
+            "allow_credits":false, "credits_in_use":false,
+            "observed_at":"2026-10-29T00:00:00Z",
+            "windows":[
+                {"name":"5h","used_pct":20+i,"reset_at":"2026-10-29T05:00:00Z","status":"allowed"},
+                {"name":"7d","used_pct":40+i,"reset_at":"2026-11-05T00:00:00Z","status":"allowed"}
+            ]
+        })).collect();
+        let now: SystemTime = chrono::DateTime::parse_from_rfc3339("2026-10-29T00:00:00Z")
+            .unwrap()
+            .to_utc()
+            .into();
+        let view = v2::project(&serde_json::json!({"accounts":accounts}).to_string(), now).unwrap();
+        assert_eq!(
+            view.sections
+                .iter()
+                .map(|s| s.rows.len() + s.disabled_rows.len())
+                .sum::<usize>(),
+            9
+        );
+        view
+    }
+
+    fn presentation(offset: f32) -> g::Presentation {
+        let mut p = g::Presentation {
+            offset,
+            ..Default::default()
+        };
+        p.expanded.insert("claude".into(), true);
+        p.expanded.insert("codex".into(), true);
+        p
+    }
+
+    // Independent raw-layout oracle: unchanged bounds, font/weight and wrapping.
+    // The raw path stays deliberately uncached and is not used by production.
+    fn raw_presentation(
+        renderer: &Renderer,
+        view: &v2::View,
+        measured: &g::Presentation,
+    ) -> Result<g::Presentation> {
+        let mut raw = measured.clone();
+        for (key, width) in &mut raw.text_widths {
+            let mut fields = key.splitn(3, ':');
+            let size: u8 = fields.next().unwrap().parse().unwrap();
+            let bold = fields.next().unwrap() == "b";
+            let text = fields.next().unwrap();
+            let b = bounds(r(0., 0., 65536., 32.));
+            let s = style(size as f32, bold, 32.);
+            let expected = renderer.text.layout(text, b, s)?.metrics;
+            assert_eq!(renderer.text.measure(text, b, s)?, expected);
+            *width = expected.natural_width;
+        }
+        raw.subtitle_lines.clear();
+        let mut cases: Vec<(String, f32, f32, bool, bool)> = g::QUIT_DETAILS
+            .iter()
+            .map(|s| {
+                (
+                    crate::i18n::static_text(s).to_owned(),
+                    266.,
+                    4096.,
+                    false,
+                    false,
+                )
+            })
+            .collect();
+        cases.extend(
+            view.summaries
+                .iter()
+                .map(|s| (s.forecast_line.clone(), 312., 65536., false, true)),
+        );
+        for row in view
+            .sections
+            .iter()
+            .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+        {
+            cases.extend(
+                row.subscription_lines
+                    .iter()
+                    .cloned()
+                    .map(|s| (s, 328., 65536., false, true)),
+            );
+            if let Some(s) = &row.outside_note {
+                cases.push((s.clone(), 328., 65536., false, true));
+            }
+            if let Some(s) = row.forecast_lines.first() {
+                cases.push((s.clone(), 328., 65536., row.forecast_warning, true));
+            }
+        }
+        for (text, width, height, bold, at_least_one) in cases {
+            let mut s = style(12., bold, 16.);
+            s.wrap = Wrap::KeepAll;
+            let b = bounds(r(0., 0., width, height));
+            let expected = renderer.text.layout(&text, b, s)?.metrics;
+            assert_eq!(renderer.text.measure(&text, b, s)?, expected);
+            raw.subtitle_lines.insert(
+                text,
+                if at_least_one {
+                    expected.total_lines.max(1)
+                } else {
+                    expected.total_lines
+                },
+            );
+        }
+        assert_eq!(measured.text_widths, raw.text_widths);
+        assert_eq!(measured.subtitle_lines, raw.subtitle_lines);
+        Ok(raw)
+    }
+
+    #[test]
+    fn r19_immutable_metrics_nine_account_raw_geometry_and_warm_zero_creations() -> Result<()> {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || -> Result<()> {
+                let view = nine_account_view();
+                let renderer = Renderer::new(false)?;
+                renderer.begin_flyout_phase_stats();
+                let mut cold = presentation(0.);
+                renderer.measure(&view, &mut cold)?;
+                assert!(
+                    renderer.flyout_phase_stats().layout_creations > 0,
+                    "cold control must really shape text"
+                );
+                let raw = raw_presentation(&renderer, &view, &cold)?;
+                for cap in [240., 480., 800.] {
+                    for offset in [0., 72.] {
+                        let mut warm = presentation(offset);
+                        renderer.begin_flyout_phase_stats();
+                        renderer.measure(&view, &mut warm)?;
+                        let stats = renderer.flyout_phase_stats();
+                        assert_eq!(
+                            stats.layout_creations, 0,
+                            "unchanged nine-account warm measurement"
+                        );
+                        assert_eq!(stats.format_creations, 0);
+                        let mut reference = raw.clone();
+                        reference.offset = offset;
+                        let expected = g::Scene::build(&view, reference, cap);
+                        let actual = g::Scene::build(&view, warm, cap);
+                        let mut cold_at_offset = cold.clone();
+                        cold_at_offset.offset = offset;
+                        let cold_scene = g::Scene::build(&view, cold_at_offset, cap);
+                        // Full structural Debug includes all boxes, targets, IDs,
+                        // clip regions and offsets; Scene has no PartialEq.
+                        assert_eq!(format!("{actual:#?}"), format!("{expected:#?}"));
+                        assert_eq!(format!("{actual:#?}"), format!("{cold_scene:#?}"));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r19_immutable_metrics_takeover_and_tooltip_match_raw_and_warm() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let view = nine_account_view();
+        let body = format!(
+            "Synthetic 원본 경로: C:/{}\n마지막 갱신: 알 수 없음",
+            "긴폴더-name/".repeat(6)
+        );
+        let wrapped = renderer.takeover_wrap(&body)?;
+        let mut body_style = style(13., false, 20.);
+        body_style.wrap = Wrap::KeepAll;
+        let body_metrics = renderer
+            .text
+            .layout(&wrapped, bounds(r(0., 0., 288., 65536.)), body_style)?
+            .metrics;
+        let make = || g::Presentation {
+            overlay: g::Overlay::TakeoverCard {
+                body: body.clone(),
+                confirming: true,
+                ready: true,
+                replace: false,
+            },
+            ..presentation(0.)
+        };
+        let mut cold = make();
+        renderer.measure(&view, &mut cold)?;
+        assert_eq!(cold.credits_body_lines, body_metrics.total_lines.max(1));
+        let mut warm = make();
+        renderer.begin_flyout_phase_stats();
+        renderer.measure(&view, &mut warm)?;
+        assert_eq!(renderer.flyout_phase_stats().layout_creations, 0);
+        assert_eq!(renderer.flyout_phase_stats().format_creations, 0);
+        for cap in [240., 480., 800.] {
+            assert_eq!(
+                format!("{:#?}", g::Scene::build(&view, cold.clone(), cap)),
+                format!("{:#?}", g::Scene::build(&view, warm.clone(), cap))
+            );
+        }
+        for row in view
+            .sections
+            .iter()
+            .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+        {
+            let Some(confirm) = &row.menu.credits_enable_confirmation else {
+                continue;
+            };
+            let mut s = style(13., false, 20.);
+            s.wrap = Wrap::KeepAll;
+            let raw = renderer
+                .text
+                .layout(&confirm.body, bounds(r(0., 0., 288., 4096.)), s)?
+                .metrics;
+            let mut p = presentation(0.);
+            p.overlay = g::Overlay::CreditsConfirm(row.raw.id.clone());
+            renderer.begin_flyout_phase_stats();
+            renderer.measure(&view, &mut p)?;
+            assert_eq!(p.credits_body_lines, raw.total_lines);
+            assert_eq!(renderer.flyout_phase_stats().layout_creations, 0);
+            assert_eq!(renderer.flyout_phase_stats().format_creations, 0);
+        }
+        for width in [160., 360.] {
+            let scene = r(0., 0., width, 480.);
+            let anchor = r(20., 100., 40., 20.);
+            let text = "Synthetic tooltip 긴 한국어 줄과 English words for wrapping";
+            let mut s = style(12., false, 16.);
+            s.wrap = Wrap::KeepAll;
+            let tip_width = (width - 16.).clamp(32., 288.);
+            let raw = renderer
+                .text
+                .layout(text, bounds(r(0., 0., tip_width - 20., 4096.)), s)?
+                .metrics;
+            let cold = renderer.tooltip(text, anchor, scene)?;
+            assert_eq!(
+                cold.rect.bottom - cold.rect.top,
+                (raw.required_height + 16.).min(464.)
+            );
+            renderer.begin_flyout_phase_stats();
+            let warm = renderer.tooltip(text, anchor, scene)?;
+            assert_eq!(cold.rect, warm.rect);
+            assert_eq!(cold.text, warm.text);
+            assert_eq!(renderer.flyout_phase_stats().layout_creations, 0);
+            assert_eq!(renderer.flyout_phase_stats().format_creations, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r19_excluded_paid_confirmation_keeps_the_full_consent_body() -> Result<()> {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || -> Result<()> {
+                let input = serde_json::json!({"accounts":[{
+                    "id":"sample-acct","provider":"codex","plan":"plus",
+                    "label":"sample long account name ".repeat(8),
+                    "source":{"kind":"oauth"},"user_state":"paused",
+                    "health":{"kind":"ready"},"allow_credits":false
+                }]})
+                .to_string();
+                let view = v2::project(&input, std::time::SystemTime::UNIX_EPOCH).unwrap();
+                let row = &view.sections.last().unwrap().disabled_rows[0];
+                let confirm = row.menu.credits_enable_confirmation.as_ref().unwrap();
+                let mut style = style(13., false, 20.);
+                style.wrap = Wrap::KeepAll;
+                let renderer = Renderer::new(false)?;
+                let expected = renderer
+                    .text
+                    .layout(&confirm.body, bounds(r(0., 0., 288., 4096.)), style)?
+                    .metrics;
+                assert!(
+                    expected.total_lines > 3,
+                    "must exceed the default consent height"
+                );
+                let mut p = g::Presentation {
+                    overlay: g::Overlay::CreditsConfirm(row.raw.id.clone()),
+                    ..Default::default()
+                };
+                renderer.measure(&view, &mut p)?;
+                assert_eq!(p.credits_body_lines, expected.total_lines);
+                let scene = g::Scene::build(&view, p, 800.);
+                assert!(g::h(scene.dialog.as_ref().unwrap().body) >= expected.required_height);
                 Ok(())
             })?;
         }

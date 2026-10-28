@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R18 Part 2/3 집중 관문 완료·dev 병합
-목표: Claude permission_error 때 요금제를 다시 읽어 Free 계정을 배정에서 빼고, 요금제·구독 시작일(Claude)·이용 기간(Codex)을 최신으로 표시하기
-핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (홈 서버 꺼짐)
-사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 보류 유지(추천). L1 P5 서버 수용은 홈 서버가 켜지면 사용자와 진행
-갱신: 2026-10-28 20:19 KST (양 OS·날짜 화면 검수 완료; 원본 takeover400·Codex probe_failed 제한 보존)
+현재 마일스톤: R19 트레이 전체902통과·Windows CLI 기대값2건 보완 (R18 설치·R2 완료; N6r 보존)
+목표: 실제 토큰 갱신 주체를 모든 화면에 맞게 표시하고, 트레이 휠 응답을 측정해 개선하며, 배정 제외 계정을 간결하게 묶기
+핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
+사용자 대기: 없음
+갱신: 2026-10-29 02:45 KST (R18 dev1e8a4be 설치·R2 0e29393 수동 인수 완료; N7 진단 실행·기준 미달, R19 관문 계속)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -120,7 +120,7 @@ Nothing else orders work. Among ready nodes, the Codex main picks by importance:
 4. small fixes;
 5. structure.
 
-Long waits and work that needs no build run as background lanes (W) with one completion signal. Minor items are not parallelized; usage limits apply. User-set safety and authorization rules are unchanged, and R2 Part B stays held.
+Long waits and work that needs no build run as background lanes (W) with one completion signal. Minor items are not parallelized; usage limits apply. User-set safety and authorization rules are unchanged. R2 Part B is closed by the user's manual adoption procedure (0e29393).
 
 | Node | Lane | Inputs (real data only) | Start | Pass signal |
 |---|---|---|---|---|
@@ -143,11 +143,11 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N8 R15 compiled admin contract | completed gate; S2 install | none | `impl/r15`, brief R15-contract.md | shared nested responses, round trips, static guard, routing properties; qualified full matrix and real-path KO/EN captures passed |
 | N9 README final and v0.2.0 release | S2 and design | N1 and N2 installed | design session | public export scan clean, release assets built from the export |
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
-| Held | R2 Part B (retire-cpa) | user decision | — | — |
+| R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order** (remaining ready work): R17.1 complete; R18 Part 1 gate passed on `impl/plan-change`, continue Part 2 provider-date facts, then N6r (`impl/r14-replay`) and N7 calibration on separate branches. N6r and N7 must not merge into dev without explicit owner gate approval. L1 P5 real acceptance stays with the design session and user; any L1 fix brief takes priority. R2 Part B stays held and N12 is not ready.
+**Current S1 order**: finish R19 (impl/r19), then resume N6r (impl/r14-replay) with reference 1e8a4be and .sandbox/exports/n6r-frozen-20261029/ fixed. The next N6r unit executes one epoch through both routers and ends with paired counters, coverage/loss and a margin-zero verdict before extending to >=24 h; otherwise the owner runs the stagnation review before more N6r work. N7 runs its real-export backtest independently in W during long checks; its code stays on its own branch. N6r/N7 do not merge into dev without explicit owner gate approval. Build-free Linux/capture work runs as soon as its actual inputs exist, outside the Windows Cargo queue. L1 P5 real acceptance stays with the owner/user; L1 fix briefs take priority. R2 Part B is closed and N12 remains unready.
 
-**Start now in W:** N5m and the N7 backtest.
+**W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
 **No polling.** Nobody polls a running job or a pane in a loop. Every wait has the next ready node from this table.
 

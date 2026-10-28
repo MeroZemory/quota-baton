@@ -4,6 +4,13 @@ use std::{borrow::Cow, cell::Cell};
 pub mod forecast;
 mod strings;
 
+const EXCLUDED_STRINGS: &[(&str, &str)] = &[
+    ("배정 안 함 ({0})", "Not used ({0})"),
+    ("사용 안 함", "Disabled"),
+    ("일시 중지", "Paused"),
+    ("Claude Code 사용 불가", "No Claude Code access"),
+];
+
 const PLAN_STRINGS: &[(&str, &str)] = &[
     (
         "Free 요금제 · Claude Code 사용 불가",
@@ -48,6 +55,7 @@ pub fn text(ko: &str) -> Cow<'_, str> {
             .chain(crate::i18n_shell_strings::STRINGS)
             .chain(crate::i18n_client_strings::STRINGS)
             .chain(PLAN_STRINGS)
+            .chain(EXCLUDED_STRINGS)
             .find_map(|(key, en)| (*key == ko).then_some(*en))
     {
         return Cow::Borrowed(en);
