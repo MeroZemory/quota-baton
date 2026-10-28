@@ -1936,6 +1936,25 @@ async fn offline_online_import_and_admin_refusal() {
 
 #[test]
 fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
+    fn status_cell<'a>(status: &'a str, id: &str, column: &str) -> &'a str {
+        let header: Vec<_> = status
+            .lines()
+            .find(|line| line.starts_with("계정 ID\t"))
+            .unwrap()
+            .split('\t')
+            .collect();
+        let cells: Vec<_> = status
+            .lines()
+            .find(|line| line.starts_with(&format!("{id}\t")))
+            .unwrap()
+            .split('\t')
+            .collect();
+        assert_eq!(cells.len(), header.len());
+        cells[header
+            .iter()
+            .position(|name| *name == column)
+            .expect("status column")]
+    }
     let _serial = SERVE_SERIAL.blocking_lock();
     let home = fixture();
     let cpa = home.path().join("cpa");
@@ -2012,6 +2031,8 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
         String::from_utf8_lossy(&output.stderr)
     );
     let status = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(status_cell(&status, &id, "출처"), "CPA 연결");
+    assert_eq!(status_cell(&status, &id, "갱신 주체"), "CPA");
     for expected in [
         "중지됨",
         "CPA는 계속 실행되어야 합니다 (연결 계정 1개의 토큰 갱신)",
@@ -2048,14 +2069,10 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(output.status.success());
     let status = String::from_utf8(output.stdout).unwrap();
-    let columns: Vec<_> = status
-        .lines()
-        .find(|line| line.starts_with(&format!("{id}\t")))
-        .unwrap()
-        .split('\t')
-        .collect();
-    assert_eq!(columns[5], "리셋됨");
-    assert_eq!(columns[7], "리셋됨");
+    assert_eq!(status_cell(&status, &id, "출처"), "CPA 연결");
+    assert_eq!(status_cell(&status, &id, "갱신 주체"), "CPA");
+    assert_eq!(status_cell(&status, &id, "5시간 남음"), "리셋됨");
+    assert_eq!(status_cell(&status, &id, "7일 남음"), "리셋됨");
     assert!(!status.contains("100.0%"));
     assert!(!status.contains("99.0%"));
     for (health, pending, failures, expected) in [
@@ -2093,13 +2110,9 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
         let output = command(home.path()).arg("status").bounded_output().unwrap();
         assert!(output.status.success());
         let status = String::from_utf8(output.stdout).unwrap();
-        let columns: Vec<_> = status
-            .lines()
-            .find(|line| line.starts_with(&format!("{id}\t")))
-            .unwrap()
-            .split('\t')
-            .collect();
-        assert_eq!(columns[4], expected);
+        assert_eq!(status_cell(&status, &id, "출처"), "CPA 연결");
+        assert_eq!(status_cell(&status, &id, "갱신 주체"), "CPA");
+        assert_eq!(status_cell(&status, &id, "계정 상태"), expected);
     }
     let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
     let account_path = home.path().join("accounts").join(format!("{id}.json"));
@@ -2282,14 +2295,14 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
         "코어: 실행 중\n",
         "claude: 사용 가능 0 · 대기 [] · 사용 불가 0\n",
         "codex: 사용 가능 2 · 대기 [인증 오류 1] · 사용 불가 1\n",
-        "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 남음\t5시간 초기화\t7일 남음\t7일 초기화\t30일 남음\t30일 초기화\t상태 이유\t대기 종료\n",
-        "cx-expired-five\tcodex\t합성 🧪\t활성\t인증 확인 대기\t리셋됨\t2000-01-01T09:00:00.123+09:00\t62.5%\t2099-01-07T00:00:00Z\t-\t-\t-\t-\n",
+        "계정 ID\t제공자\t라벨\t출처\t갱신 주체\t사용 상태\t계정 상태\t5시간 남음\t5시간 초기화\t7일 남음\t7일 초기화\t30일 남음\t30일 초기화\t상태 이유\t대기 종료\n",
+        "cx-expired-five\tcodex\t합성 🧪\t직접 로그인\tqb\t활성\t인증 확인 대기\t리셋됨\t2000-01-01T09:00:00.123+09:00\t62.5%\t2099-01-07T00:00:00Z\t-\t-\t-\t-\n",
         "  소진 예측: 측정 중\n",
-        "cx-expired-seven\tcodex\t합성 계정\t활성\t준비됨\t9%\t2099-01-01T05:00:00Z\t리셋됨\t2000-01-07T00:00:00Z\t-\t-\t-\t-\n",
+        "cx-expired-seven\tcodex\t합성 계정\t직접 로그인\tqb\t활성\t준비됨\t9%\t2099-01-01T05:00:00Z\t리셋됨\t2000-01-07T00:00:00Z\t-\t-\t-\t-\n",
         "  소진 예측: 측정 중\n",
-        "cx-missing-reset\tcodex\t-\t활성\t준비됨\t88%\t-\t-\t-\t-\t-\t-\t-\n",
+        "cx-missing-reset\tcodex\t-\t직접 로그인\tqb\t활성\t준비됨\t88%\t-\t-\t-\t-\t-\t-\t-\n",
         "  소진 예측: 측정 중\n",
-        "cx-invalid-reset\tcodex\t-\t활성\t대기 중\t-\t-\t75%\tinvalid\t98%\t2099-02-01T00:00:00Z\t인증 오류\t2099-01-01T00:00:00Z\n",
+        "cx-invalid-reset\tcodex\t-\t직접 로그인\tqb\t활성\t대기 중\t-\t-\t75%\tinvalid\t98%\t2099-02-01T00:00:00Z\t인증 오류\t2099-01-01T00:00:00Z\n",
         "  소진 예측: 측정 중\n",
     );
     let piped = command(home.path()).arg("status").bounded_output().unwrap();
@@ -2306,6 +2319,25 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
     let file_bytes = std::fs::read(output_path).unwrap();
     for bytes in [&piped.stdout, &file_bytes] {
         let table_status = status_without_platform_trailer(std::str::from_utf8(bytes).unwrap());
+        let header: Vec<_> = table_status
+            .lines()
+            .find(|line| line.starts_with("계정 ID\t"))
+            .unwrap()
+            .split('\t')
+            .collect();
+        let origin = header.iter().position(|name| *name == "출처").unwrap();
+        let refresher = header.iter().position(|name| *name == "갱신 주체").unwrap();
+        let rows: Vec<_> = table_status
+            .lines()
+            .filter(|line| line.starts_with("cx-"))
+            .collect();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            let cells: Vec<_> = row.split('\t').collect();
+            assert_eq!(cells.len(), header.len());
+            assert_eq!(cells[origin], "직접 로그인");
+            assert_eq!(cells[refresher], "qb");
+        }
         assert_eq!(table_status, expected);
         assert_eq!(table_status.as_bytes(), expected.as_bytes());
         assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
