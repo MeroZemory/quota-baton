@@ -26,6 +26,14 @@ pub(crate) fn plan(profile: &Value) -> Option<&'static str> {
             {
                 Some("free")
             }
+            _ if matches!(kind, Some("free" | "claude_free"))
+                && profile["account"]["has_claude_max"] != true
+                && profile["account"]["has_claude_pro"] != true =>
+            {
+                // An explicit Free organization is subscription evidence even
+                // when its rate tier is new. Known paid tiers still win above.
+                Some("free")
+            }
             _ => {
                 tracing::debug!(tier = %bounded_tier(tier), "Unknown Claude profile tier");
                 None
@@ -136,6 +144,43 @@ mod tests {
             (json!({}), None),
         ] {
             assert_eq!(plan(&shape), expected);
+        }
+    }
+
+    #[test]
+    fn r18_explicit_free_organization_survives_an_unknown_rate_tier() {
+        for (profile, expected) in [
+            (
+                json!({"account":{"has_claude_pro":false,"has_claude_max":false},
+                    "organization":{"organization_type":"claude_free","rate_limit_tier":"synthetic_unknown_tier"}}),
+                Some("free"),
+            ),
+            (
+                json!({"organization":{"organization_type":"free","rate_limit_tier":"synthetic_unknown_tier"}}),
+                Some("free"),
+            ),
+            (
+                json!({"account":{"has_claude_pro":false,"has_claude_max":false},
+                    "organization":{"organization_type":"synthetic_unknown_kind","rate_limit_tier":"synthetic_unknown_tier"}}),
+                None,
+            ),
+            (
+                json!({"account":{"has_claude_pro":true},
+                    "organization":{"organization_type":"claude_free","rate_limit_tier":"synthetic_unknown_tier"}}),
+                None,
+            ),
+            (
+                json!({"account":{"has_claude_max":true},
+                    "organization":{"organization_type":"claude_free","rate_limit_tier":"synthetic_unknown_tier"}}),
+                None,
+            ),
+            (
+                json!({"account":{"has_claude_pro":false,"has_claude_max":false},
+                    "organization":{"organization_type":"claude_free","rate_limit_tier":"default_claude_pro"}}),
+                Some("pro"),
+            ),
+        ] {
+            assert_eq!(plan(&profile), expected);
         }
     }
 

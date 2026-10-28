@@ -24,7 +24,7 @@ async fn permission_request(f: &Fixture, free: bool) {
     f.fake.state.push(if free {
         ScriptedResponse::json(reqwest::StatusCode::OK, json!({
             "account":{"uuid":"synthetic-claude-0","has_claude_pro":false,"has_claude_max":false},
-            "organization":{"uuid":"synthetic-organization","organization_type":"claude_free","rate_limit_tier":"default_claude_free"}
+            "organization":{"uuid":"synthetic-organization","organization_type":"claude_free","rate_limit_tier":"synthetic_unknown_tier"}
         }).to_string())
     } else { profile_reply("default_claude_max_20x") });
     let mut servers = crate::http::spawn_with_routes(
