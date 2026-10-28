@@ -1195,6 +1195,167 @@ impl Renderer {
 mod tests {
     use super::*;
     #[test]
+    fn r15_start_and_activity_cells_fit_native_text_and_keep_their_gap() -> Result<()> {
+        use crate::{dashboard_fixtures as fixtures, dashboard_model as m, i18n};
+
+        for language in [i18n::UiLanguage::Ko, i18n::UiLanguage::En] {
+            i18n::with_language(language, || -> Result<()> {
+                let renderer = Renderer::new(false)?;
+                let mut clock = fixtures::clock();
+                clock.now =
+                    chrono::DateTime::parse_from_rfc3339("2026-10-29T12:00:00+09:00").unwrap();
+                clock.day_start = fixtures::at("2026-10-28T15:00:00Z");
+                clock.day_end = fixtures::at("2026-10-29T15:00:00Z");
+                for first_seen in [
+                    Some(fixtures::at("2026-10-24T15:49:00Z")),
+                    Some(fixtures::at("2026-10-29T01:00:00Z")),
+                    None,
+                ] {
+                    let mut data = fixtures::snapshot();
+                    data.sessions.sessions.truncate(1);
+                    let session = &mut data.sessions.sessions[0];
+                    session.first_seen_at = first_seen;
+                    session.last_used_at = Some(clock.utc() - chrono::Duration::minutes(1));
+                    session.inflight = m::Inflight {
+                        requests: Some(0),
+                        ..Default::default()
+                    };
+                    session.inflight_known = true;
+                    session.provider = "claude".into();
+                    session.account = "cl-a".into();
+                    session.routing = Some(m::SessionRouting {
+                        action_id: "a".repeat(64),
+                        on_5h_limit: "wait".into(),
+                        mode: "strict".into(),
+                    });
+                    let id = session.id.clone();
+                    for grouped in [false, true] {
+                        let mut state = DashboardState {
+                            grouped,
+                            range: Range::All,
+                            ..Default::default()
+                        };
+                        let mut view = m::project(&data, &mut state, &clock);
+                        view.provider_usage.clear();
+                        let row = view.flat.iter().find(|row| row.id == id).unwrap();
+                        assert_eq!(row.first_seen, first_seen);
+                        let full_start = first_seen.map_or_else(
+                            || i18n::static_text("이전 실행부터").to_owned(),
+                            |at| clock.time(Some(at)),
+                        );
+                        assert_eq!(row.start, full_start, "date formatting must stay intact");
+                        let compact_start = match first_seen {
+                            Some(at) if at == fixtures::at("2026-10-24T15:49:00Z") => {
+                                if language == i18n::UiLanguage::Ko {
+                                    "10/25".into()
+                                } else {
+                                    "Oct 25".into()
+                                }
+                            }
+                            Some(_) => "10:00".into(),
+                            None => full_start.clone(),
+                        };
+                        let mut visible_starts = 0;
+                        for viewport_width in [1024., 1179., 1180., 1304., 1320., 1600.] {
+                            let scene = renderer.scene(&view, &state, [viewport_width, 960.])?;
+                            let session_box = scene
+                                .session_rows
+                                .iter()
+                                .find(|session| session.id == id)
+                                .unwrap()
+                                .rect;
+                            assert_eq!(height(session_box), 35.);
+                            let start = scene.draw.iter().find_map(|draw| match draw {
+                                Draw::Text { rect, measure, .. }
+                                    if (measure.text == row.start
+                                        || measure.text == compact_start)
+                                        && rect.top >= session_box.top
+                                        && rect.bottom <= session_box.bottom =>
+                                {
+                                    Some((*rect, measure))
+                                }
+                                _ => None,
+                            });
+                            let Some((start_rect, start_measure)) = start else {
+                                // Existing responsive policy drops Start before Model.
+                                continue;
+                            };
+                            visible_starts += 1;
+                            assert_eq!(
+                                start_measure.text, compact_start,
+                                "old start must use a readable compact label"
+                            );
+                            if start_measure.text != row.start || first_seen.is_none() {
+                                assert!(
+                                    scene.tooltips.iter().any(|tip| {
+                                        tip.text == row.start && tip.rect == start_rect
+                                    }),
+                                    "full start remains available as a tooltip"
+                                );
+                            }
+                            let (activity_rect, activity_measure) = scene
+                                .draw
+                                .iter()
+                                .find_map(|draw| match draw {
+                                    Draw::Text { rect, measure, .. }
+                                        if measure.text == row.activity
+                                            && rect.top >= session_box.top
+                                            && rect.bottom <= session_box.bottom
+                                            && rect.left > start_rect.left =>
+                                    {
+                                        Some((*rect, measure))
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap();
+                            assert!(activity_rect.left - start_rect.right >= 8.);
+                            for (rect, measure) in [
+                                (start_rect, start_measure),
+                                (activity_rect, activity_measure),
+                            ] {
+                                // Unknown first-seen keeps its existing fallback;
+                                // it may elide, but cannot run into the next cell.
+                                if first_seen.is_none() && measure.text == row.start {
+                                    continue;
+                                }
+                                let natural = renderer.shared.dashboard_text().measure(
+                                    &measure.text,
+                                    bounds(crate::Rect {
+                                        left: 0.,
+                                        top: 0.,
+                                        right: 65536.,
+                                        bottom: height(rect),
+                                    }),
+                                    style(measure),
+                                )?;
+                                assert!(
+                                    natural.natural_width <= width(rect) + 0.1,
+                                    "{language:?}/{grouped}/{viewport_width}/{:?}: native width {} exceeds actual cell {}",
+                                    measure.text,
+                                    natural.natural_width,
+                                    width(rect),
+                                );
+                                let fitted = renderer.shared.dashboard_text().layout(
+                                    &measure.text,
+                                    bounds(rect),
+                                    style(measure),
+                                )?;
+                                assert!(!fitted.metrics.trimmed);
+                                assert!(!fitted.metrics.ink_overflow);
+                            }
+                            assert!(scene.targets.iter().any(|hit| {
+                                hit.target == Target::Session(id.clone()) && hit.enabled
+                            }));
+                        }
+                        assert!(visible_starts > 0, "must test actual rendered Start cells");
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+    #[test]
     fn r10_relogin_action_keeps_its_complete_directwrite_label_at_boundary_widths() -> Result<()> {
         let renderer = Renderer::new(false)?;
         let mut state = DashboardState::default();
