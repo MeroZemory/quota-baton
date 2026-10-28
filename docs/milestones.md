@@ -8,7 +8,7 @@ This file names the verification for each unit and each row. The row list and th
 현재 마일스톤: R18 Part 2/3 집중 관문 완료·dev 병합
 목표: Claude permission_error 때 요금제를 다시 읽어 Free 계정을 배정에서 빼고, 요금제·구독 시작일(Claude)·이용 기간(Codex)을 최신으로 표시하기
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (홈 서버 꺼짐)
-사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 보류 유지(추천). L1 P5 서버 수용은 홈 서버가 켜지면 사용자와 진행
+사용자 대기: L1 P5 서버 수용은 새 에이전트 서버가 준비되면 사용자와 진행 (R2 Part B는 2026-10-29 수동 인수로 완료)
 갱신: 2026-10-28 20:19 KST (양 OS·날짜 화면 검수 완료; 원본 takeover400·Codex probe_failed 제한 보존)
 <!-- status:end -->
 

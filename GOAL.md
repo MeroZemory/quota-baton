@@ -59,7 +59,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 |---|---|
 | M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8, M6c | merged, including the M7c 24 h addendum (no upward trend). Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
 | R1 | merged (all five groups plus R1-tray.1) |
-| R2 | Part A merged (adopt, manual refresh, refresh regardless of user_state). Part B (retire-cpa/restore-cpa) is held by the user's design/review pause below; do not change the real profile or install. Resume only when that hold is lifted. Brief: `R2-adopt-retire-cpa.md` |
+| R2 | 완료(사용자 결정 2026-10-29): Part A merged. Part B는 별도 retire-cpa 명령 없이 수동 절차로 수행: CPA 작업 `cliproxyapi-proxy`·`cliproxyapi-quota-watch` 비활성화, CPA 프로세스 PID 종료, Claude 4계정 `accounts adopt`(CPA 파일 출처) → 모두 qb 직접 갱신. CPA 인증 파일은 이름을 바꾸지 않고 그대로 둠(작업 비활성화로 재시작 차단, 되돌리기 가능) |
 | R3 | merged (codex-qb and claude-qb) |
 | R1-tray.2 | merged (notifications) |
 | R4 | merged (plan tier, credits_in_use, precondition) |
