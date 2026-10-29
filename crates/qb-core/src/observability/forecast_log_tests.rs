@@ -209,17 +209,18 @@ fn n7_missing_measurements_are_unavailable_never_zero() {
     );
 }
 #[test]
-fn n7_malformed_identity_and_storage_cap_stop_with_durable_explicit_loss() {
+fn n7_malformed_identity_retries_but_storage_cap_stops_with_durable_explicit_loss() {
     let home = private_fixture();
     let log = ForecastLog::open(home.path()).unwrap();
     let mut bad = pair(START);
     bad[0].id = "personal-identity@example.invalid".into();
     assert!(log.sample(at(START), &bad).is_err());
-    assert!(log.status().unwrap().stopped);
+    assert!(!log.status().unwrap().stopped);
     assert_eq!(log.status().unwrap().losses, 1);
     drop(log);
     let log = ForecastLog::open(home.path()).unwrap();
     assert!(!log.due(at(START)));
+    assert!(log.due(at(START + 60)));
     let other = private_fixture();
     let small = ForecastLog::open(other.path()).unwrap();
     small.worker.lock().unwrap().log_cap = 1;
@@ -1131,7 +1132,7 @@ fn n7_diagnostics_are_static_typed_and_do_not_match_arbitrary_error_substrings()
 }
 
 #[test]
-fn n7_sample_failure_persists_exact_reason_and_later_refusals_do_not_overwrite_it() {
+fn n7_invalid_sample_retries_persists_first_reason_and_later_good_sample_settles() {
     for reason in [
         FailureReason::WindowName,
         FailureReason::DuplicateWindow,
@@ -1165,46 +1166,58 @@ fn n7_sample_failure_persists_exact_reason_and_later_refusals_do_not_overwrite_i
                 reason
             }
         );
-        assert_eq!(error.to_string(), format!("sample:{}", reason.as_str()));
         let path = home.path().join("state/forecast-log/checkpoint.json");
-        let before = fs::read(&path).unwrap();
-        let checkpoint: Checkpoint = serde_json::from_slice(&before).unwrap();
+        let checkpoint: Checkpoint = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(checkpoint.last_failure, Some(failure));
-        assert!(checkpoint.status.stopped);
+        assert!(!checkpoint.status.stopped);
         assert_eq!(checkpoint.status.losses, 1);
+        assert_eq!(checkpoint.status.unavailable, 1);
+        assert_eq!(checkpoint.retry_at, Some(START + 60));
         assert_eq!(checkpoint.sequence, 0);
         assert_eq!(checkpoint.status.origins, 0);
         assert!(checkpoint.last_sample.is_none() && checkpoint.last_origin_hour.is_none());
-        let native = crate::accounts::health::tests::fixture();
-        let error = log.observe_account(&native).unwrap_err();
-        assert_eq!(
-            diagnostic(&error, FailurePhase::Observation),
-            FailureDiagnostic {
-                phase: FailurePhase::Observation,
-                reason: FailureReason::Stopped,
-            }
-        );
-        let error = log.sample(at(START), &pair(START)).unwrap_err();
-        assert_eq!(
-            diagnostic(&error, FailurePhase::Sample).reason,
-            FailureReason::Stopped
-        );
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(checkpoint.pending.is_empty() && checkpoint.outbox.is_empty());
+        assert!(records(&log).is_empty());
+        // Actual observer callbacks remain accepted while the sampler waits.
+        let mut native = crate::accounts::health::tests::fixture();
+        native.id = accounts[0].id.clone();
+        if reason == FailureReason::DuplicateAccount {
+            native.id = "cx-000001".into();
+        }
+        log.observe_account(&native).unwrap();
         log.close().unwrap();
-        let closed: Checkpoint = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(closed.clean && closed.status.stopped);
-        assert_eq!(closed.last_failure, Some(failure));
-        let error = log.sample(at(START), &pair(START)).unwrap_err();
-        assert_eq!(
-            diagnostic(&error, FailurePhase::Sample).reason,
-            FailureReason::Closed
-        );
+        drop(log);
         let reopened = ForecastLog::open(home.path()).unwrap();
-        assert!(reopened.status().unwrap().stopped); // No implicit recovery/reset.
+        assert!(!reopened.due(at(START + 59)));
+        assert!(reopened.due(at(START + 60)));
+        assert_eq!(reopened.last_failure().unwrap(), Some(failure));
+        // A different invalid sample must not replace the first reason or add records.
+        let mut bad = pair(START + 60);
+        bad[0].id = "invalid".into();
+        assert!(reopened.sample(at(START + 60), &bad).is_err());
+        assert_eq!(reopened.last_failure().unwrap(), Some(failure));
+        assert!(records(&reopened).is_empty());
+        let good_at = START + 120;
+        reopened.sample(at(good_at), &pair(good_at)).unwrap();
+        assert_eq!(reopened.worker.lock().unwrap().checkpoint.retry_at, None);
         assert_eq!(
-            reopened.worker.lock().unwrap().checkpoint.last_failure,
-            Some(failure)
+            reopened.worker.lock().unwrap().checkpoint.last_sample,
+            Some(good_at)
         );
+        assert_eq!(records(&reopened).len(), 2);
+        reopened.close().unwrap();
+        drop(reopened);
+        let resumed = ForecastLog::open(home.path()).unwrap();
+        resumed
+            .sample(at(good_at + 3600), &pair(good_at + 3600))
+            .unwrap();
+        let outcomes = codex_outcomes(&resumed);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1.is_some_and(|r| (r - 0.8).abs() < 1e-12));
+        assert_eq!(outcomes[0].2, None);
+        assert!(!resumed.status().unwrap().stopped);
+        assert_eq!(resumed.last_failure().unwrap(), Some(failure));
+        resumed.close().unwrap();
     }
 }
 
@@ -1220,107 +1233,202 @@ async fn n7_native_parser_slot_names_reach_actual_runtime_views_and_log_without_
     };
     use std::sync::Arc;
 
-    let fixture = private_fixture();
-    let home = fixture.path().join("parser-home");
-    crate::platform::prepare_observation_directory(&home).unwrap();
-    let mut config = Config::default();
-    config.secrets.linux_backend = LinuxSecretBackend::File0600;
-    crate::platform::atomic_write_account(
-        &home,
-        &home.join("config.toml"),
-        toml::to_string(&config).unwrap().as_bytes(),
-    )
-    .unwrap();
-    let store = Arc::new(AccountStore::acquire(&home).unwrap());
-    let obs = Arc::new(Observability::new(&home, None).unwrap());
-    obs.configure_forecast(true);
-    let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
-    let bindings = BindingTable::new(&home, config.routing).unwrap();
-    let log = Arc::new(ForecastLog::open(&home).unwrap());
-    let now = Utc::now();
-    for index in 0..2 {
-        let mut native = crate::accounts::health::tests::fixture();
-        native.identity = Identity::Codex {
-            user_id: None,
-            account_id: format!("synthetic-n7-parser-{index}"),
-            email: format!("synthetic-n7-parser-{index}@example.invalid"),
-        };
-        native.id = native.identity.id();
-        native.plan = Some("plus".into());
-        native.token_meta.expires_at = Some(now + chrono::Duration::days(365));
-        let saved = store
-            .save(
-                &native,
-                &Tokens {
-                    access_token: format!("synthetic-n7-parser-access-{index}"),
-                    refresh_token: format!("synthetic-n7-parser-refresh-{index}"),
-                    id_token: None,
-                },
-                None,
-            )
-            .unwrap();
-        log.observe_account(&saved).unwrap();
-        // Actual native parser output, not a constructed DTO or guessed bucket duration.
-        let body = serde_json::to_vec(&json!({"rate_limit": {
-            "primary_window": {"used_percent":25},
-            "secondary_window": {"used_percent":50}
-        }}))
+    for native_slots in [false, true] {
+        let fixture = private_fixture();
+        let home = fixture.path().join("parser-home");
+        crate::platform::prepare_observation_directory(&home).unwrap();
+        let mut config = Config::default();
+        config.secrets.linux_backend = LinuxSecretBackend::File0600;
+        crate::platform::atomic_write_account(
+            &home,
+            &home.join("config.toml"),
+            toml::to_string(&config).unwrap().as_bytes(),
+        )
         .unwrap();
-        let parsed = crate::quota::parse_snapshot_for_test(Provider::Codex, &body, now).unwrap();
-        let snapshot = obs.observe_poll(&saved.id, parsed, true).unwrap();
-        runtime
-            .apply_quota_snapshot(&saved.id, snapshot, None)
-            .await
-            .unwrap();
-    }
-    let views = runtime.typed_views_with_bindings(&bindings).await.unwrap();
-    assert_eq!(views.len(), 2);
-    for view in &views {
-        assert!(view.pool_eligible);
-        assert_eq!(
-            view.windows
-                .iter()
-                .map(|w| w.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["primary", "secondary"]
+        let store = Arc::new(AccountStore::acquire(&home).unwrap());
+        let obs = Arc::new(Observability::new(&home, None).unwrap());
+        obs.configure_forecast(true);
+        let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
+        let bindings = BindingTable::new(&home, config.routing).unwrap();
+        let log = Arc::new(ForecastLog::open(&home).unwrap());
+        let now = Utc::now();
+        for (index, plan) in ["pro", "plus", "free", "plus"].into_iter().enumerate() {
+            let mut native = crate::accounts::health::tests::fixture();
+            native.identity = Identity::Codex {
+                user_id: None,
+                account_id: format!("synthetic-n7-parser-{index}"),
+                email: format!("synthetic-n7-parser-{index}@example.invalid"),
+            };
+            native.id = native.identity.id();
+            native.plan = Some(plan.into());
+            native.token_meta.expires_at = Some(now + chrono::Duration::days(365));
+            let saved = store
+                .save(
+                    &native,
+                    &Tokens {
+                        access_token: format!("synthetic-n7-parser-access-{index}"),
+                        refresh_token: format!("synthetic-n7-parser-refresh-{index}"),
+                        id_token: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            log.observe_account(&saved).unwrap();
+            // Actual native parser output, not a constructed DTO or guessed bucket duration.
+            let used = [25, 50, 40, 10][index];
+            let (minutes, secondary) = if index == 2 {
+                (43200, 0)
+            } else if index == 3 {
+                (300, 10080)
+            } else {
+                (300, 0)
+            };
+            let body = if native_slots {
+                json!({"plan_type":plan,"rate_limit": {
+                    "primary_window": {"used_percent":used,"limit_window_seconds":minutes * 60u64},
+                    "secondary_window": {"used_percent":if index == 3 {80} else {0},"limit_window_seconds":secondary * 60u64}
+                }})
+            } else {
+                json!({"rate_limit": {
+                    "primary_window": {"used_percent":25}, "secondary_window": {"used_percent":50}
+                }})
+            };
+            let body = serde_json::to_vec(&body).unwrap();
+            let parsed =
+                crate::quota::parse_snapshot_for_test(Provider::Codex, &body, now).unwrap();
+            let snapshot = obs.observe_poll(&saved.id, parsed, true).unwrap();
+            runtime
+                .apply_quota_snapshot(&saved.id, snapshot, None)
+                .await
+                .unwrap();
+            if native_slots {
+                // The native HTTP header parser is the actual producer of 0m.
+                // Body parsing deliberately omits explicit duration-zero windows.
+                let mut headers = axum::http::HeaderMap::new();
+                for (key, value) in [
+                    ("x-codex-primary-used-percent", used.to_string()),
+                    ("x-codex-primary-window-minutes", minutes.to_string()),
+                    (
+                        "x-codex-secondary-used-percent",
+                        if index == 3 { "80" } else { "0" }.into(),
+                    ),
+                    ("x-codex-secondary-window-minutes", secondary.to_string()),
+                ] {
+                    headers.insert(key, value.parse().unwrap());
+                }
+                let snapshot = obs
+                    .observe_headers_snapshot(&saved.id, Provider::Codex, &headers)
+                    .unwrap();
+                runtime
+                    .apply_quota_snapshot(&saved.id, snapshot, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        // A cached orphan's native quota report is not a stored account and
+        // must never become a typed account or a pooled cohort member.
+        let mut orphan_headers = axum::http::HeaderMap::new();
+        for (key, value) in [
+            ("x-codex-primary-used-percent", "20"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-secondary-window-minutes", "0"),
+        ] {
+            orphan_headers.insert(key, value.parse().unwrap());
+        }
+        assert!(
+            obs.observe_headers_snapshot("cx-413c3b", Provider::Codex, &orphan_headers)
+                .is_some()
         );
-        assert!(view.usage_forecast.windows.is_empty());
-    }
-    let sampling = log.clone();
-    tokio::task::spawn_blocking(move || sampling.sample(now, &views))
-        .await
-        .unwrap()
-        .unwrap();
-    let origin = records(&log)
-        .into_iter()
-        .find_map(|record| match record.event {
-            Event::Origin { origin } if origin.provider == "codex" => Some(origin),
-            _ => None,
+        let now = Utc::now();
+        let views = runtime.typed_views_with_bindings(&bindings).await.unwrap();
+        assert_eq!(views.len(), 4);
+        assert!(!views.iter().any(|a| a.id == "cx-413c3b")); // No native account file: never an input.
+        for view in &views {
+            assert!(view.pool_eligible);
+            if native_slots {
+                assert!(
+                    view.windows
+                        .iter()
+                        .all(|w| matches!(w.name.as_str(), "5h" | "7d" | "0m" | "43200m"))
+                );
+                if matches!(view.plan.as_deref(), Some("pro" | "free")) {
+                    assert!(view.windows.iter().any(|w| w.name == "0m"));
+                }
+                if view.plan.as_deref() == Some("free") {
+                    assert!(view.windows.iter().any(|w| w.name == "43200m"));
+                    assert!(
+                        view.usage_forecast
+                            .windows
+                            .iter()
+                            .all(|w| w.window_seconds == 30 * 86400)
+                    );
+                }
+            } else {
+                assert_eq!(
+                    view.windows
+                        .iter()
+                        .map(|w| w.name.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["primary", "secondary"]
+                );
+                assert!(view.usage_forecast.windows.is_empty());
+            }
+        }
+        let sampling = log.clone();
+        tokio::task::spawn_blocking(move || sampling.sample(now, &views))
+            .await
+            .unwrap()
+            .unwrap();
+        let origin = records(&log)
+            .into_iter()
+            .find_map(|record| match record.event {
+                Event::Origin { origin } if origin.provider == "codex" => Some(origin),
+                _ => None,
+            })
+            .unwrap();
+        if native_slots {
+            assert!(origin.remaining.is_some_and(|r| (r - 2.05).abs() < 1e-12)); // .75 + .5 + .6 + .2.
+            assert!(
+                origin
+                    .cohort
+                    .iter()
+                    .all(|input| input.windows.iter().all(|w| w.name != "0m"))
+            );
+            assert!(
+                origin
+                    .cohort
+                    .iter()
+                    .any(|input| input.windows.iter().any(|w| w.name == "43200m"))
+            );
+        } else {
+            assert_eq!(origin.remaining, None);
+            assert!(
+                origin
+                    .cohort
+                    .iter()
+                    .all(|input| input.existing_forecast.windows.is_empty()
+                        && input.windows.is_empty()
+                        && input.remaining.is_none()
+                        && input.unavailable == Some(Unavailable::MissingWindow))
+            );
+        }
+        assert!(origin.forecast_1h.is_none() && origin.forecast_3h.is_none());
+        assert_eq!(
+            log.worker.lock().unwrap().checkpoint.last_sample,
+            Some(now.timestamp())
+        );
+        assert!(log.worker.lock().unwrap().checkpoint.last_failure.is_none());
+        store.stop_writes();
+        bindings.freeze().unwrap();
+        tokio::task::spawn_blocking(move || {
+            log.close().unwrap();
+            obs.flush().unwrap();
         })
+        .await
         .unwrap();
-    assert_eq!(origin.remaining, Some(1.0)); // Two accounts, each min(.75, .5).
-    assert!(origin.forecast_1h.is_none() && origin.forecast_3h.is_none());
-    assert!(origin.cohort.iter().all(|input| {
-        input.existing_forecast.windows.is_empty()
-            && input
-                .windows
-                .iter()
-                .all(|w| matches!(w.name.as_str(), "primary" | "secondary"))
-    }));
-    assert_eq!(
-        log.worker.lock().unwrap().checkpoint.last_sample,
-        Some(now.timestamp())
-    );
-    assert!(log.worker.lock().unwrap().checkpoint.last_failure.is_none());
-    store.stop_writes();
-    bindings.freeze().unwrap();
-    tokio::task::spawn_blocking(move || {
-        log.close().unwrap();
-        obs.flush().unwrap();
-    })
-    .await
-    .unwrap();
-    store.release_lease();
+        store.release_lease();
+    }
 }
 
 #[test]
@@ -1406,9 +1514,13 @@ fn n7_stopped_history_or_coded_failure_is_not_automatically_reset() {
             serde_json::from_slice(&fs::read(root.join("checkpoint.json")).unwrap()).unwrap();
         checkpoint.status.stopped = true;
         checkpoint.status.losses = 1;
-        checkpoint.last_failure = (!with_history).then_some(FailureDiagnostic {
+        checkpoint.last_failure = Some(FailureDiagnostic {
             phase: FailurePhase::Sample,
-            reason: FailureReason::WindowName,
+            reason: if with_history {
+                FailureReason::WindowName
+            } else {
+                FailureReason::Forecast
+            },
         });
         crate::platform::atomic_write_observation(
             &root.join("checkpoint.json"),
@@ -1446,4 +1558,216 @@ fn n7_stopped_history_or_coded_failure_is_not_automatically_reset() {
         );
         reopened.close().unwrap();
     }
+}
+
+#[test]
+fn n7_ignored_slots_never_contribute_capacity_or_validate_ignored_payloads() {
+    let mut view = account(1, START, Some(20.), Some(40.));
+    for name in ["0m", "primary", "secondary", "0m"] {
+        let mut ignored = view.windows[0].clone();
+        ignored.name = name.into();
+        ignored.used_pct = Some(f64::NAN);
+        ignored.observed_at = Some("invalid-ignored-observation".into());
+        ignored.reset_at = Some("invalid-ignored-reset".into());
+        view.windows.push(ignored);
+    }
+    let measured = input(&view, START).unwrap();
+    assert_eq!(measured.windows.len(), 2);
+    assert_eq!(measured.remaining, Some(0.6));
+    view.windows.drain(..2);
+    let missing = input(&view, START).unwrap();
+    assert!(missing.windows.is_empty());
+    assert_eq!(missing.remaining, None);
+    assert_eq!(missing.unavailable, Some(Unavailable::MissingWindow));
+}
+
+#[test]
+fn n7_preflight_bound_retries_but_late_reconciliation_bound_stops() {
+    let home = private_fixture();
+    let log = ForecastLog::open(home.path()).unwrap();
+    let oversized = vec![account(1, START, Some(20.), Some(40.)); ACCOUNTS + 1];
+    let error = log.sample(at(START), &oversized).unwrap_err();
+    assert_eq!(
+        diagnostic(&error, FailurePhase::Sample).reason,
+        FailureReason::Bounds
+    );
+    assert!(!log.status().unwrap().stopped);
+    assert!(log.users.lock().unwrap().accounts.is_empty());
+    assert!(records(&log).is_empty());
+    // Same reason code, but reconciliation has begun: this is never retried.
+    log.users
+        .lock()
+        .unwrap()
+        .revisions
+        .insert("codex".into(), u64::MAX);
+    let error = log.sample(at(START + 60), &pair(START + 60)).unwrap_err();
+    assert_eq!(
+        diagnostic(&error, FailurePhase::Sample).reason,
+        FailureReason::Bounds
+    );
+    assert!(log.status().unwrap().stopped);
+    assert_eq!(log.status().unwrap().unavailable, 1);
+    assert!(records(&log).is_empty());
+    log.close().unwrap();
+}
+
+#[test]
+fn n7_coded_empty_window_name_recovery_preserves_prior_archive_lineage() {
+    for clean in [false, true] {
+        for prior in [false, true] {
+            let home = private_fixture();
+            let root = home.path().join("state/forecast-log");
+            let log = ForecastLog::open(home.path()).unwrap();
+            log.close().unwrap();
+            drop(log);
+            let path = root.join("checkpoint.json");
+            let mut checkpoint: Checkpoint =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let first_archive = if prior {
+                checkpoint.status.stopped = true;
+                checkpoint.status.losses = 1;
+                crate::platform::atomic_write_observation(
+                    &path,
+                    &serde_json::to_vec(&checkpoint).unwrap(),
+                )
+                .unwrap();
+                let first = ForecastLog::open(home.path()).unwrap();
+                first.close().unwrap();
+                drop(first);
+                checkpoint = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                Some(
+                    home.path()
+                        .join("state")
+                        .join(&checkpoint.recovery.as_ref().unwrap().archive),
+                )
+            } else {
+                None
+            };
+            let first_bytes = first_archive
+                .as_ref()
+                .map(|p| fs::read(p.join("checkpoint.json")).unwrap());
+            if prior {
+                // An uncoded failure with existing lineage remains stopped.
+                let mut uncoded = checkpoint.clone();
+                uncoded.status.stopped = true;
+                uncoded.status.losses = 1;
+                crate::platform::atomic_write_observation(
+                    &path,
+                    &serde_json::to_vec(&uncoded).unwrap(),
+                )
+                .unwrap();
+                let parked = ForecastLog::open(home.path()).unwrap();
+                assert!(parked.status().unwrap().stopped);
+                assert_eq!(
+                    parked
+                        .worker
+                        .lock()
+                        .unwrap()
+                        .checkpoint
+                        .recovery
+                        .as_ref()
+                        .unwrap()
+                        .archive,
+                    checkpoint.recovery.as_ref().unwrap().archive
+                );
+                parked.close().unwrap();
+                drop(parked);
+            }
+            checkpoint.clean = clean;
+            checkpoint.status.stopped = true;
+            checkpoint.status.losses = 1;
+            checkpoint.last_failure = Some(FailureDiagnostic {
+                phase: FailurePhase::Sample,
+                reason: FailureReason::WindowName,
+            });
+            let original = serde_json::to_vec(&checkpoint).unwrap();
+            crate::platform::atomic_write_observation(&path, &original).unwrap();
+            let resumed = ForecastLog::open(home.path()).unwrap();
+            let receipt = resumed
+                .worker
+                .lock()
+                .unwrap()
+                .checkpoint
+                .recovery
+                .clone()
+                .unwrap();
+            let archive = home.path().join("state").join(&receipt.archive);
+            assert_eq!(fs::read(archive.join("checkpoint.json")).unwrap(), original);
+            if let Some(first_archive) = first_archive {
+                assert_ne!(archive, first_archive);
+                assert_eq!(
+                    fs::read(first_archive.join("checkpoint.json")).unwrap(),
+                    first_bytes.unwrap()
+                );
+            }
+            assert!(!resumed.status().unwrap().stopped);
+            assert_eq!(receipt.prior_losses, 1);
+            resumed.sample(at(START), &pair(START)).unwrap();
+            assert_eq!(records(&resumed).len(), 2);
+            resumed.close().unwrap();
+        }
+    }
+}
+
+#[test]
+fn n7_not_used_claude_accounts_never_enter_the_paid_cohort_even_with_stale_eligibility() {
+    let home = private_fixture();
+    let log = ForecastLog::open(home.path()).unwrap();
+    let mut views = Vec::new();
+    for (id, used) in [
+        (1, 20.),
+        (2, 40.),
+        (3, 99.),
+        (4, 99.),
+        (5, 99.),
+        (6, 99.),
+        (7, 99.),
+        (8, 99.),
+    ] {
+        let mut view = account(id, START, Some(used), Some(used));
+        view.provider = AdminProvider::Claude;
+        view.id = format!("cl-{id:06x}");
+        view.plan = Some(if id == 3 || id == 4 { "free" } else { "pro" }.into());
+        if id == 3 {
+            view.id = "cl-269a6a".into();
+        }
+        if id == 4 {
+            view.id = "cl-b8da25".into();
+        }
+        if id == 5 {
+            view.user_state = AdminUserState::Paused;
+        }
+        if id == 6 {
+            view.user_state = AdminUserState::Disabled;
+        }
+        if id == 7 {
+            view.health = AdminHealth::NeedsRelogin {
+                reason: "auth".into(),
+                since: stamp(START),
+            };
+        }
+        if id == 8 {
+            view.health = AdminHealth::PlanWithoutClaudeCode {};
+        }
+        view.pool_eligible = true; // Deliberately stale producer bit for every exclusion.
+        views.push(view);
+    }
+    log.sample(at(START), &views).unwrap();
+    let origin = records(&log)
+        .into_iter()
+        .find_map(|record| match record.event {
+            Event::Origin { origin } if origin.provider == "claude" => Some(origin),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        origin
+            .cohort
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cl-000001", "cl-000002"]
+    );
+    assert!(origin.remaining.is_some_and(|r| (r - 1.4).abs() < 1e-12));
+    log.close().unwrap();
 }

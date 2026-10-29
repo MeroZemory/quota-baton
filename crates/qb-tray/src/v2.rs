@@ -13,19 +13,17 @@ pub const EXCLUDED_GROUP_KEY: &str = "__excluded";
 
 /// Explicit native facts only. Missing plan/usage and temporary cooling are not exclusions.
 pub fn exclusion_reason(account: &Account) -> Option<&'static str> {
-    let reason = if account.user_state == "disabled" {
-        "사용 안 함"
-    } else if account.user_state == "paused" {
-        "일시 중지"
-    } else if (account.provider == "claude" && account.plan.as_deref() == Some("free"))
-        || account.health.kind == "plan_without_claude_code"
-    {
-        "Free 요금제 · Claude Code 사용 불가"
-    } else if account.health.kind == "needs_relogin" {
-        "다시 로그인 필요"
-    } else {
-        // Unknown entitlement has no native variant; removed accounts leave the snapshot.
-        return None;
+    use qb_proto::admin_account::{PlacementExclusion, placement_exclusion};
+    let reason = match placement_exclusion(
+        &account.provider,
+        &account.user_state,
+        account.plan.as_deref(),
+        &account.health.kind,
+    )? {
+        PlacementExclusion::Disabled => "사용 안 함",
+        PlacementExclusion::Paused => "일시 중지",
+        PlacementExclusion::ClaudeFree => "Free 요금제 · Claude Code 사용 불가",
+        PlacementExclusion::NeedsRelogin => "다시 로그인 필요",
     };
     Some(crate::i18n::static_text(reason))
 }

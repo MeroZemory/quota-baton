@@ -984,6 +984,10 @@ struct UsageWindowHistory {
 #[path = "account_runtime/r18_usage_tests.rs"]
 mod r18_usage_tests;
 
+#[cfg(test)]
+#[path = "account_runtime/orphan_reconciliation_tests.rs"]
+mod orphan_reconciliation_tests;
+
 pub struct AccountRuntime {
     pub store: Arc<AccountStore>,
     outside_owner: Arc<outside_owner::OutsideOwner>,
@@ -1171,7 +1175,15 @@ impl AccountRuntime {
                 Ok(_) => {
                     wait_owner.attach_unlocked(&store);
                     match store.list_unlocked() {
-                        Ok(existing) => obs.dashboard().baseline_accounts(&existing),
+                        Ok(existing) => {
+                            if obs.reconcile_accounts(&existing).is_err() {
+                                tracing::warn!(
+                                    code = "observation_reconcile_failed",
+                                    "Account observation cache persistence failed; next load will retry"
+                                );
+                            }
+                            obs.dashboard().baseline_accounts(&existing);
+                        }
                         Err(_) => tracing::warn!("Account observer baseline unavailable"),
                     }
                 }

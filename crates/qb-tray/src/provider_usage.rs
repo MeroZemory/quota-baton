@@ -149,8 +149,9 @@ const MAX_WINDOWS_PER_ACCOUNT: usize = 32;
 
 /// Adapts actual dashboard DTOs, never translated labels or plan weights.
 /// Both panels survive invalid/over-capacity input with explicit unknown values.
-/// Paused/disabled counts remain separate; drained and unrecognized states are
-/// counted as excluded_other. Historical membership is NOT reconstructed.
+/// Paused/disabled counts remain separate; other R19 exclusions, drained accounts
+/// and unrecognized user states count as excluded_other. Historical membership
+/// is NOT reconstructed.
 pub fn project_snapshot(
     snapshot: &crate::dashboard_model::DashboardSnapshot,
     clock: &crate::dashboard_model::Clock,
@@ -187,6 +188,24 @@ fn provider(value: &str) -> Option<Provider> {
     }
 }
 
+fn account_state(account: &crate::v2::Account) -> AccountState {
+    use qb_proto::admin_account::{PlacementExclusion, placement_exclusion};
+    match placement_exclusion(
+        &account.provider,
+        &account.user_state,
+        account.plan.as_deref(),
+        &account.health.kind,
+    ) {
+        Some(PlacementExclusion::Paused) => AccountState::Paused,
+        Some(PlacementExclusion::Disabled) => AccountState::Disabled,
+        Some(PlacementExclusion::ClaudeFree | PlacementExclusion::NeedsRelogin) => {
+            AccountState::Excluded
+        }
+        None if account.user_state == "active" && !account.drain => AccountState::Active,
+        None => AccountState::Excluded,
+    }
+}
+
 fn unknown_projection(
     selected: Provider,
     snapshot: &crate::dashboard_model::DashboardSnapshot,
@@ -205,11 +224,11 @@ fn unknown_projection(
     let mut excluded_disabled = 0;
     let mut excluded_other = 0;
     for row in rows {
-        match row.user_state.as_str() {
-            "active" if !row.drain => cohort += 1,
-            "paused" => excluded_paused += 1,
-            "disabled" => excluded_disabled += 1,
-            _ => excluded_other += 1,
+        match account_state(row) {
+            AccountState::Active => cohort += 1,
+            AccountState::Paused => excluded_paused += 1,
+            AccountState::Disabled => excluded_disabled += 1,
+            AccountState::Excluded => excluded_other += 1,
         }
     }
     let unknown = Coverage {
@@ -341,12 +360,7 @@ fn snapshot_inputs(
         let Some(provider) = provider(&account.provider) else {
             continue;
         };
-        let state = match account.user_state.as_str() {
-            "paused" => AccountState::Paused,
-            "disabled" => AccountState::Disabled,
-            "active" if !account.drain => AccountState::Active,
-            _ => AccountState::Excluded,
-        };
+        let state = account_state(account);
         let mut candidates = account
             .windows
             .iter()
@@ -1400,6 +1414,70 @@ mod snapshot_tests {
         assert!(p.verdict.is_some());
         data.accounts.raw.accounts.reverse();
         assert_eq!(project_snapshot(&data, &clock()), result);
+    }
+
+    #[test]
+    fn n7_four_claude_accounts_exclude_two_free_without_poisoning_remaining() {
+        let mut free_short = row("free-short", "claude", "free", 0., 5);
+        free_short["windows"][0]["name"] = json!("5h");
+        assert!(free_short["windows"][0].get("status").is_none());
+        let mut free_hold = row("free-hold", "claude", "free", 0., 84);
+        free_hold["health"] = json!({"kind":"plan_without_claude_code"});
+        free_hold["windows"] = json!([]);
+        let data = snapshot(vec![
+            row("paid-one", "claude", "max_20x", 20., 84),
+            row("paid-two", "claude", "pro", 40., 126),
+            free_short,
+            free_hold,
+        ]);
+        assert_eq!(data.accounts.raw.accounts.len(), 4);
+        let p = project_snapshot(&data, &clock()).remove(0);
+        assert_eq!((p.cohort, p.weekly, p.excluded_other), (2, 2, 2));
+        assert_eq!((p.excluded_paused, p.excluded_disabled), (0, 0));
+        assert_eq!(
+            (p.current.remaining.known, p.current.remaining.total),
+            (2, 2)
+        );
+        close(p.current.remaining.value.unwrap(), 1.4);
+        assert!(
+            p.knots
+                .iter()
+                .filter(|k| k.at <= p.now)
+                .all(|k| k.right.remaining.total == 2)
+        );
+        let fallback = unknown_projection(Provider::Claude, &data, clock().utc(), clock().utc());
+        assert_eq!((fallback.cohort, fallback.excluded_other), (2, 2));
+        assert_eq!(
+            (
+                fallback.current.remaining.known,
+                fallback.current.remaining.total
+            ),
+            (0, 2)
+        );
+    }
+
+    #[test]
+    fn n7_drain_and_relogin_are_other_while_cooling_and_missing_plan_keep_membership() {
+        let mut cooling = row("cooling", "claude", "max_20x", 20., 84);
+        cooling["health"] = json!({"kind":"cooling","reason":"quota","scope":"account",
+            "until":clock().utc()+Duration::hours(1)});
+        cooling["pool_eligible"] = json!(false);
+        let mut drain = row("drain", "claude", "pro", 40., 84);
+        drain["drain"] = json!(true);
+        let mut unknown_plan = row("unknown-plan", "claude", "pro", 50., 84);
+        unknown_plan["plan"] = Value::Null;
+        let mut relogin = row("relogin", "claude", "pro", 0., 84);
+        relogin["health"] = json!({"kind":"needs_relogin"});
+        let data = snapshot(vec![cooling, drain, unknown_plan, relogin]);
+        let p = project_snapshot(&data, &clock()).remove(0);
+        assert_eq!((p.cohort, p.excluded_other), (2, 2));
+        assert_eq!(
+            (p.current.remaining.known, p.current.remaining.total),
+            (2, 2)
+        );
+        close(p.current.remaining.value.unwrap(), 1.3);
+        let fallback = unknown_projection(Provider::Claude, &data, clock().utc(), clock().utc());
+        assert_eq!((fallback.cohort, fallback.excluded_other), (2, 2));
     }
 
     #[test]

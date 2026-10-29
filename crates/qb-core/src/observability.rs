@@ -242,6 +242,7 @@ struct Credits {
 
 enum Command {
     PollQuota(String, Box<Snapshot>),
+    ReconcileAccounts(BTreeSet<String>, mpsc::Sender<Result<(), String>>),
     Ledger(serde_json::Value),
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     Capture(serde_json::Value),
@@ -262,6 +263,7 @@ pub struct Observability {
     recent_burst: std::sync::Mutex<Option<(std::time::Instant, DateTime<Utc>, u32)>>,
     events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<serde_json::Value>>>,
     snapshots: std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
+    reconciliation_pending: std::sync::atomic::AtomicBool,
     shadow: std::sync::Mutex<crate::routing::forecast::Shadow>,
     tx: mpsc::SyncSender<Command>,
     worker: Option<thread::JoinHandle<()>>,
@@ -821,6 +823,7 @@ impl Observability {
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(snapshots),
+            reconciliation_pending: std::sync::atomic::AtomicBool::new(false),
             tx,
             worker: Some(worker),
             dropped,
@@ -1380,6 +1383,44 @@ impl Observability {
         }
     }
 
+    /// The caller supplies a successful authoritative Store list under its
+    /// transaction. Direct Observability users need not have an account store.
+    pub(crate) fn reconcile_accounts(
+        &self,
+        existing: &[crate::accounts::Account],
+    ) -> anyhow::Result<()> {
+        let known: BTreeSet<_> = existing.iter().map(|account| account.id.clone()).collect();
+        let quota_pruned = {
+            let mut snapshots = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+            let before = snapshots.len();
+            snapshots.retain(|id, _| known.contains(id));
+            snapshots.len() != before
+        };
+        self.shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_accounts(&known);
+        let usage_pruned = self.dashboard.retain_accounts(&known);
+        if !quota_pruned && !usage_pruned && !self.reconciliation_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Retention can remove all evidence of a previous failed disk write
+        // from memory. Keep that obligation until the writer acknowledges it.
+        self.reconciliation_pending.store(true, Ordering::Release);
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::ReconcileAccounts(known, tx))
+            .map_err(|_| anyhow::anyhow!("observability worker unavailable"))?;
+        let result = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("observability worker unavailable"))?
+            .map_err(anyhow::Error::msg);
+        if result.is_ok() {
+            self.reconciliation_pending.store(false, Ordering::Release);
+        }
+        result
+    }
+
     pub fn flush(&self) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -1659,7 +1700,10 @@ impl Writer {
                 Some(path) => self.append(path, &value["shape"]),
                 None => Ok(()),
             },
-            Command::Flush(_) | Command::FreezeQuota(_) | Command::Stop => unreachable!(),
+            Command::ReconcileAccounts(_, _)
+            | Command::Flush(_)
+            | Command::FreezeQuota(_)
+            | Command::Stop => unreachable!(),
         };
         if result.is_err() {
             tracing::warn!("Observability write failed; later events will retry");
@@ -1775,6 +1819,17 @@ fn run(
     };
     loop {
         match rx.recv_timeout(SYNC_INTERVAL.saturating_sub(writer.last_sync.elapsed())) {
+            Ok(Command::ReconcileAccounts(known, reply)) => {
+                let result = if writer.quota_frozen {
+                    Err("observability quota is frozen".into())
+                } else {
+                    let before = writer.state.accounts.len();
+                    writer.state.accounts.retain(|id, _| known.contains(id));
+                    writer.quota_dirty |= before != writer.state.accounts.len();
+                    writer.flush()
+                };
+                let _ = reply.send(result);
+            }
             Ok(Command::Flush(reply)) => {
                 let _ = reply.send(writer.flush());
             }
@@ -2539,6 +2594,7 @@ mod tests {
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
+            reconciliation_pending: std::sync::atomic::AtomicBool::new(false),
             tx,
             worker: None,
             dropped: Arc::new(AtomicU64::new(0)),
@@ -2587,6 +2643,7 @@ mod tests {
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
+            reconciliation_pending: std::sync::atomic::AtomicBool::new(false),
             tx,
             worker: None,
             dropped: Arc::new(AtomicU64::new(0)),
@@ -2728,6 +2785,7 @@ mod tests {
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
+            reconciliation_pending: std::sync::atomic::AtomicBool::new(false),
             tx,
             worker: Some(worker),
             dropped: Arc::new(AtomicU64::new(0)),
