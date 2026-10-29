@@ -42,6 +42,20 @@ Startup or sample failures use `forecast_log_start_failed` or
 `forecast_log_sample_failed`. Preserve the existing directory on failure;
 deleting it discards pending observations and continuity evidence.
 
+Warnings include finite `phase` and `reason` values, without raw errors or account
+names. The checkpoint's `last_failure` retains the first sample failure even if
+later observations are refused because collection has stopped. The message
+`Forecast log first sample recorded` confirms the first committed sample.
+
+An upgrade can preserve an old, uncoded stopped capture that has no origins,
+outcomes, sequence, sample, pending work or journal. While holding the Store
+lease after the old writer closed, it renames that checkpoint-only directory
+to a sibling `forecast-log.failed-*` archive and creates a fresh capture. The
+new checkpoint's `recovery` records the archive name and prior losses. Both
+clean and unclean old checkpoints qualify; no earlier observations are filled
+in. Captures containing history or a recorded failure reason are not reset
+automatically. Keep the sibling archive when exporting recovery evidence.
+
 Persistence is bounded to a 16 MiB checkpoint and 64 MiB total journal. During
 active sampling, whole daily segments are pruned once their end is at least
 seven days old; stopping collection does not automatically delete old files.
