@@ -751,3 +751,362 @@ fn reader_rejects_bad_ordinal_even_with_matching_compressed_hash() {
     fs::write(path.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
     assert!(read_epoch(&path).is_err());
 }
+
+#[test]
+fn schema6_producer_failure_reasons_count_once_even_after_disable() {
+    use ProducerFailureReason::*;
+    let (_directory, producer, writer) = fixture();
+    let path = writer.root.clone();
+    producer.disable();
+    let reasons = [
+        Unspecified,
+        RuntimeIdExhausted,
+        MetadataCursorExhausted,
+        DecisionCursorExhausted,
+        PermitCursorExhausted,
+        CommitCursorExhausted,
+        CommitWithoutProposal,
+        StartupActiveState,
+        StartupImageSerialization,
+        StartupAccountsSerialization,
+        StartupPublication,
+    ];
+    for reason in reasons {
+        producer.failed(reason);
+    }
+    writer.close(at(1)).unwrap();
+    let m = manifest(&path);
+    assert_eq!(m.schema, 6);
+    assert_eq!(m.losses.producer_failure, reasons.len() as u64);
+    assert_eq!(m.producer_failure_reasons.len(), reasons.len());
+    for reason in reasons {
+        assert_eq!(m.producer_failure_reasons[&reason], 1);
+    }
+    let epoch = read_epoch(&path).unwrap();
+    assert_eq!(epoch.losses, reasons.len() as u64);
+    assert!(!epoch.complete);
+    assert!(!epoch.permit_complete);
+}
+
+#[test]
+fn schema6_native_refusals_count_the_record_reason_or_missing_permit() {
+    use crate::bindings::kernel::PermitDecision;
+    let (_directory, producer, writer) = fixture();
+    let path = writer.root.clone();
+    witness(&producer);
+    let mut inputs = permit_inputs();
+    inputs.model = Some("private-model-canary".into());
+    assert!(
+        producer
+            .permit(at(2), 1, &inputs, &PermitDecision::NotRequired)
+            .is_some()
+    );
+    inputs.model = None;
+    inputs.from = Some("native-source".into());
+    inputs.permit = None;
+    assert!(
+        producer
+            .permit(at(3), 2, &inputs, &PermitDecision::NotRequired)
+            .is_some()
+    );
+    writer.close(at(4)).unwrap();
+    let m = manifest(&path);
+    assert_eq!(m.permit_not_comparable, 2);
+    assert_eq!(
+        m.permit_not_comparable_reasons,
+        BTreeMap::from([(WireRefusal::Model, 1), (WireRefusal::MissingPermit, 1),])
+    );
+    let epoch = read_epoch(&path).unwrap();
+    assert_eq!(epoch.permits[0].refusal, Some(WireRefusal::Model));
+    assert!(epoch.permits[0].inputs.is_none());
+    assert!(epoch.permits[1].refusal.is_none());
+    assert!(epoch.permits[1].inputs.as_ref().unwrap().permit.is_none());
+    assert!(
+        epoch
+            .permits
+            .iter()
+            .all(|p| p.actual == PermitDecision::NotRequired)
+    );
+}
+
+#[test]
+fn schema6_rejects_diagnostic_tampering_omissions_unknown_keys_and_overflow() {
+    let (_directory, producer, writer) = fixture();
+    let path = writer.root.clone();
+    witness(&producer);
+    let mut inputs = permit_inputs();
+    inputs.model = Some("private-model-canary".into());
+    assert!(
+        producer
+            .permit(
+                at(2),
+                1,
+                &inputs,
+                &crate::bindings::kernel::PermitDecision::NotRequired
+            )
+            .is_some()
+    );
+    producer.failed(ProducerFailureReason::StartupPublication);
+    writer.close(at(3)).unwrap();
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+    assert!(read_epoch(&path).is_ok());
+    for case in 0..9 {
+        let mut tampered = original.clone();
+        match case {
+            0 => {
+                tampered["permit_not_comparable_reasons"] = serde_json::json!({"model": 2});
+            }
+            // Same total, wrong record reason must also fail.
+            1 => {
+                tampered["permit_not_comparable_reasons"] = serde_json::json!({"plan": 1});
+            }
+            2 => {
+                tampered["producer_failure_reasons"] =
+                    serde_json::json!({"startup_publication": 2});
+            }
+            3 => {
+                tampered["producer_failure_reasons"] =
+                    serde_json::json!({"private-error-canary": 1});
+            }
+            4 => {
+                tampered["permit_not_comparable_reasons"] =
+                    serde_json::json!({"private-quota-canary": 1});
+            }
+            5 => {
+                tampered
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("permit_not_comparable_reasons");
+            }
+            6 => {
+                tampered
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("producer_failure_reasons");
+            }
+            7 => {
+                tampered["producer_failure_reasons"] =
+                    serde_json::json!({"unspecified": u64::MAX, "runtime_id_exhausted": 2});
+            }
+            8 => {
+                tampered["permit_not_comparable_reasons"] =
+                    serde_json::json!({"model": u64::MAX, "plan": 2});
+            }
+            _ => unreachable!(),
+        }
+        fs::write(
+            path.join("manifest.json"),
+            serde_json::to_vec(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(read_epoch(&path).is_err(), "accepted tamper case {case}");
+    }
+    fs::write(
+        path.join("manifest.json"),
+        serde_json::to_vec(&original).unwrap(),
+    )
+    .unwrap();
+    assert!(read_epoch(&path).is_ok());
+}
+
+#[test]
+fn schema6_writer_refuses_legacy5_root_without_rewriting_it() {
+    let (_directory, producer, writer) = fixture();
+    let path = writer.root.clone();
+    witness(&producer);
+    let mut inputs = permit_inputs();
+    assert!(
+        producer
+            .permit(
+                at(2),
+                1,
+                &inputs,
+                &crate::bindings::kernel::PermitDecision::NotRequired
+            )
+            .is_some()
+    );
+    inputs.model = Some("private-model-canary".into());
+    assert!(
+        producer
+            .permit(
+                at(3),
+                2,
+                &inputs,
+                &crate::bindings::kernel::PermitDecision::NotRequired
+            )
+            .is_some()
+    );
+    writer.close(at(4)).unwrap();
+    for name in ["epoch.json", "header.json", "manifest.json"] {
+        let p = path.join(name);
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        value["schema"] = 5.into();
+        if name == "manifest.json" {
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("permit_not_comparable_reasons");
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("producer_failure_reasons");
+        }
+        fs::write(p, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let before: BTreeMap<_, _> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name(),
+                if e.file_type().unwrap().is_file() {
+                    fs::read(e.path()).unwrap()
+                } else {
+                    Vec::new()
+                },
+            )
+        })
+        .collect();
+    let loaded = crate::observability::decision_reader::load(&path).unwrap();
+    assert_eq!(loaded.permits.len(), 2);
+    assert_eq!(loaded.permits[1].refusal, Some(WireRefusal::Model));
+    let epoch_before = loaded.tape_sha256;
+    assert!(open(path.parent().unwrap(), Limits::default(), at(5)).is_err());
+    assert_eq!(read_epoch(&path).unwrap().tape_sha256, epoch_before);
+    for (name, bytes) in before {
+        let p = path.parent().unwrap().join(name);
+        if p.is_file() {
+            assert_eq!(fs::read(p).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn unchanged_legacy5_bytes_keep_the_frozen_hash_without_new_diagnostics() {
+    // Frozen old controls, deliberately not serialized through the schema 6 DTO.
+    let directory = directory();
+    let path = directory.path().join("legacy5");
+    fs::create_dir(&path).unwrap();
+    let epoch = br#"{"schema":5,"start_utc_ns":1000000}"#;
+    let header = br#"{"schema":5,"start":{"utc_ns":1000000,"monotonic_ns":0},"capture":"frozen-legacy5","identity_domain_version":1,"build":{},"provenance":"Synthetic"}"#;
+    let manifest = br#"{"schema":5,"sealed":true,"capture":"frozen-legacy5","attempted":0,"accepted":0,"persisted":0,"deduplicated":0,"permit_records":0,"permit_not_comparable":0,"encoded_bytes":0,"compressed_bytes":0,"hourly_encoded_byte_limit":20000000,"budget_window_ns":0,"budget_window_used":0,"budget_window_stopped":false,"losses":{"capture_aborted":0,"budget":0,"queue_full":0,"invalid":0,"clock_regressed":0,"owner_gap":0,"producer_failure":0,"disk_cap":0,"write_error":0,"unpersisted":0,"saturated":false},"segments":[]}"#;
+    for (name, bytes) in [
+        ("epoch.json", epoch.as_slice()),
+        ("header.json", header.as_slice()),
+        ("manifest.json", manifest.as_slice()),
+    ] {
+        fs::write(path.join(name), bytes).unwrap();
+    }
+    let loaded = crate::observability::decision_reader::load(&path).unwrap();
+    assert_eq!(
+        loaded.tape_sha256,
+        "063ccf9dd022eba9259fae549b1cd414e74b798ace08ccb19b8781110cb917e3"
+    );
+    assert_eq!(loaded.losses, 0);
+    assert!(loaded.permits.is_empty());
+    assert!(!loaded.complete);
+    assert!(!loaded.permit_complete);
+    assert_eq!(fs::read(path.join("manifest.json")).unwrap(), manifest);
+
+    let v6 = directory.path().join("schema6");
+    fs::create_dir(&v6).unwrap();
+    for (name, bytes) in [
+        ("epoch.json", epoch.as_slice()),
+        ("header.json", header.as_slice()),
+        ("manifest.json", manifest.as_slice()),
+    ] {
+        let text = std::str::from_utf8(bytes).unwrap()
+            .replace("\"schema\":5", "\"schema\":6")
+            .replace("\"segments\":[]", "\"permit_not_comparable_reasons\":{},\"producer_failure_reasons\":{},\"segments\":[]");
+        fs::write(v6.join(name), text).unwrap();
+    }
+    let loaded6 = crate::observability::decision_reader::load(&v6).unwrap();
+    assert_eq!(
+        loaded6.tape_sha256,
+        "d7fec5cebdcc37123c05a115e5d5848bbde4e6f0605860e6cb6b80ff76b8410a"
+    );
+    assert_ne!(loaded6.tape_sha256, loaded.tape_sha256);
+}
+
+#[test]
+fn schema6_native_quota_refusals_have_finite_manifest_counters() {
+    use crate::bindings::kernel::PermitDecision;
+    use WireRefusal::*;
+    use serde_json::json;
+    let (_directory, producer, writer) = fixture();
+    let path = writer.root.clone();
+    witness(&producer);
+    let cases = [
+        (QuotaRoot, json!(false)),
+        (QuotaWindows, json!({"windows": {}})),
+        (QuotaWindow, json!({"windows": [false]})),
+        (
+            QuotaWindowName,
+            json!({"windows": [{"name": "private-window-canary"}]}),
+        ),
+        (
+            QuotaWindowUsed,
+            json!({"windows": [{"used_pct": "private-used-canary"}]}),
+        ),
+        (
+            QuotaWindowStatus,
+            json!({"windows": [{"status": "private-status-canary"}]}),
+        ),
+        (
+            QuotaWindowReset,
+            json!({"windows": [{"reset_at": "private-reset-canary"}]}),
+        ),
+        (
+            QuotaWindowObserved,
+            json!({"windows": [{"observed_at": "private-observed-canary"}]}),
+        ),
+        (QuotaCredits, json!({"credits": false})),
+        (
+            QuotaCreditFlag,
+            json!({"credits": {"has_credits": "private-flag-canary"}}),
+        ),
+        (
+            QuotaCreditFlag,
+            json!({"credits": {"unlimited": "private-flag-canary"}}),
+        ),
+        (
+            QuotaCreditBalance,
+            json!({"credits": {"balance": "private-balance-canary"}}),
+        ),
+        (
+            QuotaPaidServing,
+            json!({"paid_serving_observed_at": "private-paid-canary"}),
+        ),
+    ];
+    let mut expected = BTreeMap::new();
+    let mut inputs = permit_inputs();
+    for (index, (reason, quota)) in cases.into_iter().enumerate() {
+        inputs.accounts.get_mut("native-source").unwrap().quota = Some(quota);
+        let cursor = index as u64 + 1;
+        assert!(
+            producer
+                .permit(
+                    at(cursor + 1),
+                    cursor,
+                    &inputs,
+                    &PermitDecision::NotRequired
+                )
+                .is_some()
+        );
+        *expected.entry(reason).or_insert(0u64) += 1;
+    }
+    writer.close(at(20)).unwrap();
+    let m = manifest(&path);
+    assert_eq!(m.permit_not_comparable, 13);
+    assert_eq!(m.permit_not_comparable_reasons, expected);
+    let epoch = read_epoch(&path).unwrap();
+    assert_eq!(epoch.permits.len(), 13);
+    for record in epoch.permits {
+        assert!(record.inputs.is_none());
+        assert!(record.refusal.is_some());
+        assert_eq!(record.actual, PermitDecision::NotRequired);
+    }
+    let wire = String::from_utf8(fs::read(path.join("manifest.json")).unwrap()).unwrap();
+    assert!(!wire.contains("private-"));
+}

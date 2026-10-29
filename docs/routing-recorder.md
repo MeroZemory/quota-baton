@@ -1,5 +1,9 @@
 # Routing metadata recorder: minimum delivery
 
+The minimum-delivery description below is historical. Current enabled builds use
+the decision-local tape described at the end of this page, with the same opt-in
+configuration.
+
 This optional diagnostic recorder is off by default. It does not change account
 selection, move protection or request retry rules. D29 in [decisions.md](decisions.md)
 owns the purpose and the later real-trace replay requirement.
@@ -47,3 +51,23 @@ this minimum delivery. Policy, binding, quota, accounting, request and capacity
 owner coverage is incomplete. A sanitized 24-hour export and a production-router
 differential gate are separate work; neither an empty archive nor these synthetic
 storage tests satisfy them.
+
+## Decision-local permit tape
+
+Current builds write `state/decision-tape-v6/`. The native offline reader also
+accepts sealed schema-5 exports; older roots are neither rewritten nor removed.
+Each epoch retains the 20,000,000 encoded-byte hourly stop-go budget and explicit
+loss counters. Export the whole sealed epoch with its header, manifest and all
+segments; a live or partial directory is insufficient.
+
+Permit inputs retain native quota status strings, including literal `true` and
+`false`, without interpreting them as allowed or rejected. The startup witness
+commits restored request-cost uncertainty without clearing it or claiming a
+complete owner image. The manifest counts `permit_not_comparable_reasons` and
+`producer_failure_reasons` using closed diagnostic enums. Their checked totals
+must equal the aggregate counters. No raw error or rejected payload is retained.
+
+These inputs cover permit proposals, not selection or completed moves. More than
+1% not-comparable records makes a replay insufficient. A tape containing only
+same-account associations cannot establish the power of a changed move guard;
+zero observed differences on such a tape is not power acceptance.

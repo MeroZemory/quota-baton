@@ -511,6 +511,34 @@ pub(super) fn launch_outcome(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupWitnessFailure {
+    ActiveState,
+    ImageSerialization,
+    AccountsSerialization,
+    Publication,
+}
+
+impl StartupWitnessFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ActiveState => "active_state",
+            Self::ImageSerialization => "image_serialization",
+            Self::AccountsSerialization => "accounts_serialization",
+            Self::Publication => "publication",
+        }
+    }
+}
+
+impl std::fmt::Display for StartupWitnessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for StartupWitnessFailure {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InitialImage {
@@ -523,6 +551,7 @@ pub struct InitialImage {
     pub activity_empty: bool,
     pub thresholds_sha256: String,
     pub outside_sha256: String,
+    pub unknown_cost_sha256: String,
     pub replay_complete: bool,
 }
 impl BindingTable {
@@ -542,20 +571,19 @@ impl BindingTable {
             || !d.epochs.is_empty()
             || !d.after_move.is_empty()
             || !d.last_request_bytes.is_empty()
-            || !d.unknown_cost.is_empty()
             || !d.mark_history.is_empty()
             || !d.pacing.is_empty()
             || !d.overload_reported.is_empty()
             || !d.launch_activity.is_empty()
             || !d.deferred_fences.is_empty()
         {
-            bail!("decision tape initial witness requires startup before activity");
+            return Err(StartupWitnessFailure::ActiveState.into());
         }
         let digest = |value: &Value| -> Result<String> {
             Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
         };
         Ok(InitialImage {
-            schema: 1,
+            schema: 2,
             bindings_sha256: digest(&serde_json::to_value(snapshot(&d))?)?,
             policies_sha256: digest(&self.policies.list())?,
             routing_sha256: digest(&serde_json::to_value(&self.config)?)?,
@@ -567,6 +595,9 @@ impl BindingTable {
                 "unknown": d.outside_unknown,
                 "failure": d.outside_failure.as_ref().map(|flag| flag.load(Ordering::Acquire)),
             }))?,
+            // Recovery deliberately lacks request-cost evidence. This is a
+            // restored baseline, not live activity; commit it without clearing it.
+            unknown_cost_sha256: digest(&serde_json::to_value(&d.unknown_cost)?)?,
             revision: d.revision,
             bindings_rows: u32::try_from(d.bindings.len()).context("initial binding row count")?,
             activity_empty: true,
