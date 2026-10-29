@@ -569,12 +569,14 @@ impl Runtime {
         });
     }
     /// Called under the account store transaction before enabling its observer.
-    pub(crate) fn retain_accounts(&self, known: &BTreeSet<String>) {
+    pub(crate) fn retain_accounts(&self, known: &BTreeSet<String>) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let usage_revision = state.usage.revision();
         state.usage.retain_accounts(known);
         state.usage_forecasts.retain_accounts(known);
         state.accounts.retain(|id, _| known.contains(id.as_str()));
         state.credits.retain(|id, _| known.contains(id.as_str()));
+        state.usage.revision() != usage_revision
     }
 
     /// Called under the account store transaction before enabling its observer.

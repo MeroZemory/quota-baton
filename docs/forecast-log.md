@@ -25,6 +25,12 @@ exclude affected pending origins. Missing or stale observations remain
 unavailable rather than zero. Unclean restarts mark pending observations as
 restart gaps.
 
+The logger and provider chart share the Not Used classification: paused,
+disabled, Claude Free/no Claude Code access and re-login accounts are excluded.
+On native startup, a successful account-store list also removes quota, usage
+and forecast cache entries for missing accounts; a failed list never becomes
+an empty account set.
+
 Codex `0m` and durationless `primary`/`secondary` slots are not capacity
 windows and are excluded from remaining-capacity arithmetic. Positive native
 durations, including `43200m` (30 days), retain their exact window identity.
