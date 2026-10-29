@@ -436,6 +436,217 @@ fn startup_image_fingerprints_attached_outside_state_instead_of_rejecting_it() {
     assert!(!encoded.contains("sample-outside-account"));
 }
 
+#[tokio::test]
+async fn populated_native_reopen_records_startup_witness_before_first_permit() {
+    use crate::{
+        accounts::{AccountStore, Tokens},
+        config::{Config, LinuxSecretBackend},
+        debug_pin::DebugPins,
+        observability::{
+            Observability,
+            replay_recorder::{Event, Owner, tape},
+        },
+        relay::RelayState,
+    };
+
+    let root = fixture_dir();
+    let home = root.path().join("native-home");
+    crate::platform::prepare_observation_directory(&home).unwrap();
+    crate::platform::prepare_observation_directory(&home.join("state")).unwrap();
+    let mut config = Config::default();
+    config.secrets.linux_backend = LinuxSecretBackend::File0600;
+    config.routing_replay.enabled = true;
+    crate::platform::atomic_write_account(
+        &home,
+        &home.join("config.toml"),
+        toml::to_string(&config).unwrap().as_bytes(),
+    )
+    .unwrap();
+    let config = Config::load(&home).unwrap();
+    crate::platform::test_assert_snapshot_owner_only(&home.join("config.toml"));
+
+    // Persist through the native account and binding owners, then retire them.
+    // No restored capability or process-local activity is manufactured.
+    let store = AccountStore::acquire(&home).unwrap();
+    let mut c = candidate("n6r-restored-startup", 10.0, 168, 5);
+    c.account.id = c.account.identity.id();
+    c.account.token_meta.expires_at = Some(Utc::now() + chrono::Duration::days(365));
+    c.account = store
+        .save(
+            &c.account,
+            &Tokens {
+                access_token: "synthetic-n6r-access".into(),
+                refresh_token: "synthetic-n6r-refresh".into(),
+                id_token: None,
+            },
+            None,
+        )
+        .unwrap();
+    let key = "claude:n6r-restored-startup";
+    let seeded = BindingTable::new(&home, config.routing.clone()).unwrap();
+    let Decision::Selected { lease, .. } = seeded.choose(
+        Provider::Claude,
+        Some(key),
+        None,
+        None,
+        std::slice::from_ref(&c),
+        None,
+        100,
+    ) else {
+        panic!("native persisted binding was not selected")
+    };
+    lease.dispatched();
+    drop(lease);
+    seeded.freeze().unwrap();
+    drop(seeded);
+    drop(store);
+
+    let store = Arc::new(AccountStore::acquire(&home).unwrap());
+    let obs = Arc::new(Observability::new(&home, None).unwrap());
+    let relay = RelayState::new(
+        store.clone(),
+        &config,
+        obs.clone(),
+        Arc::new(DebugPins::default()),
+    )
+    .unwrap();
+    let expected_unknown: BTreeSet<String> = [key.to_owned()].into_iter().collect();
+    assert_eq!(
+        relay.bindings.data.lock().unwrap().unknown_cost,
+        expected_unknown
+    );
+    let image = relay.bindings.decision_tape_initial_image().unwrap();
+    assert_eq!(image.schema, 2);
+    assert_eq!(image.bindings_rows, 1);
+    assert!(image.activity_empty);
+    assert!(!image.replay_complete);
+    assert_eq!(
+        image.unknown_cost_sha256,
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&expected_unknown).unwrap())
+        )
+    );
+    assert_ne!(
+        image.unknown_cost_sha256,
+        format!("{:x}", Sha256::digest(b"[]"))
+    );
+    let expected_digest: [u8; 32] =
+        Sha256::digest(serde_json::to_vec(&(&image, store.list().unwrap())).unwrap()).into();
+
+    // A new native association enters the actual permit producer after startup.
+    c.account = store.load(&c.account.id).unwrap();
+    let Decision::Selected { lease, .. } = relay.bindings.choose(
+        Provider::Claude,
+        Some("claude:n6r-after-startup"),
+        None,
+        None,
+        std::slice::from_ref(&c),
+        None,
+        100,
+    ) else {
+        panic!("native post-startup binding was not selected")
+    };
+    lease.dispatched();
+    drop(lease);
+    assert_eq!(
+        relay.bindings.data.lock().unwrap().unknown_cost,
+        expected_unknown
+    );
+    obs.shutdown_replay();
+
+    let epoch = home.join("state/decision-tape-v6/e00");
+    let manifest: tape::Manifest =
+        serde_json::from_slice(&fs::read(epoch.join("manifest.json")).unwrap()).unwrap();
+    assert!(manifest.sealed);
+    assert_eq!(manifest.losses.producer_failure, 0);
+    assert_eq!(manifest.accepted, manifest.persisted);
+    let mut witnesses = Vec::new();
+    let mut permits = Vec::new();
+    for segment in &manifest.segments {
+        let bytes = fs::read(epoch.join(format!("s{:016x}.jsonl.zst", segment.index))).unwrap();
+        let decoded = zstd::stream::decode_all(bytes.as_slice()).unwrap();
+        for line in decoded
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let record: tape::Record = serde_json::from_slice(line).unwrap();
+            match record.event {
+                tape::Payload::Metadata(event)
+                    if matches!(*event, Event::InitialWitness { .. }) =>
+                {
+                    assert!(matches!(record.owner, Owner::Bindings));
+                    let Event::InitialWitness {
+                        component: Owner::Bindings,
+                        rows: 1,
+                        digest,
+                        ..
+                    } = *event
+                    else {
+                        panic!("unexpected production startup witness")
+                    };
+                    assert_eq!(digest.0, expected_digest);
+                    witnesses.push(record.sequence);
+                }
+                tape::Payload::PermitTape(_) => permits.push(record.sequence),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(witnesses.len(), 1);
+    assert!(
+        !permits.is_empty(),
+        "actual native permit producer must run"
+    );
+    assert!(permits.iter().all(|sequence| witnesses[0] < *sequence));
+    relay.bindings.freeze().unwrap();
+}
+
+#[test]
+fn startup_witness_failures_have_finite_stable_names_and_typed_active_state() {
+    for reason in [
+        StartupWitnessFailure::ActiveState,
+        StartupWitnessFailure::ImageSerialization,
+        StartupWitnessFailure::AccountsSerialization,
+        StartupWitnessFailure::Publication,
+    ] {
+        let encoded = serde_json::to_string(&reason).unwrap();
+        assert_eq!(encoded, format!("\"{}\"", reason.as_str()));
+        assert_eq!(
+            serde_json::from_str::<StartupWitnessFailure>(&encoded).unwrap(),
+            reason
+        );
+    }
+    let root = fixture_dir();
+    let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+    // Even a false-valued live pacing entry remains guarded.
+    table.set_pacing("n6r-active-state", false);
+    let error = table.decision_tape_initial_image().unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StartupWitnessFailure>(),
+        Some(&StartupWitnessFailure::ActiveState)
+    );
+    let producer = Arc::new(
+        crate::observability::ReplayRuntime::start_synthetic_tape(
+            &root.path().join("typed-failures"),
+            16,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        table.attach_tape(producer.clone(), &[]),
+        Err(StartupWitnessFailure::ActiveState)
+    );
+    let idle_root = fixture_dir();
+    let idle = BindingTable::new(idle_root.path(), RoutingConfig::default()).unwrap();
+    producer.disable();
+    assert_eq!(
+        idle.attach_tape(producer.clone(), &[]),
+        Err(StartupWitnessFailure::Publication)
+    );
+    producer.shutdown();
+}
+
 #[test]
 fn native_entry_records_none_and_real_rebind_without_echo_replay() {
     let root = fixture_dir();

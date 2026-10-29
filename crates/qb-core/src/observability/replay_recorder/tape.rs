@@ -1,14 +1,14 @@
-//! Schema 5 decision tape. Earlier roots are never rewritten.
+//! Schema 6 decision tape (with read-only schema 5 compatibility). Earlier roots are never rewritten.
 //! Producers only enqueue bounded typed metadata. The sole writer compresses and syncs.
 use super::*;
 use crate::bindings::decision_tape::DecisionRecord;
-use crate::bindings::permit_tape::{self, PermitRecord, QuotaKey, QuotaSnapshot};
+use crate::bindings::permit_tape::{self, PermitRecord, QuotaKey, QuotaSnapshot, WireRefusal};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, Read},
 };
 
-pub(super) const TAPE_SCHEMA: u16 = 5;
+pub(super) const TAPE_SCHEMA: u16 = 6;
 const RECORD_BYTES: usize = 256 * 1024;
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const HOUR_BYTES: u64 = 20_000_000;
@@ -74,6 +74,23 @@ pub struct SegmentInfo {
     pub encoded_bytes: u64,
     pub sha256: String,
 }
+/// Finite producer diagnostics; never includes caller-owned error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerFailureReason {
+    Unspecified,
+    RuntimeIdExhausted,
+    MetadataCursorExhausted,
+    DecisionCursorExhausted,
+    PermitCursorExhausted,
+    CommitCursorExhausted,
+    CommitWithoutProposal,
+    StartupActiveState,
+    StartupImageSerialization,
+    StartupAccountsSerialization,
+    StartupPublication,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -86,6 +103,11 @@ pub struct Manifest {
     pub deduplicated: u64,
     pub permit_records: u64,
     pub permit_not_comparable: u64,
+    // Defaults admit the unchanged schema 5 manifest only; schema 6 requires both.
+    #[serde(default)]
+    pub permit_not_comparable_reasons: BTreeMap<WireRefusal, u64>,
+    #[serde(default)]
+    pub producer_failure_reasons: BTreeMap<ProducerFailureReason, u64>,
     pub encoded_bytes: u64,
     pub compressed_bytes: u64,
     pub hourly_encoded_byte_limit: u64,
@@ -216,6 +238,8 @@ pub(crate) fn open_with_provenance(
         deduplicated: 0,
         permit_records: 0,
         permit_not_comparable: 0,
+        permit_not_comparable_reasons: BTreeMap::new(),
+        producer_failure_reasons: BTreeMap::new(),
         encoded_bytes: 0,
         compressed_bytes: 0,
         hourly_encoded_byte_limit: HOUR_BYTES,
@@ -271,10 +295,15 @@ impl Producer {
         let l = &mut s.manifest.losses;
         increment(&mut l.invalid, &mut l.saturated, 1);
     }
-    pub(crate) fn failed(&self) {
+    pub(crate) fn failed(&self, reason: ProducerFailureReason) {
         let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let l = &mut s.manifest.losses;
-        increment(&mut l.producer_failure, &mut l.saturated, 1);
+        let m = &mut s.manifest;
+        increment(&mut m.losses.producer_failure, &mut m.losses.saturated, 1);
+        increment(
+            m.producer_failure_reasons.entry(reason).or_default(),
+            &mut m.losses.saturated,
+            1,
+        );
     }
     pub(crate) fn disable(&self) {
         self.shared
@@ -345,9 +374,11 @@ impl Producer {
                 }
             },
         };
-        let not_comparable = record.refusal.is_some()
-            || (inputs.from.as_deref().is_some_and(|from| from != inputs.to)
-                && inputs.permit.is_none());
+        let refusal = record.refusal.or_else(|| {
+            (inputs.from.as_deref().is_some_and(|from| from != inputs.to)
+                && inputs.permit.is_none())
+            .then_some(WireRefusal::MissingPermit)
+        });
         let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let quotas = match record
             .inputs
@@ -392,7 +423,15 @@ impl Producer {
         s.quotas.extend(keys);
         s.quota_bytes += quota_bytes;
         s.manifest.permit_records += 1;
-        s.manifest.permit_not_comparable += u64::from(not_comparable);
+        if let Some(reason) = refusal {
+            let m = &mut s.manifest;
+            increment(&mut m.permit_not_comparable, &mut m.losses.saturated, 1);
+            increment(
+                m.permit_not_comparable_reasons.entry(reason).or_default(),
+                &mut m.losses.saturated,
+                1,
+            );
+        }
         Some(sequence)
     }
 
@@ -945,6 +984,12 @@ fn bounded_file(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn checked_reason_sum<K>(reasons: &BTreeMap<K, u64>) -> Option<u64> {
+    reasons
+        .values()
+        .try_fold(0u64, |sum, count| sum.checked_add(*count))
+}
+
 /// Bounded verification of the actual archived bytes. This is a decision-local
 /// tape, not a full owner restore or an assertion of production trace coverage.
 pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_reader::Epoch> {
@@ -954,7 +999,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     }
     let epoch_bytes = bounded_file(&path.join("epoch.json"), CONTROL_BYTES)?;
     let epoch: EpochHeader = serde_json::from_slice(&epoch_bytes).map_err(|_| fail())?;
-    if epoch.schema != TAPE_SCHEMA {
+    if !matches!(epoch.schema, 5 | TAPE_SCHEMA) {
         return Err(io::Error::other("decision_tape_unsupported_schema"));
     }
     let header_bytes = bounded_file(&path.join("header.json"), CONTROL_BYTES)?;
@@ -962,8 +1007,8 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     let manifest_path = path.join("manifest.json");
     let manifest_bytes = bounded_file(&manifest_path, MANIFEST_RESERVE / 2)?;
     let m: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|_| fail())?;
-    if header.schema != TAPE_SCHEMA
-        || m.schema != TAPE_SCHEMA
+    if header.schema != epoch.schema
+        || m.schema != epoch.schema
         || header.capture != m.capture
         || header.start.utc_ns != epoch.start_utc_ns
         || header.identity_domain_version != ID_DOMAIN_VERSION
@@ -975,8 +1020,25 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     {
         return Err(fail());
     }
+    if epoch.schema == TAPE_SCHEMA {
+        // serde defaults exist exclusively for old manifests. New manifests must
+        // explicitly carry both finite maps, even when the aggregates are zero.
+        let fields: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).map_err(|_| fail())?;
+        if fields.get("permit_not_comparable_reasons").is_none()
+            || fields.get("producer_failure_reasons").is_none()
+            || checked_reason_sum(&m.permit_not_comparable_reasons) != Some(m.permit_not_comparable)
+            || checked_reason_sum(&m.producer_failure_reasons) != Some(m.losses.producer_failure)
+        {
+            return Err(fail());
+        }
+    }
     let mut hash = Sha256::new();
-    hash.update(b"quota-baton/decision-tape-v5/epoch\0");
+    hash.update(if epoch.schema == 5 {
+        b"quota-baton/decision-tape-v5/epoch\0"
+    } else {
+        b"quota-baton/decision-tape-v6/epoch\0"
+    });
     for bytes in [&epoch_bytes, &header_bytes] {
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
@@ -994,6 +1056,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     let mut allowed_proposals = BTreeSet::new();
     let mut committed_proposals = BTreeSet::new();
     let mut not_comparable = 0u64;
+    let mut refusal_reasons = BTreeMap::new();
     let mut witness = Sha256::new();
     let mut witnesses = 0;
     let mut witness_before_decisions = true;
@@ -1101,13 +1164,17 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
                             .map_err(|_| fail())?;
                     }
                     permit_tape::validate_record(&envelope.record).map_err(|_| fail())?;
-                    not_comparable += u64::from(
-                        envelope.record.refusal.is_some()
-                            || envelope.record.inputs.as_ref().is_some_and(|inputs| {
-                                inputs.from.as_deref().is_some_and(|from| from != inputs.to)
-                                    && inputs.permit.is_none()
-                            }),
-                    );
+                    let refusal = envelope.record.refusal.or_else(|| {
+                        envelope.record.inputs.as_ref().and_then(|inputs| {
+                            (inputs.from.as_deref().is_some_and(|from| from != inputs.to)
+                                && inputs.permit.is_none())
+                            .then_some(WireRefusal::MissingPermit)
+                        })
+                    });
+                    if let Some(reason) = refusal {
+                        not_comparable += 1;
+                        *refusal_reasons.entry(reason).or_insert(0u64) += 1;
+                    }
                     if matches!(
                         &envelope.record.actual,
                         crate::bindings::kernel::PermitDecision::Allowed(_)
@@ -1196,6 +1263,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         || m.sealed && (m.accepted != m.persisted || aborted != m.losses.capture_aborted)
         || permits.len() as u64 != m.permit_records
         || not_comparable != m.permit_not_comparable
+        || epoch.schema == TAPE_SCHEMA && refusal_reasons != m.permit_not_comparable_reasons
     {
         return Err(fail());
     }

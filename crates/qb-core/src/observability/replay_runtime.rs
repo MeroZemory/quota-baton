@@ -1,4 +1,5 @@
 //! Startup-only metadata capture. Producers never perform filesystem I/O.
+use super::replay_recorder::tape::ProducerFailureReason;
 #[cfg(test)]
 use super::replay_recorder::{Archive, BuildIdentity, Provenance};
 use super::replay_recorder::{Event, Id, IdentityDomain, Owner, RecordResult, Recorder, Stamp};
@@ -54,7 +55,7 @@ impl Runtime {
             worker: Mutex::new(Some(worker)),
         })
     }
-    /// Main supplies the separate state/decision-tape-v5 root. Legacy roots are
+    /// Main supplies the separate state/decision-tape-v6 root. Legacy roots are
     /// neither inspected nor removed, even when their disk cap was exhausted.
     pub(crate) fn start_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
         Self::start_tape_with_provenance(
@@ -111,9 +112,22 @@ impl Runtime {
             worker: Mutex::new(Some(worker)),
         })
     }
-    pub(crate) fn producer_failed(&self) {
+    pub(crate) fn startup_witness_failed(&self, reason: crate::bindings::StartupWitnessFailure) {
+        use crate::bindings::StartupWitnessFailure;
+        self.failed(match reason {
+            StartupWitnessFailure::ActiveState => ProducerFailureReason::StartupActiveState,
+            StartupWitnessFailure::ImageSerialization => {
+                ProducerFailureReason::StartupImageSerialization
+            }
+            StartupWitnessFailure::AccountsSerialization => {
+                ProducerFailureReason::StartupAccountsSerialization
+            }
+            StartupWitnessFailure::Publication => ProducerFailureReason::StartupPublication,
+        });
+    }
+    fn failed(&self, reason: ProducerFailureReason) {
         if let Some(tape) = &self.tape {
-            tape.failed();
+            tape.failed(reason);
         } else {
             self.recorder.producer_failed();
         }
@@ -127,7 +141,7 @@ impl Runtime {
             )
             .ok()
             .or_else(|| {
-                self.producer_failed();
+                self.failed(ProducerFailureReason::RuntimeIdExhausted);
                 None
             })
     }
@@ -155,7 +169,7 @@ impl Runtime {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let cursor = &mut cursors[owner as usize];
         let Some(next) = cursor.checked_add(1) else {
-            self.producer_failed();
+            self.failed(ProducerFailureReason::MetadataCursorExhausted);
             return None;
         };
         *cursor = next;
@@ -179,7 +193,7 @@ impl Runtime {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let cursor = &mut cursors[Owner::Bindings as usize];
         let Some(next) = cursor.checked_add(1) else {
-            tape.failed();
+            tape.failed(ProducerFailureReason::DecisionCursorExhausted);
             return None;
         };
         *cursor = next;
@@ -195,7 +209,7 @@ impl Runtime {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let cursor = &mut cursors[Owner::Bindings as usize];
         let Some(next) = cursor.checked_add(1) else {
-            tape.failed();
+            tape.failed(ProducerFailureReason::PermitCursorExhausted);
             return None;
         };
         *cursor = next;
@@ -205,13 +219,13 @@ impl Runtime {
     pub(crate) fn record_permit_commit(&self, proposal: Option<u64>) -> Option<u64> {
         let tape = self.tape.as_ref()?;
         let Some(proposal) = proposal else {
-            tape.failed();
+            tape.failed(ProducerFailureReason::CommitWithoutProposal);
             return None;
         };
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let cursor = &mut cursors[Owner::Bindings as usize];
         let Some(next) = cursor.checked_add(1) else {
-            tape.failed();
+            tape.failed(ProducerFailureReason::CommitCursorExhausted);
             return None;
         };
         *cursor = next;
@@ -331,7 +345,8 @@ mod tests {
     use std::sync::Arc;
 
     fn directory() -> tempfile::TempDir {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let root = executable
             .parent()
             .unwrap()
             .parent()
@@ -490,5 +505,122 @@ mod tests {
             runtime.shutdown();
             assert_eq!(manifest(&root, "e00")["loss"]["producer_failure"], 1);
         }
+    }
+
+    #[test]
+    fn schema6_runtime_callsite_reasons_count_once() {
+        use crate::bindings::decision_tape::{DecisionRecord, Entry, Inputs, RebindMarker};
+        use crate::bindings::{
+            StartupWitnessFailure,
+            kernel::{DecisionInputs, PermitDecision},
+        };
+        use crate::observability::decision_comparison::{Outcome, OutcomeKind};
+        use ProducerFailureReason::*;
+        let dir = directory();
+        let root = dir.path().join("tape");
+        let runtime = Runtime::start_synthetic_tape(&root, 16).unwrap();
+        let now = chrono::Utc::now();
+        let inputs = DecisionInputs {
+            now,
+            model: None,
+            key: None,
+            from: None,
+            to: "target".into(),
+            accounts: Default::default(),
+            traffic: Default::default(),
+            pending: Default::default(),
+            groups: Default::default(),
+            bindings: Default::default(),
+            accepted_unbound: Default::default(),
+            sticky: Default::default(),
+            outside_failure: false,
+            permit: None,
+        };
+        let decision = DecisionRecord {
+            schema: 1,
+            ordinal: 0,
+            inputs: Inputs {
+                entry: Entry::Chooser,
+                at: now,
+                provider: crate::accounts::Provider::Codex,
+                key: None,
+                parent: None,
+                model: None,
+                pinned: None,
+                request_bytes: 0,
+                hold_allowed: false,
+                hold_timed_out: false,
+                coverage: None,
+                root_hint_present: false,
+                launch_metadata_valid: None,
+                launch: None,
+            },
+            state: None,
+            answers: Vec::new(),
+            rebind: RebindMarker::default(),
+            outcome: Outcome {
+                kind: OutcomeKind::None,
+                account: None,
+                until: None,
+                refusal: None,
+                moves: 0,
+            },
+            capture_aborted: false,
+            read_state_complete: false,
+        };
+        runtime
+            .next_id
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert!(runtime.next_id().is_none());
+        runtime.cursors.lock().unwrap()[Owner::Runtime as usize] = u64::MAX;
+        assert!(
+            runtime
+                .record(Owner::Runtime, None, event(&runtime))
+                .is_none()
+        );
+        runtime.cursors.lock().unwrap()[Owner::Bindings as usize] = u64::MAX;
+        assert!(runtime.record_decision(&decision).is_none());
+        assert!(
+            runtime
+                .record_permit(&inputs, &PermitDecision::NotRequired)
+                .is_none()
+        );
+        assert!(runtime.record_permit_commit(None).is_none());
+        assert!(runtime.record_permit_commit(Some(1)).is_none());
+        for reason in [
+            StartupWitnessFailure::ActiveState,
+            StartupWitnessFailure::ImageSerialization,
+            StartupWitnessFailure::AccountsSerialization,
+            StartupWitnessFailure::Publication,
+        ] {
+            runtime.startup_witness_failed(reason);
+        }
+        runtime.disable();
+        runtime.failed(Unspecified);
+        runtime.shutdown();
+        let m: super::super::replay_recorder::tape::Manifest =
+            serde_json::from_value(manifest(&root, "e00")).unwrap();
+        let reasons = [
+            Unspecified,
+            RuntimeIdExhausted,
+            MetadataCursorExhausted,
+            DecisionCursorExhausted,
+            PermitCursorExhausted,
+            CommitCursorExhausted,
+            CommitWithoutProposal,
+            StartupActiveState,
+            StartupImageSerialization,
+            StartupAccountsSerialization,
+            StartupPublication,
+        ];
+        assert_eq!(m.losses.producer_failure, reasons.len() as u64);
+        assert_eq!(m.producer_failure_reasons.len(), reasons.len());
+        for reason in reasons {
+            assert_eq!(m.producer_failure_reasons[&reason], 1);
+        }
+        let epoch = crate::observability::decision_reader::load(&root.join("e00")).unwrap();
+        assert_eq!(epoch.losses, reasons.len() as u64);
+        assert!(!epoch.complete);
+        assert!(!epoch.permit_complete);
     }
 }
