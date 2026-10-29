@@ -7,12 +7,26 @@ use std::{fs, path::Path};
 
 const ORPHAN: &str = "cx-413c3b";
 
-fn home() -> tempfile::TempDir {
+struct PrivateHome {
+    _root: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl PrivateHome {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn home() -> PrivateHome {
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
-    let home = tempfile::Builder::new()
+    let root = tempfile::Builder::new()
         .prefix("qb-orphan-observations-")
         .tempdir_in(executable.parent().unwrap())
         .unwrap();
+    let path = root.path().join("home");
+    crate::platform::prepare_observation_directory(&path).unwrap();
+    let home = PrivateHome { _root: root, path };
     let mut config = Config::default();
     config.secrets.linux_backend = LinuxSecretBackend::File0600;
     crate::platform::atomic_write_account(
@@ -203,6 +217,46 @@ fn direct_observability_without_store_preserves_its_library_cache() {
     assert!(obs.quota_snapshot(ORPHAN).is_some());
     assert_eq!(obs.dashboard().usage_page(48).unwrap().accounts.len(), 1);
     obs.freeze_quota().unwrap();
+}
+
+#[test]
+fn unchanged_keeper_reconciliation_skips_even_a_frozen_writer_and_preserves_caches() {
+    let home = home();
+    let store = AccountStore::acquire(home.path()).unwrap();
+    let keeper = keeper(&store);
+    let obs = Observability::new(home.path(), None).unwrap();
+    assert!(
+        obs.observe_poll(&keeper.id, snapshot(false), true)
+            .is_some()
+    );
+    obs.freeze_quota().unwrap();
+    let quota = obs.quota_snapshot(&keeper.id).unwrap();
+    let now = Utc::now();
+    let forecast =
+        serde_json::to_value(obs.dashboard().usage_forecast(&keeper.id, now, None)).unwrap();
+    let quota_file = fs::read(home.path().join("state/quota.json")).unwrap();
+    let usage_file = fs::read(home.path().join("state/usage-history.json")).unwrap();
+    let _transaction = store.transaction().unwrap();
+    let existing = store.list_unlocked().unwrap();
+    // Any ReconcileAccounts command would fail against this frozen writer.
+    // Success proves unchanged startup does not send IPC or force a flush.
+    obs.reconcile_accounts(&existing).unwrap();
+    assert_eq!(obs.quota_snapshot(&keeper.id).unwrap(), quota);
+    assert_eq!(
+        serde_json::to_value(obs.dashboard().usage_forecast(&keeper.id, now, None)).unwrap(),
+        forecast
+    );
+    let chart = obs.dashboard().usage_page(48).unwrap();
+    assert_eq!(chart.accounts.len(), 1);
+    assert_eq!(chart.accounts[0].id.as_str(), keeper.id);
+    assert_eq!(
+        fs::read(home.path().join("state/quota.json")).unwrap(),
+        quota_file
+    );
+    assert_eq!(
+        fs::read(home.path().join("state/usage-history.json")).unwrap(),
+        usage_file
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

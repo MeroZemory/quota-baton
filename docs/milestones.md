@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N7-L 수집 복원력·제공자 코호트 보완
-목표: 0m 제외·샘플 불가 후 지속·Free/orphan 제외를 실제 형상으로 검증; 7일 시계 시작 전
+현재 마일스톤: N7-L 복원력 관문 완료·재설치 인계
+목표: 실제 첫 origin·last_sample 지속 갱신 확인; 다음 N6r-T raw-fact/permit slice1 재개
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
 사용자 대기: 없음
-갱신: 2026-10-29 10:46 KST (aad8a58 10:41 설치 후 window_name 재실패; 코호트/orphan 결함 같은 단위 보완)
+갱신: 2026-10-29 13:44 KST (양 OS 관문·한영 실제 화면 확인 완료; aad8a58 설치 실패 보존, 7일 시계 미시작)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: N7-L aad8a58 reinstall failed with sample/window_name from native 0m slots. Fix skip/retry behavior, shared placement-exclusion cohort and orphan quota/usage cleanup on impl/n7-log-resilience first. Both prior failures and gate receipts remain preserved; the seven-day clock has not started. N6r-T slice1 is parked clean atf3c4992 until this urgent repair completes. No N7 model work before seven days of logs. Next on impl/n6r-tape: the adopted shared raw-fact DecisionInputs kernel and permit entry, old/kernel side-by-side before switching, identity on the dated fixture and a scripted hour, and two independent candidate power faults. Selection is slice2. Unit1 remains an accepted insufficient verdict: ten captured decisions/one observed move/loss0; both evaluator builds refused all ten incomplete inputs and replayed move totals remain null. Do not merge that WIP or continue old impl/r14-replay. R15.UI merged e4b4a132 and handed off for install. R19 installed3788c36; R18 installed; R2 closed. L1 fix briefs retain priority; N12 unready.
+**Current S1 order**: N7-L resilience gate passed on impl/n7-log-resilience: native undated-slot skip, preflight-only retries, shared placement exclusions, and orphan caches. Windows full matrix plus two-path focused repair, Linux native/strict and actual KO/EN Usage visual review passed; report N7-L.resilience.md preserves prior failures. Reinstall and actual first-origin/advancing-last_sample health remain with the owner; the seven-day clock has not started. Next resume N6r-T slice1 parked clean at f3c4992 on impl/n6r-tape: shared raw-fact DecisionInputs kernel and permit entry, old/kernel side-by-side before switching, dated fixture and scripted-hour identity, two independent power faults. Selection is slice2. Unit1 remains accepted insufficient; do not continue or merge old impl/r14-replay. No N7 model work before seven days of logs. R15.UI merged e4b4a132; R19 installed3788c36; R18 installed; R2 closed. L1 fix briefs retain priority; N12 unready.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
