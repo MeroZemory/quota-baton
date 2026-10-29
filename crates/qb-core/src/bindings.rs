@@ -1,8 +1,10 @@
 //! C7 placement and schema-1 affinity persistence. Callers filter tried accounts,
 //! credentials, probes and volatile failures, but retain quota cooling for holds.
 //! Move evidence is carried separately from those eligibility exclusions.
+#[cfg(test)]
+use crate::accounts::HealthSignal;
 use crate::{
-    accounts::{Account, Health, HealthReason, HealthSignal, Provider, UserState},
+    accounts::{Account, Health, HealthReason, Provider, UserState},
     config::RoutingConfig,
 };
 use anyhow::{Context, Result, bail};
@@ -27,8 +29,14 @@ mod admission;
 mod affinity;
 pub(crate) use admission::DispatchAdmission;
 mod capacity_spill;
+pub mod decision_tape;
+pub mod kernel;
+mod kernel_shell;
 mod launch;
 mod move_guard;
+#[cfg(any(test, feature = "testkit"))]
+pub mod permit_fixture;
+pub mod permit_tape;
 pub(crate) mod quota_wait;
 mod rebind;
 mod selection;
@@ -36,6 +44,7 @@ pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
 };
 pub use move_guard::Limits as MoveGuardLimits;
+pub use move_guard::Refusal as MoveGuardRefusal;
 pub(crate) use move_guard::{Observation as MoveObservation, Observations as MoveObservations};
 #[cfg(test)]
 #[path = "bindings/move_guard_tests.rs"]
@@ -573,6 +582,10 @@ pub struct BindingTable {
     writes_stopped: AtomicBool,
     unknown_cost_skips: AtomicUsize,
     usage_sequence: AtomicU64,
+    decision_recorder: Mutex<Option<decision_tape::Recorder>>,
+    permit_recorder: Mutex<Option<kernel_shell::Recorder>>,
+    permit_commit_recorder: Mutex<Option<kernel_shell::CommitRecorder>>,
+    decision_capture_losses: AtomicU64,
 }
 
 impl BindingTable {
@@ -677,38 +690,80 @@ impl BindingTable {
         now: DateTime<Utc>,
     ) -> Result<Option<move_guard::Permit>, move_guard::Denied> {
         let Some(from) = from.filter(|from| *from != to) else {
+            let captured =
+                kernel_shell::snapshot(d, key, from, to, source, candidates, model, now, None);
+            let _ = self.record_permit(&captured, &kernel::PermitDecision::NotRequired);
             return Ok(None);
         };
-        let target = candidates.iter().find(|c| c.account.id == to);
-        let source_account = source.map(|c| effective_account(c, d, &self.config, model, now));
-        let target_account = target.map(|c| effective_account(c, d, &self.config, model, now));
-        // Genuinely missing source evidence cannot grant the fresh-unusable
-        // exception. A health poll timestamp is not proof.
         let usable = source.is_some_and(|c| self.move_source_usable(d, key, c, model, now));
-        let unusable = source_account.as_ref().and_then(|account| {
-            crate::accounts::health::UnusableEvidence::observe(
-                account,
-                model,
-                Self::accepted_in(d, Some(key), &account.id),
-                now,
-            )
-        });
-        let result = self
-            .move_guard
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .prepare_observed(
+        let mut breaker = self.move_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let captured_permit = breaker.decision_inputs(
+            &self.config.move_guard,
+            key,
+            observations,
+            sole_target.map(selection::SoleEligibleTarget::decision_input),
+            now,
+        );
+        let captured = kernel_shell::snapshot(
+            d,
+            key,
+            Some(from),
+            to,
+            source,
+            candidates,
+            model,
+            now,
+            captured_permit,
+        );
+        // Native authority now consumes the same raw input as offline replay.
+        // The pre-switch implementation remains an independent test-only oracle.
+        #[cfg(test)]
+        let (legacy_breaker, legacy_result) = {
+            let mut legacy = breaker.clone();
+            let source_account =
+                source.map(|c| legacy_effective_account(c, d, &self.config, model, now));
+            let target_account = candidates
+                .iter()
+                .find(|c| c.account.id == to)
+                .map(|c| legacy_effective_account(c, d, &self.config, model, now));
+            let unusable = source_account.as_ref().and_then(|account| {
+                crate::accounts::health::UnusableEvidence::observe(
+                    account,
+                    model,
+                    Self::legacy_accepted_in(d, Some(key), &account.id),
+                    now,
+                )
+            });
+            let result = legacy.prepare_observed(
                 &self.config.move_guard,
                 key,
                 from,
                 to,
-                semantic_evidence(source_account.as_ref()),
-                semantic_evidence(target_account.as_ref()),
+                legacy_semantic_evidence(source_account.as_ref()),
+                legacy_semantic_evidence(target_account.as_ref()),
                 unusable.as_ref(),
                 sole_target.is_some_and(|proof| proof.applies_to(from, to, model, now)),
                 observations,
                 now,
             );
+            (legacy, result)
+        };
+        let mut result = breaker.prepare_captured(&captured);
+        #[cfg(test)]
+        {
+            assert_eq!(
+                kernel_shell::outcome(&result),
+                kernel_shell::outcome(&legacy_result),
+                "raw-fact move kernel must preserve the original native owner decision"
+            );
+            breaker.assert_same_prepared_state(&legacy_breaker);
+        }
+        drop(breaker);
+        let actual = kernel_shell::outcome(&result);
+        let ordinal = self.record_permit(&captured, &actual);
+        if let Ok(permit) = &mut result {
+            permit.record_ordinal(ordinal);
+        }
         match result {
             Ok(permit) => Ok(Some(permit)),
             Err(denied) => {
@@ -740,6 +795,20 @@ impl BindingTable {
             }
         }
     }
+    #[cfg(test)]
+    fn legacy_move_source_usable(
+        &self,
+        d: &Data,
+        key: &str,
+        candidate: &Candidate,
+        model: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        legacy_effective_account(candidate, d, &self.config, model, now).eligible_at(model, now)
+            && (!candidate.account.drain
+                || Self::legacy_accepted_in(d, Some(key), &candidate.account.id))
+    }
+
     fn move_source_usable(
         &self,
         d: &Data,
@@ -748,12 +817,13 @@ impl BindingTable {
         model: Option<&str>,
         now: DateTime<Utc>,
     ) -> bool {
-        effective_account(candidate, d, &self.config, model, now).eligible_at(model, now)
-            && (!candidate.account.drain || Self::accepted_in(d, Some(key), &candidate.account.id))
+        let inputs = kernel_shell::candidate_inputs(d, candidate, Some(key), model, now);
+        kernel::move_source_usable(&inputs, &candidate.account.id)
     }
 }
 
-fn semantic_evidence(candidate: Option<&Account>) -> u64 {
+#[cfg(test)]
+fn legacy_semantic_evidence(candidate: Option<&Account>) -> u64 {
     use sha2::{Digest, Sha256};
     let Some(c) = candidate else {
         return 0;
@@ -771,6 +841,27 @@ fn semantic_evidence(candidate: Option<&Account>) -> u64 {
     ))
     .expect("account health serializes");
     u64::from_be_bytes(Sha256::digest(value)[..8].try_into().unwrap())
+}
+
+fn semantic_evidence(candidate: Option<&Account>) -> u64 {
+    let Some(account) = candidate else {
+        return 0;
+    };
+    let raw = Candidate {
+        account: account.clone(),
+        quota: None,
+        inflight: 0,
+    };
+    // This already-normalized account has no quota to re-apply; the helper's
+    // clock is unread in this domain. Actual permit snapshots use native now.
+    let inputs = kernel_shell::candidate_inputs(
+        &Data::default(),
+        &raw,
+        None,
+        None,
+        DateTime::<Utc>::MIN_UTC,
+    );
+    kernel::semantic_evidence(&inputs, Some(&account.id))
 }
 
 /// A reservation belongs to the actual upstream account, even after a forced
@@ -1188,7 +1279,8 @@ type DashboardRoutingSnapshot = BTreeMap<
 >;
 
 impl BindingTable {
-    fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
+    #[cfg(test)]
+    fn legacy_accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
         if key.is_none() {
             return d.accepted_unbound.contains(id) && d.sticky.values().any(|sticky| sticky == id);
         }
@@ -1199,6 +1291,10 @@ impl BindingTable {
                         .iter()
                         .any(|k| d.bindings.get(k).is_some_and(|b| b.accepted != Some(false)))
             })
+    }
+
+    fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
+        kernel::accepted_in(&kernel_shell::acceptance_inputs(d, key, id), id)
     }
     pub(crate) fn existing_placement(&self, key: Option<&str>, id: &str) -> bool {
         Self::accepted_in(
@@ -1385,6 +1481,10 @@ impl BindingTable {
             writes_stopped: AtomicBool::new(false),
             unknown_cost_skips: AtomicUsize::new(0),
             usage_sequence: AtomicU64::new(0),
+            decision_recorder: Mutex::new(None),
+            permit_recorder: Mutex::new(None),
+            permit_commit_recorder: Mutex::new(None),
+            decision_capture_losses: AtomicU64::new(0),
         });
         table.prune(
             &mut table.data.lock().unwrap_or_else(|e| e.into_inner()),
@@ -2698,251 +2798,297 @@ impl BindingTable {
         admit: impl FnOnce(&str) -> Option<DispatchAdmission>,
     ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
-        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        for c in candidates {
-            if let Some(snapshot) = &c.quota {
-                d.placements
-                    .entry(c.account.id.clone())
-                    .or_default()
-                    .observe(snapshot);
-            }
-        }
-        self.prune(&mut d, now);
-        // Current positive full-input evidence must constrain the choice,
-        // rather than being recorded after approving a move. A handshake's
-        // zero bytes never creates known full-context cost.
-        if let Some(key) = key.filter(|_| request_bytes > 0)
-            && d.groups.contains_key(group(key))
-            && !d.unknown_cost.contains(group(key))
-        {
-            let known = d
-                .last_request_bytes
-                .entry(group(key).to_owned())
-                .or_default();
-            *known = (*known).max(request_bytes);
-        }
-        let preference = coverage.map(|coverage| launch::SelectionPreference {
-            account: None,
-            coverage: Some(coverage),
-            model_move: false,
-        });
-        let (choice, selection, sole_target) = self.select_with_return_guard_and_root_hint(
-            &d,
+        let capture = decision_tape::Capture::begin(self, || decision_tape::Inputs {
+            entry: decision_tape::Entry::Chooser,
+            at: now,
             provider,
-            key,
-            parent,
-            model,
-            candidates,
-            move_evidence,
-            None,
-            observations,
-            pinned,
-            now,
-            hold_allowed,
-            preference.as_ref(),
-            root_hint,
-        );
-        let mut reason = selection.code();
-        let mut account = match choice {
-            PreviewDecision::Hold { until } => return Decision::Hold { until },
-            PreviewDecision::None => return Decision::None,
-            PreviewDecision::Selected { account } => account,
-        };
-        if let Some(key) = key {
-            let mut extra = BTreeSet::new();
-            if !d.bindings.contains_key(key) {
-                extra.insert(key);
-            }
-            if let Some(parent) =
-                parent.filter(|p| group(p) == group(key) && !d.bindings.contains_key(*p))
-            {
-                extra.insert(parent);
-            }
-            let mut weight = d.snapshot_weight;
-            if let Some(entry) = d.groups.get(group(key))
-                && entry.account != account
-            {
-                for key in &entry.keys {
-                    weight = weight
-                        .saturating_sub(binding_bound(key, &entry.account))
-                        .saturating_add(binding_bound(key, &account));
-                }
-            }
-            weight = extra.iter().fold(weight, |n, key| {
-                n.saturating_add(binding_bound(key, &account))
-            });
-            if d.bindings.len().saturating_add(extra.len()) > CAPACITY * 2
-                || weight as u64 + 64 > SNAPSHOT_MAX_BYTES
-            {
-                tracing::warn!(
-                    code = "binding_capacity",
-                    "New binding refused at the restore-safe snapshot bound"
-                );
-                return Decision::Blocked;
-            }
-        }
-        let previous = key
-            .and_then(|key| d.groups.get(group(key)))
-            .map(|g| g.account.clone());
-        let guard_key = key
-            .map(group)
-            .map(|key| launch::ownership_group(&d, key))
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("unidentified:{}", provider.as_str()));
-        let physical_source = self.rebind_source(&d, provider, key);
-        let guard_source = self.rebind_budget_source(&d, provider, key, &account);
-        let guard_from = guard_source.as_deref();
-        // Retry exclusion removes a source from selectable candidates, not
-        // from the full source evidence. Label before guard/policy publication.
-        if reason == "forced"
-            && guard_from.is_some_and(|id| id != account)
-            && let Some(source) =
-                guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id))
-        {
-            let source = effective_account(source, &d, &self.config, model, now);
-            let plan = self.policies.plan(launch::policy_key(&d, key));
-            if source.user_state == UserState::Active
-                && let Health::Cooling {
-                    reason: HealthReason::Quota,
-                    until,
-                    scope,
-                } = &source.health
-                && *until > now
-                && (scope == "account"
-                    || scope
-                        .strip_prefix("model:")
-                        .is_some_and(|m| model == Some(m)))
-                && let Some(quota) = &source.quota_cooling
-                && quota.window == "5h"
-                && quota
-                    .reset_at
-                    .signed_duration_since(now)
-                    .to_std()
-                    .is_ok_and(|wait| wait > Duration::from_secs(plan.settings.reset_wait_secs))
-            {
-                reason = "five_hour_far_move";
-            }
-        }
-        let permit = match self.prepare_move_with_source(
-            &d,
-            &guard_key,
-            guard_from,
-            &account,
-            guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id)),
-            candidates,
-            sole_target.as_ref(),
-            observations,
-            model,
-            reason,
-            now,
-        ) {
-            Ok(permit) => permit,
-            Err(denied) => {
-                if let Some(old) =
-                    guard_from.and_then(|id| candidates.iter().find(|c| c.account.id == id))
-                    && self
-                        .policies
-                        .plan(launch::policy_key(&d, key))
-                        .anchor
-                        .as_ref()
-                        .is_none_or(|anchor| physical_source.as_ref() == Some(anchor))
-                    && self.move_source_usable(&d, &guard_key, old, model, now)
-                {
-                    account = old.account.id.clone();
-                    reason = "guard_keep";
-                    None
-                } else {
-                    return Decision::MoveHeld {
-                        until: denied.until,
-                    };
-                }
-            }
-        };
-        let policy_key = launch::policy_key(&d, key).map(str::to_owned);
-        let admitted_from = self
-            .policies
-            .plan(policy_key.as_deref())
-            .anchor
-            .or_else(|| physical_source.clone());
-        drop(d);
-        let Some(admission) = admit(&account) else {
-            return Decision::None;
-        };
-        if !selection.valid_for(key, admitted_from.as_deref(), &account, model, now) {
-            return Decision::None;
-        }
-        if !admission.valid_for(admitted_from.as_deref(), &account) {
-            return Decision::None;
-        }
-        if !admission.valid_pin_for(provider, key, &account) {
-            return Decision::None;
-        }
-        if !admission.valid_store_for(
-            admitted_from.as_deref(),
-            admitted_from.as_deref().and_then(|id| {
-                move_evidence
-                    .iter()
-                    .find(|candidate| candidate.account.id == id)
-                    .map(|candidate| &candidate.account)
-            }),
-            &account,
-        ) {
-            return Decision::None;
-        }
-        if !admission.valid_failure_for(
-            key,
-            admitted_from.as_deref().and_then(|id| {
-                move_evidence
-                    .iter()
-                    .find(|c| c.account.id == id)
-                    .map(|c| &c.account)
-            }),
-            &account,
-            model,
-        ) {
-            return Decision::None;
-        }
-        let context = rebind::RebindContext {
-            provider,
-            key,
-            guard_key: &guard_key,
-            from: physical_source.as_deref(),
-            account: &account,
-            parent,
-            model,
-            candidates,
-            sources: move_evidence,
-            pinned,
+            key: key.map(decision_tape::compact),
+            parent: parent.map(decision_tape::compact),
+            model: model.map(decision_tape::compact),
+            pinned: pinned.map(decision_tape::compact),
             request_bytes,
+            hold_allowed,
             hold_timed_out,
-            now,
-            label: reason,
-        };
-        let authority = self.owner_move_reason(&context, &admission, Some(&selection), None);
-        let rebound = self.rebind(context, authority, permit, |reason| {
-            self.policies.dispatch(
-                policy_key.as_deref(),
+            coverage: coverage.map(|ids| ids.iter().map(|id| decision_tape::compact(id)).collect()),
+            root_hint_present: root_hint.is_some(),
+            launch_metadata_valid: None,
+            launch: None,
+        });
+        let result = (|| {
+            let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+            for c in candidates {
+                if let Some(snapshot) = &c.quota {
+                    d.placements
+                        .entry(c.account.id.clone())
+                        .or_default()
+                        .observe(snapshot);
+                }
+            }
+            self.prune(&mut d, now);
+            // Current positive full-input evidence must constrain the choice,
+            // rather than being recorded after approving a move. A handshake's
+            // zero bytes never creates known full-context cost.
+            if let Some(key) = key.filter(|_| request_bytes > 0)
+                && d.groups.contains_key(group(key))
+                && !d.unknown_cost.contains(group(key))
+            {
+                let known = d
+                    .last_request_bytes
+                    .entry(group(key).to_owned())
+                    .or_default();
+                *known = (*known).max(request_bytes);
+            }
+            let preference = coverage.map(|coverage| launch::SelectionPreference {
+                account: None,
+                coverage: Some(coverage),
+                model_move: false,
+            });
+            decision_tape::observe_choice(self, &d, provider, key, model, candidates, now);
+            let (choice, selection, sole_target) = self.select_with_return_guard_and_root_hint(
+                &d,
+                provider,
+                key,
+                parent,
+                model,
+                candidates,
+                move_evidence,
+                None,
+                observations,
+                pinned,
+                now,
+                hold_allowed,
+                preference.as_ref(),
+                root_hint,
+            );
+            let mut reason = selection.code();
+            let mut account = match choice {
+                PreviewDecision::Hold { until } => return Decision::Hold { until },
+                PreviewDecision::None => return Decision::None,
+                PreviewDecision::Selected { account } => account,
+            };
+            if let Some(key) = key {
+                let mut extra = BTreeSet::new();
+                if !d.bindings.contains_key(key) {
+                    extra.insert(key);
+                }
+                if let Some(parent) =
+                    parent.filter(|p| group(p) == group(key) && !d.bindings.contains_key(*p))
+                {
+                    extra.insert(parent);
+                }
+                let mut weight = d.snapshot_weight;
+                if let Some(entry) = d.groups.get(group(key))
+                    && entry.account != account
+                {
+                    for key in &entry.keys {
+                        weight = weight
+                            .saturating_sub(binding_bound(key, &entry.account))
+                            .saturating_add(binding_bound(key, &account));
+                    }
+                }
+                weight = extra.iter().fold(weight, |n, key| {
+                    n.saturating_add(binding_bound(key, &account))
+                });
+                if d.bindings.len().saturating_add(extra.len()) > CAPACITY * 2
+                    || weight as u64 + 64 > SNAPSHOT_MAX_BYTES
+                {
+                    tracing::warn!(
+                        code = "binding_capacity",
+                        "New binding refused at the restore-safe snapshot bound"
+                    );
+                    decision_tape::capacity_refused(self);
+                    return Decision::Blocked;
+                }
+            }
+            let previous = key
+                .and_then(|key| d.groups.get(group(key)))
+                .map(|g| g.account.clone());
+            let guard_key = key
+                .map(group)
+                .map(|key| launch::ownership_group(&d, key))
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("unidentified:{}", provider.as_str()));
+            let physical_source = self.rebind_source(&d, provider, key);
+            let guard_source = self.rebind_budget_source(&d, provider, key, &account);
+            let guard_from = guard_source.as_deref();
+            // Retry exclusion removes a source from selectable candidates, not
+            // from the full source evidence. Label before guard/policy publication.
+            if reason == "forced"
+                && guard_from.is_some_and(|id| id != account)
+                && let Some(source) =
+                    guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id))
+            {
+                let source = effective_account(source, &d, &self.config, model, now);
+                let plan = self.policies.plan(launch::policy_key(&d, key));
+                if source.user_state == UserState::Active
+                    && let Health::Cooling {
+                        reason: HealthReason::Quota,
+                        until,
+                        scope,
+                    } = &source.health
+                    && *until > now
+                    && (scope == "account"
+                        || scope
+                            .strip_prefix("model:")
+                            .is_some_and(|m| model == Some(m)))
+                    && let Some(quota) = &source.quota_cooling
+                    && quota.window == "5h"
+                    && quota
+                        .reset_at
+                        .signed_duration_since(now)
+                        .to_std()
+                        .is_ok_and(|wait| wait > Duration::from_secs(plan.settings.reset_wait_secs))
+                {
+                    reason = "five_hour_far_move";
+                }
+            }
+            let permit = match self.prepare_move_with_source(
+                &d,
+                &guard_key,
+                guard_from,
                 &account,
-                previous.as_deref(),
+                guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id)),
+                candidates,
+                sole_target.as_ref(),
+                observations,
+                model,
                 reason,
                 now,
-            )
-        });
-        let rebind::Rebound { mut data, moves } = match rebound {
-            Ok(rebound) => rebound,
-            Err(rebind::RebindError::Evidence) => return Decision::None,
-            Err(rebind::RebindError::Policy) => return Decision::Blocked,
-        };
-        let d = &mut *data;
-        let lease = self.reserve(d, key, &account);
-        self.prune(d, now);
-        d.defer_count_changes = false;
-        d.commit_count_changes();
-        Decision::Selected {
-            account,
-            lease,
-            moves,
+            ) {
+                Ok(permit) => permit,
+                Err(denied) => {
+                    if let Some(old) =
+                        guard_from.and_then(|id| candidates.iter().find(|c| c.account.id == id))
+                        && self
+                            .policies
+                            .plan(launch::policy_key(&d, key))
+                            .anchor
+                            .as_ref()
+                            .is_none_or(|anchor| physical_source.as_ref() == Some(anchor))
+                        && self.move_source_usable(&d, &guard_key, old, model, now)
+                    {
+                        account = old.account.id.clone();
+                        reason = "guard_keep";
+                        None
+                    } else {
+                        return Decision::MoveHeld {
+                            until: denied.until,
+                        };
+                    }
+                }
+            };
+            let policy_key = launch::policy_key(&d, key).map(str::to_owned);
+            let admitted_from = self
+                .policies
+                .plan(policy_key.as_deref())
+                .anchor
+                .or_else(|| physical_source.clone());
+            drop(d);
+            let admission = admit(&account);
+            decision_tape::check(self, decision_tape::Check::Admission, admission.is_some());
+            let Some(admission) = admission else {
+                return Decision::None;
+            };
+            if !decision_tape::check(
+                self,
+                decision_tape::Check::Selection,
+                selection.valid_for(key, admitted_from.as_deref(), &account, model, now),
+            ) {
+                return Decision::None;
+            }
+            if !decision_tape::check(
+                self,
+                decision_tape::Check::AdmissionSource,
+                admission.valid_for(admitted_from.as_deref(), &account),
+            ) {
+                return Decision::None;
+            }
+            if !decision_tape::check(
+                self,
+                decision_tape::Check::Pin,
+                admission.valid_pin_for(provider, key, &account),
+            ) {
+                return Decision::None;
+            }
+            if !decision_tape::check(
+                self,
+                decision_tape::Check::Store,
+                admission.valid_store_for(
+                    admitted_from.as_deref(),
+                    admitted_from.as_deref().and_then(|id| {
+                        move_evidence
+                            .iter()
+                            .find(|candidate| candidate.account.id == id)
+                            .map(|candidate| &candidate.account)
+                    }),
+                    &account,
+                ),
+            ) {
+                return Decision::None;
+            }
+            if !decision_tape::check(
+                self,
+                decision_tape::Check::Failure,
+                admission.valid_failure_for(
+                    key,
+                    admitted_from.as_deref().and_then(|id| {
+                        move_evidence
+                            .iter()
+                            .find(|c| c.account.id == id)
+                            .map(|c| &c.account)
+                    }),
+                    &account,
+                    model,
+                ),
+            ) {
+                return Decision::None;
+            }
+            let context = rebind::RebindContext {
+                provider,
+                key,
+                guard_key: &guard_key,
+                from: physical_source.as_deref(),
+                account: &account,
+                parent,
+                model,
+                candidates,
+                sources: move_evidence,
+                pinned,
+                request_bytes,
+                hold_timed_out,
+                now,
+                label: reason,
+            };
+            let authority = self.owner_move_reason(&context, &admission, Some(&selection), None);
+            let rebound = self.rebind(context, authority, permit, |reason| {
+                self.policies.dispatch(
+                    policy_key.as_deref(),
+                    &account,
+                    previous.as_deref(),
+                    reason,
+                    now,
+                )
+            });
+            let rebind::Rebound { mut data, moves } = match rebound {
+                Ok(rebound) => rebound,
+                Err(rebind::RebindError::Evidence) => return Decision::None,
+                Err(rebind::RebindError::Policy) => return Decision::Blocked,
+            };
+            let d = &mut *data;
+            let lease = self.reserve(d, key, &account);
+            self.prune(d, now);
+            d.defer_count_changes = false;
+            d.commit_count_changes();
+            Decision::Selected {
+                account,
+                lease,
+                moves,
+            }
+        })();
+        if let Some(capture) = capture {
+            capture.finish(decision_tape::decision_outcome(&result));
         }
+        result
     }
     /// Read-only counterpart of prune for selection previews. Ordinary lookups
     /// visit one group; only outstanding capacity eviction walks the LRU prefix.
@@ -3152,7 +3298,8 @@ fn date(v: &Value) -> Option<DateTime<Utc>> {
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc))
 }
-fn stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool {
+#[cfg(test)]
+fn legacy_stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool {
     date(&w["observed_at"]).is_some_and(|observed| {
         (now - observed).num_seconds() > 900
             && (d.traffic.get(&c.account.id).is_some_and(|t| *t > observed)
@@ -3164,8 +3311,14 @@ fn stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool 
                     > 0)
     })
 }
+
+fn stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool {
+    let inputs = kernel_shell::candidate_inputs(d, c, None, None, now);
+    kernel::stale_window(&inputs, &c.account.id, w).expect("provided raw candidate")
+}
 /// Observed limits may construct C5 cooling; projection never constructs health.
-fn effective_account(
+#[cfg(test)]
+fn legacy_effective_account(
     c: &Candidate,
     d: &Data,
     _cfg: &RoutingConfig,
@@ -3180,7 +3333,7 @@ fn effective_account(
         account.quota_cooling = None;
         let mut snapshot = snapshot.clone();
         if let Some(windows) = snapshot["windows"].as_array_mut() {
-            windows.retain(|w| !stale_window(c, d, w, now));
+            windows.retain(|w| !legacy_stale_window(c, d, w, now));
         }
         snapshot["signals"] = Value::Null;
         account.apply_health_signal(
@@ -3193,6 +3346,17 @@ fn effective_account(
         );
     }
     account
+}
+
+fn effective_account(
+    c: &Candidate,
+    d: &Data,
+    _cfg: &RoutingConfig,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+) -> Account {
+    let inputs = kernel_shell::candidate_inputs(d, c, None, model, now);
+    kernel::effective_account(&inputs, &c.account.id).expect("provided raw candidate")
 }
 fn account_window(provider: Provider, w: &Value) -> Option<bool> {
     match w["name"].as_str()? {
@@ -4365,7 +4529,10 @@ mod tests {
         }
     }
     pub(super) fn fixture_dir() -> tempfile::TempDir {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
             .parent()
             .unwrap()
             .parent()

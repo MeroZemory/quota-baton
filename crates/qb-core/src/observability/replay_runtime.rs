@@ -1,8 +1,7 @@
 //! Startup-only metadata capture. Producers never perform filesystem I/O.
-use super::replay_recorder::{
-    Archive, BuildIdentity, Event, Id, IdentityDomain, Owner, Provenance, RecordResult, Recorder,
-    Stamp,
-};
+#[cfg(test)]
+use super::replay_recorder::{Archive, BuildIdentity, Provenance};
+use super::replay_recorder::{Event, Id, IdentityDomain, Owner, RecordResult, Recorder, Stamp};
 use std::{
     io,
     path::Path,
@@ -13,6 +12,7 @@ use std::{
 
 pub(crate) struct Runtime {
     recorder: Recorder,
+    tape: Option<super::replay_recorder::tape::Producer>,
     next_id: std::sync::atomic::AtomicU64,
     start: Instant,
     start_utc_ns: i64,
@@ -21,6 +21,7 @@ pub(crate) struct Runtime {
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 impl Runtime {
+    #[cfg(test)]
     pub(crate) fn start(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
         let start = Instant::now();
         let start_utc_ns = chrono::Utc::now()
@@ -44,6 +45,7 @@ impl Runtime {
             .spawn(move || writer(archive, producer, start, stopped))?;
         Ok(Self {
             recorder,
+            tape: None,
             next_id: std::sync::atomic::AtomicU64::new(1),
             start,
             start_utc_ns,
@@ -51,6 +53,70 @@ impl Runtime {
             stop,
             worker: Mutex::new(Some(worker)),
         })
+    }
+    /// Main supplies the separate state/decision-tape-v5 root. Legacy roots are
+    /// neither inspected nor removed, even when their disk cap was exhausted.
+    pub(crate) fn start_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
+        Self::start_tape_with_provenance(
+            root,
+            disk_limit_mib,
+            super::replay_recorder::Provenance::OperatorOptIn,
+        )
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub(crate) fn start_synthetic_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
+        Self::start_tape_with_provenance(
+            root,
+            disk_limit_mib,
+            super::replay_recorder::Provenance::Synthetic,
+        )
+    }
+
+    fn start_tape_with_provenance(
+        root: &Path,
+        disk_limit_mib: u64,
+        provenance: super::replay_recorder::Provenance,
+    ) -> io::Result<Self> {
+        let start = Instant::now();
+        let start_utc_ns = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| io::Error::other("decision_tape_clock_range"))?;
+        let limits = super::replay_recorder::Limits::new(
+            disk_limit_mib
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| io::Error::other("decision_tape_disk_limit"))?,
+        )?;
+        let (tape, archive) = super::replay_recorder::tape::open_with_provenance(
+            root,
+            limits,
+            Stamp {
+                utc_ns: start_utc_ns,
+                monotonic_ns: 0,
+            },
+            provenance,
+        )?;
+        let (stop, stopped) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("qb-decision-tape".into())
+            .spawn(move || tape_writer(archive, start, stopped))?;
+        Ok(Self {
+            recorder: Recorder::default(),
+            tape: Some(tape),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            start,
+            start_utc_ns,
+            cursors: Mutex::new([0; 8]),
+            stop,
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+    pub(crate) fn producer_failed(&self) {
+        if let Some(tape) = &self.tape {
+            tape.failed();
+        } else {
+            self.recorder.producer_failed();
+        }
     }
     pub(crate) fn next_id(&self) -> Option<u64> {
         self.next_id
@@ -61,12 +127,16 @@ impl Runtime {
             )
             .ok()
             .or_else(|| {
-                self.recorder.producer_failed();
+                self.producer_failed();
                 None
             })
     }
     pub(crate) fn identity(&self, domain: IdentityDomain, raw: &str) -> Option<Id> {
-        self.recorder.identity(domain, raw.as_bytes())
+        if let Some(tape) = &self.tape {
+            tape.identity(domain, raw.as_bytes())
+        } else {
+            self.recorder.identity(domain, raw.as_bytes())
+        }
     }
     // UTC is the process-origin mapping; monotonic bounds retain exact collection order.
     pub(crate) fn stamp_at(&self, at: Instant) -> Option<Stamp> {
@@ -85,10 +155,13 @@ impl Runtime {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let cursor = &mut cursors[owner as usize];
         let Some(next) = cursor.checked_add(1) else {
-            self.recorder.producer_failed();
+            self.producer_failed();
             return None;
         };
         *cursor = next;
+        if let Some(tape) = &self.tape {
+            return tape.metadata(self.stamp(), owner, next, cause, event);
+        }
         match self
             .recorder
             .record(self.stamp(), owner, next, cause, event)
@@ -97,8 +170,58 @@ impl Runtime {
             _ => None,
         }
     }
+    /// Serializes only the native allowlisted DTO; writer assigns its ordinal.
+    pub(crate) fn record_decision(
+        &self,
+        record: &crate::bindings::decision_tape::DecisionRecord,
+    ) -> Option<u64> {
+        let tape = self.tape.as_ref()?;
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = &mut cursors[Owner::Bindings as usize];
+        let Some(next) = cursor.checked_add(1) else {
+            tape.failed();
+            return None;
+        };
+        *cursor = next;
+        tape.decision(self.stamp(), next, record)
+    }
+
+    pub(crate) fn record_permit(
+        &self,
+        inputs: &crate::bindings::kernel::DecisionInputs,
+        actual: &crate::bindings::kernel::PermitDecision,
+    ) -> Option<u64> {
+        let tape = self.tape.as_ref()?;
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = &mut cursors[Owner::Bindings as usize];
+        let Some(next) = cursor.checked_add(1) else {
+            tape.failed();
+            return None;
+        };
+        *cursor = next;
+        tape.permit(self.stamp(), next, inputs, actual)
+    }
+
+    pub(crate) fn record_permit_commit(&self, proposal: Option<u64>) -> Option<u64> {
+        let tape = self.tape.as_ref()?;
+        let Some(proposal) = proposal else {
+            tape.failed();
+            return None;
+        };
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = &mut cursors[Owner::Bindings as usize];
+        let Some(next) = cursor.checked_add(1) else {
+            tape.failed();
+            return None;
+        };
+        *cursor = next;
+        tape.permit_commit(self.stamp(), next, proposal)
+    }
     pub(crate) fn disable(&self) {
-        self.recorder.disable()
+        self.recorder.disable();
+        if let Some(tape) = &self.tape {
+            tape.disable();
+        }
     }
     /// Called on a blocking thread before lease handover. Existing producer Arcs
     /// may survive drain, but cannot keep the archive/root lock alive afterward.
@@ -118,12 +241,38 @@ impl Runtime {
         }
     }
 }
+fn tape_writer(
+    mut archive: super::replay_recorder::tape::Writer,
+    start: Instant,
+    stopped: mpsc::Receiver<()>,
+) {
+    loop {
+        match stopped.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if archive.flush(stamp(start)).is_err() {
+            tracing::warn!(
+                code = "decision_tape_write_failed",
+                "Decision tape capture stopped after storage failure"
+            );
+            break;
+        }
+    }
+    if archive.close(stamp(start)).is_err() {
+        tracing::warn!(
+            code = "decision_tape_close_failed",
+            "Decision tape was not cleanly sealed"
+        );
+    }
+}
 fn stamp(start: Instant) -> Stamp {
     Stamp {
         utc_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
         monotonic_ns: u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
     }
 }
+#[cfg(test)]
 fn writer(mut archive: Archive, producer: Recorder, start: Instant, stopped: mpsc::Receiver<()>) {
     let mut faulted = false;
     loop {

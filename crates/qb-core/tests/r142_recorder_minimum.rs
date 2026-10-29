@@ -12,7 +12,7 @@ use qb_core::{
 };
 use qb_testkit::{ScriptedResponse, ScriptedUpstream};
 use serde_json::{Value, json};
-use std::{fs, path::Path, sync::Arc, time::Duration};
+use std::{fs, io::Read, path::Path, sync::Arc, time::Duration};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -59,7 +59,12 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
         )
         .unwrap();
         let account_id = store.list().unwrap()[0].id.clone();
-        let capture = home.join("state/routing-replay");
+        let capture = home.join("state/decision-tape-v5");
+        let legacy = home.join("state/routing-replay");
+        if mode == "on" {
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("operator-file"), b"preserve-legacy-root").unwrap();
+        }
         if mode == "foreign-storage" {
             fs::create_dir_all(&capture).unwrap();
             fs::write(capture.join("operator-file"), b"preserve-this-file").unwrap();
@@ -132,7 +137,19 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                 let mut manifests = Vec::new();
                 for path in files(&capture) {
                     let content = fs::read(&path).unwrap();
-                    let text = String::from_utf8_lossy(&content);
+                    let decoded = if path.extension().is_some_and(|e| e == "zst") {
+                        let mut decoded = Vec::new();
+                        zstd::stream::read::Decoder::new(content.as_slice())
+                            .unwrap()
+                            .take(16 * 1024 * 1024 + 1)
+                            .read_to_end(&mut decoded)
+                            .unwrap();
+                        assert!(decoded.len() <= 16 * 1024 * 1024);
+                        decoded
+                    } else {
+                        content.clone()
+                    };
+                    let text = String::from_utf8_lossy(&decoded);
                     for secret in [
                         "private-access-canary",
                         "private-refresh-canary",
@@ -146,7 +163,7 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                             "private input escaped into metadata"
                         );
                     }
-                    if path.extension().is_some_and(|e| e == "jsonl") {
+                    if path.extension().is_some_and(|e| e == "zst") {
                         events.extend(
                             text.lines()
                                 .map(|line| serde_json::from_str::<Value>(line).unwrap()),
@@ -156,27 +173,40 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                         manifests.push(serde_json::from_slice::<Value>(&content).unwrap());
                     }
                 }
-                assert!(events.iter().any(|e| e["event"]["kind"] == "AccountState"));
+                let metadata: Vec<_> = events
+                    .iter()
+                    .filter(|e| e["event"]["kind"] == "Metadata")
+                    .map(|e| &e["event"]["facts"])
+                    .collect();
+                assert!(metadata.iter().any(|e| e["kind"] == "AccountState"));
+                assert!(metadata.iter().any(|e| e["kind"] == "CollectionMember"));
                 assert!(
-                    events
-                        .iter()
-                        .any(|e| e["event"]["kind"] == "CollectionMember")
-                );
-                assert!(
-                    events
-                        .iter()
-                        .any(|e| e["event"]["kind"] == "CollectionBoundary"
-                            && e["event"]["facts"]["complete"] == true)
+                    metadata.iter().any(
+                        |e| e["kind"] == "CollectionBoundary" && e["facts"]["complete"] == true
+                    )
                 );
                 assert_eq!(manifests.len(), 1);
                 let manifest = &manifests[0];
+                assert_eq!(manifest["schema"], 5);
                 assert_eq!(manifest["sealed"], true);
-                assert_eq!(manifest["replay_ready"], false);
-                assert_eq!(manifest["initial_state_reconciled"], false);
-                assert_eq!(manifest["owner_hooks_complete"], false);
-                assert_eq!(manifest["retention_ns"], 7_u64 * 24 * 3600 * 1_000_000_000);
-                assert_eq!(manifest["queued_records"], 0);
-                assert!(manifest["persisted_through"].as_u64().unwrap() >= 3);
+                assert_eq!(manifest["accepted"], manifest["persisted"]);
+                assert!(manifest["persisted"].as_u64().unwrap() >= 3);
+                assert_eq!(manifest["hourly_encoded_byte_limit"], 20_000_000);
+                assert!(
+                    manifest["losses"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .all(|v| v == 0 || v == false)
+                );
+                let epoch =
+                    qb_core::observability::decision_reader::load(&capture.join("e00")).unwrap();
+                assert_eq!(epoch.losses, 0);
+                assert!(!epoch.initial_witness.is_empty());
+                assert_eq!(
+                    fs::read(legacy.join("operator-file")).unwrap(),
+                    b"preserve-legacy-root"
+                );
                 if let Some(output) = std::env::var_os("QB_RECORDER_SAMPLE_OUT") {
                     let output = Path::new(&output);
                     fs::create_dir_all(output).unwrap();

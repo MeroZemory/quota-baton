@@ -94,6 +94,12 @@
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
+      "expression": "call: Parenthesis( |Alone |Alone Brace( let mut d =Alone self .Alone data .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) ;Alone for c in candidates Brace( if let Some Parenthesis( snapshot ) =Alone &Alone c .Alone quota Brace( d .Alone placements .Alone entry Parenthesis( c .Alone account .Alone id .Alone clone Parenthesis( ) ) .Alone or_default Parenthesis( ) .Alone observe Parenthesis( snapshot ) ;Alone ) ) self .Alone prune Parenthesis( &Alone mut d ,Alone now ) ;Alone if let Some Parenthesis( key ) =Alone key .Alone filter Parenthesis( |Alone _ |Alone request_bytes >Alone 0 ) &Joint &Alone d .Alone groups .Alone contains_key Parenthesis( group Parenthesis( key ) ) &Joint &Alone !Alone d .Alone unknown_cost .Alone contains Parenthesis( group Parenthesis( key ) ) Brace( let known =Alone d .Alone last_request_bytes .Alone entry Parenthesis( group Parenthesis( key ) .Alone to_owned Parenthesis( ) ) .Alone or_default Parenthesis( ) ;Alone *Alone known =Alone Parenthesis( *Alone known ) .Alone max Parenthesis( request_bytes ) ;Alone ) let preference =Alone coverage .Alone map Parenthesis( |Alone coverage |Alone launch :Joint :Alone SelectionPreference Brace( account :Alone None ,Alone coverage :Alone Some Parenthesis( coverage ) ,Alone model_move :Alone false ,Alone ) ) ;Alone decision_tape :Joint :Alone observe_choice Parenthesis( self ,Alone &Alone d ,Alone provider ,Alone key ,Alone model ,Alone candidates ,Alone now ) ;Alone let Parenthesis( choice ,Alone selection ,Alone sole_target ) =Alone self .Alone select_with_return_guard_and_root_hint Parenthesis( &Alone d ,Alone provider ,Alone key ,Alone parent ,Alone model ,Alone candidates ,Alone move_evidence ,Alone None ,Alone observations ,Alone pinned ,Alone now ,Alone hold_allowed ,Alone preference .Alone as_ref Parenthesis( ) ,Alone root_hint ,Alone ) ;Alone let mut reason =Alone selection .Alone code Parenthesis( ) ;Alone let mut account =Alone match choice Brace( PreviewDecision :Joint :Alone Hold Brace( until ) =Joint >Alone return Decision :Joint :Alone Hold Brace( until ) ,Alone PreviewDecision :Joint :Alone None =Joint >Alone return Decision :Joint :Alone None ,Alone PreviewDecision :Joint :Alone Selected Brace( account ) =Joint >Alone account ,Alone ) ;Alone if let Some Parenthesis( key ) =Alone key Brace( let mut extra =Alone BTreeSet :Joint :Alone new Parenthesis( ) ;Alone if !Alone d .Alone bindings .Alone contains_key Parenthesis( key ) Brace( extra .Alone insert Parenthesis( key ) ;Alone ) if let Some Parenthesis( parent ) =Alone parent .Alone filter Parenthesis( |Alone p |Alone group Parenthesis( p ) =Joint =Alone group Parenthesis( key ) &Joint &Alone !Alone d .Alone bindings .Alone contains_key Parenthesis( *Alone p ) ) Brace( extra .Alone insert Parenthesis( parent ) ;Alone ) let mut weight =Alone d .Alone snapshot_weight ;Alone if let Some Parenthesis( entry ) =Alone d .Alone groups .Alone get Parenthesis( group Parenthesis( key ) ) &Joint &Alone entry .Alone account !Joint =Alone account Brace( for key in &Alone entry .Alone keys Brace( weight =Alone weight .Alone saturating_sub Parenthesis( binding_bound Parenthesis( key ,Alone &Alone entry .Alone account ) ) .Alone saturating_add Parenthesis( binding_bound Parenthesis( key ,Alone &Alone account ) ) ;Alone ) ) weight =Alone extra .Alone iter Parenthesis( ) .Alone fold Parenthesis( weight ,Alone |Alone n ,Alone key |Alone Brace( n .Alone saturating_add Parenthesis( binding_bound Parenthesis( key ,Alone &Alone account ) ) ) ) ;Alone if d .Alone bindings .Alone len Parenthesis( ) .Alone saturating_add Parenthesis( extra .Alone len Parenthesis( ) ) >Alone CAPACITY *Alone 2 |Joint |Alone weight as u64 +Alone 64 >Alone SNAPSHOT_MAX_BYTES Brace( tracing :Joint :Alone warn !Alone Parenthesis( code =Alone \"binding_capacity\" ,Alone \"New binding refused at the restore-safe snapshot bound\" ) ;Alone decision_tape :Joint :Alone capacity_refused Parenthesis( self ) ;Alone return Decision :Joint :Alone Blocked ;Alone ) ) let previous =Alone key .Alone and_then Parenthesis( |Alone key |Alone d .Alone groups .Alone get Parenthesis( group Parenthesis( key ) ) ) .Alone map Parenthesis( |Alone g |Alone g .Alone account .Alone clone Parenthesis( ) ) ;Alone let guard_key =Alone key .Alone map Parenthesis( group ) .Alone map Parenthesis( |Alone key |Alone launch :Joint :Alone ownership_group Parenthesis( &Alone d ,Alone key ) ) .Alone map Parenthesis( str :Joint :Alone to_owned ) .Alone unwrap_or_else Parenthesis( |Alone |Alone format !Alone Parenthesis( \"unidentified:{}\" ,Alone provider .Alone as_str Parenthesis( ) ) ) ;Alone let physical_source =Alone self .Alone rebind_source Parenthesis( &Alone d ,Alone provider ,Alone key ) ;Alone let guard_source =Alone self .Alone rebind_budget_source Parenthesis( &Alone d ,Alone provider ,Alone key ,Alone &Alone account ) ;Alone let guard_from =Alone guard_source .Alone as_deref Parenthesis( ) ;Alone if reason =Joint =Alone \"forced\" &Joint &Alone guard_from .Alone is_some_and Parenthesis( |Alone id |Alone id !Joint =Alone account ) &Joint &Alone let Some Parenthesis( source ) =Alone guard_from .Alone and_then Parenthesis( |Alone id |Alone move_evidence .Alone iter Parenthesis( ) .Alone find Parenthesis( |Alone c |Alone c .Alone account .Alone id =Joint =Alone id ) ) Brace( let source =Alone effective_account Parenthesis( source ,Alone &Alone d ,Alone &Alone self .Alone config ,Alone model ,Alone now ) ;Alone let plan =Alone self .Alone policies .Alone plan Parenthesis( launch :Joint :Alone policy_key Parenthesis( &Alone d ,Alone key ) ) ;Alone if source .Alone user_state =Joint =Alone UserState :Joint :Alone Active &Joint &Alone let Health :Joint :Alone Cooling Brace( reason :Alone HealthReason :Joint :Alone Quota ,Alone until ,Alone scope ,Alone ) =Alone &Alone source .Alone health &Joint &Alone *Alone until >Alone now &Joint &Alone Parenthesis( scope =Joint =Alone \"account\" |Joint |Alone scope .Alone strip_prefix Parenthesis( \"model:\" ) .Alone is_some_and Parenthesis( |Alone m |Alone model =Joint =Alone Some Parenthesis( m ) ) ) &Joint &Alone let Some Parenthesis( quota ) =Alone &Alone source .Alone quota_cooling &Joint &Alone quota .Alone window =Joint =Alone \"5h\" &Joint &Alone quota .Alone reset_at .Alone signed_duration_since Parenthesis( now ) .Alone to_std Parenthesis( ) .Alone is_ok_and Parenthesis( |Alone wait |Alone wait >Alone Duration :Joint :Alone from_secs Parenthesis( plan .Alone settings .Alone reset_wait_secs ) ) Brace( reason =Alone \"five_hour_far_move\" ;Alone ) ) let permit =Alone match self .Alone prepare_move_with_source Parenthesis( &Alone d ,Alone &Alone guard_key ,Alone guard_from ,Alone &Alone account ,Alone guard_from .Alone and_then Parenthesis( |Alone id |Alone move_evidence .Alone iter Parenthesis( ) .Alone find Parenthesis( |Alone c |Alone c .Alone account .Alone id =Joint =Alone id ) ) ,Alone candidates ,Alone sole_target .Alone as_ref Parenthesis( ) ,Alone observations ,Alone model ,Alone reason ,Alone now ,Alone ) Brace( Ok Parenthesis( permit ) =Joint >Alone permit ,Alone Err Parenthesis( denied ) =Joint >Alone Brace( if let Some Parenthesis( old ) =Alone guard_from .Alone and_then Parenthesis( |Alone id |Alone candidates .Alone iter Parenthesis( ) .Alone find Parenthesis( |Alone c |Alone c .Alone account .Alone id =Joint =Alone id ) ) &Joint &Alone self .Alone policies .Alone plan Parenthesis( launch :Joint :Alone policy_key Parenthesis( &Alone d ,Alone key ) ) .Alone anchor .Alone as_ref Parenthesis( ) .Alone is_none_or Parenthesis( |Alone anchor |Alone physical_source .Alone as_ref Parenthesis( ) =Joint =Alone Some Parenthesis( anchor ) ) &Joint &Alone self .Alone move_source_usable Parenthesis( &Alone d ,Alone &Alone guard_key ,Alone old ,Alone model ,Alone now ) Brace( account =Alone old .Alone account .Alone id .Alone clone Parenthesis( ) ;Alone reason =Alone \"guard_keep\" ;Alone None ) else Brace( return Decision :Joint :Alone MoveHeld Brace( until :Alone denied .Alone until ,Alone ) ;Alone ) ) ) ;Alone let policy_key =Alone launch :Joint :Alone policy_key Parenthesis( &Alone d ,Alone key ) .Alone map Parenthesis( str :Joint :Alone to_owned ) ;Alone let admitted_from =Alone self .Alone policies .Alone plan Parenthesis( policy_key .Alone as_deref Parenthesis( ) ) .Alone anchor .Alone or_else Parenthesis( |Alone |Alone physical_source .Alone clone Parenthesis( ) ) ;Alone drop Parenthesis( d ) ;Alone let admission =Alone admit Parenthesis( &Alone account ) ;Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone Admission ,Alone admission .Alone is_some Parenthesis( ) ) ;Alone let Some Parenthesis( admission ) =Alone admission else Brace( return Decision :Joint :Alone None ;Alone ) ;Alone if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone Selection ,Alone selection .Alone valid_for Parenthesis( key ,Alone admitted_from .Alone as_deref Parenthesis( ) ,Alone &Alone account ,Alone model ,Alone now ) ,Alone ) Brace( return Decision :Joint :Alone None ;Alone ) if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone AdmissionSource ,Alone admission .Alone valid_for Parenthesis( admitted_from .Alone as_deref Parenthesis( ) ,Alone &Alone account ) ,Alone ) Brace( return Decision :Joint :Alone None ;Alone ) if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone Pin ,Alone admission .Alone valid_pin_for Parenthesis( provider ,Alone key ,Alone &Alone account ) ,Alone ) Brace( return Decision :Joint :Alone None ;Alone ) if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone Store ,Alone admission .Alone valid_store_for Parenthesis( admitted_from .Alone as_deref Parenthesis( ) ,Alone admitted_from .Alone as_deref Parenthesis( ) .Alone and_then Parenthesis( |Alone id |Alone Brace( move_evidence .Alone iter Parenthesis( ) .Alone find Parenthesis( |Alone candidate |Alone candidate .Alone account .Alone id =Joint =Alone id ) .Alone map Parenthesis( |Alone candidate |Alone &Alone candidate .Alone account ) ) ) ,Alone &Alone account ,Alone ) ,Alone ) Brace( return Decision :Joint :Alone None ;Alone ) if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone Failure ,Alone admission .Alone valid_failure_for Parenthesis( key ,Alone admitted_from .Alone as_deref Parenthesis( ) .Alone and_then Parenthesis( |Alone id |Alone Brace( move_evidence .Alone iter Parenthesis( ) .Alone find Parenthesis( |Alone c |Alone c .Alone account .Alone id =Joint =Alone id ) .Alone map Parenthesis( |Alone c |Alone &Alone c .Alone account ) ) ) ,Alone &Alone account ,Alone model ,Alone ) ,Alone ) Brace( return Decision :Joint :Alone None ;Alone ) let context =Alone rebind :Joint :Alone RebindContext Brace( provider ,Alone key ,Alone guard_key :Alone &Alone guard_key ,Alone from :Alone physical_source .Alone as_deref Parenthesis( ) ,Alone account :Alone &Alone account ,Alone parent ,Alone model ,Alone candidates ,Alone sources :Alone move_evidence ,Alone pinned ,Alone request_bytes ,Alone hold_timed_out ,Alone now ,Alone label :Alone reason ,Alone ) ;Alone let authority =Alone self .Alone owner_move_reason Parenthesis( &Alone context ,Alone &Alone admission ,Alone Some Parenthesis( &Alone selection ) ,Alone None ) ;Alone let rebound =Alone self .Alone rebind Parenthesis( context ,Alone authority ,Alone permit ,Alone |Alone reason |Alone Brace( self .Alone policies .Alone dispatch Parenthesis( policy_key .Alone as_deref Parenthesis( ) ,Alone &Alone account ,Alone previous .Alone as_deref Parenthesis( ) ,Alone reason ,Alone now ,Alone ) ) ) ;Alone let rebind :Joint :Alone Rebound Brace( mut data ,Alone moves ) =Alone match rebound Brace( Ok Parenthesis( rebound ) =Joint >Alone rebound ,Alone Err Parenthesis( rebind :Joint :Alone RebindError :Joint :Alone Evidence ) =Joint >Alone return Decision :Joint :Alone None ,Alone Err Parenthesis( rebind :Joint :Alone RebindError :Joint :Alone Policy ) =Joint >Alone return Decision :Joint :Alone Blocked ,Alone ) ;Alone let d =Alone &Alone mut *Alone data ;Alone let lease =Alone self .Alone reserve Parenthesis( d ,Alone key ,Alone &Alone account ) ;Alone self .Alone prune Parenthesis( d ,Alone now ) ;Alone d .Alone defer_count_changes =Alone false ;Alone d .Alone commit_count_changes Parenthesis( ) ;Alone Decision :Joint :Alone Selected Brace( account ,Alone lease ,Alone moves ,Alone ) ) ) Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings.rs",
+      "function": "BindingTable::choose_with_hold_at_admitted_proof_and_root_hint",
       "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( group Parenthesis( key ) .Alone to_owned Parenthesis( ) )",
       "count": 1
     },
@@ -232,7 +238,7 @@
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::new",
-      "expression": "call: Arc :Joint :Alone new Parenthesis( Self Brace( policies ,Alone path ,Alone config ,Alone thresholds :Alone Mutex :Joint :Alone new Parenthesis( BTreeMap :Joint :Alone new Parenthesis( ) ) ,Alone data :Alone Mutex :Joint :Alone new Parenthesis( data ) ,Alone writer :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone mutations :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone #Alone Bracket( cfg Parenthesis( test ) ) wait_before_publication :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_guard :Alone Mutex :Joint :Alone new Parenthesis( move_guard :Joint :Alone Breaker :Joint :Alone default Parenthesis( ) ) ,Alone move_guard_observer :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_accounting :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone writes_stopped :Alone AtomicBool :Joint :Alone new Parenthesis( false ) ,Alone unknown_cost_skips :Alone AtomicUsize :Joint :Alone new Parenthesis( 0 ) ,Alone usage_sequence :Alone AtomicU64 :Joint :Alone new Parenthesis( 0 ) ,Alone ) )",
+      "expression": "call: Arc :Joint :Alone new Parenthesis( Self Brace( policies ,Alone path ,Alone config ,Alone thresholds :Alone Mutex :Joint :Alone new Parenthesis( BTreeMap :Joint :Alone new Parenthesis( ) ) ,Alone data :Alone Mutex :Joint :Alone new Parenthesis( data ) ,Alone writer :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone mutations :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone #Alone Bracket( cfg Parenthesis( test ) ) wait_before_publication :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_guard :Alone Mutex :Joint :Alone new Parenthesis( move_guard :Joint :Alone Breaker :Joint :Alone default Parenthesis( ) ) ,Alone move_guard_observer :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_accounting :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone writes_stopped :Alone AtomicBool :Joint :Alone new Parenthesis( false ) ,Alone unknown_cost_skips :Alone AtomicUsize :Joint :Alone new Parenthesis( 0 ) ,Alone usage_sequence :Alone AtomicU64 :Joint :Alone new Parenthesis( 0 ) ,Alone decision_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone permit_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone permit_commit_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone decision_capture_losses :Alone AtomicU64 :Joint :Alone new Parenthesis( 0 ) ,Alone ) )",
       "count": 1
     },
     {
@@ -735,18 +741,6 @@
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "effective_account",
-      "expression": "assignment: account .Alone health =Alone Health :Joint :Alone Ready",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "effective_account",
-      "expression": "assignment: account .Alone quota_cooling =Alone None",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
       "function": "index_group",
       "expression": "compound-assignment: account .Alone count +Joint =Alone entry .Alone keys .Alone len Parenthesis( )",
       "count": 1
@@ -880,7 +874,7 @@
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "semantic_evidence",
-      "expression": "call: serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( &Alone c .Alone user_state ,Alone &Alone c .Alone health ,Alone c .Alone payment_until ,Alone c .Alone drain ,Alone c .Alone allow_credits ,Alone reset ,Alone ) )",
+      "expression": "call: Data :Joint :Alone default Parenthesis( )",
       "count": 1
     },
     {
@@ -1004,6 +998,108 @@
       "count": 1
     },
     {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "BindingTable::decision_tape_initial_image",
+      "expression": "call: serde_json :Joint :Alone to_value Parenthesis( &Alone *Alone self .Alone thresholds .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "BindingTable::decision_tape_initial_image",
+      "expression": "call: serde_json :Joint :Alone to_value Parenthesis( &Alone self .Alone config )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "BindingTable::decision_tape_initial_image",
+      "expression": "call: serde_json :Joint :Alone to_value Parenthesis( snapshot Parenthesis( &Alone d ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "BindingTable::decision_tape_initial_image",
+      "expression": "opaque-macro: format !Alone Parenthesis( \"{:x}\" ,Alone Sha256 :Joint :Alone digest Parenthesis( serde_json :Joint :Alone to_vec Parenthesis( value ) ?Alone ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "BindingTable::decision_tape_initial_image",
+      "expression": "opaque-macro: serde_json :Joint :Alone json !Alone Parenthesis( Brace( \"used\" :Alone &Alone d .Alone outside_used ,Alone \"unknown\" :Alone d .Alone outside_unknown ,Alone \"failure\" :Alone d .Alone outside_failure .Alone as_ref Parenthesis( ) .Alone map Parenthesis( |Alone flag |Alone flag .Alone load Parenthesis( Ordering :Joint :Alone Acquire ) ) ,Alone ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "BindingTable::set_decision_recorder",
+      "expression": "assignment: *Alone self .Alone decision_recorder .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) =Alone Some Parenthesis( recorder )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "rebind_complete",
+      "expression": "compound-assignment: t .Alone rebind .Alone completed +Joint =Alone 1",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "rebind_complete",
+      "expression": "compound-assignment: t .Alone rebind .Alone replacements +Joint =Alone replacements Parenthesis( moves )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "rebind_enter",
+      "expression": "compound-assignment: t .Alone rebind .Alone entered +Joint =Alone 1",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use serde_json :Joint :Alone Value ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel.rs",
+      "function": "effective_account",
+      "expression": "assignment: account .Alone health =Alone Health :Joint :Alone Ready",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel.rs",
+      "function": "effective_account",
+      "expression": "assignment: account .Alone quota_cooling =Alone None",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel.rs",
+      "function": "semantic_evidence",
+      "expression": "call: serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( &Alone c .Alone user_state ,Alone &Alone c .Alone health ,Alone c .Alone payment_until ,Alone c .Alone drain ,Alone c .Alone allow_credits ,Alone reset ,Alone ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel_shell.rs",
+      "function": "BindingTable::attach_tape",
+      "expression": "call: Parenthesis( |Alone |Alone -Joint >Alone anyhow :Joint :Alone Result <Alone Parenthesis( ) >Alone Brace( use crate :Joint :Alone observability :Joint :Alone replay_recorder :Joint :Alone Brace( Event ,Alone Fingerprint ,Alone Owner ) ;Alone use sha2 :Joint :Alone Brace( Digest ,Alone Sha256 ) ;Alone let image =Alone self .Alone decision_tape_initial_image Parenthesis( ) ?Alone ;Alone let bytes =Alone serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( &Alone image ,Alone initial_accounts ) ) ?Alone ;Alone let digest =Alone Fingerprint Parenthesis( Sha256 :Joint :Alone digest Parenthesis( bytes ) .Alone into Parenthesis( ) ) ;Alone anyhow :Joint :Alone ensure !Alone Parenthesis( producer .Alone record Parenthesis( Owner :Joint :Alone Bindings ,Alone None ,Alone Event :Joint :Alone InitialWitness Brace( component :Alone Owner :Joint :Alone Bindings ,Alone revision :Alone image .Alone revision ,Alone cursor :Alone 0 ,Alone rows :Alone image .Alone bindings_rows ,Alone digest ,Alone ) ) .Alone is_some Parenthesis( ) ,Alone \"initial decision witness was not accepted\" ) ;Alone Ok Parenthesis( Parenthesis( ) ) ) ) Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel_shell.rs",
+      "function": "BindingTable::attach_tape",
+      "expression": "call: serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( &Alone image ,Alone initial_accounts ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel_shell.rs",
+      "function": "BindingTable::set_permit_commit_recorder",
+      "expression": "assignment: *Alone self .Alone permit_commit_recorder .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) =Alone Some Parenthesis( recorder )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel_shell.rs",
+      "function": "BindingTable::set_permit_recorder",
+      "expression": "assignment: *Alone self .Alone permit_recorder .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) =Alone Some Parenthesis( recorder )",
+      "count": 1
+    },
+    {
       "path": "crates/qb-core/src/bindings/launch.rs",
       "function": "BindingTable::bind_launch_activity",
       "expression": "method: d .Alone launch_activity .Alone insert Parenthesis( anchor .Alone to_owned Parenthesis( ) ,Alone Activity Brace( stamp :Alone Arc :Joint :Alone downgrade Parenthesis( stamp ) ,Alone writer :Alone Arc :Joint :Alone downgrade Parenthesis( self ) ,Alone ) ,Alone )",
@@ -1043,6 +1139,12 @@
       "path": "crates/qb-core/src/bindings/launch.rs",
       "function": "BindingTable::place_launch_for_issue_evidence",
       "expression": "assignment: d .Alone defer_count_changes =Alone false",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/launch.rs",
+      "function": "BindingTable::place_launch_for_issue_evidence",
+      "expression": "call: Parenthesis( |Alone |Alone Brace( if !Alone is_anchor Parenthesis( request .Alone anchor_key ) |Joint |Alone request .Alone resume_key .Alone is_some_and Parenthesis( |Alone k |Alone !Alone real_key Parenthesis( k ) ) |Joint |Alone request .Alone model .Alone is_some_and Parenthesis( |Alone m |Alone !Alone valid_model Parenthesis( m ) ) |Joint |Alone Parenthesis( request .Alone model_is_explicit &Joint &Alone request .Alone model .Alone is_none Parenthesis( ) ) Brace( return Err Parenthesis( LaunchError :Joint :Alone InvalidMetadata ) ;Alone ) if self .Alone writes_stopped .Alone load Parenthesis( Ordering :Joint :Alone Acquire ) Brace( return Err Parenthesis( LaunchError :Joint :Alone Retired ) ;Alone ) let mut d =Alone self .Alone data .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) ;Alone decision_tape :Joint :Alone observe_choice Parenthesis( self ,Alone &Alone d ,Alone Provider :Joint :Alone Codex ,Alone request .Alone resume_key .Alone or Parenthesis( Some Parenthesis( request .Alone anchor_key ) ) ,Alone request .Alone model ,Alone candidates ,Alone now ,Alone ) ;Alone if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone DispatchAllowed ,Alone operation .Alone is_some_and Parenthesis( crate :Joint :Alone issue_operation :Joint :Alone IssueOperation :Joint :Alone is_admitted ) |Joint |Alone crate :Joint :Alone boxes :Joint :Alone dispatch_allowed Parenthesis( ) ,Alone ) Brace( return Err Parenthesis( LaunchError :Joint :Alone PolicyBlocked ) ;Alone ) if let Some Parenthesis( operation ) =Alone operation Brace( let checked =Alone operation .Alone check Parenthesis( ) ;Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone Operation ,Alone checked .Alone is_ok Parenthesis( ) ) ;Alone checked .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone PolicyBlocked ) ?Alone ;Alone ) self .Alone prune Parenthesis( &Alone mut d ,Alone now ) ;Alone if let Some Parenthesis( anchor ) =Alone d .Alone launch_anchors .Alone get Parenthesis( request .Alone anchor_key ) Brace( if request .Alone resume_key .Alone is_some_and Parenthesis( |Alone k |Alone canonical Parenthesis( &Alone d ,Alone k ) !Joint =Alone Some Parenthesis( anchor .Alone canonical_key .Alone as_str Parenthesis( ) ) ) Brace( return Err Parenthesis( LaunchError :Joint :Alone AnchorConflict ) ;Alone ) let key =Alone anchor .Alone canonical_key .Alone clone Parenthesis( ) ;Alone let prior =Alone info Parenthesis( &Alone d ,Alone &Alone key ) ?Alone ;Alone let existing =Alone Self :Joint :Alone accepted_in Parenthesis( &Alone d ,Alone Some Parenthesis( &Alone key ) ,Alone &Alone prior .Alone account ) ;Alone drop Parenthesis( d ) ;Alone if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone LaunchAdmission ,Alone !Alone admit .Alone is_some_and Parenthesis( |Alone admit |Alone Brace( !Alone admit Parenthesis( &Alone prior .Alone account ,Alone existing ,Alone prior .Alone current_model .Alone as_deref Parenthesis( ) ) ) ) ,Alone ) Brace( return Err Parenthesis( LaunchError :Joint :Alone NoEligibleAccount ) ;Alone ) if let Some Parenthesis( operation ) =Alone operation Brace( crate :Joint :Alone boxes :Joint :Alone admit_operation Parenthesis( operation ) .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone PolicyBlocked ) ?Alone ;Alone ) let mut d =Alone self .Alone data .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) ;Alone touch Parenthesis( &Alone mut d ,Alone &Alone key ,Alone now ) ;Alone return Ok Parenthesis( LaunchPlacement Brace( canonical_key :Alone key ,Alone account :Alone prior .Alone account ,Alone effective_model :Alone prior .Alone current_model ,Alone moves :Alone Vec :Joint :Alone new Parenthesis( ) ,Alone ) ) ;Alone ) if d .Alone launches .Alone values Parenthesis( ) .Alone any Parenthesis( |Alone m |Alone m .Alone policy_key =Joint =Alone request .Alone anchor_key ) Brace( return Err Parenthesis( LaunchError :Joint :Alone AnchorConflict ) ;Alone ) if d .Alone bindings .Alone contains_key Parenthesis( request .Alone anchor_key ) |Joint |Alone d .Alone launch_anchors .Alone len Parenthesis( ) >Joint =Alone CAPACITY Brace( return Err Parenthesis( LaunchError :Joint :Alone Capacity ) ;Alone ) let key =Alone request .Alone resume_key .Alone and_then Parenthesis( |Alone k |Alone canonical Parenthesis( &Alone d ,Alone k ) ) .Alone or Parenthesis( request .Alone resume_key ) .Alone unwrap_or Parenthesis( request .Alone anchor_key ) .Alone to_owned Parenthesis( ) ;Alone let policy_key =Alone policy_key Parenthesis( &Alone d ,Alone Some Parenthesis( &Alone key ) ) .Alone unwrap Parenthesis( ) .Alone to_owned Parenthesis( ) ;Alone let plan =Alone self .Alone policies .Alone plan Parenthesis( Some Parenthesis( &Alone policy_key ) ) ;Alone let previous =Alone plan .Alone anchor .Alone clone Parenthesis( ) .Alone or_else Parenthesis( |Alone |Alone d .Alone groups .Alone get Parenthesis( &Alone key ) .Alone map Parenthesis( |Alone g |Alone g .Alone account .Alone clone Parenthesis( ) ) ) ;Alone let old_metadata =Alone d .Alone launches .Alone get Parenthesis( &Alone key ) .Alone cloned Parenthesis( ) ;Alone let old_model =Alone old_metadata .Alone as_ref Parenthesis( ) .Alone and_then Parenthesis( |Alone m |Alone m .Alone current_model .Alone clone Parenthesis( ) ) ;Alone let mut model =Alone if previous .Alone is_some Parenthesis( ) &Joint &Alone !Alone request .Alone model_is_explicit Brace( old_model .Alone clone Parenthesis( ) .Alone or_else Parenthesis( |Alone |Alone request .Alone model .Alone map Parenthesis( str :Joint :Alone to_owned ) ) ) else Brace( request .Alone model .Alone map Parenthesis( str :Joint :Alone to_owned ) .Alone or Parenthesis( old_model .Alone clone Parenthesis( ) ) ) ;Alone let current =Alone previous .Alone as_deref Parenthesis( ) .Alone and_then Parenthesis( |Alone id |Alone candidates .Alone iter Parenthesis( ) .Alone find Parenthesis( |Alone c |Alone c .Alone account .Alone id =Joint =Alone id ) ) ;Alone let usable =Alone current .Alone is_some_and Parenthesis( |Alone c |Alone Brace( effective_account Parenthesis( c ,Alone &Alone d ,Alone &Alone self .Alone config ,Alone old_model .Alone as_deref Parenthesis( ) ,Alone now ) .Alone eligible_at Parenthesis( old_model .Alone as_deref Parenthesis( ) ,Alone now ) &Joint &Alone Parenthesis( !Alone c .Alone account .Alone drain |Joint |Alone Self :Joint :Alone accepted_in Parenthesis( &Alone d ,Alone Some Parenthesis( &Alone key ) ,Alone &Alone c .Alone account .Alone id ) ) ) ) ;Alone let mut model_move =Alone false ;Alone if let Parenthesis( Some Parenthesis( id ) ,Alone Some Parenthesis( model ) ) =Alone Parenthesis( previous .Alone as_deref Parenthesis( ) ,Alone request .Alone model .Alone filter Parenthesis( |Alone _ |Alone request .Alone model_is_explicit &Joint &Alone usable ) ,Alone ) Brace( let supported =Alone entitlements .Alone get Parenthesis( id ) .Alone ok_or Parenthesis( LaunchError :Joint :Alone EntitlementsUnknown ) ?Alone .Alone contains Parenthesis( model ) &Joint &Alone current .Alone is_none_or Parenthesis( |Alone c |Alone Brace( effective_account Parenthesis( c ,Alone &Alone d ,Alone &Alone self .Alone config ,Alone Some Parenthesis( model ) ,Alone now ) .Alone eligible_at Parenthesis( Some Parenthesis( model ) ,Alone now ) ) ) ;Alone if !Alone supported Brace( if !Alone request .Alone allow_move_for_model &Joint &Alone request .Alone account_pref .Alone is_none Parenthesis( ) Brace( return Err Parenthesis( LaunchError :Joint :Alone ConsentRequired ) ;Alone ) model_move =Alone true ;Alone ) ) if usable &Joint &Alone !Alone model_move &Joint &Alone !Alone request .Alone model_is_explicit &Joint &Alone old_model .Alone is_none Parenthesis( ) Brace( if let Parenthesis( Some Parenthesis( id ) ,Alone Some Parenthesis( default ) ) =Alone Parenthesis( previous .Alone as_deref Parenthesis( ) ,Alone model .Alone as_deref Parenthesis( ) ) &Joint &Alone !Alone entitlements .Alone get Parenthesis( id ) .Alone is_some_and Parenthesis( |Alone s |Alone s .Alone contains Parenthesis( default ) ) Brace( model =Alone None ;Alone ) ) for candidate in candidates Brace( if let Some Parenthesis( snapshot ) =Alone &Alone candidate .Alone quota Brace( d .Alone placements .Alone entry Parenthesis( candidate .Alone account .Alone id .Alone clone Parenthesis( ) ) .Alone or_default Parenthesis( ) .Alone observe Parenthesis( snapshot ) ;Alone ) ) let filtered :Alone Vec <Alone _ >Alone =Alone candidates .Alone iter Parenthesis( ) .Alone filter Parenthesis( |Alone c |Alone c .Alone account .Alone provider =Joint =Alone Provider :Joint :Alone Codex ) .Alone filter Parenthesis( |Alone c |Alone Brace( model .Alone as_deref Parenthesis( ) .Alone is_none_or Parenthesis( |Alone m |Alone Brace( entitlements .Alone get Parenthesis( &Alone c .Alone account .Alone id ) .Alone is_some_and Parenthesis( |Alone s |Alone s .Alone contains Parenthesis( m ) ) ) ) ) ) .Alone cloned Parenthesis( ) .Alone collect Parenthesis( ) ;Alone let coverage :Alone BTreeSet <Alone _ >Alone =Alone old_metadata .Alone as_ref Parenthesis( ) .Alone map_or_else Parenthesis( BTreeSet :Joint :Alone new ,Alone |Alone m |Alone Brace( entitlements .Alone iter Parenthesis( ) .Alone filter Parenthesis( |Alone Parenthesis( _ ,Alone s ) |Alone m .Alone advertised_models .Alone is_subset Parenthesis( s ) ) .Alone map Parenthesis( |Alone Parenthesis( id ,Alone _ ) |Alone id .Alone clone Parenthesis( ) ) .Alone collect Parenthesis( ) ) ) ;Alone let preference =Alone SelectionPreference Brace( account :Alone request .Alone account_pref ,Alone coverage :Alone previous .Alone as_ref Parenthesis( ) .Alone filter Parenthesis( |Alone _ |Alone !Alone model_move ) .Alone map Parenthesis( |Alone _ |Alone &Alone coverage ) ,Alone model_move ,Alone ) ;Alone let entitled_targets :Alone BTreeSet <Alone _ >Alone =Alone sources .Alone iter Parenthesis( ) .Alone filter Parenthesis( |Alone c |Alone Brace( model .Alone as_deref Parenthesis( ) .Alone is_none_or Parenthesis( |Alone m |Alone Brace( entitlements .Alone get Parenthesis( &Alone c .Alone account .Alone id ) .Alone is_some_and Parenthesis( |Alone models |Alone models .Alone contains Parenthesis( m ) ) ) ) ) ) .Alone map Parenthesis( |Alone c |Alone c .Alone account .Alone id .Alone clone Parenthesis( ) ) .Alone collect Parenthesis( ) ;Alone let mut sole_target =Alone None ;Alone let Parenthesis( account ,Alone reason ) =Alone if usable &Joint &Alone !Alone model_move Brace( Parenthesis( previous .Alone clone Parenthesis( ) .Alone unwrap Parenthesis( ) ,Alone \"launch_resume\" ) ) else Brace( let Parenthesis( choice ,Alone _ ,Alone sole ) =Alone self .Alone select_with_return_guard Parenthesis( &Alone d ,Alone Provider :Joint :Alone Codex ,Alone Some Parenthesis( &Alone key ) ,Alone None ,Alone model .Alone as_deref Parenthesis( ) ,Alone &Alone filtered ,Alone sources ,Alone Some Parenthesis( &Alone entitled_targets ) ,Alone observations ,Alone None ,Alone now ,Alone false ,Alone Some Parenthesis( &Alone preference ) ,Alone ) ;Alone sole_target =Alone sole ;Alone match choice Brace( PreviewDecision :Joint :Alone Selected Brace( account ) =Joint >Alone Parenthesis( account ,Alone if model_move Brace( \"model_choice\" ) else if previous .Alone is_some Parenthesis( ) Brace( \"forced\" ) else Brace( \"launch_model\" ) ,Alone ) ,Alone _ if plan .Alone settings .Alone mode =Joint =Alone crate :Joint :Alone routing :Joint :Alone Mode :Joint :Alone Strict &Joint &Alone !Alone model_move =Joint >Alone Brace( return Err Parenthesis( LaunchError :Joint :Alone PolicyBlocked ) ;Alone ) _ if model .Alone is_some Parenthesis( ) &Joint &Alone candidates .Alone iter Parenthesis( ) .Alone any Parenthesis( |Alone c |Alone Brace( c .Alone account .Alone provider =Joint =Alone Provider :Joint :Alone Codex &Joint &Alone !Alone entitlements .Alone contains_key Parenthesis( &Alone c .Alone account .Alone id ) ) ) =Joint >Alone Brace( return Err Parenthesis( LaunchError :Joint :Alone EntitlementsUnknown ) ;Alone ) _ =Joint >Alone return Err Parenthesis( LaunchError :Joint :Alone NoEligibleAccount ) ,Alone ) ) ;Alone if previous .Alone as_deref Parenthesis( ) .Alone is_some_and Parenthesis( |Alone id |Alone id !Joint =Alone account ) &Joint &Alone protected Parenthesis( &Alone d ,Alone &Alone key ) Brace( return Err Parenthesis( LaunchError :Joint :Alone Busy ) ;Alone ) let metadata =Alone Metadata Brace( current_model :Alone model .Alone clone Parenthesis( ) ,Alone advertised_models :Alone old_metadata .Alone as_ref Parenthesis( ) .Alone map_or_else Parenthesis( BTreeSet :Joint :Alone new ,Alone |Alone m |Alone m .Alone advertised_models .Alone clone Parenthesis( ) ) ,Alone policy_key :Alone policy_key .Alone clone Parenthesis( ) ,Alone idle_placement :Alone old_metadata .Alone as_ref Parenthesis( ) .Alone map_or Parenthesis( !Alone d .Alone groups .Alone contains_key Parenthesis( &Alone key ) ,Alone |Alone m |Alone m .Alone idle_placement ) ,Alone ) ;Alone let anchor =Alone Anchor Brace( canonical_key :Alone key .Alone clone Parenthesis( ) ,Alone last_used :Alone now ,Alone ) ;Alone let mut weight =Alone d .Alone snapshot_weight .Alone saturating_add Parenthesis( if d .Alone launch_weight =Joint =Alone 0 Brace( 128 ) else Brace( 0 ) ) .Alone saturating_sub Parenthesis( old_metadata .Alone as_ref Parenthesis( ) .Alone map_or Parenthesis( 0 ,Alone |Alone m |Alone metadata_bound Parenthesis( &Alone key ,Alone m ) ) ) .Alone saturating_add Parenthesis( metadata_bound Parenthesis( &Alone key ,Alone &Alone metadata ) ) .Alone saturating_add Parenthesis( anchor_bound Parenthesis( request .Alone anchor_key ,Alone &Alone anchor ) ) ;Alone if let Some Parenthesis( entry ) =Alone d .Alone groups .Alone get Parenthesis( &Alone key ) Brace( for key in &Alone entry .Alone keys Brace( weight =Alone weight .Alone saturating_sub Parenthesis( binding_bound Parenthesis( key ,Alone &Alone entry .Alone account ) ) .Alone saturating_add Parenthesis( binding_bound Parenthesis( key ,Alone &Alone account ) ) ;Alone ) ) else Brace( if d .Alone bindings .Alone len Parenthesis( ) >Joint =Alone CAPACITY *Alone 2 Brace( return Err Parenthesis( LaunchError :Joint :Alone Capacity ) ;Alone ) weight =Alone weight .Alone saturating_add Parenthesis( binding_bound Parenthesis( &Alone key ,Alone &Alone account ) ) ;Alone ) room Parenthesis( weight ) ?Alone ;Alone let move_source =Alone self .Alone rebind_source Parenthesis( &Alone d ,Alone Provider :Joint :Alone Codex ,Alone Some Parenthesis( &Alone key ) ) ;Alone let budget_source =Alone self .Alone rebind_budget_source Parenthesis( &Alone d ,Alone Provider :Joint :Alone Codex ,Alone Some Parenthesis( &Alone key ) ,Alone &Alone account ) ;Alone let permit =Alone self .Alone prepare_move_with_source Parenthesis( &Alone d ,Alone &Alone key ,Alone budget_source .Alone as_deref Parenthesis( ) ,Alone &Alone account ,Alone budget_source .Alone as_deref Parenthesis( ) .Alone and_then Parenthesis( |Alone id |Alone sources .Alone iter Parenthesis( ) .Alone find Parenthesis( |Alone c |Alone c .Alone account .Alone id =Joint =Alone id ) ) ,Alone candidates ,Alone sole_target .Alone as_ref Parenthesis( ) ,Alone observations ,Alone model .Alone as_deref Parenthesis( ) ,Alone reason ,Alone now ,Alone ) .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone MoveGuard ) ?Alone ;Alone let existing =Alone Self :Joint :Alone accepted_in Parenthesis( &Alone d ,Alone Some Parenthesis( &Alone key ) ,Alone &Alone account ) ;Alone if model_move &Joint &Alone !Alone filtered .Alone iter Parenthesis( ) .Alone any Parenthesis( |Alone c |Alone Brace( c .Alone account .Alone id =Joint =Alone account &Joint &Alone effective_account Parenthesis( c ,Alone &Alone d ,Alone &Alone self .Alone config ,Alone model .Alone as_deref Parenthesis( ) ,Alone now ) .Alone eligible_at Parenthesis( model .Alone as_deref Parenthesis( ) ,Alone now ) &Joint &Alone Parenthesis( !Alone c .Alone account .Alone drain |Joint |Alone existing ) ) ) Brace( return Err Parenthesis( LaunchError :Joint :Alone NoEligibleAccount ) ;Alone ) drop Parenthesis( d ) ;Alone if !Alone decision_tape :Joint :Alone check Parenthesis( self ,Alone decision_tape :Joint :Alone Check :Joint :Alone LaunchAdmission ,Alone admit .Alone is_none_or Parenthesis( |Alone admit |Alone admit Parenthesis( &Alone account ,Alone existing ,Alone model .Alone as_deref Parenthesis( ) ) ) ,Alone ) Brace( return Err Parenthesis( LaunchError :Joint :Alone NoEligibleAccount ) ;Alone ) let consent =Alone if model_move Brace( Some Parenthesis( LaunchPolicyMove Brace( key :Alone policy_key .Alone clone Parenthesis( ) ,Alone previous :Alone previous .Alone clone Parenthesis( ) .Alone ok_or Parenthesis( LaunchError :Joint :Alone PolicyBlocked ) ?Alone ,Alone account :Alone account .Alone clone Parenthesis( ) ,Alone expected_revision :Alone plan .Alone revision ,Alone model :Alone model .Alone clone Parenthesis( ) .Alone ok_or Parenthesis( LaunchError :Joint :Alone PolicyBlocked ) ?Alone ,Alone at :Alone now ,Alone ) ) ) else Brace( None ) ;Alone let admission =Alone DispatchAdmission :Joint :Alone ordinary Parenthesis( ) .Alone with_store_evidence Parenthesis( store_evidence ) .Alone with_runtime_evidence Parenthesis( runtime_evidence ) ;Alone let context =Alone rebind :Joint :Alone RebindContext Brace( provider :Alone Provider :Joint :Alone Codex ,Alone key :Alone Some Parenthesis( &Alone key ) ,Alone guard_key :Alone &Alone key ,Alone from :Alone move_source .Alone as_deref Parenthesis( ) ,Alone account :Alone &Alone account ,Alone parent :Alone None ,Alone model :Alone model .Alone as_deref Parenthesis( ) ,Alone candidates ,Alone sources ,Alone pinned :Alone None ,Alone request_bytes :Alone 0 ,Alone hold_timed_out :Alone false ,Alone now ,Alone label :Alone reason ,Alone ) ;Alone let authority =Alone self .Alone owner_move_reason Parenthesis( &Alone context ,Alone &Alone admission ,Alone None ,Alone consent .Alone as_ref Parenthesis( ) ) ;Alone let rebound =Alone self .Alone rebind Parenthesis( context ,Alone authority ,Alone permit ,Alone |Alone reason |Alone Brace( if let Some Parenthesis( consent ) =Alone &Alone consent Brace( consent .Alone validate_context Parenthesis( &Alone policy_key ,Alone previous .Alone as_deref Parenthesis( ) ,Alone &Alone account ,Alone self .Alone policies .Alone plan Parenthesis( Some Parenthesis( &Alone policy_key ) ) .Alone revision ,Alone model .Alone as_deref Parenthesis( ) ,Alone now ,Alone ) ?Alone ;Alone if plan .Alone settings .Alone mode =Joint =Alone crate :Joint :Alone routing :Joint :Alone Mode :Joint :Alone Strict Brace( authorize Parenthesis( &Alone self .Alone policies ,Alone consent ) .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone PolicyBlocked ) ?Alone ;Alone ) let current =Alone self .Alone policies .Alone plan Parenthesis( Some Parenthesis( &Alone policy_key ) ) ;Alone let expected_revision =Alone if plan .Alone settings .Alone mode =Joint =Alone crate :Joint :Alone routing :Joint :Alone Mode :Joint :Alone Strict Brace( if current .Alone settings .Alone mode !Joint =Alone crate :Joint :Alone routing :Joint :Alone Mode :Joint :Alone Strict |Joint |Alone current .Alone anchor .Alone as_deref Parenthesis( ) !Joint =Alone Some Parenthesis( account .Alone as_str Parenthesis( ) ) Brace( bail !Alone Parenthesis( \"launch authorization changed\" ) ;Alone ) plan .Alone revision .Alone checked_add Parenthesis( 1 ) .Alone ok_or_else Parenthesis( |Alone |Alone anyhow :Joint :Alone anyhow !Alone Parenthesis( \"launch revision overflow\" ) ) ?Alone ) else Brace( plan .Alone revision ) ;Alone if current .Alone revision !Joint =Alone expected_revision Brace( bail !Alone Parenthesis( \"launch authorization changed\" ) ;Alone ) ) self .Alone policies .Alone dispatch_for_issue Parenthesis( Some Parenthesis( &Alone policy_key ) ,Alone &Alone account ,Alone previous .Alone as_deref Parenthesis( ) ,Alone reason ,Alone now ,Alone operation ,Alone ) .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone PolicyBlocked ) ?Alone ;Alone Ok Parenthesis( Parenthesis( ) ) ) ) .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone PolicyBlocked ) ?Alone ;Alone let rebind :Joint :Alone Rebound Brace( data :Alone mut d ,Alone moves ) =Alone rebound ;Alone let authority_changed =Alone old_metadata .Alone as_ref Parenthesis( ) .Alone is_none_or Parenthesis( |Alone old |Alone Brace( old .Alone current_model !Joint =Alone metadata .Alone current_model |Joint |Alone old .Alone policy_key !Joint =Alone metadata .Alone policy_key ) ) |Joint |Alone d .Alone launch_anchors .Alone get Parenthesis( request .Alone anchor_key ) .Alone is_none_or Parenthesis( |Alone old |Alone old .Alone canonical_key !Joint =Alone key ) ;Alone d .Alone launches .Alone insert Parenthesis( key .Alone clone Parenthesis( ) ,Alone metadata ) ;Alone d .Alone launch_anchors .Alone insert Parenthesis( request .Alone anchor_key .Alone to_owned Parenthesis( ) ,Alone anchor ) ;Alone reweight Parenthesis( &Alone mut d ) ;Alone d .Alone changed Parenthesis( ) ;Alone d .Alone defer_count_changes =Alone false ;Alone d .Alone commit_count_changes Parenthesis( ) ;Alone if authority_changed Brace( self .Alone policies .Alone changed .Alone notify_waiters Parenthesis( ) ;Alone ) Ok Parenthesis( LaunchPlacement Brace( canonical_key :Alone key ,Alone account ,Alone effective_model :Alone model ,Alone moves ,Alone ) ) ) ) Parenthesis( )",
       "count": 1
     },
     {
@@ -1451,6 +1553,102 @@
       "path": "crates/qb-core/src/bindings/launch.rs",
       "function": "touch",
       "expression": "method: d .Alone launch_retention .Alone get_mut Parenthesis( key )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_fixture.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use crate :Joint :Alone Brace( accounts :Joint :Alone Brace( Identity ,Alone Source ,Alone TokenMeta ) ,Alone observability :Joint :Alone ReplayRuntime ,Alone ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_fixture.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use super :Joint :Alone Brace( Account ,Alone BindingTable ,Alone Candidate ,Alone Data ,Alone Health ,Alone HealthReason ,Alone MoveObservation ,Alone MoveObservations ,Alone Provider ,Alone RoutingConfig ,Alone UserState ,Alone move_guard ,Alone ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_fixture.rs",
+      "function": "candidate",
+      "expression": "call: account Parenthesis( id ,Alone provider )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_fixture.rs",
+      "function": "scripted_hour",
+      "expression": "assignment: fb .Alone account .Alone health =Alone Health :Joint :Alone Cooling Brace( reason :Alone HealthReason :Joint :Alone Quota ,Alone until :Alone now -Alone Delta :Joint :Alone seconds Parenthesis( 1 ) ,Alone scope :Alone \"account\" .Alone into Parenthesis( ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_fixture.rs",
+      "function": "scripted_hour",
+      "expression": "assignment: fb .Alone account .Alone plan =Alone Some Parenthesis( \"free\" .Alone into Parenthesis( ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_fixture.rs",
+      "function": "scripted_hour",
+      "expression": "call: Data :Joint :Alone default Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use crate :Joint :Alone accounts :Joint :Alone Brace( Account ,Alone Health ,Alone HealthReason ,Alone Identity ,Alone Provider ,Alone QuotaCooling ,Alone Source ,Alone TokenMeta ,Alone UserState ,Alone ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use serde_json :Joint :Alone Brace( Map ,Alone Number ,Alone Value ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "WireInputs::intern_quotas",
+      "expression": "assignment: *Alone self =Alone interned",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "WireInputs::resolve_quotas",
+      "expression": "assignment: *Alone self =Alone resolved",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "WireInputs::to_inputs",
+      "expression": "assignment: account .Alone generation =Alone c .Alone revision",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "bounded",
+      "expression": "call: serde_json :Joint :Alone to_writer Parenthesis( Budget Parenthesis( MAX_BYTES ) ,Alone value )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "capture",
+      "expression": "method: groups .Alone insert Parenthesis( map Parenthesis( IdKind :Joint :Alone Session ,Alone key ) ?Alone ,Alone AcceptanceGroup Brace( account :Alone map Parenthesis( IdKind :Joint :Alone Account ,Alone &Alone g .Alone account ) ?Alone ,Alone keys :Alone g .Alone keys .Alone iter Parenthesis( ) .Alone map Parenthesis( |Alone k |Alone map Parenthesis( IdKind :Joint :Alone Session ,Alone k ) ) .Alone collect :Joint :Alone <Alone Result <Alone _ ,Alone _ >Alone >Alone Parenthesis( ) ?Alone ,Alone ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "quota_digest",
+      "expression": "call: serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( SCHEMA ,Alone account ,Alone revision ,Alone quota ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "remap_actual",
+      "expression": "assignment: *Alone id =Alone map Parenthesis( IdKind :Joint :Alone Account ,Alone id ) ?Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape.rs",
+      "function": "remap_permit",
+      "expression": "assignment: *Alone id =Alone map Parenthesis( IdKind :Joint :Alone Account ,Alone id ) ?Alone",
       "count": 1
     },
     {

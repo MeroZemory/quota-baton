@@ -99,6 +99,16 @@ pub(super) struct SoleEligibleTarget {
     at: DateTime<Utc>,
 }
 impl SoleEligibleTarget {
+    pub(super) fn decision_input(&self) -> super::kernel::permit::SoleTargetInput {
+        super::kernel::permit::SoleTargetInput {
+            from: self.from.clone(),
+            to: self.to.clone(),
+            model: self.model.clone(),
+            at: self.at,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn applies_to(
         &self,
         from: &str,

@@ -783,6 +783,17 @@ impl RelayState {
         for account in &initial_accounts {
             observability.forecast_account(account);
         }
+        if let Some(producer) = observability.replay()
+            && bindings
+                .attach_tape(producer.clone(), &initial_accounts)
+                .is_err()
+        {
+            producer.producer_failed();
+            tracing::warn!(
+                code = "decision_tape_initial_witness_failed",
+                "Decision tape startup state is incomplete"
+            );
+        }
         Ok(Self {
             accounts,
             quota,
