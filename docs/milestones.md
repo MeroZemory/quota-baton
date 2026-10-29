@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R18-window-hold 후속 관문 완료·설치 인계
-목표: 제거된 창의 실제429 hold 복구 보완 설치; N6r 새 실제>=1h 기준·N7 7일 로그는 별도
+현재 마일스톤: R13.CLI 관문 완료·설치 인계; 다음 N6r selection slice2
+목표: urgent-off 인계 충돌 재시도·core 오류 이유 표시 설치; N6r 선택 입력/커널 구현
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
-사용자 대기: 없음 (설계 세션 R18/N6r 보완 설치·새 tape export; N7 최초 채점11-05 13:49)
-갱신: 2026-10-29 23:35 KST (원본 전체 행렬·의도된RED 보존, 결합core1604·Linux22/check/strict 통과; 실계정 변경 없음)
+사용자 대기: 없음 (다음24h tape export는 설계 세션; N7 최초 채점11-05 13:49)
+갱신: 2026-10-30 00:52 KST (CLI기본671/0/3제외·전체677/0/4제외·양OS집중/strict·Linux청소 완료; N6r445실제identity 수용)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: R18-window-hold gates closed and ready for owner installation, with native RED, original workspace matrices and fingerprint reuse preserved in R18-window-hold.md. The combined core1604 suite, required8, Windows checks/build, private-fixture12 and Linux22/check/product strict checks passed; no real account was changed. N6r v6 producer repair is merged2ed0971; first real-hour verdict remains insufficient (297/885 supported,588quota66.44%,producer_failure1 without retained subreason, no applicable source-fault input). Owner installs and exports a new >=1h epoch to verify <=1% not-comparable, budget and losses. Selection and24h acceptance remain separate; impl/r14-replay stays stopped/unmerged. During capture, inspect the queued R13.G urgent-off CLI conflict/error-body follow-up without a new Series B producer unit. N7-L c84076a clock starts2026-10-29 13:49 KST, earliest scoring2026-11-05 13:49; no model work before then. R18 Parts1-3 installed1e8a4be, R19 installed3788c36, R15.UI merged e4b4a132, R2 closed. L1 defects retain priority; N12 awaits O14. Linux all-targets Windows-only integration-root compile failures and rare listener handover timeout remain qualified known follow-ups.
+**Current S1 order**: R18-window-hold f40bd53 is installed and accepted (00:05 KST, takeover1995/0, codex-qb OK). The second sealed real permit hour (producer2ed0971, n6r-tape-real-20261030-0006) has447 permits,445/445 comparable identity matches,2model refusals0.447%,loss0,InitialWitness sequence1 and3.58MB/h. Actual ordinary/no-30-minute-guard/Free-rule/restored ordinary builds all445 equal: power is insufficient_not_exercised because all comparable source/destination pairs are equal. No full-routing/24h verdict or Series B increment. Owner accepted real identity and retained synthetic power; next24h export will census actual guard reach, and any controlled model trigger requires no reaching decision and joint owner execution. Replace the masked Free fault with a preregistered shared-raw-fact fault. Start selection slice2 after CLI; impl/r14-replay stays stopped/unmerged. R13.CLI gate is complete on impl/r13-cli: Windows full CLI671/0/3ignored and677/0/4ignored, strict checks and scoped Linux15+15+1+6/check/strict pass, with original fixture failures retained and Linux target cleaned. Merge and hand off for owner installation, then implement selection slice2 on impl/n6r-tape with a preregistered replacement shared-raw-fact fault. N7-L c84076a clock starts2026-10-29 13:49 KST, earliest scoring2026-11-05 13:49; no model work before then. R18 Parts1-3 installed1e8a4be, R19 installed3788c36, R15.UI merged e4b4a132, R2 closed. L1 defects retain priority; N12 awaits O14. Linux all-targets Windows-only integration-root compile failures and rare listener handover timeout remain qualified known follow-ups.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
@@ -570,7 +570,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
 | Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
-| N6r decision tape | 첫 실제1h885건 중297지원·588quota(66.44%)·loss1로 insufficient; 두 source faults 미적용 | v6 새>=1h 비교 불가<=1%·loss0·실제identity/독립power, 이후 selection·24h margin0 | native 상태·유한 사유 보완 설치 후 설계 export 검증; impl/r14-replay 재개·병합 금지 |
+| N6r decision tape | 두 번째 실제1h447건·445동일·model2/0.447%·loss0·Witness1; 두 source faults 차이0·가드 도달 입력 없어 insufficient_not_exercised | 실제 guard 적용 입력과 독립power, 이후 selection·24h margin0 | 24h 자연 관측·실제 조건 census 제안, 실제identity 수용·합성power 유지, CLI 뒤 selection slice2; impl/r14-replay 재개·병합 금지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

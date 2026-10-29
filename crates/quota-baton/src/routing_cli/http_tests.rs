@@ -268,15 +268,16 @@ async fn known_conflict_survives_closed_listener_gap_before_successor_rebinds() 
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_millis(50))
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
         let body = urgent(flag);
-        // Attempt two hits the closed port at ~100 ms; attempt three waits
-        // another 400 ms, allowing the successor to bind after the 250 ms gap.
+        // Attempt two hits the closed port at ~100 ms with a bounded connect
+        // timeout; attempt three waits one second, past the 500 ms handoff gap.
         let delays = [
             Duration::from_millis(100),
-            Duration::from_millis(400),
+            Duration::from_secs(1),
             Duration::from_millis(100),
             Duration::from_millis(100),
         ];
@@ -287,14 +288,17 @@ async fn known_conflict_survives_closed_listener_gap_before_successor_rebinds() 
                 .expect("incumbent did not receive the urgent request");
             let before = incumbent.finish().await;
             // This is a real unavailable TCP endpoint, not a scripted status.
-            let probe = tokio::time::timeout(
-                Duration::from_millis(100),
-                tokio::net::TcpStream::connect(address),
-            )
-            .await
-            .expect("closed loopback port did not refuse promptly");
-            assert!(probe.is_err(), "incumbent listener remained open");
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Windows can defer a refused connect. Bound the connect itself,
+            // rather than requiring the kernel to refuse within 100 ms.
+            let probe = tokio::time::timeout(Duration::from_millis(300), client.get(&url).send())
+                .await
+                .expect("closed endpoint exceeded the explicit connect timeout")
+                .expect_err("incumbent listener remained open");
+            assert!(
+                probe.is_connect(),
+                "closed endpoint was not a connect failure"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let successor = Fixture::start_at(
                 address,
                 vec![Reply::json(StatusCode::OK, json!({"ok": true}))],
@@ -302,10 +306,9 @@ async fn known_conflict_survives_closed_listener_gap_before_successor_rebinds() 
             .await;
             (before, successor)
         };
-        let (result, (before, successor)) = tokio::time::timeout(
-            Duration::from_secs(3),
-            async { tokio::join!(request, handoff) },
-        )
+        let (result, (before, successor)) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(request, handoff)
+        })
         .await
         .expect("handoff retry exceeded the regression deadline");
         let after = successor.finish().await;
