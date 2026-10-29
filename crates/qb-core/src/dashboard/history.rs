@@ -658,6 +658,14 @@ impl WriteBehind {
     }
 }
 impl UsageHistory {
+    pub(crate) fn retain_accounts(&mut self, known: &std::collections::BTreeSet<String>) {
+        let before = self.accounts.len();
+        self.accounts.retain(|id, _| known.contains(id.as_str()));
+        if before != self.accounts.len() {
+            self.changed();
+        }
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
