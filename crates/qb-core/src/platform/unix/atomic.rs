@@ -24,6 +24,7 @@ pub(crate) fn atomic_write_observation(path: &Path, bytes: &[u8]) -> io::Result<
 pub(crate) fn prepare_observation_directory(path: &Path) -> io::Result<()> {
     private_fs::prepare_private_directory(path).map(drop)
 }
+#[cfg(any(test, feature = "testkit"))]
 pub(crate) fn create_private_directory_new(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     std::fs::DirBuilder::new().mode(0o700).create(path)?;

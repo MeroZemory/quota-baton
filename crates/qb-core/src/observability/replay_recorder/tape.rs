@@ -165,6 +165,7 @@ fn compact_id(id: Id) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.0)
 }
+#[cfg(test)]
 pub(crate) fn open(root: &Path, limits: Limits, at: Stamp) -> io::Result<(Producer, Writer)> {
     open_with_provenance(root, limits, at, Provenance::OperatorOptIn)
 }

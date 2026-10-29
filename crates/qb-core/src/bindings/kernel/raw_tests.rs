@@ -73,11 +73,11 @@ fn inputs(c: &Candidate, d: &Data, key: Option<&str>, model: Option<&str>) -> De
 
 fn compare(c: &Candidate, d: &Data, model: Option<&str>) -> Account {
     let input = inputs(c, d, Some("claude:raw"), model);
-    let old = native::effective_account(c, d, &RoutingConfig::default(), model, now());
+    let old = native::legacy_effective_account(c, d, &RoutingConfig::default(), model, now());
     assert_eq!(effective_account(&input, &c.account.id), Some(old.clone()));
     assert_eq!(
         semantic_evidence(&input, Some(&c.account.id)),
-        native::semantic_evidence(Some(&old))
+        native::legacy_semantic_evidence(Some(&old))
     );
     old
 }
@@ -103,7 +103,7 @@ fn stale_window_matches_native_at_age_and_activity_boundaries() {
                     let input = inputs(&c, &d, None, None);
                     assert_eq!(
                         stale_window(&input, &c.account.id, &w),
-                        Some(native::stale_window(&c, &d, &w, now()))
+                        Some(native::legacy_stale_window(&c, &d, &w, now()))
                     );
                     for malformed in [
                         json!({}),
@@ -112,7 +112,7 @@ fn stale_window_matches_native_at_age_and_activity_boundaries() {
                     ] {
                         assert_eq!(
                             stale_window(&input, &c.account.id, &malformed),
-                            Some(native::stale_window(&c, &d, &malformed, now()))
+                            Some(native::legacy_stale_window(&c, &d, &malformed, now()))
                         );
                     }
                     let expected = age_ms >= 901_000
@@ -169,7 +169,7 @@ fn raw_quota_and_health_match_native_without_healing_free_accounts() {
                         let input = inputs(&c, &Data::default(), Some("claude:raw"), model);
                         assert_eq!(
                             move_source_usable(&input, &c.account.id),
-                            table.move_source_usable(
+                            table.legacy_move_source_usable(
                                 &Data::default(),
                                 "claude:raw",
                                 &c,
@@ -249,12 +249,12 @@ fn acceptance_and_drain_match_native_for_group_and_unbound_rows() {
                         let expected = group_matches && row_present && accepted != Some(false);
                         assert_eq!(
                             accepted_in(&input, &c.account.id),
-                            native::BindingTable::accepted_in(&d, Some(key), &c.account.id)
+                            native::BindingTable::legacy_accepted_in(&d, Some(key), &c.account.id)
                         );
                         assert_eq!(accepted_in(&input, &c.account.id), expected);
                         assert_eq!(
                             move_source_usable(&input, &c.account.id),
-                            table.move_source_usable(&d, key, &c, None, now())
+                            table.legacy_move_source_usable(&d, key, &c, None, now())
                         );
                         assert_eq!(
                             move_source_usable(&input, &c.account.id),
@@ -278,7 +278,7 @@ fn acceptance_and_drain_match_native_for_group_and_unbound_rows() {
             let input = inputs(&c, &d, None, None);
             assert_eq!(
                 accepted_in(&input, &c.account.id),
-                native::BindingTable::accepted_in(&d, None, &c.account.id)
+                native::BindingTable::legacy_accepted_in(&d, None, &c.account.id)
             );
             assert_eq!(accepted_in(&input, &c.account.id), accepted && sticky);
         }
@@ -315,9 +315,10 @@ fn acceptance_and_drain_match_native_for_group_and_unbound_rows() {
     assert!(accepted_in(&input, &c.account.id));
     assert_eq!(
         accepted_in(&input, &c.account.id),
-        BindingTable::accepted_in(&d, input.key.as_deref(), &c.account.id)
+        BindingTable::legacy_accepted_in(&d, input.key.as_deref(), &c.account.id)
     );
-    let usable = table.move_source_usable(&d, input.key.as_deref().unwrap(), &c, None, now());
+    let usable =
+        table.legacy_move_source_usable(&d, input.key.as_deref().unwrap(), &c, None, now());
     assert_eq!(move_source_usable(&input, &c.account.id), usable);
     input.outside_failure = !input.outside_failure;
     assert_eq!(
@@ -335,7 +336,7 @@ fn missing_evidence_never_reads_an_owner_and_api_is_input_only() {
     assert!(!move_source_usable(&input, "missing"));
     assert_eq!(
         semantic_evidence(&input, Some("missing")),
-        native::semantic_evidence(None)
+        native::legacy_semantic_evidence(None)
     );
     assert_eq!(semantic_evidence(&input, None), 0);
     let _: fn(&DecisionInputs, &str) -> Option<Account> = effective_account;
@@ -356,7 +357,7 @@ fn semantic_evidence_matches_native_and_excludes_poll_and_identity_noise() {
     });
     let d = Data::default();
     let baseline = semantic_evidence(&inputs(&c, &d, None, None), Some(&c.account.id));
-    assert_eq!(baseline, native::semantic_evidence(Some(&c.account)));
+    assert_eq!(baseline, native::legacy_semantic_evidence(Some(&c.account)));
     let mut noisy = c.clone();
     noisy.account.generation += 1;
     noisy.account.label = "synthetic-noise".into();
@@ -368,7 +369,7 @@ fn semantic_evidence_matches_native_and_excludes_poll_and_identity_noise() {
     assert_eq!(semantic_evidence(&input, Some(&noisy.account.id)), baseline);
     assert_eq!(
         semantic_evidence(&input, Some(&noisy.account.id)),
-        native::semantic_evidence(Some(&noisy.account))
+        native::legacy_semantic_evidence(Some(&noisy.account))
     );
     for field in [
         "user_state",
@@ -393,7 +394,10 @@ fn semantic_evidence_matches_native_and_excludes_poll_and_identity_noise() {
             _ => unreachable!(),
         }
         let hash = semantic_evidence(&inputs(&changed, &d, None, None), Some(&changed.account.id));
-        assert_eq!(hash, native::semantic_evidence(Some(&changed.account)));
+        assert_eq!(
+            hash,
+            native::legacy_semantic_evidence(Some(&changed.account))
+        );
         assert_ne!(hash, baseline, "semantic change: {field}");
     }
 }

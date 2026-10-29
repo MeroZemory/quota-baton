@@ -260,7 +260,13 @@ use crate::{
 };
 
 fn directory() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/n6r-tape-tests");
+    let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let root = executable
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".sandbox/n6r-tape-tests");
     fs::create_dir_all(&root).unwrap();
     tempfile::tempdir_in(root).unwrap()
 }

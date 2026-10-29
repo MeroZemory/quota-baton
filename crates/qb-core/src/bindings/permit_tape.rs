@@ -184,7 +184,7 @@ impl Window {
                 .all(|b| b.is_ascii_digit())
             && duration[..duration.len() - 1].parse::<u64>().is_ok();
         let known_suffix = suffix.is_none_or(|s| matches!(s, "oi" | "sonnet" | "opus" | "haiku"));
-        if !named && !(numeric && known_suffix) {
+        if !(named || numeric && known_suffix) {
             return Err(WireRefusal::Quota);
         }
         Ok(Self(text.into()))

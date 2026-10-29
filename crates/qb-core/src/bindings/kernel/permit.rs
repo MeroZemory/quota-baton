@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::super::move_guard::{Limits, Refusal};
+use super::super::move_guard::{GLOBAL_RECORDS, Limits, RECORDS, Refusal, SESSIONS};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,16 +145,16 @@ pub fn decide_move(inputs: &super::DecisionInputs) -> PermitDecision {
             newly_tripped: true,
         });
     }
-    if (!shares_incident && permit.global.len() >= 4096)
+    if (!shares_incident && permit.global.len() >= GLOBAL_RECORDS)
         || permit.revision == u64::MAX
-        || (!permit.session_exists && permit.session_count >= 20_000)
+        || (!permit.session_exists && permit.session_count >= SESSIONS)
     {
         return denied(Refusal::Capacity, now + Duration::minutes(10));
     }
     let mut emergency_return = false;
     let history = &permit.history;
     if permit.session_exists {
-        if history.len() >= 128 {
+        if history.len() >= RECORDS {
             return denied(Refusal::Capacity, history[0].at + Duration::hours(1));
         }
         let after = |age: Option<u64>, committed: u64| age.is_some_and(|age| age < committed);

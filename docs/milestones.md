@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N6r-T slice1 공유 raw-fact·permit kernel
-목표: 원래 native 경로 보존 비교 뒤 별도 실행 identity·두 source fault power·margin0 판정
+현재 마일스톤: N6r-T slice1 관문 판정
+목표: 합성 63/63·margin0 통과; 필수 과거 사례 insufficient 보존·실제 수집 승인 인계
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
 사용자 대기: 없음
-갱신: 2026-10-29 14:54 KST (N7-L 13:49 설치·실제 수집 수용, 7일 시계 시작; N6r 원래 경로267/0·기준 합성63 frame 보존)
+갱신: 2026-10-29 19:34 KST (Windows/Linux 경계15·strict 통과; N7-L c84076a 수집 시계10-29 13:49 시작)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: N7-L c84076a installed and capture health accepted at 2026-10-29 13:49 KST: on, first origins2/sequence2/loss0, last_sample advanced60s, stoppedfalse/unavailable0, journal3.7KB after1min; seven-day clock starts then, earliest scoring2026-11-05 13:49 KST. No N7 model work before that. N6r-T slice1 active on impl/n6r-tape: native-old preservation bindings267/0 and actual reference executable synthetic63 frames/1h inputs/loss0 retained before kernel authority switch; independent built controls and paired verdict remain. Scope is move proposals only; dated historical incident lacks raw facts and must not be reconstructed. Selection is slice2. Old Unit1 insufficient remains accepted; do not continue or merge impl/r14-replay. R15.UI merged e4b4a132; R19 installed3788c36; R18 installed; R2 closed. L1 defects retain priority; N12 unready. Rare listener-handover timeout remains a known follow-up (latest install1034 connects/1 timeout1.015s).
+**Current S1 order**: N6r-T slice1 full-brief verdict insufficient: required 10-22 12:01 raw facts are unavailable; the separate synthetic native reference/candidate passes 63/63 at margin 0, with independently built guard/Free faults differing exactly at 14/49. Old/native side-by-side preservation, Windows/Linux executable gates and final guard15/strict checks passed. Preserve impl/n6r-tape; no dev merge/install before the owner's prospective-capture decision. Selection stays slice2; do not continue or merge impl/r14-replay. Next ready implementation is the small R18 removed-window quota-hold follow-up on its own branch. N7-L c84076a is installed and healthy: seven-day clock starts 2026-10-29 13:49 KST, earliest scoring 2026-11-05 13:49 KST; no model work before then. R15.UI merged e4b4a132; R19 installed3788c36; R18 installed; R2 closed. L1 defects retain priority; N12 awaits O14. Rare listener handover timeout remains a known follow-up (1034 connects/1 timeout1.015s).
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 

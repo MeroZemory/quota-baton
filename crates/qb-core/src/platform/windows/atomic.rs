@@ -18,6 +18,7 @@ use windows::{
 pub(crate) fn prepare_observation_directory(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)
 }
+#[cfg(any(test, feature = "testkit"))]
 pub(crate) fn create_private_directory_new(path: &Path) -> std::io::Result<()> {
     if let Err(error) = fs::create_dir(path) {
         if fs::symlink_metadata(path).is_ok() {
