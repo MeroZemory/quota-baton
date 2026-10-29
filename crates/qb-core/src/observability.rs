@@ -345,7 +345,7 @@ impl Observability {
             }
         }
         match replay_runtime::Runtime::start_tape(
-            &home.join("state/decision-tape-v5"),
+            &home.join("state/decision-tape-v6"),
             config.disk_limit_mib,
         ) {
             Ok(runtime) => *slot = Some(Arc::new(runtime)),

@@ -466,23 +466,58 @@ fn free_with_expired_raw_cooling_and_absent_quota_stays_native_unusable() {
 
 #[test]
 fn unsupported_quota_shapes_and_oversized_read_sets_refuse_explicitly() {
-    for quota in [
-        json!({"windows":[{"name":"private-window"}]}),
-        json!({"windows":[{"name":"5h", "used_pct":"private-number"}]}),
-        json!({"windows":[{"observed_at":"private-date"}]}),
-        json!({"windows":{}}),
+    for (quota, expected) in [
+        (
+            json!({"windows":[{"name":"private-window"}]}),
+            WireRefusal::QuotaWindowName,
+        ),
+        (
+            json!({"windows":[{"name":"5h", "used_pct":"private-number"}]}),
+            WireRefusal::QuotaWindowUsed,
+        ),
+        (
+            json!({"windows":[{"observed_at":"private-date"}]}),
+            WireRefusal::QuotaWindowObserved,
+        ),
+        (json!({"windows":{}}), WireRefusal::QuotaWindows),
+        (json!([]), WireRefusal::QuotaRoot),
+        (json!({"windows":[false]}), WireRefusal::QuotaWindow),
+        (
+            json!({"windows":[{"status":"private-status"}]}),
+            WireRefusal::QuotaWindowStatus,
+        ),
+        (
+            json!({"windows":[{"reset_at":"private-date"}]}),
+            WireRefusal::QuotaWindowReset,
+        ),
+        (json!({"credits":false}), WireRefusal::QuotaCredits),
+        (
+            json!({"credits":{"has_credits":"private-flag"}}),
+            WireRefusal::QuotaCreditFlag,
+        ),
+        (
+            json!({"credits":{"balance":"private-balance"}}),
+            WireRefusal::QuotaCreditBalance,
+        ),
+        (
+            json!({"paid_serving_observed_at":"private-date"}),
+            WireRefusal::QuotaPaidServing,
+        ),
     ] {
         let mut input = inputs();
         input.accounts.get_mut("private-source-id").unwrap().quota = Some(quota);
         let mut ids = BTreeMap::new();
-        let error = capture(&input, &kernel::decide_move(&input), |kind, raw| {
+        // Deliberately malformed quota is not a valid input to the native
+        // evaluator. Exercise the wire refusal independently of evaluation.
+        let error = capture(&input, &PermitDecision::NotRequired, |kind, raw| {
             let next = ids.len();
             ids.entry((kind, raw.to_owned()))
                 .or_insert_with(|| format!("p{next}"))
                 .clone()
         })
         .unwrap_err();
-        assert_eq!(error, WireRefusal::Quota);
+        assert_eq!(error, expected);
+        assert!(!serde_json::to_string(&error).unwrap().contains("private-"));
     }
     let mut input = inputs();
     input.bindings = (0..=MAX_ROWS)
@@ -686,4 +721,75 @@ fn validator_accepts_retained_refusals_but_rejects_malformed_actual_ids() {
         validate_record(&referenced).unwrap_err(),
         WireRefusal::QuotaReference
     );
+}
+
+#[test]
+fn native_codex_boolean_header_status_survives_wire_without_becoming_rejection() {
+    for reached in [false, true] {
+        let home = crate::bindings::tests::fixture_dir();
+        let obs = crate::observability::Observability::new(home.path(), None).unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        for (key, value) in [
+            ("x-codex-primary-window-minutes", "300".to_owned()),
+            ("x-codex-primary-used-percent", "25".to_owned()),
+            ("x-codex-primary-reset-after-seconds", "3600".to_owned()),
+            ("x-codex-secondary-window-minutes", "0".to_owned()),
+            ("x-codex-secondary-used-percent", "0".to_owned()),
+            ("x-codex-limit-reached", reached.to_string()),
+        ] {
+            headers.insert(key, value.parse().unwrap());
+        }
+        let native = obs
+            .observe_headers_snapshot("cx-native-status", Provider::Codex, &headers)
+            .unwrap();
+        assert_eq!(native["signals"]["limit_reached"], reached);
+        assert_eq!(native["windows"][0]["status"], reached.to_string());
+        assert_eq!(native["windows"][1]["name"], "0m");
+        let projected = quota(&native).expect("native boolean status is a valid raw fact");
+        let restored_windows = projected.value()["windows"].clone();
+        let native_windows = native["windows"].as_array().unwrap();
+        let restored_windows = restored_windows.as_array().unwrap();
+        assert_eq!(restored_windows.len(), native_windows.len());
+        for (native, restored) in native_windows.iter().zip(restored_windows) {
+            for field in ["name", "used_pct", "status"] {
+                assert_eq!(restored[field], native[field]);
+            }
+            // Date facts preserve the exact instant and precision; Z and
+            // +00:00 are equivalent RFC3339 spellings of the same UTC value.
+            for field in ["reset_at", "observed_at"] {
+                let parsed = |value: &Value| {
+                    value
+                        .as_str()
+                        .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc))
+                };
+                assert_eq!(parsed(&restored[field]), parsed(&native[field]));
+                assert_eq!(restored[field].is_null(), native[field].is_null());
+            }
+        }
+
+        let mut input = inputs();
+        input.now = Utc::now();
+        input.model = None;
+        input.permit.as_mut().unwrap().now = input.now;
+        let c = input.accounts.get_mut("private-source-id").unwrap();
+        c.account.provider = Provider::Codex;
+        c.account.plan = Some("prolite".into());
+        c.quota = Some(native);
+        let native_health = kernel::effective_account(&input, "private-source-id")
+            .unwrap()
+            .health;
+        let record = capture_input(&input);
+        let decoded = record.inputs.as_ref().unwrap().to_inputs().unwrap();
+        let source = decoded.from.as_deref().unwrap();
+        assert_eq!(
+            decoded.accounts[source].quota.as_ref().unwrap()["windows"][0]["status"],
+            reached.to_string()
+        );
+        assert_eq!(
+            kernel::effective_account(&decoded, source).unwrap().health,
+            native_health
+        );
+        assert_eq!(replay(&record).unwrap(), record.actual);
+        assert!(record.refusal.is_none());
+    }
 }

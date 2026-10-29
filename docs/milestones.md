@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N6r-T 실제1시간 판정·producer 복구
-목표: 588 quota 거절·초기 witness 누락 복구, 실제 identity·두 power 실행 후 재수집
+현재 마일스톤: R18-window-hold 제거된 창의 quota hold 후속 관문
+목표: 최신 완전 보고로 제거된 창의 실제429 hold 해제·더 강한 상태 보존, 기존 관문 지문을 재사용해 통합 완료
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
-사용자 대기: 없음
-갱신: 2026-10-29 21:29 KST (봉인885건 중588 quota·producer_failure1, 비교 가능297; R18 allfeature4279/0 후 깨끗한 지점 보존)
+사용자 대기: 없음 (N6r v6 설치·새 실캡처는 설계 세션; N7 최초 채점11-05 13:49)
+갱신: 2026-10-29 23:00 KST (R18 WIP68b3315 재개·dev2ed0971 결합; N6r 첫 실캡처 insufficient·생산자 보완 설치 인계 완료)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: N6r-T slice1 full-brief verdict insufficient: required 10-22 12:01 raw facts are unavailable; the separate synthetic native reference/candidate passes 63/63 at margin 0, with independently built guard/Free faults differing exactly at 14/49. Old/native side-by-side preservation, Windows/Linux executable gates and final guard15/strict checks passed. Owner approved merging 672a6d3 and installing the producer; the owner records capture health and exports >=1h real tape, then the implementer runs installed identity plus both separately built source-fault controls. Selection stays slice2; do not continue or merge impl/r14-replay. Next ready implementation is the small R18 removed-window quota-hold follow-up on its own branch. N7-L c84076a is installed and healthy: seven-day clock starts 2026-10-29 13:49 KST, earliest scoring 2026-11-05 13:49 KST; no model work before then. R15.UI merged e4b4a132; R19 installed3788c36; R18 installed; R2 closed. L1 defects retain priority; N12 awaits O14. Rare listener handover timeout remains a known follow-up (1034 connects/1 timeout1.015s).
+**Current S1 order**: Resume R18-window-hold WIP68b3315 with dev2ed0971; close remaining core/Windows/Linux checks and the focused producer integration without repeating the passed original workspace matrices.  N6r-T first real hour is insufficient: 297/885 supported installed outcomes match; 588 quota refusals (66.44%) lack their inputs, and producer_failure1 has no retained subreason or InitialWitness. Both independently built source faults were actually executed, with zero supported differences and no applicable move input; power is insufficient, not passed. The bounded v6 producer repair preserves native boolean status strings and restored uncertainty, and adds checked finite diagnostic counters. Its Windows focused/contract gates and qualified Linux tests, product checks and product/selected-guard strict lints passed. The broader Linux all-targets command failed on unchanged Windows-only integration roots and remains unqualified, with raw and source-only evidence preserved. Owner installs the fix and exports another >=1h capture from state/decision-tape-v6 to verify not-comparable<=1%, encoded budget and losses; selection and actual24h remain separate. The R18 follow-up is active on impl/r18-window-hold while the owner collects another tape hour. Keep impl/r14-replay stopped and unmerged. N7-L c84076a is installed and healthy: clock starts 2026-10-29 13:49 KST, earliest scoring 2026-11-05 13:49 KST; no model work before then. R15.UI merged e4b4a132; R19 installed3788c36; R18 Parts1-3 installed1e8a4be; R2 closed. L1 defects retain priority; N12 awaits O14. Rare listener handover timeout remains a known follow-up (1034 connects/1 timeout1.015s).
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
@@ -570,7 +570,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
 | Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
-| N6r decision tape | 구 schema3 export 입력 부족 확정·구 브랜치 중단 | Unit1 producer + identity/power/paired testkit verdict, 설치 후 실제1h identity | UI 뒤 impl/n6r-tape에서 chooser 진입 기록·20MB/h·손실 명시; consumer를 입력보다 먼저 만들지 않음 |
+| N6r decision tape | 첫 실제1h885건 중297지원·588quota(66.44%)·loss1로 insufficient; 두 source faults 미적용 | v6 새>=1h 비교 불가<=1%·loss0·실제identity/독립power, 이후 selection·24h margin0 | native 상태·유한 사유 보완 설치 후 설계 export 검증; impl/r14-replay 재개·병합 금지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
