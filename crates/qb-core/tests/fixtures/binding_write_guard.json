@@ -1006,6 +1006,12 @@
     {
       "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
       "function": "BindingTable::decision_tape_initial_image",
+      "expression": "call: serde_json :Joint :Alone to_value Parenthesis( &Alone d .Alone unknown_cost )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/decision_tape/mod.rs",
+      "function": "BindingTable::decision_tape_initial_image",
       "expression": "call: serde_json :Joint :Alone to_value Parenthesis( &Alone self .Alone config )",
       "count": 1
     },
@@ -1078,7 +1084,7 @@
     {
       "path": "crates/qb-core/src/bindings/kernel_shell.rs",
       "function": "BindingTable::attach_tape",
-      "expression": "call: Parenthesis( |Alone |Alone -Joint >Alone anyhow :Joint :Alone Result <Alone Parenthesis( ) >Alone Brace( use crate :Joint :Alone observability :Joint :Alone replay_recorder :Joint :Alone Brace( Event ,Alone Fingerprint ,Alone Owner ) ;Alone use sha2 :Joint :Alone Brace( Digest ,Alone Sha256 ) ;Alone let image =Alone self .Alone decision_tape_initial_image Parenthesis( ) ?Alone ;Alone let bytes =Alone serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( &Alone image ,Alone initial_accounts ) ) ?Alone ;Alone let digest =Alone Fingerprint Parenthesis( Sha256 :Joint :Alone digest Parenthesis( bytes ) .Alone into Parenthesis( ) ) ;Alone anyhow :Joint :Alone ensure !Alone Parenthesis( producer .Alone record Parenthesis( Owner :Joint :Alone Bindings ,Alone None ,Alone Event :Joint :Alone InitialWitness Brace( component :Alone Owner :Joint :Alone Bindings ,Alone revision :Alone image .Alone revision ,Alone cursor :Alone 0 ,Alone rows :Alone image .Alone bindings_rows ,Alone digest ,Alone ) ) .Alone is_some Parenthesis( ) ,Alone \"initial decision witness was not accepted\" ) ;Alone Ok Parenthesis( Parenthesis( ) ) ) ) Parenthesis( )",
+      "expression": "call: Parenthesis( |Alone |Alone -Joint >Alone Result <Alone Parenthesis( ) ,Alone StartupWitnessFailure >Alone Brace( use crate :Joint :Alone observability :Joint :Alone replay_recorder :Joint :Alone Brace( Event ,Alone Fingerprint ,Alone Owner ) ;Alone use sha2 :Joint :Alone Brace( Digest ,Alone Sha256 ) ;Alone let image =Alone self .Alone decision_tape_initial_image Parenthesis( ) .Alone map_err Parenthesis( |Alone error |Alone Brace( error .Alone downcast_ref :Joint :Alone <Alone StartupWitnessFailure >Alone Parenthesis( ) .Alone copied Parenthesis( ) .Alone unwrap_or Parenthesis( StartupWitnessFailure :Joint :Alone ImageSerialization ) ) ) ?Alone ;Alone let bytes =Alone serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( &Alone image ,Alone initial_accounts ) ) .Alone map_err Parenthesis( |Alone _ |Alone StartupWitnessFailure :Joint :Alone AccountsSerialization ) ?Alone ;Alone let digest =Alone Fingerprint Parenthesis( Sha256 :Joint :Alone digest Parenthesis( bytes ) .Alone into Parenthesis( ) ) ;Alone if producer .Alone record Parenthesis( Owner :Joint :Alone Bindings ,Alone None ,Alone Event :Joint :Alone InitialWitness Brace( component :Alone Owner :Joint :Alone Bindings ,Alone revision :Alone image .Alone revision ,Alone cursor :Alone 0 ,Alone rows :Alone image .Alone bindings_rows ,Alone digest ,Alone ) ,Alone ) .Alone is_none Parenthesis( ) Brace( return Err Parenthesis( StartupWitnessFailure :Joint :Alone Publication ) ;Alone ) Ok Parenthesis( Parenthesis( ) ) ) ) Parenthesis( )",
       "count": 1
     },
     {
