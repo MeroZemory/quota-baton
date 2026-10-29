@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N6r-T slice1 producer 병합·실제 수집 인계
-목표: 실제 >=1h permit tape의 installed identity·두 source fault power; selection은 slice2
+현재 마일스톤: N6r-T 실제1시간 판정·producer 복구
+목표: 588 quota 거절·초기 witness 누락 복구, 실제 identity·두 power 실행 후 재수집
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
 사용자 대기: 없음
-갱신: 2026-10-29 19:36 KST (설계 승인·672a6d3 dev 병합; 과거 사례 insufficient 유지; N7 최초 채점11-05 13:49)
+갱신: 2026-10-29 21:29 KST (봉인885건 중588 quota·producer_failure1, 비교 가능297; R18 allfeature4279/0 후 깨끗한 지점 보존)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.

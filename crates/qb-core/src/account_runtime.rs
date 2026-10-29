@@ -2998,7 +2998,12 @@ impl AccountRuntime {
                     // Force the root timestamp to the captured send time even if a
                     // caller accidentally supplied a response-completion timestamp.
                     snapshot["observed_at"] = json!(report.started_at);
-                    snapshot = obs.observe_poll(&account_id, snapshot, report.complete).ok_or(())?;
+                    snapshot = match current.quota_cooling.as_ref().filter(|cause| {
+                        removed_windows.contains(&cause.window) && report.started_at > cause.started_at
+                    }) {
+                        Some(cause) => obs.observe_poll_after_window_removal(&account_id, snapshot, cause),
+                        None => obs.observe_poll(&account_id, snapshot, report.complete),
+                    }.ok_or(())?;
                     history_update = Some(history);
                 }
                 // Consume the pre-send ordinal before classification, even for a
@@ -3072,15 +3077,13 @@ impl AccountRuntime {
                         // reproduce the quota reducer alone, with those same
                         // facts on both sides of its exact native comparison.
                         let before = attributed.then(|| account.clone());
-                        // Only a native quota hold whose recorded causing window
-                        // disappeared may be reconsidered. Stronger health and
-                        // independent request-rejection evidence remain intact.
+                        // Retire only the removed window's native quota hold.
+                        // The cache owner fenced freshness and retired inherited
+                        // rejection; the reducer reapplies current quota evidence.
                         if account.quota_cooling.as_ref().is_some_and(|cause| {
                             removed_windows.contains(&cause.window)
                                 && poll.as_ref().is_some_and(|report| report.started_at > cause.started_at)
                         }) && matches!(account.health, Health::Cooling { reason: HealthReason::Quota, .. })
-                            && health_snapshot["signals"]["unified_status"] != "rejected"
-                            && health_snapshot["signals"]["limit_reached"] != true
                         {
                             account.health = Health::Ready;
                             account.quota_cooling = None;

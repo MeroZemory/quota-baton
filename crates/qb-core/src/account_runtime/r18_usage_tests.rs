@@ -47,6 +47,9 @@ impl Fixture {
         let mut config = Config::default();
         config.quota.poll_min_interval_secs = 1;
         config.upstream.codex_usage_base = fake.url.clone();
+        config.upstream.codex_base = fake.url.clone();
+        // Native 429 tests consume the original reply without a replay attempt.
+        config.guard.retain_max_per_request_mib = 0;
         let obs = Arc::new(Observability::new(root.path(), None).unwrap());
         let relay =
             Arc::new(RelayState::new(store, &config, obs, Arc::new(DebugPins::default())).unwrap());
@@ -572,5 +575,289 @@ async fn held_busy_real_poll_updates_only_plan_and_end_marker_without_quota_auth
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, axum::http::Method::GET);
         assert_eq!(requests[0].path_and_query, "/backend-api/wham/usage");
+    }
+}
+
+/// Exercise the production header observation, known-body classification and
+/// native hardening used by n5a_http_429_matching_known_body_hardens_native_hold_and_composes_proof.
+async fn native_429_hold(f: &Fixture) -> Account {
+    let reset = Utc::now().timestamp() + 7200;
+    let raw = json!({"error":{"type":"usage_limit_reached","resets_at":reset}}).to_string();
+    let mut response = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, raw.clone());
+    for (name, value) in [
+        ("x-codex-primary-window-minutes", "300".to_owned()),
+        ("x-codex-primary-used-percent", "100".to_owned()),
+        ("x-codex-primary-reset-at", reset.to_string()),
+        ("x-codex-limit-reached", "true".to_owned()),
+        ("x-codex-active-limit", "5h".to_owned()),
+    ] {
+        response.headers.insert(name, value.parse().unwrap());
+    }
+    f.fake.state.push(response);
+    let mut config = Config::default();
+    config.server.data_port = 0;
+    config.server.admin_port = 0;
+    let servers = crate::http::spawn_with_routes(
+        &config,
+        crate::local_secrets::LocalSecrets {
+            client_key: "synthetic-r18-native-key".into(),
+            admin_token: "synthetic-r18-native-admin".into(),
+        },
+        crate::relay::router(f.relay.clone()),
+        axum::Router::new(),
+    )
+    .await
+    .unwrap();
+    let response = tokio::time::timeout(StdDuration::from_secs(5), async {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{}/v1/responses", servers.data_addr))
+            .bearer_auth("synthetic-r18-native-key")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        response.bytes().await.unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.as_ref(), raw.as_bytes());
+    assert_eq!(
+        f.fake.state.requests().len(),
+        1,
+        "one actual native attempt"
+    );
+    let held = f.account();
+    assert!(matches!(
+        held.health,
+        Health::Cooling {
+            reason: HealthReason::Quota,
+            ..
+        }
+    ));
+    assert_eq!(held.quota_cooling.as_ref().unwrap().window, "5h");
+    assert!(
+        !held.quota_credit_releasable,
+        "known body must harden the native hold"
+    );
+    assert_eq!(
+        f.relay.accounts.obs.quota_snapshot(&f.id).unwrap()["signals"]["limit_reached"],
+        true
+    );
+    held
+}
+
+#[tokio::test]
+async fn native_429_removed_window_retires_stale_rejection_without_recooling() {
+    for paused in [false, true] {
+        let f = Fixture::new().await;
+        let held = native_429_hold(&f).await;
+        let held_reset = held.quota_cooling.as_ref().unwrap().reset_at;
+        // Also cover a retained normalized rejection from an older cached
+        // observation. The hard hold itself came from the real HTTP 429 above.
+        let mut inherited = f.relay.accounts.obs.quota_snapshot(&f.id).unwrap();
+        inherited["signals"]["unified_status"] = json!("rejected");
+        inherited["signals"]["unified_reset_at"] =
+            json!(held.quota_cooling.as_ref().unwrap().reset_at);
+        inherited["signals"]["representative_claim"] = json!("five_hour");
+        inherited["signals"]["retry_after_seconds"] = json!(7200);
+        f.relay
+            .accounts
+            .obs
+            .observe_poll(&f.id, inherited, false)
+            .unwrap();
+        if paused {
+            f.relay
+                .accounts
+                .store
+                .update_metadata(&f.id, |account| {
+                    account.user_state = crate::accounts::UserState::Paused;
+                })
+                .unwrap();
+        }
+        let pro = usage("pro", false, false);
+        // The native completeness contract requires this provider flag.
+        // Its fresh false value must coexist with retirement of the inherited
+        // normalized rejection, rather than classifying this as a partial poll.
+        assert!(crate::quota::is_complete_snapshot_for_test(
+            Provider::Codex,
+            &serde_json::to_vec(&pro).unwrap()
+        ));
+        let (ready, snapshot) = f.apply(pro.clone()).await;
+        assert!(!has_five_hour(&snapshot));
+        assert!(ready.plan_observed_at.unwrap() > held.quota_cooling.unwrap().started_at);
+        assert_eq!(
+            ready.health,
+            Health::Ready,
+            "removed_window_native_quota_hold_survived_complete_plan_change"
+        );
+        assert!(ready.quota_cooling.is_none());
+        assert_eq!(
+            ready.user_state,
+            if paused {
+                crate::accounts::UserState::Paused
+            } else {
+                crate::accounts::UserState::Active
+            }
+        );
+        for field in ["unified_status", "active_limit", "representative_claim"] {
+            assert!(
+                snapshot["signals"][field].is_null(),
+                "retired {field} is unknown"
+            );
+        }
+        assert_eq!(snapshot["signals"]["limit_reached"], false);
+        assert_eq!(snapshot["signals"]["unified_reset_at"], json!(held_reset));
+        assert_eq!(
+            snapshot["signals"]["retry_after_seconds"].as_f64(),
+            Some(7200.0)
+        );
+        // Replaying the published cache, then another flag-omitting poll, must
+        // not recreate a hard hold from retained old rejection signals.
+        let reapplied = f
+            .relay
+            .accounts
+            .apply_quota_snapshot(&f.id, snapshot, None)
+            .await
+            .unwrap();
+        assert_eq!(reapplied.health, Health::Ready);
+        let (next, _) = f.apply(pro).await;
+        assert_eq!(next.health, Health::Ready);
+        assert!(next.quota_cooling.is_none());
+        assert_eq!(next.user_state, ready.user_state);
+    }
+}
+
+#[tokio::test]
+async fn native_429_removed_window_preserves_current_rejection_and_new_window_quota() {
+    for rejection in [true, false] {
+        let f = Fixture::new().await;
+        let old = native_429_hold(&f).await;
+        let mut inherited = f.relay.accounts.obs.quota_snapshot(&f.id).unwrap();
+        inherited["signals"]["representative_claim"] = json!("five_hour");
+        inherited["signals"]["unified_reset_at"] =
+            json!(old.quota_cooling.as_ref().unwrap().reset_at);
+        f.relay
+            .accounts
+            .obs
+            .observe_poll(&f.id, inherited, false)
+            .unwrap();
+        let mut pro = usage("pro", rejection, false);
+        if !rejection {
+            pro["rate_limit"]["primary_window"]["used_percent"] = json!(100);
+        }
+        let (held, snapshot) = f.apply(pro).await;
+        assert!(!has_five_hour(&snapshot));
+        assert!(matches!(
+            held.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        let cause = held.quota_cooling.as_ref().unwrap();
+        assert_eq!(cause.window, "7d");
+        let weekly = snapshot["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == "7d")
+            .unwrap();
+        assert_eq!(json!(cause.reset_at), weekly["reset_at"]);
+        assert!(snapshot["signals"]["active_limit"].is_null());
+        assert!(snapshot["signals"]["representative_claim"].is_null());
+        assert_eq!(
+            snapshot["signals"]["unified_reset_at"],
+            json!(old.quota_cooling.as_ref().unwrap().reset_at)
+        );
+        assert_eq!(snapshot["signals"]["limit_reached"], rejection);
+    }
+}
+
+#[tokio::test]
+async fn native_429_partial_or_present_window_does_not_retire_rejection() {
+    for partial in [true, false] {
+        let f = Fixture::new().await;
+        let before = native_429_hold(&f).await;
+        let mut pro = usage("pro", !partial, !partial);
+        if partial {
+            pro["rate_limit"]
+                .as_object_mut()
+                .unwrap()
+                .remove("limit_reached");
+            pro["rate_limit"]
+                .as_object_mut()
+                .unwrap()
+                .remove("secondary_window");
+        }
+        assert_eq!(
+            crate::quota::is_complete_snapshot_for_test(
+                Provider::Codex,
+                &serde_json::to_vec(&pro).unwrap()
+            ),
+            !partial,
+            "cover an actual partial report and a complete report retaining 5h"
+        );
+        let (held, snapshot) = f.apply(pro).await;
+        assert!(has_five_hour(&snapshot));
+        assert_eq!(snapshot["signals"]["limit_reached"], true);
+        assert!(matches!(
+            held.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        assert!(!held.quota_credit_releasable);
+        assert_eq!(
+            held.quota_cooling.as_ref().unwrap().window,
+            before.quota_cooling.as_ref().unwrap().window
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_429_plan_change_preserves_stronger_health() {
+    for kind in ["payment", "auth", "plan"] {
+        let f = Fixture::new().await;
+        native_429_hold(&f).await;
+        f.relay
+            .accounts
+            .store
+            .update_metadata(&f.id, |account| match kind {
+                "payment" => {
+                    account.apply_health_signal(
+                        crate::accounts::HealthSignal::Cooling {
+                            reason: HealthReason::Payment,
+                            until: Utc::now() + Duration::hours(6),
+                            scope: "account".into(),
+                        },
+                        Utc::now(),
+                    );
+                }
+                "auth" => {
+                    account.apply_health_signal(
+                        crate::accounts::HealthSignal::Cooling {
+                            reason: HealthReason::Auth,
+                            until: Utc::now() + Duration::hours(6),
+                            scope: "account".into(),
+                        },
+                        Utc::now(),
+                    );
+                }
+                _ => {
+                    account.health = Health::PlanWithoutClaudeCode;
+                }
+            })
+            .unwrap();
+        let before = f.account();
+        let (after, snapshot) = f.apply(usage("pro", false, false)).await;
+        assert!(!has_five_hour(&snapshot));
+        assert_eq!(after.health, before.health);
+        assert_eq!(after.payment_until, before.payment_until);
+        assert_eq!(after.auth_probe_pending, before.auth_probe_pending);
     }
 }
