@@ -308,13 +308,35 @@ impl Observability {
                         losses = status.losses,
                         "Forecast log restored"
                     );
+                    if status.stopped {
+                        let failure = match log.last_failure() {
+                            Ok(Some(failure)) => failure,
+                            Ok(None) => forecast_log::FailureDiagnostic {
+                                phase: forecast_log::FailurePhase::Open,
+                                reason: forecast_log::FailureReason::Stopped,
+                            },
+                            Err(error) => {
+                                forecast_log::diagnostic(&error, forecast_log::FailurePhase::Open)
+                            }
+                        };
+                        tracing::warn!(
+                            phase = failure.phase.as_str(),
+                            reason = failure.reason.as_str(),
+                            "Forecast log restored in stopped state"
+                        );
+                    }
                 }
                 *self.forecast_log.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(log))
             }
-            Err(_) => tracing::warn!(
-                code = "forecast_log_start_failed",
-                "Optional forecast log unavailable"
-            ),
+            Err(error) => {
+                let failure = forecast_log::diagnostic(&error, forecast_log::FailurePhase::Open);
+                tracing::warn!(
+                    code = "forecast_log_start_failed",
+                    phase = failure.phase.as_str(),
+                    reason = failure.reason.as_str(),
+                    "Optional forecast log unavailable"
+                );
+            }
         }
         match replay_runtime::Runtime::start(
             &home.join("state/routing-replay"),
@@ -332,10 +354,13 @@ impl Observability {
     /// Blocking close for drain or normal process shutdown; call off the async worker.
     pub fn shutdown_replay(&self) {
         if let Some(log) = self.forecast_log()
-            && log.close().is_err()
+            && let Err(error) = log.close()
         {
+            let failure = forecast_log::diagnostic(&error, forecast_log::FailurePhase::Close);
             tracing::warn!(
                 code = "forecast_log_close_failed",
+                phase = failure.phase.as_str(),
+                reason = failure.reason.as_str(),
                 "Forecast log was not cleanly closed"
             );
         }
@@ -353,10 +378,13 @@ impl Observability {
 
     pub(crate) fn forecast_account(&self, account: &crate::accounts::Account) {
         if let Some(log) = self.forecast_log()
-            && log.observe_account(account).is_err()
+            && let Err(error) = log.observe_account(account)
         {
+            let failure = forecast_log::diagnostic(&error, forecast_log::FailurePhase::Observation);
             tracing::warn!(
                 code = "forecast_log_account_refused",
+                phase = failure.phase.as_str(),
+                reason = failure.reason.as_str(),
                 "Forecast cohort observation refused"
             );
         }
