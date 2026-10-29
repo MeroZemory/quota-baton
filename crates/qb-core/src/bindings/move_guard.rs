@@ -8,9 +8,9 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-const SESSIONS: usize = 20_000;
-const RECORDS: usize = 128;
-const GLOBAL_RECORDS: usize = 4096;
+pub(super) const SESSIONS: usize = 20_000;
+pub(super) const RECORDS: usize = 128;
+pub(super) const GLOBAL_RECORDS: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -43,9 +43,9 @@ impl Limits {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Refusal {
+pub enum Refusal {
     SessionTenMinutes,
     SessionHour,
     PingPong,
@@ -118,7 +118,7 @@ impl Observations {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Movement {
     at: DateTime<Utc>,
     committed: Instant,
@@ -133,13 +133,13 @@ struct Movement {
 
 // A shared failure moves many sessions, but consumes only one global incident.
 // Unknown or usable-source moves are independent; never merge missing evidence.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Incident {
     at: DateTime<Utc>,
     shared: Option<(String, u64)>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Breaker {
     sessions: BTreeMap<String, VecDeque<Movement>>,
     global: VecDeque<Incident>,
@@ -151,6 +151,7 @@ pub(crate) struct Breaker {
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct Permit {
+    recorded_ordinal: Option<u64>,
     revision: u64,
     shared_incident: Option<(String, u64)>,
     key: String,
@@ -186,6 +187,28 @@ impl CommittedMove {
 }
 
 impl Permit {
+    pub(super) fn record_ordinal(&mut self, ordinal: Option<u64>) {
+        self.recorded_ordinal = ordinal;
+    }
+
+    pub(super) fn recorded_ordinal(&self) -> Option<u64> {
+        self.recorded_ordinal
+    }
+
+    pub(super) fn decision(&self) -> super::kernel::PermitDecision {
+        super::kernel::PermitDecision::Allowed(super::kernel::PreparedMove {
+            revision: self.revision,
+            shared_incident: self.shared_incident.clone(),
+            key: self.key.clone(),
+            at: self.at,
+            from: self.from.clone(),
+            to: self.to.clone(),
+            departure_evidence: self.departure_evidence,
+            destination_evidence: self.destination_evidence,
+            emergency_return: self.emergency_return,
+        })
+    }
+
     pub(super) fn emergency_return(&self) -> bool {
         self.emergency_return
     }
@@ -195,6 +218,139 @@ impl Permit {
 }
 
 impl Breaker {
+    #[cfg(test)]
+    pub(super) fn assert_same_prepared_state(&self, legacy: &Self) {
+        assert_eq!(
+            self, legacy,
+            "pure permit decision must preserve native breaker mutations"
+        );
+    }
+
+    /// Only the native owner mints a live permit, from its just-captured state.
+    /// A replay result is proof-free and cannot be committed through this API.
+    pub(super) fn prepare_captured(
+        &mut self,
+        inputs: &super::kernel::DecisionInputs,
+    ) -> Result<Permit, Denied> {
+        use super::kernel::PermitDecision;
+        let denied = |reason| Denied {
+            reason,
+            until: inputs.permit.as_ref().map_or(inputs.now, |p| p.now) + Duration::minutes(10),
+            newly_tripped: false,
+        };
+        let state = inputs
+            .permit
+            .as_ref()
+            .ok_or_else(|| denied(Refusal::Capacity))?;
+        if state.revision != self.revision || self.last_now != Some(state.now) {
+            return Err(denied(Refusal::StalePermit));
+        }
+        match super::kernel::decide_move(inputs) {
+            PermitDecision::Allowed(proposal) => {
+                if proposal.revision != self.revision
+                    || Some(proposal.key.as_str()) != inputs.key.as_deref()
+                    || Some(proposal.from.as_str()) != inputs.from.as_deref()
+                    || proposal.to != inputs.to
+                    || proposal.at != state.now
+                {
+                    return Err(denied(Refusal::StalePermit));
+                }
+                Ok(Permit {
+                    recorded_ordinal: None,
+                    revision: proposal.revision,
+                    shared_incident: proposal.shared_incident,
+                    key: proposal.key,
+                    at: proposal.at,
+                    from: proposal.from,
+                    to: proposal.to,
+                    departure_evidence: proposal.departure_evidence,
+                    destination_evidence: proposal.destination_evidence,
+                    emergency_return: proposal.emergency_return,
+                })
+            }
+            PermitDecision::Denied(decision) => {
+                if decision.newly_tripped {
+                    self.tripped_until = Some(decision.until);
+                    self.revision = self.revision.saturating_add(1);
+                }
+                Err(Denied {
+                    reason: decision.reason,
+                    until: decision.until,
+                    newly_tripped: decision.newly_tripped,
+                })
+            }
+            PermitDecision::NotComparable | PermitDecision::NotRequired => {
+                Err(denied(Refusal::Capacity))
+            }
+        }
+    }
+
+    /// Snapshot after the same native pre-decision prune/clamp. Instants are
+    /// represented by exact ages from a single anchor; nothing is resampled on
+    /// replay and equality keeps the original strict observation ordering.
+    pub(super) fn decision_inputs(
+        &mut self,
+        limits: &Limits,
+        key: &str,
+        observations: Observations,
+        sole_target: Option<super::kernel::permit::SoleTargetInput>,
+        now: DateTime<Utc>,
+    ) -> Option<super::kernel::PermitInputs> {
+        use super::kernel::permit::{IncidentInput, MovementInput, PermitInputs};
+        let now = self.prune(now);
+        let history = self.sessions.get(key);
+        let anchor = history
+            .into_iter()
+            .flatten()
+            .map(|m| m.committed)
+            .chain(observations.source.started)
+            .chain(observations.target.started)
+            .fold(Instant::now(), std::cmp::max);
+        let age = |at: Instant| u64::try_from(anchor.duration_since(at).as_nanos()).ok();
+        let source_observation_age_ns = match observations.source.started {
+            Some(at) => Some(age(at)?),
+            None => None,
+        };
+        let target_observation_age_ns = match observations.target.started {
+            Some(at) => Some(age(at)?),
+            None => None,
+        };
+        Some(PermitInputs {
+            limits: limits.clone(),
+            now,
+            history: history
+                .into_iter()
+                .flatten()
+                .map(|m| {
+                    Some(MovementInput {
+                        at: m.at,
+                        committed_age_ns: age(m.committed)?,
+                        from: m.from.clone(),
+                        departure_evidence: m.departure_evidence,
+                        to: m.to.clone(),
+                        destination_evidence: m.destination_evidence,
+                        emergency_return: m.emergency_return,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            global: self
+                .global
+                .iter()
+                .map(|i| IncidentInput {
+                    at: i.at,
+                    shared: i.shared.clone(),
+                })
+                .collect(),
+            session_count: self.sessions.len(),
+            session_exists: self.sessions.contains_key(key),
+            tripped_until: self.tripped_until,
+            revision: self.revision,
+            source_observation_age_ns,
+            target_observation_age_ns,
+            sole_target,
+        })
+    }
+
     fn prune(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let now = self.last_now.map_or(now, |prior| now.max(prior));
         self.last_now = Some(now);
@@ -215,6 +371,7 @@ impl Breaker {
     /// Production callers must supply a judgement from the health owner.
     /// A missing/filtered source or a reason string cannot mint this authority.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn prepare_observed(
         &mut self,
         limits: &Limits,
@@ -273,6 +430,7 @@ impl Breaker {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn prepare_checked(
         &mut self,
         limits: &Limits,
@@ -387,6 +545,7 @@ impl Breaker {
             }
         }
         Ok(Permit {
+            recorded_ordinal: None,
             revision: self.revision,
             shared_incident,
             key: key.into(),

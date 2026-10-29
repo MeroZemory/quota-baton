@@ -8,4 +8,10 @@ mod native;
 
 pub(crate) use native::*;
 
+/// Exclusively create one private leaf; an existing path is never reused.
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) fn create_private_directory_new(path: &std::path::Path) -> std::io::Result<()> {
+    native::create_private_directory_new(path)
+}
+
 pub(crate) mod box_sockets;

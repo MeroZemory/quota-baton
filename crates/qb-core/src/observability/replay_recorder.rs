@@ -10,6 +10,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod tape;
+pub use tape::read_epoch;
+
 // Distinct from the preserved larger schema-2 tapes; never reinterpret their layout.
 const SCHEMA: u16 = 3;
 const ID_DOMAIN_VERSION: u16 = 1;
@@ -140,6 +143,7 @@ struct EpochHeader {
 /// Lock is held by the sole Archive until close/drop, and released by OS on crash.
 /// Eight generated slots only; unknown files/symlinks cause a closed failure.
 struct EpochStore {
+    schema: u16,
     root: PathBuf,
     _lock: fs::File,
     limits: Limits,
@@ -221,7 +225,7 @@ impl EpochStore {
             }
             let mut bytes = 0u64;
             for (n, file) in fs::read_dir(entry.path())?.enumerate() {
-                if n >= MAX_SEGMENTS + 3 {
+                if n >= MAX_SEGMENTS + if self.schema == SCHEMA { 3 } else { 4 } {
                     return Err(io::Error::other("capture_file_count"));
                 }
                 let file = file?;
@@ -229,18 +233,25 @@ impl EpochStore {
                 let name = name
                     .to_str()
                     .ok_or_else(|| io::Error::other("capture_foreign_entry"))?;
-                let segment = name.len() == 23
+                let suffix = if self.schema == SCHEMA {
+                    ".jsonl"
+                } else {
+                    ".jsonl.zst"
+                };
+                let segment = name.len() == 17 + suffix.len()
                     && name.starts_with('s')
-                    && name.ends_with(".jsonl")
+                    && name.ends_with(suffix)
                     && name.as_bytes()[1..17].iter().all(u8::is_ascii_hexdigit);
-                if !segment && !["epoch.json", "manifest.json", "manifest.pending"].contains(&name)
+                if !(segment
+                    || ["epoch.json", "manifest.json", "manifest.pending"].contains(&name)
+                    || self.schema == tape::TAPE_SCHEMA && name == "header.json")
                 {
                     return Err(io::Error::other("capture_foreign_entry"));
                 }
                 let size = regular_file(&file.path())?;
                 let max = if segment {
                     SEGMENT_BYTES
-                } else if name == "epoch.json" {
+                } else if name == "epoch.json" || name == "header.json" {
                     CONTROL_BYTES
                 } else {
                     MANIFEST_RESERVE / 2
@@ -253,7 +264,7 @@ impl EpochStore {
                     .ok_or_else(|| io::Error::other("capture_size_overflow"))?;
             }
             let header: EpochHeader = read_control(&entry.path().join("epoch.json"))?;
-            if header.schema != SCHEMA {
+            if header.schema != self.schema {
                 return Err(io::Error::other("capture_epoch_schema"));
             }
             epochs.push((slot, header, bytes));
@@ -309,6 +320,14 @@ impl EpochStore {
         self.write_status()
     }
     fn open(root: &Path, limits: Limits, at: Stamp) -> io::Result<(Self, PathBuf)> {
+        Self::open_schema(root, limits, at, SCHEMA)
+    }
+    fn open_schema(
+        root: &Path,
+        limits: Limits,
+        at: Stamp,
+        schema: u16,
+    ) -> io::Result<(Self, PathBuf)> {
         match fs::create_dir(root) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -341,6 +360,7 @@ impl EpochStore {
             Err(e) => return Err(e),
         };
         let mut store = Self {
+            schema,
             root: root.to_owned(),
             _lock: lock,
             limits,
@@ -362,7 +382,7 @@ impl EpochStore {
         write_control(
             &path.join("epoch.json"),
             &EpochHeader {
-                schema: SCHEMA,
+                schema,
                 start_utc_ns: at.utc_ns,
             },
         )?;
@@ -370,9 +390,9 @@ impl EpochStore {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Id([u8; 32]);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint(pub [u8; 32]);
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -408,28 +428,28 @@ fn pseudonym(key: &[u8; 32], domain: IdentityDomain, raw: &[u8]) -> Id {
     Id(result.finalize().into())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
     pub utc_ns: i64,
     pub monotonic_ns: u64,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Provider {
     Codex,
     Claude,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Transport {
     Http,
     WebSocket,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Route {
     Responses,
     Messages,
     Launch,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Owner {
     Relay,
@@ -441,27 +461,27 @@ pub enum Owner {
     Accounting,
     Control,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Origin {
     IndependentPoll,
     Operator,
     ResponseAttempt { attempt: u64 },
     Probe { attempt: u64 },
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Window {
     FiveHour,
     SevenDay,
     Session,
     OtherSupported,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum CollectionSide {
     Source,
     Target,
     SourceAndTarget,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Exclusion {
     None,
     Tried,
@@ -471,14 +491,14 @@ pub enum Exclusion {
     Entitlement,
     Unknown,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Disposition {
     Dispatch,
     Hold,
     Refuse,
     NoEligible,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Guard {
     Allowed,
     ReturnVeto,
@@ -486,7 +506,7 @@ pub enum Guard {
     GlobalIncidentLimit,
     ActiveTrip,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Lifecycle {
     Reserved,
     Sent,
@@ -498,7 +518,7 @@ pub enum Lifecycle {
     SocketOpen,
     SocketClose,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Terminal {
     Success,
     Error,
@@ -506,7 +526,7 @@ pub enum Terminal {
     Cancelled,
     Unknown,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Intent {
     Alias,
     GuardClear,
@@ -518,7 +538,7 @@ pub enum Intent {
 }
 
 /// Fixed allowlist only; no string, Value, Account, Candidate, path or body field.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "facts")]
 pub enum Event {
     CollectionBoundary {
@@ -640,14 +660,14 @@ impl Event {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Provenance {
     Synthetic,
     OperatorOptIn,
 }
 // Unknown metadata is None, never a sentinel digest. An executable digest alone
 // does not attest its source revision, build inputs, or replay adapter identity.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct BuildIdentity {
     pub installed_executable: Option<Fingerprint>,
     pub installed_source: Option<Fingerprint>,

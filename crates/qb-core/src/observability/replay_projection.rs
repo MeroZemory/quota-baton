@@ -1,15 +1,15 @@
 //! Explicit metadata projections: never serialize the account or quota source object.
 use super::{replay_recorder as tape, replay_runtime::Runtime};
 use crate::accounts::{Account, Health, HealthReason, UserState};
-use serde::Serialize;
-#[derive(Clone, Copy, Debug, Serialize)]
+use serde::{Deserialize, Serialize};
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum HealthKind {
     Ready,
     Cooling,
     NeedsRelogin,
     PlanWithoutClaudeCode,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Reason {
     Quota,
     Rate,
@@ -19,19 +19,19 @@ pub enum Reason {
     StoreError,
     LinkStale,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Scope {
     Account,
     Model(tape::Id),
     Unknown,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum State {
     Active,
     Paused,
     Disabled,
 }
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct AccountFacts {
     pub account: tape::Id,
     pub provider: tape::Provider,

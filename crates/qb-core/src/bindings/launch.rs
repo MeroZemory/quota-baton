@@ -752,390 +752,461 @@ impl BindingTable {
         admit: Option<&LaunchAdmission<'_>>,
         authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
     ) -> std::result::Result<LaunchPlacement, LaunchError> {
-        if !is_anchor(request.anchor_key)
-            || request.resume_key.is_some_and(|k| !real_key(k))
-            || request.model.is_some_and(|m| !valid_model(m))
-            || (request.model_is_explicit && request.model.is_none())
-        {
-            return Err(LaunchError::InvalidMetadata);
-        }
+        // Retain the single mutation gate through finish and capture's unwind
+        // publication. Invalid metadata also waits for this gate so freeze
+        // cannot overtake its recorded refusal.
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
-        if self.writes_stopped.load(Ordering::Acquire) {
-            return Err(LaunchError::Retired);
-        }
-        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        // Refuse revoked, unadmitted placement before even pruning shared data.
-        // This observation is not admission; the actual admit seams below and
-        // in routing serialize fresh admission with the grant's revoke gate.
-        if !operation.is_some_and(crate::issue_operation::IssueOperation::is_admitted)
-            && !crate::boxes::dispatch_allowed()
-        {
-            return Err(LaunchError::PolicyBlocked);
-        }
-        // Both binding gates are held; this remains a precommit check.
-        if let Some(operation) = operation {
-            operation.check().map_err(|_| LaunchError::PolicyBlocked)?;
-        }
-        self.prune(&mut d, now);
-        if let Some(anchor) = d.launch_anchors.get(request.anchor_key) {
-            if request
-                .resume_key
-                .is_some_and(|k| canonical(&d, k) != Some(anchor.canonical_key.as_str()))
+        let capture = decision_tape::Capture::begin(self, || decision_tape::Inputs {
+            entry: decision_tape::Entry::Launch,
+            at: now,
+            provider: Provider::Codex,
+            key: Some(decision_tape::compact(request.anchor_key)),
+            parent: None,
+            model: request.model.map(decision_tape::compact),
+            pinned: None,
+            request_bytes: 0,
+            hold_allowed: false,
+            hold_timed_out: false,
+            coverage: None,
+            root_hint_present: false,
+            launch_metadata_valid: Some(
+                is_anchor(request.anchor_key)
+                    && request.resume_key.is_none_or(real_key)
+                    && request.model.is_none_or(valid_model)
+                    && (!request.model_is_explicit || request.model.is_some()),
+            ),
+            launch: Some(decision_tape::LaunchInputs {
+                resume: request.resume_key.map(decision_tape::compact),
+                model_is_explicit: request.model_is_explicit,
+                account_preference: request.account_pref.map(decision_tape::compact),
+                allow_move_for_model: request.allow_move_for_model,
+                operation_present: operation.is_some(),
+                admission_present: admit.is_some(),
+                entitlements: entitlements
+                    .iter()
+                    .map(|(id, models)| {
+                        (
+                            decision_tape::compact(id),
+                            models.iter().map(|m| decision_tape::compact(m)).collect(),
+                        )
+                    })
+                    .collect(),
+            }),
+        });
+        let result = (|| {
+            if !is_anchor(request.anchor_key)
+                || request.resume_key.is_some_and(|k| !real_key(k))
+                || request.model.is_some_and(|m| !valid_model(m))
+                || (request.model_is_explicit && request.model.is_none())
+            {
+                return Err(LaunchError::InvalidMetadata);
+            }
+            if self.writes_stopped.load(Ordering::Acquire) {
+                return Err(LaunchError::Retired);
+            }
+            let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+            decision_tape::observe_choice(
+                self,
+                &d,
+                Provider::Codex,
+                request.resume_key.or(Some(request.anchor_key)),
+                request.model,
+                candidates,
+                now,
+            );
+            // Refuse revoked, unadmitted placement before even pruning shared data.
+            // This observation is not admission; the actual admit seams below and
+            // in routing serialize fresh admission with the grant's revoke gate.
+            if !decision_tape::check(
+                self,
+                decision_tape::Check::DispatchAllowed,
+                operation.is_some_and(crate::issue_operation::IssueOperation::is_admitted)
+                    || crate::boxes::dispatch_allowed(),
+            ) {
+                return Err(LaunchError::PolicyBlocked);
+            }
+            // Both binding gates are held; this remains a precommit check.
+            if let Some(operation) = operation {
+                let checked = operation.check();
+                decision_tape::check(self, decision_tape::Check::Operation, checked.is_ok());
+                checked.map_err(|_| LaunchError::PolicyBlocked)?;
+            }
+            self.prune(&mut d, now);
+            if let Some(anchor) = d.launch_anchors.get(request.anchor_key) {
+                if request
+                    .resume_key
+                    .is_some_and(|k| canonical(&d, k) != Some(anchor.canonical_key.as_str()))
+                {
+                    return Err(LaunchError::AnchorConflict);
+                }
+                let key = anchor.canonical_key.clone();
+                let prior = info(&d, &key)?;
+                let existing = Self::accepted_in(&d, Some(&key), &prior.account);
+                drop(d);
+                if !decision_tape::check(
+                    self,
+                    decision_tape::Check::LaunchAdmission,
+                    !admit.is_some_and(|admit| {
+                        !admit(&prior.account, existing, prior.current_model.as_deref())
+                    }),
+                ) {
+                    return Err(LaunchError::NoEligibleAccount);
+                }
+                if let Some(operation) = operation {
+                    crate::boxes::admit_operation(operation)
+                        .map_err(|_| LaunchError::PolicyBlocked)?;
+                }
+                let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+                touch(&mut d, &key, now);
+                return Ok(LaunchPlacement {
+                    canonical_key: key,
+                    account: prior.account,
+                    effective_model: prior.current_model,
+                    moves: Vec::new(),
+                });
+            }
+            if d.launches
+                .values()
+                .any(|m| m.policy_key == request.anchor_key)
             {
                 return Err(LaunchError::AnchorConflict);
             }
-            let key = anchor.canonical_key.clone();
-            let prior = info(&d, &key)?;
-            let existing = Self::accepted_in(&d, Some(&key), &prior.account);
-            drop(d);
-            if admit.is_some_and(|admit| {
-                !admit(&prior.account, existing, prior.current_model.as_deref())
-            }) {
-                return Err(LaunchError::NoEligibleAccount);
-            }
-            if let Some(operation) = operation {
-                crate::boxes::admit_operation(operation).map_err(|_| LaunchError::PolicyBlocked)?;
-            }
-            let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-            touch(&mut d, &key, now);
-            return Ok(LaunchPlacement {
-                canonical_key: key,
-                account: prior.account,
-                effective_model: prior.current_model,
-                moves: Vec::new(),
-            });
-        }
-        if d.launches
-            .values()
-            .any(|m| m.policy_key == request.anchor_key)
-        {
-            return Err(LaunchError::AnchorConflict);
-        }
-        if d.bindings.contains_key(request.anchor_key) || d.launch_anchors.len() >= CAPACITY {
-            return Err(LaunchError::Capacity);
-        }
-        let key = request
-            .resume_key
-            .and_then(|k| canonical(&d, k))
-            .or(request.resume_key)
-            .unwrap_or(request.anchor_key)
-            .to_owned();
-        let policy_key = policy_key(&d, Some(&key)).unwrap().to_owned();
-        let plan = self.policies.plan(Some(&policy_key));
-        let previous = plan
-            .anchor
-            .clone()
-            .or_else(|| d.groups.get(&key).map(|g| g.account.clone()));
-        let old_metadata = d.launches.get(&key).cloned();
-        let old_model = old_metadata.as_ref().and_then(|m| m.current_model.clone());
-        let mut model = if previous.is_some() && !request.model_is_explicit {
-            old_model
-                .clone()
-                .or_else(|| request.model.map(str::to_owned))
-        } else {
-            request.model.map(str::to_owned).or(old_model.clone())
-        };
-        let current = previous
-            .as_deref()
-            .and_then(|id| candidates.iter().find(|c| c.account.id == id));
-        let usable = current.is_some_and(|c| {
-            effective_account(c, &d, &self.config, old_model.as_deref(), now)
-                .eligible_at(old_model.as_deref(), now)
-                && (!c.account.drain || Self::accepted_in(&d, Some(&key), &c.account.id))
-        });
-        let mut model_move = false;
-        if let (Some(id), Some(model)) = (
-            previous.as_deref(),
-            request
-                .model
-                .filter(|_| request.model_is_explicit && usable),
-        ) {
-            let supported = entitlements
-                .get(id)
-                .ok_or(LaunchError::EntitlementsUnknown)?
-                .contains(model)
-                && current.is_none_or(|c| {
-                    effective_account(c, &d, &self.config, Some(model), now)
-                        .eligible_at(Some(model), now)
-                });
-            if !supported {
-                if !request.allow_move_for_model && request.account_pref.is_none() {
-                    return Err(LaunchError::ConsentRequired);
-                }
-                model_move = true;
-            }
-        }
-        if usable && !model_move && !request.model_is_explicit && old_model.is_none() {
-            // A legacy binding has no proved current model. An incompatible
-            // implicit default never turns that into permission to relocate.
-            if let (Some(id), Some(default)) = (previous.as_deref(), model.as_deref())
-                && !entitlements.get(id).is_some_and(|s| s.contains(default))
-            {
-                model = None;
-            }
-        }
-        for candidate in candidates {
-            if let Some(snapshot) = &candidate.quota {
-                d.placements
-                    .entry(candidate.account.id.clone())
-                    .or_default()
-                    .observe(snapshot);
-            }
-        }
-        let filtered: Vec<_> = candidates
-            .iter()
-            .filter(|c| c.account.provider == Provider::Codex)
-            .filter(|c| {
-                model.as_deref().is_none_or(|m| {
-                    entitlements
-                        .get(&c.account.id)
-                        .is_some_and(|s| s.contains(m))
-                })
-            })
-            .cloned()
-            .collect();
-        let coverage: BTreeSet<_> = old_metadata.as_ref().map_or_else(BTreeSet::new, |m| {
-            entitlements
-                .iter()
-                .filter(|(_, s)| m.advertised_models.is_subset(s))
-                .map(|(id, _)| id.clone())
-                .collect()
-        });
-        let preference = SelectionPreference {
-            account: request.account_pref,
-            coverage: previous.as_ref().filter(|_| !model_move).map(|_| &coverage),
-            model_move,
-        };
-        let entitled_targets: BTreeSet<_> = sources
-            .iter()
-            .filter(|c| {
-                model.as_deref().is_none_or(|m| {
-                    entitlements
-                        .get(&c.account.id)
-                        .is_some_and(|models| models.contains(m))
-                })
-            })
-            .map(|c| c.account.id.clone())
-            .collect();
-        let mut sole_target = None;
-        let (account, reason) = if usable && !model_move {
-            (previous.clone().unwrap(), "launch_resume")
-        } else {
-            let (choice, _, sole) = self.select_with_return_guard(
-                &d,
-                Provider::Codex,
-                Some(&key),
-                None,
-                model.as_deref(),
-                &filtered,
-                sources,
-                Some(&entitled_targets),
-                observations,
-                None,
-                now,
-                false,
-                Some(&preference),
-            );
-            sole_target = sole;
-            match choice {
-                PreviewDecision::Selected { account } => (
-                    account,
-                    if model_move {
-                        "model_choice"
-                    } else if previous.is_some() {
-                        "forced"
-                    } else {
-                        "launch_model"
-                    },
-                ),
-                _ if plan.settings.mode == crate::routing::Mode::Strict && !model_move => {
-                    return Err(LaunchError::PolicyBlocked);
-                }
-                _ if model.is_some()
-                    && candidates.iter().any(|c| {
-                        c.account.provider == Provider::Codex
-                            && !entitlements.contains_key(&c.account.id)
-                    }) =>
-                {
-                    return Err(LaunchError::EntitlementsUnknown);
-                }
-                _ => return Err(LaunchError::NoEligibleAccount),
-            }
-        };
-        if previous.as_deref().is_some_and(|id| id != account) && protected(&d, &key) {
-            return Err(LaunchError::Busy);
-        }
-        let metadata = Metadata {
-            current_model: model.clone(),
-            advertised_models: old_metadata
-                .as_ref()
-                .map_or_else(BTreeSet::new, |m| m.advertised_models.clone()),
-            policy_key: policy_key.clone(),
-            idle_placement: old_metadata
-                .as_ref()
-                .map_or(!d.groups.contains_key(&key), |m| m.idle_placement),
-        };
-        let anchor = Anchor {
-            canonical_key: key.clone(),
-            last_used: now,
-        };
-        let mut weight = d
-            .snapshot_weight
-            .saturating_add(if d.launch_weight == 0 { 128 } else { 0 })
-            .saturating_sub(old_metadata.as_ref().map_or(0, |m| metadata_bound(&key, m)))
-            .saturating_add(metadata_bound(&key, &metadata))
-            .saturating_add(anchor_bound(request.anchor_key, &anchor));
-        if let Some(entry) = d.groups.get(&key) {
-            for key in &entry.keys {
-                weight = weight
-                    .saturating_sub(binding_bound(key, &entry.account))
-                    .saturating_add(binding_bound(key, &account));
-            }
-        } else {
-            if d.bindings.len() >= CAPACITY * 2 {
+            if d.bindings.contains_key(request.anchor_key) || d.launch_anchors.len() >= CAPACITY {
                 return Err(LaunchError::Capacity);
             }
-            weight = weight.saturating_add(binding_bound(&key, &account));
-        }
-        room(weight)?;
-        let move_source = self.rebind_source(&d, Provider::Codex, Some(&key));
-        let budget_source = self.rebind_budget_source(&d, Provider::Codex, Some(&key), &account);
-        let permit = self
-            .prepare_move_with_source(
-                &d,
-                &key,
-                budget_source.as_deref(),
-                &account,
-                budget_source
-                    .as_deref()
-                    .and_then(|id| sources.iter().find(|c| c.account.id == id)),
-                candidates,
-                sole_target.as_ref(),
-                observations,
-                model.as_deref(),
-                reason,
-                now,
-            )
-            .map_err(|_| LaunchError::MoveGuard)?;
-        let existing = Self::accepted_in(&d, Some(&key), &account);
-        // Recheck the selected destination before it can become owner evidence.
-        if model_move
-            && !filtered.iter().any(|c| {
-                c.account.id == account
-                    && effective_account(c, &d, &self.config, model.as_deref(), now)
-                        .eligible_at(model.as_deref(), now)
-                    && (!c.account.drain || existing)
-            })
-        {
-            return Err(LaunchError::NoEligibleAccount);
-        }
-        drop(d);
-        if admit.is_some_and(|admit| !admit(&account, existing, model.as_deref())) {
-            return Err(LaunchError::NoEligibleAccount);
-        }
-        let consent = if model_move {
-            Some(LaunchPolicyMove {
-                key: policy_key.clone(),
-                previous: previous.clone().ok_or(LaunchError::PolicyBlocked)?,
-                account: account.clone(),
-                expected_revision: plan.revision,
-                model: model.clone().ok_or(LaunchError::PolicyBlocked)?,
-                at: now,
-            })
-        } else {
-            None
-        };
-        let admission = DispatchAdmission::ordinary()
-            .with_store_evidence(store_evidence)
-            .with_runtime_evidence(runtime_evidence);
-        let context = rebind::RebindContext {
-            provider: Provider::Codex,
-            key: Some(&key),
-            guard_key: &key,
-            from: move_source.as_deref(),
-            account: &account,
-            parent: None,
-            model: model.as_deref(),
-            candidates,
-            sources,
-            pinned: None,
-            request_bytes: 0,
-            hold_timed_out: false,
-            now,
-            label: reason,
-        };
-        let authority = self.owner_move_reason(&context, &admission, None, consent.as_ref());
-        let rebound = self
-            .rebind(context, authority, permit, |reason| {
-                if let Some(consent) = &consent {
-                    // Validate before the callback: Strict authorization itself advances
-                    // the revision. Admission callbacks may have interposed a policy edit.
-                    consent.validate_context(
-                        &policy_key,
-                        previous.as_deref(),
-                        &account,
-                        self.policies.plan(Some(&policy_key)).revision,
-                        model.as_deref(),
-                        now,
-                    )?;
-                    if plan.settings.mode == crate::routing::Mode::Strict {
-                        authorize(&self.policies, consent)
-                            .map_err(|_| LaunchError::PolicyBlocked)?;
+            let key = request
+                .resume_key
+                .and_then(|k| canonical(&d, k))
+                .or(request.resume_key)
+                .unwrap_or(request.anchor_key)
+                .to_owned();
+            let policy_key = policy_key(&d, Some(&key)).unwrap().to_owned();
+            let plan = self.policies.plan(Some(&policy_key));
+            let previous = plan
+                .anchor
+                .clone()
+                .or_else(|| d.groups.get(&key).map(|g| g.account.clone()));
+            let old_metadata = d.launches.get(&key).cloned();
+            let old_model = old_metadata.as_ref().and_then(|m| m.current_model.clone());
+            let mut model = if previous.is_some() && !request.model_is_explicit {
+                old_model
+                    .clone()
+                    .or_else(|| request.model.map(str::to_owned))
+            } else {
+                request.model.map(str::to_owned).or(old_model.clone())
+            };
+            let current = previous
+                .as_deref()
+                .and_then(|id| candidates.iter().find(|c| c.account.id == id));
+            let usable = current.is_some_and(|c| {
+                effective_account(c, &d, &self.config, old_model.as_deref(), now)
+                    .eligible_at(old_model.as_deref(), now)
+                    && (!c.account.drain || Self::accepted_in(&d, Some(&key), &c.account.id))
+            });
+            let mut model_move = false;
+            if let (Some(id), Some(model)) = (
+                previous.as_deref(),
+                request
+                    .model
+                    .filter(|_| request.model_is_explicit && usable),
+            ) {
+                let supported = entitlements
+                    .get(id)
+                    .ok_or(LaunchError::EntitlementsUnknown)?
+                    .contains(model)
+                    && current.is_none_or(|c| {
+                        effective_account(c, &d, &self.config, Some(model), now)
+                            .eligible_at(Some(model), now)
+                    });
+                if !supported {
+                    if !request.allow_move_for_model && request.account_pref.is_none() {
+                        return Err(LaunchError::ConsentRequired);
                     }
-                    let current = self.policies.plan(Some(&policy_key));
-                    let expected_revision = if plan.settings.mode == crate::routing::Mode::Strict {
-                        // Exactly one durable authorization, with no intervening edit.
-                        if current.settings.mode != crate::routing::Mode::Strict
-                            || current.anchor.as_deref() != Some(account.as_str())
-                        {
+                    model_move = true;
+                }
+            }
+            if usable && !model_move && !request.model_is_explicit && old_model.is_none() {
+                // A legacy binding has no proved current model. An incompatible
+                // implicit default never turns that into permission to relocate.
+                if let (Some(id), Some(default)) = (previous.as_deref(), model.as_deref())
+                    && !entitlements.get(id).is_some_and(|s| s.contains(default))
+                {
+                    model = None;
+                }
+            }
+            for candidate in candidates {
+                if let Some(snapshot) = &candidate.quota {
+                    d.placements
+                        .entry(candidate.account.id.clone())
+                        .or_default()
+                        .observe(snapshot);
+                }
+            }
+            let filtered: Vec<_> = candidates
+                .iter()
+                .filter(|c| c.account.provider == Provider::Codex)
+                .filter(|c| {
+                    model.as_deref().is_none_or(|m| {
+                        entitlements
+                            .get(&c.account.id)
+                            .is_some_and(|s| s.contains(m))
+                    })
+                })
+                .cloned()
+                .collect();
+            let coverage: BTreeSet<_> = old_metadata.as_ref().map_or_else(BTreeSet::new, |m| {
+                entitlements
+                    .iter()
+                    .filter(|(_, s)| m.advertised_models.is_subset(s))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            });
+            let preference = SelectionPreference {
+                account: request.account_pref,
+                coverage: previous.as_ref().filter(|_| !model_move).map(|_| &coverage),
+                model_move,
+            };
+            let entitled_targets: BTreeSet<_> = sources
+                .iter()
+                .filter(|c| {
+                    model.as_deref().is_none_or(|m| {
+                        entitlements
+                            .get(&c.account.id)
+                            .is_some_and(|models| models.contains(m))
+                    })
+                })
+                .map(|c| c.account.id.clone())
+                .collect();
+            let mut sole_target = None;
+            let (account, reason) = if usable && !model_move {
+                (previous.clone().unwrap(), "launch_resume")
+            } else {
+                let (choice, _, sole) = self.select_with_return_guard(
+                    &d,
+                    Provider::Codex,
+                    Some(&key),
+                    None,
+                    model.as_deref(),
+                    &filtered,
+                    sources,
+                    Some(&entitled_targets),
+                    observations,
+                    None,
+                    now,
+                    false,
+                    Some(&preference),
+                );
+                sole_target = sole;
+                match choice {
+                    PreviewDecision::Selected { account } => (
+                        account,
+                        if model_move {
+                            "model_choice"
+                        } else if previous.is_some() {
+                            "forced"
+                        } else {
+                            "launch_model"
+                        },
+                    ),
+                    _ if plan.settings.mode == crate::routing::Mode::Strict && !model_move => {
+                        return Err(LaunchError::PolicyBlocked);
+                    }
+                    _ if model.is_some()
+                        && candidates.iter().any(|c| {
+                            c.account.provider == Provider::Codex
+                                && !entitlements.contains_key(&c.account.id)
+                        }) =>
+                    {
+                        return Err(LaunchError::EntitlementsUnknown);
+                    }
+                    _ => return Err(LaunchError::NoEligibleAccount),
+                }
+            };
+            if previous.as_deref().is_some_and(|id| id != account) && protected(&d, &key) {
+                return Err(LaunchError::Busy);
+            }
+            let metadata = Metadata {
+                current_model: model.clone(),
+                advertised_models: old_metadata
+                    .as_ref()
+                    .map_or_else(BTreeSet::new, |m| m.advertised_models.clone()),
+                policy_key: policy_key.clone(),
+                idle_placement: old_metadata
+                    .as_ref()
+                    .map_or(!d.groups.contains_key(&key), |m| m.idle_placement),
+            };
+            let anchor = Anchor {
+                canonical_key: key.clone(),
+                last_used: now,
+            };
+            let mut weight = d
+                .snapshot_weight
+                .saturating_add(if d.launch_weight == 0 { 128 } else { 0 })
+                .saturating_sub(old_metadata.as_ref().map_or(0, |m| metadata_bound(&key, m)))
+                .saturating_add(metadata_bound(&key, &metadata))
+                .saturating_add(anchor_bound(request.anchor_key, &anchor));
+            if let Some(entry) = d.groups.get(&key) {
+                for key in &entry.keys {
+                    weight = weight
+                        .saturating_sub(binding_bound(key, &entry.account))
+                        .saturating_add(binding_bound(key, &account));
+                }
+            } else {
+                if d.bindings.len() >= CAPACITY * 2 {
+                    return Err(LaunchError::Capacity);
+                }
+                weight = weight.saturating_add(binding_bound(&key, &account));
+            }
+            room(weight)?;
+            let move_source = self.rebind_source(&d, Provider::Codex, Some(&key));
+            let budget_source =
+                self.rebind_budget_source(&d, Provider::Codex, Some(&key), &account);
+            let permit = self
+                .prepare_move_with_source(
+                    &d,
+                    &key,
+                    budget_source.as_deref(),
+                    &account,
+                    budget_source
+                        .as_deref()
+                        .and_then(|id| sources.iter().find(|c| c.account.id == id)),
+                    candidates,
+                    sole_target.as_ref(),
+                    observations,
+                    model.as_deref(),
+                    reason,
+                    now,
+                )
+                .map_err(|_| LaunchError::MoveGuard)?;
+            let existing = Self::accepted_in(&d, Some(&key), &account);
+            // Recheck the selected destination before it can become owner evidence.
+            if model_move
+                && !filtered.iter().any(|c| {
+                    c.account.id == account
+                        && effective_account(c, &d, &self.config, model.as_deref(), now)
+                            .eligible_at(model.as_deref(), now)
+                        && (!c.account.drain || existing)
+                })
+            {
+                return Err(LaunchError::NoEligibleAccount);
+            }
+            drop(d);
+            if !decision_tape::check(
+                self,
+                decision_tape::Check::LaunchAdmission,
+                admit.is_none_or(|admit| admit(&account, existing, model.as_deref())),
+            ) {
+                return Err(LaunchError::NoEligibleAccount);
+            }
+            let consent = if model_move {
+                Some(LaunchPolicyMove {
+                    key: policy_key.clone(),
+                    previous: previous.clone().ok_or(LaunchError::PolicyBlocked)?,
+                    account: account.clone(),
+                    expected_revision: plan.revision,
+                    model: model.clone().ok_or(LaunchError::PolicyBlocked)?,
+                    at: now,
+                })
+            } else {
+                None
+            };
+            let admission = DispatchAdmission::ordinary()
+                .with_store_evidence(store_evidence)
+                .with_runtime_evidence(runtime_evidence);
+            let context = rebind::RebindContext {
+                provider: Provider::Codex,
+                key: Some(&key),
+                guard_key: &key,
+                from: move_source.as_deref(),
+                account: &account,
+                parent: None,
+                model: model.as_deref(),
+                candidates,
+                sources,
+                pinned: None,
+                request_bytes: 0,
+                hold_timed_out: false,
+                now,
+                label: reason,
+            };
+            let authority = self.owner_move_reason(&context, &admission, None, consent.as_ref());
+            let rebound = self
+                .rebind(context, authority, permit, |reason| {
+                    if let Some(consent) = &consent {
+                        // Validate before the callback: Strict authorization itself advances
+                        // the revision. Admission callbacks may have interposed a policy edit.
+                        consent.validate_context(
+                            &policy_key,
+                            previous.as_deref(),
+                            &account,
+                            self.policies.plan(Some(&policy_key)).revision,
+                            model.as_deref(),
+                            now,
+                        )?;
+                        if plan.settings.mode == crate::routing::Mode::Strict {
+                            authorize(&self.policies, consent)
+                                .map_err(|_| LaunchError::PolicyBlocked)?;
+                        }
+                        let current = self.policies.plan(Some(&policy_key));
+                        let expected_revision =
+                            if plan.settings.mode == crate::routing::Mode::Strict {
+                                // Exactly one durable authorization, with no intervening edit.
+                                if current.settings.mode != crate::routing::Mode::Strict
+                                    || current.anchor.as_deref() != Some(account.as_str())
+                                {
+                                    bail!("launch authorization changed");
+                                }
+                                plan.revision
+                                    .checked_add(1)
+                                    .ok_or_else(|| anyhow::anyhow!("launch revision overflow"))?
+                            } else {
+                                plan.revision
+                            };
+                        if current.revision != expected_revision {
                             bail!("launch authorization changed");
                         }
-                        plan.revision
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("launch revision overflow"))?
-                    } else {
-                        plan.revision
-                    };
-                    if current.revision != expected_revision {
-                        bail!("launch authorization changed");
                     }
-                }
-                self.policies
-                    .dispatch_for_issue(
-                        Some(&policy_key),
-                        &account,
-                        previous.as_deref(),
-                        reason,
-                        now,
-                        operation,
-                    )
-                    .map_err(|_| LaunchError::PolicyBlocked)?;
-                Ok(())
+                    self.policies
+                        .dispatch_for_issue(
+                            Some(&policy_key),
+                            &account,
+                            previous.as_deref(),
+                            reason,
+                            now,
+                            operation,
+                        )
+                        .map_err(|_| LaunchError::PolicyBlocked)?;
+                    Ok(())
+                })
+                .map_err(|_| LaunchError::PolicyBlocked)?;
+            let rebind::Rebound { data: mut d, moves } = rebound;
+            let authority_changed = old_metadata.as_ref().is_none_or(|old| {
+                old.current_model != metadata.current_model || old.policy_key != metadata.policy_key
+            }) || d
+                .launch_anchors
+                .get(request.anchor_key)
+                .is_none_or(|old| old.canonical_key != key);
+            d.launches.insert(key.clone(), metadata);
+            d.launch_anchors
+                .insert(request.anchor_key.to_owned(), anchor);
+            reweight(&mut d);
+            d.changed();
+            d.defer_count_changes = false;
+            d.commit_count_changes();
+            if authority_changed {
+                self.policies.changed.notify_waiters();
+            }
+            Ok(LaunchPlacement {
+                canonical_key: key,
+                account,
+                effective_model: model,
+                moves,
             })
-            .map_err(|_| LaunchError::PolicyBlocked)?;
-        let rebind::Rebound { data: mut d, moves } = rebound;
-        let authority_changed = old_metadata.as_ref().is_none_or(|old| {
-            old.current_model != metadata.current_model || old.policy_key != metadata.policy_key
-        }) || d
-            .launch_anchors
-            .get(request.anchor_key)
-            .is_none_or(|old| old.canonical_key != key);
-        d.launches.insert(key.clone(), metadata);
-        d.launch_anchors
-            .insert(request.anchor_key.to_owned(), anchor);
-        reweight(&mut d);
-        d.changed();
-        d.defer_count_changes = false;
-        d.commit_count_changes();
-        if authority_changed {
-            self.policies.changed.notify_waiters();
+        })();
+        if let Some(capture) = capture {
+            capture.finish(decision_tape::launch_outcome(&result));
         }
-        Ok(LaunchPlacement {
-            canonical_key: key,
-            account,
-            effective_model: model,
-            moves,
-        })
+        result
     }
 
     /// Call on EVERY managed data request before routing, including unprefixed

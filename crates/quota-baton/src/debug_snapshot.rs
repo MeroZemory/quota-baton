@@ -17,13 +17,229 @@ pub enum DebugCommand {
         )]
         out: PathBuf,
     },
+    #[command(about = "Execute this router on a sealed decision-tape epoch")]
+    TapeRun {
+        #[arg(long)]
+        epoch: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, hide = true)]
+        plant: Option<u64>,
+    },
+    #[command(about = "Check decision identity, planted power and margin-zero move totals")]
+    TapeCompare {
+        #[arg(long)]
+        epoch: PathBuf,
+        #[arg(long)]
+        reference: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+        #[arg(long)]
+        power: PathBuf,
+        #[arg(long)]
+        reference_build: String,
+        #[arg(long)]
+        candidate_build: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(about = "Execute the raw-fact permit kernel on a verified epoch")]
+    PermitRun {
+        #[arg(long)]
+        epoch: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(about = "Check permit identity, two built fault controls and margin-zero proposals")]
+    PermitCompare {
+        #[arg(long)]
+        epoch: PathBuf,
+        #[arg(long)]
+        reference: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+        #[arg(long)]
+        no_guard: PathBuf,
+        #[arg(long)]
+        free_rule: PathBuf,
+        #[arg(long)]
+        reference_build: String,
+        #[arg(long)]
+        candidate_build: String,
+        #[arg(long)]
+        no_guard_build: String,
+        #[arg(long)]
+        free_rule_build: String,
+        #[arg(long)]
+        guard_ordinal: u64,
+        #[arg(long)]
+        free_ordinal: u64,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[cfg(feature = "testkit")]
+    #[command(hide = true)]
+    PermitFixture {
+        #[arg(long)]
+        fixture_home: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 pub async fn run(home: &Path, command: DebugCommand) -> anyhow::Result<()> {
     match command {
+        DebugCommand::PermitRun { epoch, out } => {
+            let result = std::thread::Builder::new()
+                .name("qb-permit-reader".into())
+                .spawn(move || -> anyhow::Result<_> {
+                    let capture = qb_core::observability::decision_reader::load(&epoch)?;
+                    Ok(qb_core::observability::permit_reader::execute(
+                        &capture,
+                        executable_digest()?,
+                    ))
+                })?
+                .join()
+                .map_err(|_| anyhow::anyhow!("permit reader thread failed"))?;
+            write_verdict(&out, result)
+        }
+        DebugCommand::PermitCompare {
+            epoch,
+            reference,
+            candidate,
+            no_guard,
+            free_rule,
+            reference_build,
+            candidate_build,
+            no_guard_build,
+            free_rule_build,
+            guard_ordinal,
+            free_ordinal,
+            out,
+        } => {
+            let result = (|| -> anyhow::Result<_> {
+                let capture = qb_core::observability::decision_reader::load(&epoch)?;
+                Ok(qb_core::observability::permit_reader::compare(
+                    &capture,
+                    &read_execution(&reference)?,
+                    &read_execution(&candidate)?,
+                    &read_execution(&no_guard)?,
+                    &read_execution(&free_rule)?,
+                    [
+                        &reference_build,
+                        &candidate_build,
+                        &no_guard_build,
+                        &free_rule_build,
+                    ],
+                    guard_ordinal,
+                    free_ordinal,
+                )?)
+            })();
+            let passed = result.as_ref().is_ok_and(|report| {
+                report.verdict == qb_core::observability::decision_comparison::Verdict::Pass
+            });
+            write_verdict(&out, result)?;
+            anyhow::ensure!(passed, "permit tape verdict did not pass");
+            Ok(())
+        }
+        #[cfg(feature = "testkit")]
+        DebugCommand::PermitFixture { fixture_home, out } => {
+            let result = std::thread::Builder::new()
+                .name("qb-permit-fixture".into())
+                .spawn(move || qb_core::bindings::permit_fixture::capture(&fixture_home))?
+                .join()
+                .map_err(|_| anyhow::anyhow!("permit fixture thread failed"))?;
+            write_verdict(&out, result)
+        }
         DebugCommand::Snapshot { out } => {
             let bytes = crate::platform::capture_debug_snapshot(home).await?;
             write_new(&out, &bytes)
+        }
+        DebugCommand::TapeRun { epoch, out, plant } => {
+            let result = std::thread::Builder::new()
+                .name("qb-decision-tape-reader".into())
+                .spawn(move || -> anyhow::Result<_> {
+                    let capture = qb_core::observability::decision_reader::load(&epoch)?;
+                    Ok(qb_core::observability::decision_reader::execute(
+                        &capture,
+                        executable_digest()?,
+                        plant,
+                    )?)
+                })?
+                .join()
+                .map_err(|_| anyhow::anyhow!("decision reader thread failed"))?;
+            write_verdict(&out, result)
+        }
+        DebugCommand::TapeCompare {
+            epoch,
+            reference,
+            candidate,
+            power,
+            reference_build,
+            candidate_build,
+            out,
+        } => {
+            let result = (|| -> anyhow::Result<_> {
+                use qb_core::observability::decision_reader;
+                let capture = decision_reader::load(&epoch)?;
+                decision_reader::compare(
+                    &capture,
+                    &read_execution(&reference)?,
+                    &read_execution(&candidate)?,
+                    &read_execution(&power)?,
+                    &reference_build,
+                    &candidate_build,
+                )
+                .map_err(Into::into)
+            })();
+            let passed = result.as_ref().is_ok_and(|report| {
+                report.paired.verdict == qb_core::observability::decision_comparison::Verdict::Pass
+            });
+            write_verdict(&out, result)?;
+            anyhow::ensure!(passed, "decision tape verdict did not pass");
+            Ok(())
+        }
+    }
+}
+
+fn executable_digest() -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(std::env::current_exe()?)?;
+    let mut digest = Sha256::new();
+    let mut bytes = [0u8; 65536];
+    loop {
+        let count = file.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&bytes[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn read_execution<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file() && file.metadata()?.len() <= 128 * 1024 * 1024,
+        "decision execution exceeds bound"
+    );
+    let mut bytes = Vec::new();
+    file.take(128 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 128 * 1024 * 1024,
+        "decision execution exceeds bound"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_verdict(out: &Path, result: anyhow::Result<impl serde::Serialize>) -> anyhow::Result<()> {
+    match result {
+        Ok(report) => write_new(out, &serde_json::to_vec_pretty(&report)?),
+        Err(_) => {
+            write_new(out, br#"{"verdict":"insufficient","reason":"decision_tape_input_or_execution_refused"}"#)?;
+            anyhow::bail!("decision tape input or execution refused; insufficient verdict written")
         }
     }
 }
@@ -46,6 +262,94 @@ fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn permit_run_requires_output_and_has_no_comparator_or_output_fault_switch() {
+        assert!(
+            crate::Cli::try_parse_from(["quota-baton", "debug", "permit-run", "--epoch", "epoch"])
+                .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "quota-baton",
+                "debug",
+                "permit-run",
+                "--epoch",
+                "epoch",
+                "--out",
+                "result.json",
+                "--plant",
+                "1"
+            ])
+            .is_err()
+        );
+        let cli = crate::Cli::try_parse_from([
+            "quota-baton",
+            "debug",
+            "permit-run",
+            "--epoch",
+            "epoch",
+            "--out",
+            "result.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Debug {
+                command: DebugCommand::PermitRun { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_permit_epoch_writes_insufficient_without_creating_a_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("unused-home");
+        let out = directory.path().join("verdict.json");
+        assert!(
+            run(
+                &home,
+                DebugCommand::PermitRun {
+                    epoch: directory.path().join("missing-epoch"),
+                    out: out.clone()
+                }
+            )
+            .await
+            .is_err()
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+        assert_eq!(value["verdict"], "insufficient");
+        assert!(value.get("candidate_moves").is_none());
+        assert!(!home.exists());
+    }
+
+    #[cfg(feature = "testkit")]
+    #[test]
+    fn synthetic_permit_capture_requires_an_explicit_fresh_fixture_home() {
+        assert!(
+            crate::Cli::try_parse_from([
+                "quota-baton",
+                "debug",
+                "permit-fixture",
+                "--out",
+                "fixture.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "quota-baton",
+                "debug",
+                "permit-fixture",
+                "--fixture-home",
+                "owned-new-home",
+                "--out",
+                "fixture.json"
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn r16_debug_snapshot_command_requires_output() {
@@ -74,5 +378,27 @@ mod tests {
         write_new(&path, b"first").unwrap();
         assert!(write_new(&path, b"second").is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"first");
+    }
+
+    #[tokio::test]
+    async fn missing_tape_writes_insufficient_without_starting_a_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("unused-home");
+        let out = directory.path().join("verdict.json");
+        let result = run(
+            &home,
+            DebugCommand::TapeRun {
+                epoch: directory.path().join("missing-epoch"),
+                out: out.clone(),
+                plant: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+        assert_eq!(value["verdict"], "insufficient");
+        assert!(value.get("candidate_moves").is_none());
+        assert!(!home.exists());
     }
 }
