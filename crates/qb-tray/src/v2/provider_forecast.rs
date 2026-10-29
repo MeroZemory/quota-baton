@@ -34,7 +34,15 @@ pub(super) fn line(
             ProviderAccount {
                 id: &a.id,
                 name: &row.name,
-                user_state: if a.user_state == "active" {
+                user_state: if a.user_state == "active"
+                    && qb_proto::admin_account::placement_exclusion(
+                        &a.provider,
+                        &a.user_state,
+                        a.plan.as_deref(),
+                        &a.health.kind,
+                    )
+                    .is_none()
+                {
                     UserState::Active
                 } else {
                     UserState::Paused
@@ -357,9 +365,9 @@ mod tests {
                 "전체 4개 · 사용 가능 확인 전"
             }));
             assert!(text.contains(if english {
-                "2 accounts measuring"
+                "1 account measuring"
             } else {
-                "2개 계정 측정 중"
+                "1개 계정 측정 중"
             }));
             assert!(text.contains(if english { "Measuring" } else { "측정 중" }));
             assert!(!text.contains(if english {
@@ -607,6 +615,81 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn n7_claude_not_used_rows_keep_configured_four_and_forecast_coverage_two_of_two() {
+        let mut paid_one = account("cl-paid-one", vec![window("7d", Some(30))]);
+        paid_one["provider"] = json!("claude");
+        paid_one["plan"] = json!("max_20x");
+        let mut paid_two = account("cl-paid-two", vec![window("7d", Some(60))]);
+        paid_two["provider"] = json!("claude");
+        paid_two["plan"] = json!("pro");
+        let mut free_short = account("cl-269a6a", vec![]);
+        free_short["provider"] = json!("claude");
+        free_short["plan"] = json!("free");
+        free_short["windows"] = json!([{"name":"5h","scope":"account","used_pct":0.,
+            "observed_at":now(),"reset_at":now()+Duration::hours(5)}]);
+        assert!(free_short["windows"][0].get("status").is_none());
+        let mut free_hold = account("cl-b8da25", vec![]);
+        free_hold["provider"] = json!("claude");
+        free_hold["plan"] = json!("free");
+        free_hold["health"] = json!({"kind":"plan_without_claude_code"});
+        // Both excluded accounts deliberately retain stale native pool bits.
+        assert_eq!(free_short["pool_eligible"], true);
+        assert_eq!(free_hold["pool_eligible"], true);
+        assert!(
+            free_hold["usage_forecast"]["windows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let accounts = vec![paid_one, paid_two, free_short, free_hold];
+        for language in [UiLanguage::Ko, UiLanguage::En] {
+            for eligible in [Some(2), None] {
+                let view = with_language(language, || {
+                    v2::project(
+                        &json!({"accounts":accounts,
+                        "pools":{"claude":{"eligible":eligible}}})
+                        .to_string(),
+                        now().into(),
+                    )
+                    .unwrap()
+                });
+                assert_eq!(view.raw.accounts.len(), 4);
+                let summary = &view.summaries[0];
+                assert_eq!(summary.eligible, eligible);
+                let text = &summary.forecast_line;
+                let english = language == UiLanguage::En;
+                assert_eq!(
+                    text.matches(if english {
+                        "forecast measured 2/2 accounts"
+                    } else {
+                        "예측 측정 2/2 계정"
+                    })
+                    .count(),
+                    1,
+                    "{text}"
+                );
+                let count = match (english, eligible) {
+                    (true, Some(2)) => "2 of 4 usable",
+                    (false, Some(2)) => "4개 중 2개 사용 가능",
+                    (true, None) => "Usable unknown / 4 accounts",
+                    (false, None) => "전체 4개 · 사용 가능 확인 전",
+                    _ => unreachable!(),
+                };
+                assert!(text.contains(count), "{text}");
+                assert!(
+                    !text.contains(if english {
+                        "account measuring"
+                    } else {
+                        "개 계정 측정 중"
+                    }),
+                    "{text}"
+                );
+                assert!(!text.contains("accounts measuring"), "{text}");
+            }
+        }
+    }
+
     #[test]
     fn provider_coverage_always_names_measured_and_active_non_drained_total() {
         for language in [UiLanguage::En, UiLanguage::Ko] {

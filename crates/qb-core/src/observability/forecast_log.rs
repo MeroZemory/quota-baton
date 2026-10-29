@@ -333,6 +333,8 @@ struct Checkpoint {
     schema: u32,
     clean: bool,
     last_sample: Option<i64>,
+    #[serde(default)]
+    retry_at: Option<i64>,
     last_origin_hour: Option<i64>,
     sequence: u64,
     users: Users,
@@ -351,6 +353,7 @@ impl Default for Checkpoint {
             schema: 1,
             clean: true,
             last_sample: None,
+            retry_at: None,
             last_origin_hour: None,
             sequence: 0,
             users: Users::default(),
@@ -401,19 +404,24 @@ impl ForecastLog {
         };
         validate_checkpoint(&checkpoint)?;
         // The native caller owns the Store lease; the preceding core closed its
-        // logger before releasing it. Only the old, uncoded, zero-record failure
-        // may start afresh. Keep its exact checkpoint in a sibling archive.
+        // logger before releasing it. Only the legacy empty stop or exact coded
+        // empty WindowName failure may restart, preserving all prior lineage.
         if checkpoint.status.stopped
             && checkpoint.status.losses > 0
             && checkpoint.status.origins == 0
             && checkpoint.status.outcomes == 0
             && checkpoint.sequence == 0
+            && checkpoint.retry_at.is_none()
             && checkpoint.last_sample.is_none()
             && checkpoint.last_origin_hour.is_none()
             && checkpoint.pending.is_empty()
             && checkpoint.outbox.is_empty()
-            && checkpoint.last_failure.is_none()
-            && checkpoint.recovery.is_none()
+            && ((checkpoint.last_failure.is_none() && checkpoint.recovery.is_none())
+                || checkpoint.last_failure
+                    == Some(FailureDiagnostic {
+                        phase: FailurePhase::Sample,
+                        reason: FailureReason::WindowName,
+                    }))
         {
             let receipt =
                 recovery::archive_empty(&root, checkpoint.status.losses).map_err(|error| {
@@ -454,11 +462,12 @@ impl ForecastLog {
         worker.checkpoint.clean = false;
         worker.save()?;
         let stopped = worker.checkpoint.status.stopped;
+        let retry_at = worker.checkpoint.retry_at.unwrap_or(0);
         let users = worker.checkpoint.users.clone();
         Ok(Self {
             users: Mutex::new(users),
             worker: Mutex::new(worker),
-            next_sample: AtomicI64::new(0),
+            next_sample: AtomicI64::new(retry_at),
             stopped: AtomicBool::new(stopped),
             closed: AtomicBool::new(false),
         })
@@ -549,19 +558,39 @@ impl ForecastLog {
             .map_err(|_| anyhow::anyhow!("forecast_log_worker_poisoned"))?;
         ensure!(!self.closed.load(Ordering::Acquire), "forecast_log_closed");
         let first_sample = worker.checkpoint.last_sample.is_none();
-        let result = self.sample_inner(&mut worker, now, accounts);
-        if let Err(error) = result {
+        // Retry only side-effect-free snapshot validation, never a partially
+        // reconciled, pruned, checkpointed or appended transaction.
+        let result = match sample_inputs(worker.checkpoint.last_sample, now, accounts) {
+            Ok(inputs) => self
+                .sample_inner(&mut worker, now, accounts, inputs)
+                .map_err(|error| (error, false)),
+            Err(error) => Err((error, true)),
+        };
+        if let Err((error, retryable)) = result {
             let failure = diagnostic(&error, FailurePhase::Sample);
-            worker.checkpoint.last_failure = Some(failure);
-            self.stopped.store(true, Ordering::Release);
-            worker.checkpoint.status.stopped = true;
+            worker.checkpoint.last_failure.get_or_insert(failure);
             worker.checkpoint.status.losses = worker.checkpoint.status.losses.saturating_add(1);
+            if retryable {
+                worker.checkpoint.status.unavailable =
+                    worker.checkpoint.status.unavailable.saturating_add(1);
+                worker.checkpoint.retry_at = Some(now.saturating_add(60));
+            } else {
+                self.stopped.store(true, Ordering::Release);
+                worker.checkpoint.status.stopped = true;
+            }
             // The caller receives failure even when persisting the loss also fails.
             if let Err(persistence) = worker.save() {
+                // A failed retry-state write cannot safely advertise continuity.
+                self.stopped.store(true, Ordering::Release);
+                worker.checkpoint.status.stopped = true;
                 return Err(
                     anyhow::Error::new(diagnostic(&persistence, FailurePhase::Checkpoint))
                         .context(failure),
                 );
+            }
+            if retryable {
+                self.next_sample
+                    .store(now.saturating_add(60), Ordering::Release);
             }
             return Err(anyhow::Error::new(failure));
         }
@@ -574,26 +603,14 @@ impl ForecastLog {
             .store(now.saturating_add(60), Ordering::Release);
         Ok(())
     }
-    fn sample_inner(&self, worker: &mut Worker, now: i64, accounts: &[AdminAccount]) -> Result<()> {
-        ensure!(accounts.len() <= ACCOUNTS, "forecast_log_account_cap");
-        ensure!(
-            worker.checkpoint.last_sample.is_none_or(|last| now >= last),
-            "forecast_log_clock_rollback"
-        );
-        let mut ids = BTreeSet::new();
-        let mut inputs = BTreeMap::new();
-        for account in accounts {
-            let provider = provider(account.provider);
-            ensure!(
-                valid_id(&account.id, provider),
-                "forecast_log_invalid_identity"
-            );
-            ensure!(
-                ids.insert(account.id.clone()),
-                "forecast_log_duplicate_account"
-            );
-            inputs.insert(account.id.clone(), input(account, now)?);
-        }
+    fn sample_inner(
+        &self,
+        worker: &mut Worker,
+        now: i64,
+        accounts: &[AdminAccount],
+        inputs: BTreeMap<String, Input>,
+    ) -> Result<()> {
+        let ids: BTreeSet<_> = inputs.keys().cloned().collect();
         let (users, observer_race) = {
             let mut users = self
                 .users
@@ -664,6 +681,7 @@ impl ForecastLog {
         let mut next = worker.checkpoint.clone();
         next.users = users;
         next.last_sample = Some(now);
+        next.retry_at = None;
         let mut events = Vec::new();
         for origin in &mut next.pending {
             for horizon in [3600, 10800] {
@@ -1062,8 +1080,37 @@ fn window_name(name: &str) -> bool {
             .ok()
             .is_some_and(|n| n > 0)
 }
+// Entirely local preparation: failure cannot contaminate Users, origins or outbox.
+fn sample_inputs(
+    last_sample: Option<i64>,
+    now: i64,
+    accounts: &[AdminAccount],
+) -> Result<BTreeMap<String, Input>> {
+    ensure!(accounts.len() <= ACCOUNTS, "forecast_log_account_cap");
+    ensure!(
+        last_sample.is_none_or(|last| now >= last),
+        "forecast_log_clock_rollback"
+    );
+    let mut inputs = BTreeMap::new();
+    for account in accounts {
+        ensure!(
+            valid_id(&account.id, provider(account.provider)),
+            "forecast_log_invalid_identity"
+        );
+        ensure!(
+            !inputs.contains_key(&account.id),
+            "forecast_log_duplicate_account"
+        );
+        inputs.insert(account.id.clone(), input(account, now)?);
+    }
+    Ok(inputs)
+}
+fn capacity_window(name: &str) -> bool {
+    !matches!(name, "0m" | "primary" | "secondary")
+}
 fn usable(a: &AdminAccount) -> bool {
-    a.user_state == AdminUserState::Active
+    a.placement_exclusion().is_none()
+        && a.user_state == AdminUserState::Active
         && a.pool_eligible
         && !a.drain
         && !a.takeover_pending
@@ -1078,13 +1125,26 @@ fn input(a: &AdminAccount, now: i64) -> Result<Input> {
     );
     // Forecast wire fields contain only numeric/timestamp/allowlisted-window facts;
     // no label, email, source, identity or arbitrary account payload is copied.
-    validate_forecast(&a.usage_forecast)?;
-    let f = &a.usage_forecast;
+    let mut forecast = a.usage_forecast.clone();
+    forecast.windows.retain(|w| capacity_window(&w.name));
+    if forecast
+        .earliest_window
+        .as_deref()
+        .is_some_and(|name| !capacity_window(name))
+    {
+        forecast.earliest_window = None;
+    }
+    validate_forecast(&forecast)?;
+    let f = &forecast;
     let mut windows = Vec::new();
     let mut names = BTreeSet::new();
-    let mut reason = a.windows.is_empty().then_some(Unavailable::MissingWindow);
+    let mut reason = None;
     let mut remaining = 1.0f64;
     for w in &a.windows {
+        // Skip placeholders before validating their timestamps, usage or duplicates.
+        if !capacity_window(&w.name) {
+            continue;
+        }
         ensure!(window_name(&w.name), "forecast_log_window_name_invalid");
         ensure!(names.insert(&w.name), "forecast_log_duplicate_window");
         let observed = w
@@ -1120,6 +1180,9 @@ fn input(a: &AdminAccount, now: i64) -> Result<Input> {
             observed_at: observed,
             reset_at: reset,
         });
+    }
+    if windows.is_empty() {
+        reason = Some(Unavailable::MissingWindow);
     }
     Ok(Input {
         id: a.id.clone(),
@@ -1206,6 +1269,11 @@ fn validate_forecast(f: &AccountUsageForecast) -> Result<()> {
     Ok(())
 }
 fn validate_checkpoint(c: &Checkpoint) -> Result<()> {
+    ensure!(
+        c.retry_at
+            .is_none_or(|at| DateTime::from_timestamp(at, 0).is_some()),
+        "forecast_log_checkpoint_bounds"
+    );
     if let Some(receipt) = &c.recovery {
         ensure!(
             receipt.archive.starts_with("forecast-log.failed-")

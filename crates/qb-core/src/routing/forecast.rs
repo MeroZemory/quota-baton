@@ -36,6 +36,11 @@ fn supported(name: &str) -> bool {
     matches!(name, "5h" | "7d" | "30d")
 }
 impl Shadow {
+    pub(crate) fn retain_accounts(&mut self, known: &std::collections::BTreeSet<String>) {
+        self.series.retain(|(id, _), _| known.contains(id));
+        self.regimes.retain(|id, _| known.contains(id));
+    }
+
     pub fn enable(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
