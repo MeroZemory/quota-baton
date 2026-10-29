@@ -24,6 +24,11 @@ const HANDOVERS: usize = 200;
 const OVERALL: Duration = Duration::from_secs(18 * 60);
 const PERIOD: Duration = Duration::from_millis(10);
 const BODY_LIMIT: usize = 16 * 1024;
+const SYNTHETIC_SSE: &str = concat!(
+    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r20-synthetic\",\"status\":\"in_progress\",\"model\":\"fixture\",\"output\":[]}}\n\n",
+    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r20-synthetic\",\"status\":\"completed\",\"model\":\"fixture\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    "data: [DONE]\n\n"
+);
 
 fn nonreserved(port: u16) {
     assert!(port >= 1024 && !matches!(port, 10100 | 10101 | 10200 | 10201));
@@ -42,6 +47,7 @@ struct Counts {
     timeline_checks: usize,
     unavailable_timelines: usize,
     malformed_lifecycle_lines: usize,
+    probe_close_failures: u64,
 }
 
 struct Journal {
@@ -105,8 +111,17 @@ impl Owners {
                 let start = Instant::now();
                 let late = start.saturating_duration_since(due).as_micros();
                 let result = TcpStream::connect_timeout(&address, Duration::from_secs(1));
+                let mut close_error = None;
                 let (ok, timed_out, kind, os_code) = match result {
                     Ok(socket) => {
+                        // The connect-only probe sends no HTTP. Abortive close
+                        // avoids exhausting ephemeral ports with TIME_WAIT.
+                        if let Err(error) =
+                            socket2::SockRef::from(&socket).set_linger(Some(Duration::ZERO))
+                        {
+                            close_error =
+                                Some((format!("{:?}", error.kind()), error.raw_os_error()));
+                        }
                         drop(socket);
                         (true, false, "success".to_owned(), None)
                     }
@@ -118,15 +133,23 @@ impl Owners {
                     ),
                 };
                 let started_us = start.duration_since(journal_start(&journal)).as_micros();
-                journal.lock().unwrap().outcome(
+                let mut j = journal.lock().unwrap();
+                if close_error.is_some() {
+                    j.counts.probe_close_failures += 1;
+                }
+                j.outcome(
                     0,
                     json!({"event":"connect",
                     "started_us":started_us,
                     "elapsed_us":start.elapsed().as_micros(),"schedule_late_us":late,
-                    "ok":ok,"kind":kind,"os_code":os_code}),
+                    "ok":ok,"kind":kind,"os_code":os_code,
+                    "close_ok":if ok {Some(close_error.is_none())} else {None},
+                    "close_error_kind":close_error.as_ref().map(|e| &e.0),
+                    "close_os_code":close_error.as_ref().and_then(|e| e.1)}),
                     ok,
                     timed_out,
                 );
+                drop(j);
                 // No catch-up burst after a blocked connect; record scheduling lag.
                 due += PERIOD;
                 if due > Instant::now() {
@@ -157,8 +180,13 @@ impl Owners {
                     .unwrap();
                 while !stop.load(Ordering::Acquire) {
                     let start = Instant::now();
+                    let request_body = if lane == 1 {
+                        json!({"model":"fixture","input":[],"stream":true})
+                    } else {
+                        json!({"model":"fixture","input":[]})
+                    };
                     let mut row = json!({"event":"request", "lane":lane,
-                        "shape":"POST /v1/responses; model=fixture; input=[]; stream=true",
+                        "method":"POST","path":"/v1/responses","shape":request_body,
                         "started_us":start.duration_since(journal_start(&journal)).as_micros()});
                     let mut request = http
                         .post(&url)
@@ -171,7 +199,7 @@ impl Owners {
                                 "r20-fresh"
                             },
                         )
-                        .json(&json!({"model":"fixture","input":[],"stream":true}));
+                        .json(&request_body);
                     if lane == 2 {
                         request = request.header("connection", "close");
                     }
@@ -186,6 +214,20 @@ impl Owners {
                         Ok(mut response) => {
                             let status = response.status();
                             row["status"] = json!(status.as_u16());
+                            row["response_headers"] = json!({});
+                            for name in ["content-type", "content-length", "connection"] {
+                                if let Some(value) =
+                                    response.headers().get(name).and_then(|v| v.to_str().ok())
+                                {
+                                    row["response_headers"][name] = json!(
+                                        value
+                                            .chars()
+                                            .take(128)
+                                            .filter(|c| !c.is_control())
+                                            .collect::<String>()
+                                    );
+                                }
+                            }
                             if !status.is_success() {
                                 journal.lock().unwrap().counts.non_2xx += 1;
                             }
@@ -214,13 +256,20 @@ impl Owners {
                             if !status.is_success() {
                                 row["error"] = safe_error(&body, &key);
                             }
-                            ok = status.is_success()
-                                && body_ok
-                                && body
-                                    .windows(b"response.completed".len())
-                                    .any(|w| w == b"response.completed");
+                            row["body_bytes"] = json!(body.len());
+                            let expected_body = if lane == 1 {
+                                body.as_slice() == SYNTHETIC_SSE.as_bytes()
+                            } else {
+                                serde_json::from_slice::<Value>(&body)
+                                    .is_ok_and(|value| value == json!({"fake":true}))
+                            };
+                            ok = status.is_success() && body_ok && expected_body;
                             if status.is_success() && body_ok && !ok {
-                                row["body_error"] = json!("missing_synthetic_completion");
+                                row["body_error"] = json!(if lane == 1 {
+                                    "unexpected_synthetic_sse"
+                                } else {
+                                    "unexpected_synthetic_json"
+                                });
                             }
                         }
                     }
@@ -289,17 +338,21 @@ async fn fake() -> (String, AbortTask<()>) {
         match (request.method().as_str(), request.uri().path()) {
             ("GET", path) if path.ends_with("/models") => axum::Json(json!({"models":[{"slug":"fixture"}]})).into_response(),
             ("GET", _) => axum::Json(json!({"plan_type":"plus","rate_limit":{"allowed":true,
-                "limit_reached":false,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":4102444800},
-                "secondary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":4102444800}}})).into_response(),
+                "limit_reached":false,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":4102444800_i64},
+                "secondary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":4102444800_i64}}})).into_response(),
             ("POST", path) if path.ends_with("/responses") => {
                 // Drain a bounded valid request so keepalive really remains usable.
-                if axum::body::to_bytes(request.into_body(), BODY_LIMIT).await.is_err() {
+                let Ok(body) = axum::body::to_bytes(request.into_body(), BODY_LIMIT).await else {
                     return StatusCode::BAD_REQUEST.into_response();
+                };
+                let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                if body["stream"] == true {
+                    ([("content-type", "text/event-stream")], SYNTHETIC_SSE).into_response()
+                } else {
+                    axum::Json(json!({"fake":true})).into_response()
                 }
-                ([("content-type", "text/event-stream")], concat!(
-                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r20-synthetic\",\"status\":\"in_progress\",\"model\":\"fixture\",\"output\":[]}}\n\n",
-                    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r20-synthetic\",\"status\":\"completed\",\"model\":\"fixture\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
-                    "data: [DONE]\n\n")).into_response()
             }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
@@ -367,11 +420,12 @@ impl Run {
             "non_2xx":c.non_2xx,"transport_failures":c.transport,"evidence_io_errors":c.io_errors,
             "timeline_checks":c.timeline_checks,"unavailable_timelines":c.unavailable_timelines,
             "malformed_lifecycle_lines":c.malformed_lifecycle_lines,
+            "probe_close_failures":c.probe_close_failures,
             "home_removed":removed_home,"elapsed_us":j.start.elapsed().as_micros(),
             "gate_passed":reason == "complete" && c.completed >= HANDOVERS && c.failures == [0;3]
                 && c.timeouts == [0;3] && c.non_2xx == 0 && c.transport == 0 && c.io_errors == 0
                 && c.timeline_checks == c.completed + 1 && c.unavailable_timelines == 0
-                && c.malformed_lifecycle_lines == 0 && removed_home});
+                && c.malformed_lifecycle_lines == 0 && c.probe_close_failures == 0 && removed_home});
         let file = fs::File::create(self.directory.join("summary.json")).unwrap();
         serde_json::to_writer_pretty(&file, &summary).unwrap();
         file.sync_all().unwrap();
@@ -694,12 +748,18 @@ async fn r20_spawned_core_200_handovers() {
     let metadata = json!({"schema":1,"label":label,"handovers":HANDOVERS,
         "started_utc":chrono::Utc::now().to_rfc3339(),"os":std::env::consts::OS,
         "arch":std::env::consts::ARCH,"probe_period_ms":10,"connect_timeout_ms":1000,
+        "probe_close_mode":"abortive_linger_zero_no_application_request",
         "request_timeout_ms":2000,"overall_timeout_secs":OVERALL.as_secs(),
         "harness_sha256":format!("{:x}",Sha256::digest(include_bytes!("r20_stress.rs"))),
         "binary_sha256":format!("{:x}",Sha256::digest(fs::read(binary).unwrap())),
         "testkit":cfg!(feature="testkit"),"phase0":cfg!(feature="phase0"),
         "shape_capture":cfg!(feature="shape-capture"),"automatic_request_retries":false,
         "lanes":["OS-thread TCP connect","HTTP/1 pooled keepalive","HTTP/1 connection-close fresh"],
+        "request_shapes":{"keepalive":{"model":"fixture","input":[],"stream":true},
+            "fresh":{"model":"fixture","input":[]}},
+        "expected_responses":{"keepalive":"exact synthetic created/completed SSE and DONE",
+            "fresh":{"fake":true}},
+        "response_header_allowlist":["content-type","content-length","connection"],
         "qualifiers":["synthetic loopback only; no live profile",
             "native ts is wall clock; observed_us is monotonic since journal creation",
             "10ms target cadence; blocking probes record lag; no catch-up burst",
@@ -707,7 +767,7 @@ async fn r20_spawned_core_200_handovers() {
             "native ledger and allowlisted timestamped stderr lifecycle fields; no inferred timestamps",
             "missing required lifecycle phases make timeline unavailable and fail the gate; last live core close excluded",
             "gate uses final per-core census; per-handover successor snapshots can precede a later first accept",
-            "stderr files unique per core, disposable with home; no raw logs/headers/bodies retained"]});
+            "stderr files unique per core, disposable with home; no raw logs or bodies; only three allowlisted response headers retained"]});
     fs::write(
         directory.join("metadata.json"),
         serde_json::to_vec_pretty(&metadata).unwrap(),

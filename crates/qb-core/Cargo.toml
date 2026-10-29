@@ -52,7 +52,7 @@ http-body-util.workspace = true
 qb-tray = { path = "../qb-tray" }
 
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_Networking_WinSock"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"

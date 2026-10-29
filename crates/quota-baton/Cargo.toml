@@ -41,6 +41,7 @@ bytes.workspace = true
 qb-core = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
 qb-testkit.workspace = true
+socket2 = "=0.6.5"
 
 [features]
 default = []
