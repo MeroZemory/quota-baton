@@ -267,7 +267,7 @@ fn return_blocked(inputs: &DecisionInputs, row: &CandidateInput) -> bool {
         })
 }
 
-fn rebind_budget_source(inputs: &DecisionInputs, to: &str) -> Option<String> {
+pub(crate) fn rebind_budget_source(inputs: &DecisionInputs, to: &str) -> Option<String> {
     let s = inputs.selection.as_deref().expect("selection context");
     let key = inputs.key.as_deref();
     let physical = key

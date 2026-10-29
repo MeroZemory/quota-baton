@@ -111,6 +111,14 @@ fn epoch() -> Epoch {
             .map(|ordinal| {
                 let mut record = record.clone();
                 record.ordinal = ordinal;
+                if ordinal == FAULT {
+                    record
+                        .inputs
+                        .as_mut()
+                        .unwrap()
+                        .sticky
+                        .insert("claude".into(), "a:unit-source".into());
+                }
                 SelectionEnvelope {
                     entry: Entry::Chooser,
                     capture_id: 1,
@@ -131,7 +139,12 @@ fn epoch() -> Epoch {
 fn controls(epoch: &Epoch) -> [Execution; 3] {
     let mut runs = ['a', 'd', 'e'].map(|b| execute(epoch, b.to_string().repeat(64)));
     // Deliberately edited UNIT output, never native power acceptance evidence.
-    frame(&mut runs[2], FAULT).label = SelectionLabel::Forced;
+    let fault = frame(&mut runs[2], FAULT);
+    fault.label = SelectionLabel::Forced;
+    fault.choice = SelectionChoice::Selected {
+        account: "a:unit-target".into(),
+    };
+    fault.budget_source = Some("a:unit-source".into());
     runs
 }
 
@@ -410,10 +423,14 @@ fn power_requires_one_difference_at_the_registered_ordinal() {
     for case in 0..3 {
         let mut runs = controls(&epoch);
         match case {
-            0 => frame(&mut runs[2], FAULT).label = SelectionLabel::New,
+            0 => {
+                let original = frame(&mut runs[0], FAULT).clone();
+                *frame(&mut runs[2], FAULT) = original;
+            }
             1 => frame(&mut runs[2], 13).label = SelectionLabel::Forced,
             _ => {
-                frame(&mut runs[2], FAULT).label = SelectionLabel::New;
+                let original = frame(&mut runs[0], FAULT).clone();
+                *frame(&mut runs[2], FAULT) = original;
                 frame(&mut runs[2], 13).label = SelectionLabel::Forced;
             }
         }
@@ -480,8 +497,17 @@ fn identity_compares_all_outcomes_reasons_and_evidence() {
 
 #[test]
 fn paired_zero_margin_counts_only_proposed_moves_with_a_known_different_source() {
-    let epoch = epoch();
     for case in 0..5 {
+        let mut epoch = epoch();
+        if case >= 2 {
+            epoch.selections[0]
+                .record
+                .inputs
+                .as_mut()
+                .unwrap()
+                .sticky
+                .insert("claude".into(), "a:unit-source".into());
+        }
         let mut runs = controls(&epoch);
         let decision = frame(&mut runs[1], 1);
         decision.choice = match case {
@@ -494,7 +520,7 @@ fn paired_zero_margin_counts_only_proposed_moves_with_a_known_different_source()
         decision.budget_source = match case {
             0 => None,                  // New placement, not a move.
             1 => Some("target".into()), // Retention.
-            _ => Some("source".into()),
+            _ => Some("a:unit-source".into()),
         };
         let report = comparison(&epoch, &runs).unwrap();
         assert_eq!(report.reference_moves, Some(0));
@@ -508,4 +534,60 @@ fn paired_zero_margin_counts_only_proposed_moves_with_a_known_different_source()
             }
         );
     }
+}
+
+#[test]
+fn candidate_cannot_pass_zero_moves_by_silently_dropping_a_dispatch() {
+    // UNIT outcome fixture, not native identity/power evidence. The actual
+    // synthetic source fault independently exercises this same loss below.
+    let mut epoch = epoch();
+    let retained = SelectionChoice::Selected {
+        account: "a:retained".into(),
+    };
+    epoch.selections[0].record.actual.choice = retained.clone();
+    let mut runs = controls(&epoch);
+    frame(&mut runs[0], 1).choice = retained.clone();
+    frame(&mut runs[1], 1).choice = retained.clone();
+    frame(&mut runs[2], 1).choice = retained;
+    frame(&mut runs[1], 1).choice = SelectionChoice::None;
+    let report = comparison(&epoch, &runs).unwrap();
+    assert_eq!(report.reference_moves, Some(0));
+    assert_eq!(report.candidate_moves, Some(0));
+    assert_eq!(report.verdict, Verdict::Fail);
+    assert_eq!(report.lost_selected_ordinals, [1]);
+}
+
+#[test]
+fn proposal_counter_uses_raw_source_even_when_candidate_reports_retention() {
+    let mut epoch = epoch();
+    epoch.selections[0]
+        .record
+        .inputs
+        .as_mut()
+        .unwrap()
+        .sticky
+        .insert("claude".into(), "a:unit-source".into());
+    let mut runs = controls(&epoch);
+    let changed = frame(&mut runs[1], 1);
+    changed.choice = SelectionChoice::Selected {
+        account: "a:unit-target".into(),
+    };
+    changed.budget_source = Some("a:unit-target".into());
+    let report = comparison(&epoch, &runs).unwrap();
+    assert_eq!(report.reference_moves, Some(0));
+    assert_eq!(report.candidate_moves, Some(1));
+    assert_eq!(report.verdict, Verdict::Fail);
+}
+
+#[test]
+fn power_must_fail_the_paired_rule_not_only_change_a_label() {
+    let epoch = epoch();
+    let mut runs = controls(&epoch);
+    let original = frame(&mut runs[0], FAULT).clone();
+    *frame(&mut runs[2], FAULT) = original;
+    frame(&mut runs[2], FAULT).label = SelectionLabel::Forced;
+    insufficient(
+        &comparison(&epoch, &runs).unwrap(),
+        "independent_power_failed",
+    );
 }

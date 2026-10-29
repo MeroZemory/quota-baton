@@ -43,6 +43,13 @@ pub struct Check {
     pub reason: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ChoiceCounts {
+    pub selected: usize,
+    pub hold: usize,
+    pub none: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub schema: u16,
@@ -66,6 +73,11 @@ pub struct Report {
     pub reference_identity: Check,
     pub candidate_identity: Check,
     pub power: Check,
+    pub source_fault_identity_verdict: Verdict,
+    pub source_fault_paired_verdict: Option<Verdict>,
+    pub reference_choices: ChoiceCounts,
+    pub candidate_choices: ChoiceCounts,
+    pub lost_selected_ordinals: Vec<u64>,
     pub reference_moves: Option<usize>,
     pub candidate_moves: Option<usize>,
     pub margin: u8,
@@ -148,14 +160,74 @@ fn identity(epoch: &Epoch, run: &Execution) -> Check {
     }
 }
 
-fn moves(run: &Execution) -> usize {
-    run.frames
+/// Derive proposal sources from raw owner facts, never a candidate-reported
+/// budget_source counter. The native shell independently resolves this source
+/// after selection and ignores the descriptive output field.
+fn moves(epoch: &Epoch, run: &Execution) -> Option<usize> {
+    run.frames.iter().try_fold(0usize, |total, frame| {
+        let SelectionChoice::Selected { account } = &frame.decision.choice else {
+            return Some(total);
+        };
+        let index = epoch
+            .selections
+            .binary_search_by_key(&frame.ordinal, |e| e.record.ordinal)
+            .ok()?;
+        let inputs = epoch.selections[index]
+            .record
+            .inputs
+            .as_ref()?
+            .to_inputs()
+            .ok()?;
+        let source = crate::bindings::kernel::selection::rebind_budget_source(&inputs, account);
+        total.checked_add(usize::from(
+            source.as_deref().is_some_and(|source| source != account),
+        ))
+    })
+}
+
+fn counts(run: &Execution) -> ChoiceCounts {
+    let mut counts = ChoiceCounts::default();
+    for frame in &run.frames {
+        match frame.decision.choice {
+            SelectionChoice::Selected { .. } => counts.selected += 1,
+            SelectionChoice::Hold { .. } => counts.hold += 1,
+            SelectionChoice::None => counts.none += 1,
+        }
+    }
+    counts
+}
+
+fn lost_selected(reference: &Execution, candidate: &Execution) -> Vec<u64> {
+    reference
+        .frames
         .iter()
+        .filter(|frame| matches!(frame.decision.choice, SelectionChoice::Selected { .. }))
         .filter(|frame| {
-            matches!((&frame.decision.choice, &frame.decision.budget_source),
-            (SelectionChoice::Selected { account }, Some(source)) if account != source)
+            candidate
+                .frames
+                .binary_search_by_key(&frame.ordinal, |f| f.ordinal)
+                .ok()
+                .is_none_or(|index| {
+                    !matches!(
+                        candidate.frames[index].decision.choice,
+                        SelectionChoice::Selected { .. }
+                    )
+                })
         })
-        .count()
+        .map(|frame| frame.ordinal)
+        .collect()
+}
+
+fn paired_verdict(epoch: &Epoch, reference: &Execution, candidate: &Execution) -> Option<Verdict> {
+    moves(epoch, reference)
+        .zip(moves(epoch, candidate))
+        .map(|(before, after)| {
+            if after > before || !lost_selected(reference, candidate).is_empty() {
+                Verdict::Fail
+            } else {
+                Verdict::Pass
+            }
+        })
 }
 
 /// `power` is output from a separately built source fault. The ordinal must be
@@ -194,13 +266,19 @@ pub fn compare(
     }
     let reference_identity = identity(epoch, reference);
     let candidate_identity = identity(epoch, candidate);
+    let source_fault_paired_verdict = paired_verdict(epoch, reference, power);
     let mut power = identity(epoch, power);
-    power.verdict = if power.differing_ordinals == [expected_fault_ordinal] {
+    let source_fault_identity_verdict = power.verdict;
+    power.verdict = if power.differing_ordinals == [expected_fault_ordinal]
+        && source_fault_identity_verdict == Verdict::Fail
+        && source_fault_paired_verdict == Some(Verdict::Fail)
+    {
         Verdict::Pass
     } else {
         Verdict::Fail
     };
-    power.reason = Some("separately_built_source_fault_requires_exact_registered_difference");
+    power.reason =
+        Some("separately_built_source_fault_requires_exact_difference_and_paired_failure");
     let observed_completed_rebind_markers = epoch
         .decisions
         .iter()
@@ -215,6 +293,9 @@ pub fn compare(
             })
         })
         .collect::<Vec<_>>();
+    let reference_total = moves(epoch, reference);
+    let candidate_total = moves(epoch, candidate);
+    let lost_selected_ordinals = lost_selected(reference, candidate);
     let reason = if epoch.selections.is_empty() || !epoch.selection_complete || epoch.losses > 0 {
         Some("incomplete_capture")
     } else if runs.iter().any(|run| run.frames.is_empty()) {
@@ -230,13 +311,15 @@ pub fn compare(
         Some("reference_identity_failed")
     } else if power.verdict != Verdict::Pass {
         Some("independent_power_failed")
+    } else if reference_total.is_none() || candidate_total.is_none() {
+        Some("move_source_inputs_unavailable")
     } else if observed_completed_rebind_markers.is_none() {
         Some("completed_rebind_counter_overflow")
     } else {
         None
     };
-    let reference_moves = reason.is_none().then(|| moves(reference));
-    let candidate_moves = reason.is_none().then(|| moves(candidate));
+    let reference_moves = reason.is_none().then_some(reference_total).flatten();
+    let candidate_moves = reason.is_none().then_some(candidate_total).flatten();
     let times = epoch
         .selections
         .iter()
@@ -247,7 +330,7 @@ pub fn compare(
         scope: "selection_move_proposals_only_completed_rebinds_not_replayed",
         verdict: if reason.is_some() {
             Verdict::Insufficient
-        } else if candidate_moves <= reference_moves {
+        } else if candidate_moves <= reference_moves && lost_selected_ordinals.is_empty() {
             Verdict::Pass
         } else {
             Verdict::Fail
@@ -275,6 +358,14 @@ pub fn compare(
         expected_fault_ordinal,
         reference_identity,
         candidate_identity,
+        source_fault_identity_verdict,
+        source_fault_paired_verdict: reason
+            .is_none()
+            .then_some(source_fault_paired_verdict)
+            .flatten(),
+        reference_choices: counts(reference),
+        candidate_choices: counts(candidate),
+        lost_selected_ordinals,
         power,
         reference_moves,
         candidate_moves,
