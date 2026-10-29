@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) mod selection;
+
 pub const SCHEMA: u32 = 1;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_ROWS: usize = 4096;
@@ -1045,6 +1047,7 @@ impl WireInputs {
             }
         }
         Ok(DecisionInputs {
+            selection: None,
             now: self.now,
             model: self.model.as_ref().map(|m| m.text().into()),
             key: self.key.clone(),

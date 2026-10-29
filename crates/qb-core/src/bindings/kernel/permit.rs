@@ -26,7 +26,7 @@ pub struct IncidentInput {
 
 /// Recorded contents of the selection owner's scoped sole-target judgement.
 /// This is descriptive data, not a replacement for that owner's live authority.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoleTargetInput {
     pub from: String,

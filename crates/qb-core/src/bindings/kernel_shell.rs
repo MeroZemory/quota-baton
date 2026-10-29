@@ -2,6 +2,11 @@
 //! this projection and no captured value can authorize a binding mutation.
 use super::*;
 
+mod selection;
+pub(super) use selection::{
+    SnapshotRefusal as SelectionSnapshotRefusal, snapshot as selection_snapshot,
+};
+
 pub(crate) type Recorder =
     Arc<dyn Fn(&kernel::DecisionInputs, &kernel::PermitDecision) -> Option<u64> + Send + Sync>;
 pub(crate) type CommitRecorder = Arc<dyn Fn(Option<u64>) -> Option<u64> + Send + Sync>;
@@ -43,6 +48,15 @@ impl BindingTable {
             }
             Ok(())
         })();
+        let selections = producer.clone();
+        *self
+            .selection_recorder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(
+            move |entry, capture_id, invocation, inputs, actual| {
+                selections.record_selection(entry, capture_id, invocation, inputs, actual)
+            },
+        ));
         let permits = producer.clone();
         self.set_permit_recorder(Arc::new(move |inputs, actual| {
             permits.record_permit(inputs, actual)
@@ -173,6 +187,7 @@ pub(super) fn snapshot(
         .map(|(id, count)| (id.clone(), *count))
         .collect();
     kernel::DecisionInputs {
+        selection: None,
         now,
         model: model.map(str::to_owned),
         key: Some(key.to_owned()),
