@@ -13,6 +13,12 @@ pub struct Epoch {
     pub losses: u64,
     pub complete: bool,
     pub decisions: Vec<DecisionRecord>,
+    pub permits: Vec<crate::bindings::permit_tape::PermitRecord>,
+    pub permit_complete: bool,
+    pub permit_commits: u64,
+    pub provenance: super::replay_recorder::Provenance,
+    pub capture_started_utc_ns: i64,
+    pub capture_ended_utc_ns: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -238,6 +244,12 @@ mod tests {
             initial_witness: "b".repeat(64),
             losses: 0,
             complete: true,
+            permits: Vec::new(),
+            permit_complete: false,
+            permit_commits: 0,
+            provenance: super::super::replay_recorder::Provenance::Synthetic,
+            capture_started_utc_ns: 0,
+            capture_ended_utc_ns: 0,
             decisions: vec![DecisionRecord {
                 schema: 1,
                 ordinal: 1,

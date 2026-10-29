@@ -358,6 +358,7 @@ impl BindingTable {
         now: DateTime<Utc>,
     ) -> Option<move_guard::CommittedMove> {
         if let Some(permit) = permit {
+            let recorded_ordinal = permit.recorded_ordinal();
             // Internal invariant: neither clear nor rename can interleave under
             // mutations. A stale permit never changes a binding.
             let committed = self
@@ -366,6 +367,7 @@ impl BindingTable {
                 .unwrap_or_else(|e| e.into_inner())
                 .commit(permit, to)
                 .expect("move permit serialized by mutations");
+            self.record_permit_commit(recorded_ordinal);
             if let Some(obs) = self.move_observability()
                 && let Err(error) = obs.committed_move(provider, key, to, model, now)
             {
