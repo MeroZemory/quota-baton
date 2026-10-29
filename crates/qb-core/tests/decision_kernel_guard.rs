@@ -2357,7 +2357,7 @@ const SELECTION_SOURCE: &str = include_str!("../src/bindings/kernel/selection.rs
 const SELECTION_SIGNATURES: &[&str] = &[
     "pub fn select(inputs: &DecisionInputs) -> Result<SelectionEvaluation, SelectionInputError>",
     "fn return_blocked(inputs: &DecisionInputs, row: &CandidateInput) -> bool",
-    "fn rebind_budget_source(inputs: &DecisionInputs, to: &str) -> Option<String>",
+    "pub(crate) fn rebind_budget_source(inputs: &DecisionInputs, to: &str) -> Option<String>",
     "fn select_ordered(inputs: &DecisionInputs, candidates: &[CandidateInput]) -> SelectionEvaluation",
     "fn prefer<T>(pool: &mut Vec<(&CandidateInput, T)>, preference: Option<&PreferenceInput>)",
     "fn prefer_root_hint<T>(pool: &mut Vec<(&CandidateInput, T)>, account: Option<&str>)",
