@@ -55,7 +55,7 @@ impl Runtime {
             worker: Mutex::new(Some(worker)),
         })
     }
-    /// Main supplies the separate state/decision-tape-v7 root. Legacy roots are
+    /// Main supplies the separate state/decision-tape-v8 root. Legacy roots are
     /// neither inspected nor removed, even when their disk cap was exhausted.
     pub(crate) fn start_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
         Self::start_tape_with_provenance(

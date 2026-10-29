@@ -555,12 +555,13 @@ async fn populated_native_reopen_records_startup_witness_before_first_permit() {
     );
     obs.shutdown_replay();
 
-    let epoch = home.join("state/decision-tape-v7/e00");
+    let epoch = home.join("state/decision-tape-v8/e00");
     let manifest: tape::Manifest =
         serde_json::from_slice(&fs::read(epoch.join("manifest.json")).unwrap()).unwrap();
     assert!(manifest.sealed);
     assert_eq!(manifest.losses.producer_failure, 0);
     assert_eq!(manifest.accepted, manifest.persisted);
+    assert_eq!(tape::read_epoch(&epoch).unwrap().losses, 0);
     let mut witnesses = Vec::new();
     let mut permits = Vec::new();
     for segment in &manifest.segments {
@@ -570,7 +571,13 @@ async fn populated_native_reopen_records_startup_witness_before_first_permit() {
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
         {
-            let record: tape::Record = serde_json::from_slice(line).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(line).unwrap();
+            let record = wire.get("record").expect("schema8 frame record");
+            if record["event"]["kind"] == "SelectionTape" {
+                // Its reference payload is verified by the native reader above.
+                continue;
+            }
+            let record: tape::Record = serde_json::from_value(record.clone()).unwrap();
             match record.event {
                 tape::Payload::Metadata(event)
                     if matches!(*event, Event::InitialWitness { .. }) =>
