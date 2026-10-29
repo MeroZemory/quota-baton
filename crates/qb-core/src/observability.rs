@@ -858,7 +858,7 @@ impl Observability {
     ) -> Option<(serde_json::Value, serde_json::Value)> {
         let snapshot = snapshot(provider, headers, Utc::now())?;
         let reported = serde_json::to_value(&snapshot).ok()?;
-        let merged = self.remember(account_id, &snapshot, true)?;
+        let merged = self.remember(account_id, &snapshot, true, None)?;
         Some((merged, reported))
     }
 
@@ -871,7 +871,27 @@ impl Observability {
         let next: Snapshot = serde_json::from_value(value).ok()?;
         // Complete poll responses replace the window set. Partial responses
         // retain known windows just like partial response headers.
-        self.remember(id, &next, !replace_windows)
+        self.remember(id, &next, !replace_windows, None)
+    }
+
+    /// The runtime has proved complete inventory removal of this durable cause.
+    /// The cache owner must still fence any header published since that proof.
+    pub(crate) fn observe_poll_after_window_removal(
+        &self,
+        id: &str,
+        value: serde_json::Value,
+        cause: &crate::accounts::QuotaCooling,
+    ) -> Option<serde_json::Value> {
+        let next: Snapshot = serde_json::from_value(value).ok()?;
+        if next.observed_at <= cause.started_at
+            || next
+                .windows
+                .iter()
+                .any(|window| window.name == cause.window)
+        {
+            return None;
+        }
+        self.remember(id, &next, false, Some(cause))
     }
 
     pub(crate) fn capture_poll(&self, provider: Provider, body: &[u8]) {
@@ -959,7 +979,7 @@ impl Observability {
         if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
             snapshot.source = "codex.rate_limits".into();
             let reported = serde_json::to_value(&snapshot).ok()?;
-            let merged = self.remember(account_id, &snapshot, true)?;
+            let merged = self.remember(account_id, &snapshot, true, None)?;
             return Some((merged, reported));
         }
         None
@@ -1130,8 +1150,10 @@ impl Observability {
         id: &str,
         next: &Snapshot,
         preserve_missing_windows: bool,
+        removed_cause: Option<&crate::accounts::QuotaCooling>,
     ) -> Option<serde_json::Value> {
         use crate::dashboard::history::*;
+        let merged = self.merge_snapshot(id, next, preserve_missing_windows, removed_cause)?;
         if let Some(balance) = next.credits.as_ref().and_then(|c| c.balance) {
             self.dashboard
                 .observe_credit_forecast(id, balance, next.observed_at);
@@ -1170,11 +1192,29 @@ impl Observability {
             }
         }
 
+        Some(merged)
+    }
+
+    fn merge_snapshot(
+        &self,
+        id: &str,
+        next: &Snapshot,
+        preserve_missing_windows: bool,
+        removed_cause: Option<&crate::accounts::QuotaCooling>,
+    ) -> Option<serde_json::Value> {
         if let Ok(mut snapshots) = self.snapshots.lock()
             && let Ok(mut value) = serde_json::to_value(next)
         {
             // 부분 헤더 응답은 기존 창 정보를 지우지 않는다.
             if let Some(old) = snapshots.get(id) {
+                // Headers publish before taking Store. Check and merge under
+                // this one lock, or a late poll could erase their rejection.
+                if removed_cause.is_some()
+                    && old["observed_at"].as_str()?.parse::<DateTime<Utc>>().ok()?
+                        >= next.observed_at
+                {
+                    return None;
+                }
                 if let (Some(new), Some(previous)) =
                     (value["windows"].as_array_mut(), old["windows"].as_array())
                 {
@@ -1214,6 +1254,35 @@ impl Observability {
                         prior_signals.limit_reached = None;
                         prior_signals.serving_from_credits = None;
                         prior_signals.active_limit = None;
+                    }
+                    if let Some(cause) = removed_cause {
+                        // Retire inherited evidence to unknown, not acceptance.
+                        // Explicit incoming fields are merged afterwards.
+                        prior_signals.unified_status = None;
+                        prior_signals.limit_reached = None;
+                        let names_removed = |claim: &str| {
+                            claim == cause.window
+                                || matches!(
+                                    (claim, cause.window.as_str()),
+                                    ("primary" | "five_hour", "5h")
+                                        | ("secondary" | "seven_day", "7d")
+                                        | ("seven_day_opus", "7d_oi")
+                                )
+                        };
+                        if prior_signals
+                            .active_limit
+                            .as_deref()
+                            .is_some_and(names_removed)
+                        {
+                            prior_signals.active_limit = None;
+                        }
+                        if prior_signals
+                            .representative_claim
+                            .as_deref()
+                            .is_some_and(names_removed)
+                        {
+                            prior_signals.representative_claim = None;
+                        }
                     }
                     next_signals.merge(prior_signals);
                     value["signals"] = serde_json::to_value(next_signals).unwrap_or_default();
@@ -2264,7 +2333,10 @@ mod tests {
     }
 
     fn directory() -> tempfile::TempDir {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let base = std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
             .parent()
             .unwrap()
             .parent()
@@ -2362,6 +2434,220 @@ mod tests {
         assert!(state["accounts"].get("unrelated").is_none());
         assert!(!text.contains("fake-access-marker"));
         assert!(!text.contains("health"));
+    }
+
+    #[test]
+    fn r18_removed_window_poll_declines_newer_native_header_atomically() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let started = Utc::now() - Duration::seconds(1);
+        let cause = crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: started + Duration::hours(2),
+            started_at: started - Duration::seconds(1),
+        };
+        obs.observe_poll(
+            "cx-r18-race",
+            json!({
+                "windows":[{"name":"5h","used_pct":100.0,"reset_at":cause.reset_at}],
+                "plan":"plus","credits":null,"source":"poll",
+                "observed_at":started - Duration::seconds(2),"signals":{"limit_reached":true}
+            }),
+            true,
+        )
+        .unwrap();
+        // The earlier runtime precheck passes. The actual native header then
+        // publishes before the removal poll reaches the merge owner.
+        let prechecked = obs.quota_snapshot("cx-r18-race").unwrap();
+        assert!(
+            prechecked["observed_at"]
+                .as_str()
+                .unwrap()
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+                < started
+        );
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-codex-primary-window-minutes", "300".to_owned()),
+            ("x-codex-primary-used-percent", "100".to_owned()),
+            (
+                "x-codex-primary-reset-at",
+                cause.reset_at.timestamp().to_string(),
+            ),
+            ("x-codex-limit-reached", "true".to_owned()),
+            ("x-codex-active-limit", "5h".to_owned()),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let (fresh, _) = obs
+            .observe_headers_reported("cx-r18-race", Provider::Codex, &headers)
+            .unwrap();
+        assert_eq!(fresh["signals"]["limit_reached"], true);
+        let fresh_at = fresh["observed_at"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        assert!(fresh_at > started);
+        for at in [started, fresh_at] {
+            let poll = json!({"windows":[{"name":"7d","used_pct":0.0,
+                "reset_at":started + Duration::days(2)}],"plan":"pro","credits":null,
+                "source":"poll","observed_at":at,"signals":{}});
+            assert!(
+                obs.observe_poll_after_window_removal("cx-r18-race", poll, &cause)
+                    .is_none()
+            );
+            assert_eq!(
+                obs.quota_snapshot("cx-r18-race").unwrap(),
+                fresh,
+                "decline before any cache/root regression or inherited-signal retirement"
+            );
+        }
+    }
+
+    #[test]
+    fn r18_window_removal_retires_health_fields_and_preserves_other_hints() {
+        for explicit in [false, true] {
+            let dir = directory();
+            let obs = Observability::new(dir.path(), None).unwrap();
+            let now = Utc::now();
+            let cause = crate::accounts::QuotaCooling {
+                window: "5h".into(),
+                reset_at: now + Duration::hours(2),
+                started_at: now - Duration::seconds(1),
+            };
+            let old = json!({"windows":[{"name":"5h","used_pct":100.0,"reset_at":cause.reset_at}],
+                "plan":"plus","credits":null,"source":"poll","observed_at":now - Duration::seconds(2),
+                "signals":{"unified_status":"rejected","limit_reached":true,
+                "unified_reset_at":cause.reset_at,"retry_after_seconds":7200.0,"overage_status":"rejected",
+                "active_limit":"primary","representative_claim":"five_hour"}});
+            let before = obs.observe_poll("cx-r18-hints", old, true).unwrap();
+            let signals = if explicit {
+                json!({"unified_status":"rejected","limit_reached":true,
+                    "unified_reset_at":now + Duration::days(2),"retry_after_seconds":60.0,"overage_status":"allowed",
+                    "active_limit":"7d","representative_claim":"7d"})
+            } else {
+                json!({})
+            };
+            let poll = json!({"windows":[{"name":"7d","used_pct":0.0,"reset_at":now + Duration::days(2)}],
+                "plan":"pro","credits":null,"source":"poll","observed_at":now,"signals":signals});
+            let merged = obs
+                .observe_poll_after_window_removal("cx-r18-hints", poll, &cause)
+                .unwrap();
+            for field in [
+                "unified_status",
+                "limit_reached",
+                "active_limit",
+                "representative_claim",
+            ] {
+                assert_eq!(merged["signals"][field], signals[field]);
+            }
+            for field in ["unified_reset_at", "retry_after_seconds", "overage_status"] {
+                assert_eq!(
+                    merged["signals"][field],
+                    if explicit {
+                        signals[field].clone()
+                    } else {
+                        before["signals"][field].clone()
+                    }
+                );
+            }
+            assert!(merged["credits"].is_null());
+            // Existing normalization may retain false from a non-credit limit;
+            // removal never invents paid-serving or credit entitlement.
+            assert_ne!(merged["signals"]["serving_from_credits"], true);
+        }
+    }
+
+    #[test]
+    fn r18_removed_subbucket_selectors_cannot_mask_remaining_account_quota() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let now = Utc::now();
+        let cause = crate::accounts::QuotaCooling {
+            window: "7d_oi".into(),
+            reset_at: now + Duration::days(1),
+            started_at: now - Duration::seconds(1),
+        };
+        obs.observe_poll("cx-r18-selector", json!({
+            "windows":[{"name":"7d_oi","used_pct":100.0,"reset_at":cause.reset_at}],
+            "plan":"plus","credits":null,"source":"poll","observed_at":now - Duration::seconds(2),
+            "signals":{"active_limit":"7d_oi","representative_claim":"seven_day_opus"}
+        }), true).unwrap();
+        let merged = obs
+            .observe_poll_after_window_removal(
+                "cx-r18-selector",
+                json!({
+                    "windows":[{"name":"5h","used_pct":10.0,"reset_at":now + Duration::hours(1)},
+                        {"name":"7d","used_pct":100.0,"reset_at":now + Duration::days(2)}],
+                    "plan":"pro","credits":null,"source":"poll","observed_at":now,"signals":{}
+                }),
+                &cause,
+            )
+            .unwrap();
+        assert!(merged["signals"]["active_limit"].is_null());
+        assert!(merged["signals"]["representative_claim"].is_null());
+        let mut account = crate::accounts::health::tests::fixture();
+        account.apply_health_signal(
+            crate::accounts::HealthSignal::UsageSnapshot {
+                snapshot: merged,
+                model: Some("synthetic-r18-model".into()),
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+        assert!(matches!(account.health, crate::accounts::Health::Cooling {
+            reason: crate::accounts::HealthReason::Quota, ref scope, ..
+        } if scope == "account"));
+        assert_eq!(account.quota_cooling.as_ref().unwrap().window, "7d");
+    }
+
+    #[test]
+    fn r18_window_removal_preserves_independent_credit_serving_evidence() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let now = Utc::now();
+        let cause = crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: now + Duration::hours(2),
+            started_at: now - Duration::seconds(1),
+        };
+        let old = obs
+            .observe_poll(
+                "cx-r18-credits",
+                json!({
+                    "windows":[{"name":"5h","used_pct":100.0,"reset_at":cause.reset_at}],
+                    "plan":"plus","credits":{"has_credits":true,"balance":12.5},
+                    "source":"poll","observed_at":now - Duration::seconds(2),
+                    "signals":{"active_limit":"credits","serving_from_credits":true,
+                        "representative_claim":"five_hour"}
+                }),
+                true,
+            )
+            .unwrap();
+        let before = obs
+            .paid_serving_proof("cx-r18-credits", &old["observed_at"])
+            .unwrap();
+        assert!(before["paid_serving_observed_at"].is_string());
+        let merged = obs
+            .observe_poll_after_window_removal(
+                "cx-r18-credits",
+                json!({
+                    "windows":[{"name":"7d","used_pct":20.0,"reset_at":now + Duration::days(2)}],
+                    "plan":"pro","credits":null,"source":"poll","observed_at":now,"signals":{}
+                }),
+                &cause,
+            )
+            .unwrap();
+        assert_eq!(merged["signals"]["active_limit"], "credits");
+        assert_eq!(merged["signals"]["serving_from_credits"], true);
+        assert!(merged["signals"]["representative_claim"].is_null());
+        assert_eq!(merged["credits"], before["credits"]);
+        assert_eq!(
+            merged["paid_serving_observed_at"],
+            before["paid_serving_observed_at"]
+        );
     }
 
     #[test]
