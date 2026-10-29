@@ -1,4 +1,4 @@
-//! Schema 7 selection tape (with read-only schema 5/6 compatibility). Earlier roots are never rewritten.
+//! Schema 8 selection tape (with read-only schema 5/6/7 compatibility). Earlier roots are never rewritten.
 //! Producers only enqueue bounded typed metadata. The sole writer compresses and syncs.
 use super::*;
 use crate::bindings::decision_tape::DecisionRecord;
@@ -8,8 +8,13 @@ use std::{
     io::{BufRead, Read},
 };
 
-pub(super) const TAPE_SCHEMA: u16 = 7;
+mod codec;
+
+pub(super) const TAPE_SCHEMA: u16 = 8;
 const RECORD_BYTES: usize = 256 * 1024;
+// Schema 8 definitions can make a cold frame larger than its logical Record.
+// Includes the JSONL newline; logical expansion keeps RECORD_BYTES unchanged.
+const WIRE_RECORD_BYTES: usize = 1024 * 1024;
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const HOUR_BYTES: u64 = 20_000_000;
 const DECODED_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
@@ -174,6 +179,7 @@ struct TapeState {
     accounts: BTreeMap<[u8; 32], [u8; 32]>,
     quotas: BTreeSet<QuotaKey>,
     quota_bytes: usize,
+    codec: codec::Encoder,
     manifest: Manifest,
 }
 struct TapeShared {
@@ -284,6 +290,7 @@ pub(crate) fn open_with_provenance(
                 accounts: BTreeMap::new(),
                 quotas: BTreeSet::new(),
                 quota_bytes: 0,
+                codec: codec::Encoder::default(),
                 manifest,
             }),
         }),
@@ -631,13 +638,15 @@ impl Producer {
             cause,
             event,
         };
-        let mut bytes = Vec::new();
-        if serde_json::to_writer(BoundedSink::new(&mut bytes), &record).is_err() {
-            let l = &mut s.manifest.losses;
-            increment(&mut l.invalid, &mut l.saturated, 1);
-            return None;
-        }
-        bytes.push(b'\n');
+        let prepared = match s.codec.prepare(&record) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                let l = &mut s.manifest.losses;
+                increment(&mut l.invalid, &mut l.saturated, 1);
+                return None;
+            }
+        };
+        let codec::Prepared { bytes, update } = prepared;
         if s.used + bytes.len() as u64 > HOUR_BYTES {
             s.budget_stopped = true;
             let l = &mut s.manifest.losses;
@@ -664,6 +673,9 @@ impl Producer {
             increment(&mut l.capture_aborted, &mut l.saturated, 1);
         }
         s.queue.push_back(Queued { sequence, bytes });
+        // Publishing dictionary state before queue acceptance could strand all
+        // subsequent refs if this envelope failed a budget or queue check.
+        s.codec.commit(update);
         Some(sequence)
     }
 }
@@ -838,22 +850,32 @@ fn valid_refusal(record: &DecisionRecord) -> bool {
 
 // Limits encoding allocation even for a huge malformed typed input. One byte
 // reserved for the JSONL newline. A sink-only pass can reject before cloning.
-#[derive(Default)]
 struct BoundedSink<'a> {
     output: Option<&'a mut Vec<u8>>,
     written: usize,
+    limit: usize,
+}
+impl Default for BoundedSink<'_> {
+    fn default() -> Self {
+        Self {
+            output: None,
+            written: 0,
+            limit: RECORD_BYTES,
+        }
+    }
 }
 impl<'a> BoundedSink<'a> {
-    fn new(output: &'a mut Vec<u8>) -> Self {
+    fn wire(output: &'a mut Vec<u8>) -> Self {
         Self {
             output: Some(output),
             written: 0,
+            limit: WIRE_RECORD_BYTES,
         }
     }
 }
 impl Write for BoundedSink<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() >= RECORD_BYTES.saturating_sub(self.written) {
+        if bytes.len() >= self.limit.saturating_sub(self.written) {
             return Err(io::Error::other("decision_tape_record_size"));
         }
         self.written += bytes.len();
@@ -1086,7 +1108,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     }
     let epoch_bytes = bounded_file(&path.join("epoch.json"), CONTROL_BYTES)?;
     let epoch: EpochHeader = serde_json::from_slice(&epoch_bytes).map_err(|_| fail())?;
-    if !matches!(epoch.schema, 5 | 6 | TAPE_SCHEMA) {
+    if !matches!(epoch.schema, 5 | 6 | 7 | TAPE_SCHEMA) {
         return Err(io::Error::other("decision_tape_unsupported_schema"));
     }
     let header_bytes = bounded_file(&path.join("header.json"), CONTROL_BYTES)?;
@@ -1141,8 +1163,10 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         b"quota-baton/decision-tape-v5/epoch\0"
     } else if epoch.schema == 6 {
         b"quota-baton/decision-tape-v6/epoch\0"
-    } else {
+    } else if epoch.schema == 7 {
         b"quota-baton/decision-tape-v7/epoch\0"
+    } else {
+        b"quota-baton/decision-tape-v8/epoch\0"
     });
     for bytes in [&epoch_bytes, &header_bytes] {
         hash.update((bytes.len() as u64).to_be_bytes());
@@ -1170,6 +1194,12 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     let mut aborted = 0u64;
     let mut read_states_complete = true;
     let mut last_stamp = header.start;
+    let mut codec = codec::Decoder::default();
+    let line_limit = if epoch.schema == 8 {
+        WIRE_RECORD_BYTES
+    } else {
+        RECORD_BYTES
+    };
     for (index, segment) in m.segments.iter().enumerate() {
         if segment.index != index as u64
             || segment.compressed_bytes > SEGMENT_BYTES
@@ -1198,20 +1228,24 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
             let mut line = Vec::new();
             let read = reader
                 .by_ref()
-                .take(RECORD_BYTES as u64 + 1)
+                .take(line_limit as u64 + 1)
                 .read_until(b'\n', &mut line)?;
             if read == 0 {
                 break;
             }
             segment_encoded += read as u64;
-            if read > RECORD_BYTES
+            if read > line_limit
                 || line.last() != Some(&b'\n')
                 || segment_encoded > DECODED_SEGMENT_BYTES as u64
                 || count >= MAX_RECORDS as u64
             {
                 return Err(fail());
             }
-            let record: Record = serde_json::from_slice(&line).map_err(|_| fail())?;
+            let record: Record = if epoch.schema == 8 {
+                codec.decode(&line).map_err(|_| fail())?
+            } else {
+                serde_json::from_slice(&line).map_err(|_| fail())?
+            };
             if record.sequence != sequence.checked_add(1).ok_or_else(fail)?
                 || record.at.monotonic_ns < last_stamp.monotonic_ns
                 || record.at.utc_ns < last_stamp.utc_ns

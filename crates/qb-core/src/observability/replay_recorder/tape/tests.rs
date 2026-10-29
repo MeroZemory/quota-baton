@@ -1,5 +1,26 @@
 use super::*;
 
+// Test mutations operate on logical records, then use the current wire codec.
+// Otherwise a schema-8 parse error could mask the intended native rejection.
+fn decode_current_records(raw: &[u8]) -> Vec<Record> {
+    let mut decoder = codec::Decoder::default();
+    raw.split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| decoder.decode(line).unwrap())
+        .collect()
+}
+
+fn encode_current_records(records: &[Record]) -> Vec<u8> {
+    let mut encoder = codec::Encoder::default();
+    let mut raw = Vec::new();
+    for record in records {
+        let codec::Prepared { bytes, update } = encoder.prepare(record).unwrap();
+        raw.extend_from_slice(&bytes);
+        encoder.commit(update);
+    }
+    raw
+}
+
 fn permit_inputs() -> crate::bindings::kernel::DecisionInputs {
     use crate::accounts::{Account, Health, Identity, Source, TokenMeta, UserState};
     use crate::bindings::kernel::{CandidateInput, DecisionInputs, PermitInputs};
@@ -94,11 +115,12 @@ fn permit_envelopes_deduplicate_native_quota_and_round_trip_without_private_meta
     {
         let state = producer.shared.state.lock().unwrap();
         assert_eq!(state.quotas.len(), 1);
-        let records: Vec<Record> = state
+        let raw: Vec<u8> = state
             .queue
             .iter()
-            .map(|q| serde_json::from_slice(&q.bytes).unwrap())
+            .flat_map(|q| q.bytes.iter().copied())
             .collect();
+        let records = decode_current_records(&raw);
         let envelopes: Vec<_> = records
             .iter()
             .filter_map(|r| match &r.event {
@@ -260,7 +282,7 @@ use crate::{
     },
 };
 
-fn directory() -> tempfile::TempDir {
+pub(super) fn directory() -> tempfile::TempDir {
     let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
     let root = executable
         .parent()
@@ -732,19 +754,11 @@ fn reader_rejects_bad_ordinal_even_with_matching_compressed_hash() {
     let segment = path.join(segment_name(0));
     let bytes = fs::read(&segment).unwrap();
     let raw = zstd::stream::decode_all(bytes.as_slice()).unwrap();
-    let mut records: Vec<Record> = raw
-        .split(|b| *b == b'\n')
-        .filter(|s| !s.is_empty())
-        .map(|s| serde_json::from_slice(s).unwrap())
-        .collect();
+    let mut records = decode_current_records(&raw);
     if let Payload::DecisionTape(d) = &mut records[1].event {
         d.ordinal = 99;
     }
-    let mut raw = Vec::new();
-    for r in records {
-        serde_json::to_writer(&mut raw, &r).unwrap();
-        raw.push(b'\n');
-    }
+    let raw = encode_current_records(&records);
     let bytes = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
     fs::write(segment, &bytes).unwrap();
     m.segments[0].sha256 = digest(&bytes);
@@ -942,6 +956,32 @@ fn schema6_writer_refuses_legacy5_root_without_rewriting_it() {
             .is_some()
     );
     writer.close(at(4)).unwrap();
+    // Construct an actual legacy payload, not schema-8 envelopes wearing a
+    // schema-5 header. Only this fixture is converted; frozen old bytes below
+    // remain unchanged and retain their independent expected epoch hashes.
+    let mut legacy = manifest(&path);
+    assert_eq!(legacy.segments.len(), 1);
+    let segment_path = path.join(segment_name(0));
+    let current = zstd::stream::decode_all(fs::read(&segment_path).unwrap().as_slice()).unwrap();
+    let records = decode_current_records(&current);
+    let mut raw = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut raw, &record).unwrap();
+        raw.push(b'\n');
+    }
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    fs::write(segment_path, &compressed).unwrap();
+    legacy.segments[0].encoded_bytes = raw.len() as u64;
+    legacy.segments[0].compressed_bytes = compressed.len() as u64;
+    legacy.segments[0].sha256 = digest(&compressed);
+    legacy.encoded_bytes = raw.len() as u64;
+    legacy.compressed_bytes = compressed.len() as u64;
+    legacy.budget_window_used = raw.len() as u64;
+    fs::write(
+        path.join("manifest.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
     for name in ["epoch.json", "header.json", "manifest.json"] {
         let p = path.join(name);
         let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
@@ -1031,6 +1071,34 @@ fn unchanged_legacy5_bytes_keep_the_frozen_hash_without_new_diagnostics() {
         "d7fec5cebdcc37123c05a115e5d5848bbde4e6f0605860e6cb6b80ff76b8410a"
     );
     assert_ne!(loaded6.tape_sha256, loaded.tape_sha256);
+
+    let v7 = directory.path().join("schema7");
+    fs::create_dir(&v7).unwrap();
+    for (name, bytes) in [
+        ("epoch.json", epoch.as_slice()),
+        ("header.json", header.as_slice()),
+        ("manifest.json", manifest.as_slice()),
+    ] {
+        let text = std::str::from_utf8(bytes).unwrap()
+            .replace("\"schema\":5", "\"schema\":7")
+            .replace("\"segments\":[]", "\"permit_not_comparable_reasons\":{},\"producer_failure_reasons\":{},\"selection_records\":0,\"selection_not_comparable\":0,\"selection_not_comparable_reasons\":{},\"segments\":[]");
+        fs::write(v7.join(name), text).unwrap();
+    }
+    let controls_before: Vec<_> = ["epoch.json", "header.json", "manifest.json"]
+        .iter()
+        .map(|name| fs::read(v7.join(name)).unwrap())
+        .collect();
+    let loaded7 = read_epoch(&v7).unwrap();
+    assert_eq!(
+        loaded7.tape_sha256,
+        "912c50c026d34cfbdac91a4eddb15330d5fcff7500b9fbf03d81ad90861ab42f"
+    );
+    for (name, before) in ["epoch.json", "header.json", "manifest.json"]
+        .iter()
+        .zip(controls_before)
+    {
+        assert_eq!(fs::read(v7.join(name)).unwrap(), before);
+    }
 }
 
 fn rewrite_selection_fixture(path: &Path, change: impl FnOnce(&mut [Record])) {
@@ -1038,17 +1106,9 @@ fn rewrite_selection_fixture(path: &Path, change: impl FnOnce(&mut [Record])) {
     assert_eq!(m.segments.len(), 1);
     let segment = path.join(segment_name(0));
     let raw = zstd::stream::decode_all(fs::read(&segment).unwrap().as_slice()).unwrap();
-    let mut rows: Vec<Record> = raw
-        .split(|b| *b == b'\n')
-        .filter(|r| !r.is_empty())
-        .map(|r| serde_json::from_slice(r).unwrap())
-        .collect();
+    let mut rows = decode_current_records(&raw);
     change(&mut rows);
-    let mut raw = Vec::new();
-    for row in rows {
-        serde_json::to_writer(&mut raw, &row).unwrap();
-        raw.push(b'\n');
-    }
+    let raw = encode_current_records(&rows);
     let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
     fs::write(segment, &compressed).unwrap();
     m.segments[0].sha256 = digest(&compressed);

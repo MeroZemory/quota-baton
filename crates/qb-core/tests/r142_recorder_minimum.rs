@@ -59,7 +59,7 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
         )
         .unwrap();
         let account_id = store.list().unwrap()[0].id.clone();
-        let capture = home.join("state/decision-tape-v7");
+        let capture = home.join("state/decision-tape-v8");
         let legacy = home.join("state/routing-replay");
         if mode == "on" {
             fs::create_dir_all(&legacy).unwrap();
@@ -175,8 +175,8 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                 }
                 let metadata: Vec<_> = events
                     .iter()
-                    .filter(|e| e["event"]["kind"] == "Metadata")
-                    .map(|e| &e["event"]["facts"])
+                    .filter(|e| e["record"]["event"]["kind"] == "Metadata")
+                    .map(|e| &e["record"]["event"]["facts"])
                     .collect();
                 assert!(metadata.iter().any(|e| e["kind"] == "AccountState"));
                 assert!(metadata.iter().any(|e| e["kind"] == "CollectionMember"));
@@ -187,7 +187,7 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                 );
                 assert_eq!(manifests.len(), 1);
                 let manifest = &manifests[0];
-                assert_eq!(manifest["schema"], 7);
+                assert_eq!(manifest["schema"], 8);
                 assert_eq!(manifest["sealed"], true);
                 assert_eq!(manifest["accepted"], manifest["persisted"]);
                 assert!(manifest["persisted"].as_u64().unwrap() >= 3);
