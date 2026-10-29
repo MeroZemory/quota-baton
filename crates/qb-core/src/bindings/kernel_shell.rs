@@ -11,29 +11,36 @@ impl BindingTable {
         &self,
         producer: Arc<crate::observability::ReplayRuntime>,
         initial_accounts: &[Account],
-    ) -> anyhow::Result<()> {
-        let witness = (|| -> anyhow::Result<()> {
+    ) -> Result<(), decision_tape::StartupWitnessFailure> {
+        use decision_tape::StartupWitnessFailure;
+        let witness = (|| -> Result<(), StartupWitnessFailure> {
             use crate::observability::replay_recorder::{Event, Fingerprint, Owner};
             use sha2::{Digest, Sha256};
-            let image = self.decision_tape_initial_image()?;
-            let bytes = serde_json::to_vec(&(&image, initial_accounts))?;
+            let image = self.decision_tape_initial_image().map_err(|error| {
+                error
+                    .downcast_ref::<StartupWitnessFailure>()
+                    .copied()
+                    .unwrap_or(StartupWitnessFailure::ImageSerialization)
+            })?;
+            let bytes = serde_json::to_vec(&(&image, initial_accounts))
+                .map_err(|_| StartupWitnessFailure::AccountsSerialization)?;
             let digest = Fingerprint(Sha256::digest(bytes).into());
-            anyhow::ensure!(
-                producer
-                    .record(
-                        Owner::Bindings,
-                        None,
-                        Event::InitialWitness {
-                            component: Owner::Bindings,
-                            revision: image.revision,
-                            cursor: 0,
-                            rows: image.bindings_rows,
-                            digest,
-                        }
-                    )
-                    .is_some(),
-                "initial decision witness was not accepted"
-            );
+            if producer
+                .record(
+                    Owner::Bindings,
+                    None,
+                    Event::InitialWitness {
+                        component: Owner::Bindings,
+                        revision: image.revision,
+                        cursor: 0,
+                        rows: image.bindings_rows,
+                        digest,
+                    },
+                )
+                .is_none()
+            {
+                return Err(StartupWitnessFailure::Publication);
+            }
             Ok(())
         })();
         let permits = producer.clone();

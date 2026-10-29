@@ -32,6 +32,7 @@ mod capacity_spill;
 pub mod decision_tape;
 pub mod kernel;
 mod kernel_shell;
+pub(crate) use decision_tape::StartupWitnessFailure;
 mod launch;
 mod move_guard;
 #[cfg(any(test, feature = "testkit"))]
