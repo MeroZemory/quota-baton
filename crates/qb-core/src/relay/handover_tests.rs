@@ -262,7 +262,11 @@ async fn undrained_empty_pool_keeps_genuine_no_account_400() {
     let result = AssertUnwindSafe(tokio::time::timeout(LIMIT, async {
         assert!(!fixture.state.is_draining());
         assert!(fixture.state.store.list().unwrap().is_empty());
-        let response = relay(State(fixture.state.clone()), fixture.request(Body::from(PAYLOAD))).await;
+        let mut request = fixture.request(Body::from(PAYLOAD));
+        // This control checks no-account behavior, not an unregistered project's
+        // independent admission conflict. The held-upload case keeps the hint.
+        assert!(request.headers_mut().remove(crate::routing::PROJECT_HEADER).is_some());
+        let response = relay(State(fixture.state.clone()), request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();

@@ -99,12 +99,12 @@ fn recipient_life(recipient: &OwnedHandle) -> RecipientLife {
 
 fn can_recover_grant(
     stopping: bool,
-    draining: bool,
+    prior_ready: bool,
     prior_pid: u32,
     next_pid: u32,
     life: RecipientLife,
 ) -> bool {
-    !stopping && !draining && prior_pid != next_pid && life == RecipientLife::Dead
+    !stopping && !prior_ready && prior_pid != next_pid && life == RecipientLife::Dead
 }
 
 impl Transfer {
@@ -297,7 +297,7 @@ fn duplicate(listener: &TcpListener, role: &str, pid: u32) -> Result<SocketInfo>
     })
 }
 
-pub(super) fn export(pid: u32, relay: &crate::relay::RelayState) -> Result<Export> {
+pub(super) fn export(pid: u32) -> Result<Export> {
     ensure!(
         pid != 0 && pid != std::process::id(),
         "listener recipient invalid"
@@ -307,14 +307,14 @@ pub(super) fn export(pid: u32, relay: &crate::relay::RelayState) -> Result<Expor
         .as_mut()
         .ok_or_else(|| anyhow!("listener bank unavailable"))?;
     ensure!(
-        bank.initialized && !bank.stopping && !relay.is_draining() && bank.closed == [false; 2],
+        bank.initialized && !bank.stopping && bank.closed == [false; 2],
         "listener export unavailable"
     );
     if let Some(prior) = &bank.transfer {
         ensure!(
             can_recover_grant(
                 bank.stopping,
-                relay.is_draining(),
+                prior.ready,
                 prior.pid,
                 pid,
                 recipient_life(&prior.recipient)
@@ -322,7 +322,9 @@ pub(super) fn export(pid: u32, relay: &crate::relay::RelayState) -> Result<Expor
             "listener export already used or recipient not proven exited"
         );
         // The retained process object proves the recipient of every prior
-        // capability is gone. Drop that grant; never reuse its nonce or bytes.
+        // capability is gone and readiness was never accepted. Failed drain
+        // preparation keeps the incumbent serving; a new recipient may retry
+        // it without releasing the lease or reusing the old nonce or bytes.
         bank.transfer.take();
     }
     ensure!(
