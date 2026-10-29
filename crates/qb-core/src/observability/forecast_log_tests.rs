@@ -1016,3 +1016,434 @@ fn n7_native_generation_witness_distinguishes_closed_gaps_from_live_updates() {
         log.close().unwrap();
     }
 }
+
+#[test]
+fn n7_native_window_names_are_exact_and_numeric_durations_are_bounded_u64() {
+    for name in [
+        "primary",
+        "secondary",
+        "7d_oi",
+        "7d_sonnet",
+        "5h",
+        "7d",
+        "1s",
+        "18446744073709551615s",
+        "18446744073709551615m",
+    ] {
+        assert!(window_name(name), "native name rejected: {name}");
+    }
+    for name in [
+        "Primary",
+        "primaryx",
+        " secondary",
+        "0s",
+        "000m",
+        "-1h",
+        "+1d",
+        "1.5h",
+        "1w",
+        "18446744073709551616s",
+        "000000000000000000001s",
+        "1\u{e9}",
+    ] {
+        assert!(!window_name(name), "non-native name accepted: {name}");
+    }
+}
+
+#[test]
+fn n7_diagnostics_are_static_typed_and_do_not_match_arbitrary_error_substrings() {
+    for (code, reason) in [
+        (
+            "forecast_log_window_name_invalid",
+            FailureReason::WindowName,
+        ),
+        (
+            "forecast_log_duplicate_window",
+            FailureReason::DuplicateWindow,
+        ),
+        ("forecast_log_forecast_invalid", FailureReason::Forecast),
+        ("forecast_log_timestamp_invalid", FailureReason::Timestamp),
+        ("forecast_log_invalid_identity", FailureReason::Identity),
+        (
+            "forecast_log_duplicate_account",
+            FailureReason::DuplicateAccount,
+        ),
+        ("forecast_log_log_cap", FailureReason::Bounds),
+        ("forecast_log_clock_rollback", FailureReason::Clock),
+        ("forecast_log_sequence_invalid", FailureReason::Sequence),
+        ("forecast_log_checkpoint_write", FailureReason::Storage),
+        ("forecast_log_closed", FailureReason::Closed),
+        ("forecast_log_stopped", FailureReason::Stopped),
+        ("forecast_log_observer_poisoned", FailureReason::Poisoned),
+        ("forecast_log_task_join", FailureReason::TaskJoin),
+        (
+            "forecast_log_snapshot_unavailable",
+            FailureReason::SnapshotUnavailable,
+        ),
+    ] {
+        let error = anyhow::anyhow!(code).context("private-error-detail");
+        let failure = diagnostic(&error, FailurePhase::Sample);
+        assert_eq!(
+            failure,
+            FailureDiagnostic {
+                phase: FailurePhase::Sample,
+                reason
+            }
+        );
+        let wire = serde_json::to_string(&failure).unwrap();
+        assert!(!wire.contains("private-error-detail") && !wire.contains("forecast_log_"));
+        assert_eq!(
+            serde_json::from_str::<FailureDiagnostic>(&wire).unwrap(),
+            failure
+        );
+        assert_eq!(
+            wire,
+            format!(
+                "{{\"phase\":\"sample\",\"reason\":\"{}\"}}",
+                reason.as_str()
+            )
+        );
+    }
+    let unknown = anyhow::anyhow!("private path forecast_log_window_name_invalid suffix");
+    assert_eq!(
+        diagnostic(&unknown, FailurePhase::Open).reason,
+        FailureReason::Unknown
+    );
+    let io = anyhow::Error::new(std::io::Error::other("private path/body"));
+    assert_eq!(
+        diagnostic(&io, FailurePhase::Archive).reason,
+        FailureReason::Storage
+    );
+    let original = FailureDiagnostic {
+        phase: FailurePhase::Sample,
+        reason: FailureReason::WindowName,
+    };
+    let chained = io.context(original);
+    assert_eq!(diagnostic(&chained, FailurePhase::Close), original);
+    let mut legacy = serde_json::to_value(Checkpoint::default()).unwrap();
+    legacy.as_object_mut().unwrap().remove("last_failure");
+    assert!(
+        serde_json::from_value::<Checkpoint>(legacy)
+            .unwrap()
+            .last_failure
+            .is_none()
+    );
+}
+
+#[test]
+fn n7_sample_failure_persists_exact_reason_and_later_refusals_do_not_overwrite_it() {
+    for reason in [
+        FailureReason::WindowName,
+        FailureReason::DuplicateWindow,
+        FailureReason::DuplicateAccount,
+        FailureReason::Timestamp,
+        FailureReason::Forecast,
+    ] {
+        let home = private_fixture();
+        let log = ForecastLog::open(home.path()).unwrap();
+        let mut accounts = pair(START);
+        match reason {
+            FailureReason::WindowName => {
+                accounts[0].windows[0].name = "private-invalid-window".into()
+            }
+            FailureReason::DuplicateWindow => accounts[0].windows[1].name = "5h".into(),
+            FailureReason::DuplicateAccount => accounts[1] = accounts[0].clone(),
+            FailureReason::Timestamp => {
+                accounts[0].windows[0].observed_at = Some("private-invalid-time".into())
+            }
+            FailureReason::Forecast => {
+                accounts[0].usage_forecast.earliest_window = Some("private-invalid-forecast".into())
+            }
+            _ => unreachable!(),
+        }
+        let error = log.sample(at(START), &accounts).unwrap_err();
+        let failure = diagnostic(&error, FailurePhase::Sample);
+        assert_eq!(
+            failure,
+            FailureDiagnostic {
+                phase: FailurePhase::Sample,
+                reason
+            }
+        );
+        assert_eq!(error.to_string(), format!("sample:{}", reason.as_str()));
+        let path = home.path().join("state/forecast-log/checkpoint.json");
+        let before = fs::read(&path).unwrap();
+        let checkpoint: Checkpoint = serde_json::from_slice(&before).unwrap();
+        assert_eq!(checkpoint.last_failure, Some(failure));
+        assert!(checkpoint.status.stopped);
+        assert_eq!(checkpoint.status.losses, 1);
+        assert_eq!(checkpoint.sequence, 0);
+        assert_eq!(checkpoint.status.origins, 0);
+        assert!(checkpoint.last_sample.is_none() && checkpoint.last_origin_hour.is_none());
+        let native = crate::accounts::health::tests::fixture();
+        let error = log.observe_account(&native).unwrap_err();
+        assert_eq!(
+            diagnostic(&error, FailurePhase::Observation),
+            FailureDiagnostic {
+                phase: FailurePhase::Observation,
+                reason: FailureReason::Stopped,
+            }
+        );
+        let error = log.sample(at(START), &pair(START)).unwrap_err();
+        assert_eq!(
+            diagnostic(&error, FailurePhase::Sample).reason,
+            FailureReason::Stopped
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        log.close().unwrap();
+        let closed: Checkpoint = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(closed.clean && closed.status.stopped);
+        assert_eq!(closed.last_failure, Some(failure));
+        let error = log.sample(at(START), &pair(START)).unwrap_err();
+        assert_eq!(
+            diagnostic(&error, FailurePhase::Sample).reason,
+            FailureReason::Closed
+        );
+        let reopened = ForecastLog::open(home.path()).unwrap();
+        assert!(reopened.status().unwrap().stopped); // No implicit recovery/reset.
+        assert_eq!(
+            reopened.worker.lock().unwrap().checkpoint.last_failure,
+            Some(failure)
+        );
+    }
+}
+
+#[tokio::test]
+async fn n7_native_parser_slot_names_reach_actual_runtime_views_and_log_without_invented_durations()
+{
+    use crate::{
+        account_runtime::AccountRuntime,
+        accounts::{AccountStore, Identity, Provider, Tokens},
+        bindings::BindingTable,
+        config::{Config, LinuxSecretBackend},
+        observability::Observability,
+    };
+    use std::sync::Arc;
+
+    let fixture = private_fixture();
+    let home = fixture.path().join("parser-home");
+    crate::platform::prepare_observation_directory(&home).unwrap();
+    let mut config = Config::default();
+    config.secrets.linux_backend = LinuxSecretBackend::File0600;
+    crate::platform::atomic_write_account(
+        &home,
+        &home.join("config.toml"),
+        toml::to_string(&config).unwrap().as_bytes(),
+    )
+    .unwrap();
+    let store = Arc::new(AccountStore::acquire(&home).unwrap());
+    let obs = Arc::new(Observability::new(&home, None).unwrap());
+    obs.configure_forecast(true);
+    let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
+    let bindings = BindingTable::new(&home, config.routing).unwrap();
+    let log = Arc::new(ForecastLog::open(&home).unwrap());
+    let now = Utc::now();
+    for index in 0..2 {
+        let mut native = crate::accounts::health::tests::fixture();
+        native.identity = Identity::Codex {
+            user_id: None,
+            account_id: format!("synthetic-n7-parser-{index}"),
+            email: format!("synthetic-n7-parser-{index}@example.invalid"),
+        };
+        native.id = native.identity.id();
+        native.plan = Some("plus".into());
+        native.token_meta.expires_at = Some(now + chrono::Duration::days(365));
+        let saved = store
+            .save(
+                &native,
+                &Tokens {
+                    access_token: format!("synthetic-n7-parser-access-{index}"),
+                    refresh_token: format!("synthetic-n7-parser-refresh-{index}"),
+                    id_token: None,
+                },
+                None,
+            )
+            .unwrap();
+        log.observe_account(&saved).unwrap();
+        // Actual native parser output, not a constructed DTO or guessed bucket duration.
+        let body = serde_json::to_vec(&json!({"rate_limit": {
+            "primary_window": {"used_percent":25},
+            "secondary_window": {"used_percent":50}
+        }}))
+        .unwrap();
+        let parsed = crate::quota::parse_snapshot_for_test(Provider::Codex, &body, now).unwrap();
+        let snapshot = obs.observe_poll(&saved.id, parsed, true).unwrap();
+        runtime
+            .apply_quota_snapshot(&saved.id, snapshot, None)
+            .await
+            .unwrap();
+    }
+    let views = runtime.typed_views_with_bindings(&bindings).await.unwrap();
+    assert_eq!(views.len(), 2);
+    for view in &views {
+        assert!(view.pool_eligible);
+        assert_eq!(
+            view.windows
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "secondary"]
+        );
+        assert!(view.usage_forecast.windows.is_empty());
+    }
+    let sampling = log.clone();
+    tokio::task::spawn_blocking(move || sampling.sample(now, &views))
+        .await
+        .unwrap()
+        .unwrap();
+    let origin = records(&log)
+        .into_iter()
+        .find_map(|record| match record.event {
+            Event::Origin { origin } if origin.provider == "codex" => Some(origin),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(origin.remaining, Some(1.0)); // Two accounts, each min(.75, .5).
+    assert!(origin.forecast_1h.is_none() && origin.forecast_3h.is_none());
+    assert!(origin.cohort.iter().all(|input| {
+        input.existing_forecast.windows.is_empty()
+            && input
+                .windows
+                .iter()
+                .all(|w| matches!(w.name.as_str(), "primary" | "secondary"))
+    }));
+    assert_eq!(
+        log.worker.lock().unwrap().checkpoint.last_sample,
+        Some(now.timestamp())
+    );
+    assert!(log.worker.lock().unwrap().checkpoint.last_failure.is_none());
+    store.stop_writes();
+    bindings.freeze().unwrap();
+    tokio::task::spawn_blocking(move || {
+        log.close().unwrap();
+        obs.flush().unwrap();
+    })
+    .await
+    .unwrap();
+    store.release_lease();
+}
+
+#[test]
+fn n7_legacy_empty_stop_archives_exact_bytes_and_starts_only_new_origin() {
+    for clean in [false, true] {
+        let home = private_fixture();
+        let root = home.path().join("state/forecast-log");
+        crate::platform::prepare_observation_directory(&root).unwrap();
+        let failed = Checkpoint {
+            clean,
+            status: Status {
+                stopped: true,
+                losses: 1,
+                ..Status::default()
+            },
+            ..Checkpoint::default()
+        };
+        let mut legacy = serde_json::to_value(failed).unwrap();
+        legacy.as_object_mut().unwrap().remove("last_failure");
+        legacy.as_object_mut().unwrap().remove("recovery");
+        let original = serde_json::to_vec(&legacy).unwrap();
+        crate::platform::atomic_write_observation(&root.join("checkpoint.json"), &original)
+            .unwrap();
+        let log = ForecastLog::open(home.path()).unwrap();
+        let archive = {
+            let worker = log.worker.lock().unwrap();
+            assert!(!worker.checkpoint.status.stopped);
+            assert_eq!(worker.checkpoint.status.losses, 0);
+            assert_eq!(worker.checkpoint.sequence, 0);
+            assert_eq!(worker.checkpoint.last_sample, None);
+            assert_eq!(worker.checkpoint.last_origin_hour, None);
+            assert!(worker.checkpoint.pending.is_empty());
+            let receipt = worker.checkpoint.recovery.as_ref().unwrap();
+            assert_eq!(receipt.prior_losses, 1);
+            home.path().join("state").join(&receipt.archive)
+        };
+        assert_eq!(fs::read(archive.join("checkpoint.json")).unwrap(), original);
+        // First production sampling uses now; recovery copies no earlier rows.
+        let now = Utc::now();
+        log.sample(now, &pair(now.timestamp())).unwrap();
+        let fresh = records(&log);
+        assert_eq!(fresh.len(), 2);
+        assert!(
+            fresh
+                .iter()
+                .all(|record| record.sampled_at == now.timestamp())
+        );
+        assert_eq!(log.worker.lock().unwrap().checkpoint.sequence, 2);
+        log.close().unwrap();
+        drop(log);
+        let reopened = ForecastLog::open(home.path()).unwrap();
+        assert!(!reopened.status().unwrap().stopped);
+        assert_eq!(reopened.worker.lock().unwrap().checkpoint.sequence, 2);
+        assert_eq!(
+            fs::read_dir(home.path().join("state"))
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("forecast-log.failed-"))
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(archive.join("checkpoint.json")).unwrap(), original);
+        reopened.close().unwrap();
+    }
+}
+
+#[test]
+fn n7_stopped_history_or_coded_failure_is_not_automatically_reset() {
+    for with_history in [false, true] {
+        let home = private_fixture();
+        let root = home.path().join("state/forecast-log");
+        let log = ForecastLog::open(home.path()).unwrap();
+        if with_history {
+            log.sample(at(START), &pair(START)).unwrap();
+        }
+        log.close().unwrap();
+        drop(log);
+        let mut checkpoint: Checkpoint =
+            serde_json::from_slice(&fs::read(root.join("checkpoint.json")).unwrap()).unwrap();
+        checkpoint.status.stopped = true;
+        checkpoint.status.losses = 1;
+        checkpoint.last_failure = (!with_history).then_some(FailureDiagnostic {
+            phase: FailurePhase::Sample,
+            reason: FailureReason::WindowName,
+        });
+        crate::platform::atomic_write_observation(
+            &root.join("checkpoint.json"),
+            &serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+        let reopened = ForecastLog::open(home.path()).unwrap();
+        assert!(reopened.status().unwrap().stopped);
+        assert!(!reopened.due(Utc::now()));
+        assert!(
+            reopened
+                .worker
+                .lock()
+                .unwrap()
+                .checkpoint
+                .recovery
+                .is_none()
+        );
+        assert_eq!(
+            reopened.worker.lock().unwrap().checkpoint.sequence,
+            if with_history { 2 } else { 0 }
+        );
+        assert_eq!(records(&reopened).len(), if with_history { 2 } else { 0 });
+        assert_eq!(
+            fs::read_dir(home.path().join("state"))
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("forecast-log.failed-"))
+                .count(),
+            0
+        );
+        reopened.close().unwrap();
+    }
+}
