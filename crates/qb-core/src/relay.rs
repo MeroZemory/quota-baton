@@ -386,6 +386,43 @@ impl RelayState {
         })
     }
 
+    /// Periodic log IO has its own owner; it cannot delay memory-guard sampling.
+    /// The caller aborts/awaits this task and closes the logger before lease handover.
+    pub fn start_forecast_log_sampler(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let log = self.observability.forecast_log()?;
+        let accounts = self.accounts.clone();
+        let bindings = self.bindings.clone();
+        Some(crate::boxes::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !log.due(chrono::Utc::now()) {
+                    continue;
+                }
+                match accounts.typed_views_with_bindings(&bindings).await {
+                    Ok(views) => {
+                        let writer = log.clone();
+                        let result = crate::boxes::spawn_blocking(move || {
+                            writer.sample(chrono::Utc::now(), &views)
+                        })
+                        .await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            tracing::warn!(
+                                code = "forecast_log_sample_failed",
+                                "Forecast log sample unavailable"
+                            );
+                        }
+                    }
+                    Err(()) => tracing::warn!(
+                        code = "forecast_log_views_failed",
+                        "Forecast log input snapshot unavailable"
+                    ),
+                }
+            }
+        }))
+    }
+
     #[cfg(feature = "testkit")]
     pub fn force_memory_sample_for_test(
         &self,
@@ -697,7 +734,7 @@ impl RelayState {
         );
         accounts.set_poller(&quota);
         // The lease is held and account expiry/reconciliation precedes affinity restore.
-        store.list()?;
+        let initial_accounts = store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
         accounts.attach_outside_bindings(bindings.clone());
         observability.configure_move_notice(
@@ -721,6 +758,9 @@ impl RelayState {
             bindings.set_account_threshold(id, settings.spread_threshold);
         }
         observability.configure_replay(store.home(), &config.routing_replay)?;
+        for account in &initial_accounts {
+            observability.forecast_account(account);
+        }
         Ok(Self {
             accounts,
             quota,
