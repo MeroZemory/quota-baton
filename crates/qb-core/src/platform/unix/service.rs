@@ -883,3 +883,11 @@ mod tests;
 #[cfg(test)]
 #[path = "service_http_tests.rs"]
 mod http_admin_tests;
+
+pub(crate) async fn wait_handover_ready() -> bool {
+    true
+}
+
+pub(crate) fn listener_closed(_: &'static str) {}
+
+pub(crate) async fn prepare_listener_shutdown(_: Arc<RelayState>) {}

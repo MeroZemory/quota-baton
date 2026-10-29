@@ -500,7 +500,7 @@ async fn run() -> anyhow::Result<()> {
             if takeover {
                 observability.record_takeover("listening");
             }
-            let startup_failure = qb_core::service::defer_startup_error(
+            let mut lifecycle_failure = qb_core::service::defer_startup_error(
                 box_service.start(relay.clone()).and_then(|_| {
                     qb_core::service::notify_ready().and_then(|_| {
                         qb_core::service::trace_handover_phase("ready");
@@ -512,13 +512,15 @@ async fn run() -> anyhow::Result<()> {
             let refreshing = relay.start_refresh_scheduler();
             let catalogs = relay.start_catalog_scheduler();
             let memory_guard = relay.start_memory_guard();
-            let forecast_sampler = if startup_failure.is_none() {
+            let forecast_sampler = if lifecycle_failure.is_none() {
                 relay.start_forecast_log_sampler()
             } else {
                 None
             };
-            if startup_failure.is_none() {
-                qb_core::service::wait_for_shutdown(relay.clone()).await?;
+            if lifecycle_failure.is_none() {
+                lifecycle_failure = qb_core::service::wait_for_shutdown(relay.clone())
+                    .await
+                    .err();
             }
             qb_core::service::complete_shutdown(async {
                 box_service.begin_drain();
@@ -536,9 +538,10 @@ async fn run() -> anyhow::Result<()> {
                 if let Some(sampler) = forecast_sampler {
                     let _ = sampler.await;
                 }
-                // Stop accepting new connections before handing the credential
-                // lease to the successor. Existing handlers remain alive under
-                // axum's graceful-shutdown drain.
+                // Native handover may keep these acceptors serving handover-only
+                // requests until the successor is ready. Existing handlers then
+                // remain alive under axum's graceful-shutdown drain.
+                qb_core::service::prepare_listener_shutdown(relay.clone()).await;
                 qb_core::service::trace_handover_phase("listener_shutdown_requested");
                 servers.shutdown();
                 servers.wait_for_listener_close().await;
@@ -606,7 +609,7 @@ async fn run() -> anyhow::Result<()> {
                 Ok(())
             })
             .await?;
-            if let Some(error) = startup_failure {
+            if let Some(error) = lifecycle_failure {
                 return Err(error);
             }
             qb_core::service::finish()?;

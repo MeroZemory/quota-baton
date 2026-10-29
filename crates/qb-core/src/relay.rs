@@ -1,5 +1,7 @@
 mod box_scope;
 pub(crate) mod credentials;
+#[cfg(test)]
+mod handover_tests;
 mod headers;
 mod hold;
 mod http_data;
@@ -498,6 +500,9 @@ impl RelayState {
     }
 
     pub fn release_lease_after_drain(&self) {
+        if self.lease_released.load(Ordering::Acquire) {
+            return;
+        }
         self.store.release_lease();
         self.observability.record_takeover("lease_released");
         self.lease_released.store(true, Ordering::Release);
@@ -672,6 +677,9 @@ impl RelayState {
         websocket: bool,
         model: Option<&str>,
     ) -> Response {
+        if self.is_draining() {
+            return handover_unavailable();
+        }
         if completion.record.outcome == "move_guard_hold" {
             let mut response = native_error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -699,9 +707,15 @@ impl RelayState {
             completion.usage_prepolled = true;
             self.quota.before_unavailable(provider).await;
         }
-        self.accounts
+        let response = self
+            .accounts
             .unavailable_known(provider, websocket, model)
-            .await
+            .await;
+        if self.is_draining() {
+            handover_unavailable()
+        } else {
+            response
+        }
     }
     fn memory_rejection(&self, provider: Provider) -> Option<Response> {
         // A zero limit is the deterministic test hook; production sampling is
@@ -2035,24 +2049,34 @@ fn failure(
 /// successor listener, then use its normal authenticated data route. The old
 /// process performs no account selection or token work for these requests.
 async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
-    let unavailable = || {
-        native_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            Provider::Codex,
-            "server_error",
-            "quota-baton successor is unavailable",
-        )
-    };
+    let (parts, body) = request.into_parts();
+    handover_body(
+        state,
+        parts,
+        reqwest::Body::wrap_stream(body.into_data_stream()),
+    )
+    .await
+}
+
+async fn handover_body(
+    state: Arc<RelayState>,
+    parts: axum::http::request::Parts,
+    body: reqwest::Body,
+) -> Response {
     if state.handover_port == 0
-        || request
-            .extensions()
+        || parts
+            .extensions
             .get::<crate::boxes::BoxAuthority>()
             .is_some()
+        || parts.extensions.get::<launch::LaunchIngress>().is_some()
     {
-        return unavailable();
+        return handover_unavailable();
     }
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
         state.wait_for_lease_release().await;
+        if !crate::service::wait_handover_ready().await {
+            return false;
+        }
         loop {
             match tokio::net::TcpStream::connect((
                 std::net::Ipv4Addr::LOCALHOST,
@@ -2063,17 +2087,16 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
                 Ok(socket) => {
                     let _ = socket.set_nodelay(true);
                     drop(socket);
-                    break;
+                    break true;
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
     })
     .await;
-    if ready.is_err() {
-        return unavailable();
+    if !matches!(ready, Ok(true)) {
+        return handover_unavailable();
     }
-    let (parts, body) = request.into_parts();
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
     let url = format!("http://127.0.0.1:{}{path}", state.handover_port);
     let mut headers = parts.headers;
@@ -2097,7 +2120,7 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
         .client
         .request(parts.method, url)
         .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(body)
         .send()
         .await;
     match result {
@@ -2112,8 +2135,40 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
             *relayed.headers_mut() = headers;
             relayed
         }
-        Err(_) => unavailable(),
+        Err(_) => handover_unavailable(),
     }
+}
+
+fn handover_unavailable() -> Response {
+    let mut response = native_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Provider::Codex,
+        "server_error",
+        "quota-baton successor is unavailable",
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("1"));
+    response
+}
+
+// Only the original, unsent upload may cross the core boundary. A provider
+// attempt is never replayed merely because shutdown overlapped its response.
+async fn handover_unsent(
+    state: Arc<RelayState>,
+    parts: axum::http::request::Parts,
+    body: reqwest::Body,
+    completion: &mut Completion,
+) -> Response {
+    if completion.record.attempts != 0 {
+        let response = handover_unavailable();
+        completion.outcome(response.status().as_u16(), "handover_unavailable");
+        return response;
+    }
+    completion.end_attempt();
+    let response = handover_body(state, parts, body).await;
+    completion.outcome(response.status().as_u16(), "handover");
+    response
 }
 
 #[derive(Clone, Copy)]
@@ -2419,6 +2474,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             );
         }
     };
+    if state.is_draining() {
+        return handover_unsent(state, parts, upload.body, &mut completion).await;
+    }
     let mut retained = upload.retained;
     completion.record.retained_copy = retained.is_some();
     let mut session_body = upload.prefix.clone();
@@ -2453,7 +2511,12 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             .await
         {
             Ok(managed) => managed,
-            Err(error) => return http_data::error(&mut completion, error),
+            Err(error) => {
+                if state.is_draining() {
+                    return handover_unsent(state, parts, upload.body, &mut completion).await;
+                }
+                return http_data::error(&mut completion, error);
+            }
         }
     } else {
         None
@@ -2473,6 +2536,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         .await
         .is_err()
     {
+        if state.is_draining() {
+            return handover_unsent(state, parts, upload.body, &mut completion).await;
+        }
         return native_error(
             StatusCode::CONFLICT,
             provider,
@@ -2513,6 +2579,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             )
             .await
     {
+        if state.is_draining() {
+            return handover_unsent(state, parts, upload.body, &mut completion).await;
+        }
         completion.outcome(response.status().as_u16(), "quota_wait_fallback");
         return response;
     }
@@ -2562,12 +2631,18 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             managed_http.as_ref(),
         )
         .await;
+    if state.is_draining() {
+        return handover_unsent(state, parts, upload.body, &mut completion).await;
+    }
     let account = match selection {
         Ok(Some(account)) => account,
         Ok(None) => {
             let response = state
                 .unavailable(&mut completion, provider, false, request_model.as_deref())
                 .await;
+            if state.is_draining() {
+                return handover_unsent(state, parts, upload.body, &mut completion).await;
+            }
             completion.outcome(response.status().as_u16(), "no_account");
             return response;
         }
@@ -2591,6 +2666,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         completion.binding = match state.bindings.begin_request_async(None, &account.id).await {
             Ok(lease) => Some(lease),
             Err(_) => {
+                if state.is_draining() {
+                    return handover_unsent(state, parts, upload.body, &mut completion).await;
+                }
                 return failure(
                     &mut completion,
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2627,6 +2705,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     {
         Ok(snapshot) => snapshot,
         Err(()) => {
+            if state.is_draining() {
+                return handover_unsent(state, parts, upload.body, &mut completion).await;
+            }
             return failure(
                 &mut completion,
                 StatusCode::BAD_GATEWAY,
@@ -2671,6 +2752,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 let response = state
                     .unavailable(&mut completion, provider, false, request_model.as_deref())
                     .await;
+                if completion.record.attempts == 0 && state.is_draining() {
+                    return handover_unsent(state, parts, body_to_send, &mut completion).await;
+                }
                 completion.outcome(response.status().as_u16(), "accounts_exhausted");
                 return response;
             }
@@ -2687,6 +2771,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                     tokens = refreshed;
                 }
                 Err(()) => {
+                    if completion.record.attempts == 0 && state.is_draining() {
+                        return handover_unsent(state, parts, body_to_send, &mut completion).await;
+                    }
                     return failure(
                         &mut completion,
                         StatusCode::BAD_GATEWAY,
@@ -2746,6 +2833,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             let response = state
                 .unavailable(&mut completion, provider, false, request_model.as_deref())
                 .await;
+            if completion.record.attempts == 0 && state.is_draining() {
+                return handover_unsent(state, parts, body_to_send, &mut completion).await;
+            }
             completion.outcome(response.status().as_u16(), "dispatch_revoked");
             return response;
         }

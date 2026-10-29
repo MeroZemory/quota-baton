@@ -74,6 +74,7 @@ impl Drop for HandoverListener {
     fn drop(&mut self) {
         drop(self.listener.take());
         listener_phase(self.role, self.port, "closed");
+        crate::platform::service::listener_closed(self.role);
         self.closed.send_replace(true);
     }
 }

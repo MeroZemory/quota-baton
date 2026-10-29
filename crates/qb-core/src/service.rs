@@ -6,6 +6,14 @@ pub fn trace_handover_phase(phase: &'static str) {
     tracing::info!(pid = std::process::id(), phase, "Core handover lifecycle");
 }
 
+pub(crate) async fn wait_handover_ready() -> bool {
+    crate::platform::service::wait_handover_ready().await
+}
+
+pub async fn prepare_listener_shutdown(relay: Arc<RelayState>) {
+    crate::platform::service::prepare_listener_shutdown(relay).await;
+}
+
 pub fn prepare_process() -> anyhow::Result<()> {
     crate::platform::service::prepare_process()
 }
