@@ -61,7 +61,7 @@ pub fn capture(home: &Path) -> Result<CaptureSummary> {
     drop(table);
 
     let table = BindingTable::new(home, config)?;
-    let root = home.join("state/decision-tape-v7");
+    let root = home.join("state/decision-tape-v8");
     let runtime = Shutdown(Arc::new(ReplayRuntime::start_synthetic_tape(&root, 32)?));
     table.attach_tape(
         runtime.0.clone(),
