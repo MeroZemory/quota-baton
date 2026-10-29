@@ -24,11 +24,13 @@ impl Fixture {
             });
         std::fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
-        let mut config = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        let home = root.path().join("home");
+        crate::platform::create_private_directory_new(&home).unwrap();
+        let mut config = tempfile::NamedTempFile::new_in(&home).unwrap();
         std::io::Write::write_all(&mut config, b"[secrets]\nlinux_backend = \"file-0600\"\n")
             .unwrap();
-        config.persist(root.path().join("config.toml")).unwrap();
-        let store = Arc::new(AccountStore::acquire(root.path()).unwrap());
+        config.persist(home.join("config.toml")).unwrap();
+        let store = Arc::new(AccountStore::acquire(&home).unwrap());
         let mut account = crate::accounts::health::tests::fixture();
         account.plan = Some("plus".into());
         account.token_meta.expires_at = Some(Utc::now() + Duration::days(2));
@@ -50,7 +52,7 @@ impl Fixture {
         config.upstream.codex_base = fake.url.clone();
         // Native 429 tests consume the original reply without a replay attempt.
         config.guard.retain_max_per_request_mib = 0;
-        let obs = Arc::new(Observability::new(root.path(), None).unwrap());
+        let obs = Arc::new(Observability::new(&home, None).unwrap());
         let relay =
             Arc::new(RelayState::new(store, &config, obs, Arc::new(DebugPins::default())).unwrap());
         Self {

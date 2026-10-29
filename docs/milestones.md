@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R18-window-hold 제거된 창의 quota hold 후속 관문
-목표: 최신 완전 보고로 제거된 창의 실제429 hold 해제·더 강한 상태 보존, 기존 관문 지문을 재사용해 통합 완료
+현재 마일스톤: R18-window-hold 후속 관문 완료·설치 인계
+목표: 제거된 창의 실제429 hold 복구 보완 설치; N6r 새 실제>=1h 기준·N7 7일 로그는 별도
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
-사용자 대기: 없음 (N6r v6 설치·새 실캡처는 설계 세션; N7 최초 채점11-05 13:49)
-갱신: 2026-10-29 23:00 KST (R18 WIP68b3315 재개·dev2ed0971 결합; N6r 첫 실캡처 insufficient·생산자 보완 설치 인계 완료)
+사용자 대기: 없음 (설계 세션 R18/N6r 보완 설치·새 tape export; N7 최초 채점11-05 13:49)
+갱신: 2026-10-29 23:35 KST (원본 전체 행렬·의도된RED 보존, 결합core1604·Linux22/check/strict 통과; 실계정 변경 없음)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: Resume R18-window-hold WIP68b3315 with dev2ed0971; close remaining core/Windows/Linux checks and the focused producer integration without repeating the passed original workspace matrices.  N6r-T first real hour is insufficient: 297/885 supported installed outcomes match; 588 quota refusals (66.44%) lack their inputs, and producer_failure1 has no retained subreason or InitialWitness. Both independently built source faults were actually executed, with zero supported differences and no applicable move input; power is insufficient, not passed. The bounded v6 producer repair preserves native boolean status strings and restored uncertainty, and adds checked finite diagnostic counters. Its Windows focused/contract gates and qualified Linux tests, product checks and product/selected-guard strict lints passed. The broader Linux all-targets command failed on unchanged Windows-only integration roots and remains unqualified, with raw and source-only evidence preserved. Owner installs the fix and exports another >=1h capture from state/decision-tape-v6 to verify not-comparable<=1%, encoded budget and losses; selection and actual24h remain separate. The R18 follow-up is active on impl/r18-window-hold while the owner collects another tape hour. Keep impl/r14-replay stopped and unmerged. N7-L c84076a is installed and healthy: clock starts 2026-10-29 13:49 KST, earliest scoring 2026-11-05 13:49 KST; no model work before then. R15.UI merged e4b4a132; R19 installed3788c36; R18 Parts1-3 installed1e8a4be; R2 closed. L1 defects retain priority; N12 awaits O14. Rare listener handover timeout remains a known follow-up (1034 connects/1 timeout1.015s).
+**Current S1 order**: R18-window-hold gates closed and ready for owner installation, with native RED, original workspace matrices and fingerprint reuse preserved in R18-window-hold.md. The combined core1604 suite, required8, Windows checks/build, private-fixture12 and Linux22/check/product strict checks passed; no real account was changed. N6r v6 producer repair is merged2ed0971; first real-hour verdict remains insufficient (297/885 supported,588quota66.44%,producer_failure1 without retained subreason, no applicable source-fault input). Owner installs and exports a new >=1h epoch to verify <=1% not-comparable, budget and losses. Selection and24h acceptance remain separate; impl/r14-replay stays stopped/unmerged. During capture, inspect the queued R13.G urgent-off CLI conflict/error-body follow-up without a new Series B producer unit. N7-L c84076a clock starts2026-10-29 13:49 KST, earliest scoring2026-11-05 13:49; no model work before then. R18 Parts1-3 installed1e8a4be, R19 installed3788c36, R15.UI merged e4b4a132, R2 closed. L1 defects retain priority; N12 awaits O14. Linux all-targets Windows-only integration-root compile failures and rare listener handover timeout remain qualified known follow-ups.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
