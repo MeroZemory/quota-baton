@@ -1,70 +1,27 @@
 # Linux headless service
 
-The P2 service is qualified on Ubuntu 24.04 with systemd 255 in a synthetic
-container: startup, status, same-PID reload, crash restart and intentional stop.
-Server login, per-box access and real-server reboot acceptance remain P3–P5.
+quota-baton runs a shared Claude and Codex account proxy under systemd. The
+supplied units keep the data port at `127.0.0.1:10200` and the host admin port at
+`127.0.0.1:10201`.
 
-## Managed lifecycle
+## Install
 
-With QB_SYSTEMD_MANAGED=1, validate LISTEN_PID=self, exactly two listening stream
-FDs 3/4, distinct names data/admin and exact configured loopback endpoints. Map
-by name, never ordering across separate socket units. Reject malformed activation;
-do not fall back to bind. Defaults here are 127.0.0.1:10200 and :10201. Emit real
-READY=1 only after both listeners and application initialization are ready.
+Use Ubuntu 24.04 or newer with systemd 255 or newer, and a release binary built
+for your machine's architecture and glibc. A Debian 13 glibc 2.41 binary is not
+assumed to run on Ubuntu 24.04 glibc 2.39. Qualification evidence and lifecycle
+details are in [Linux service internals](linux-internals.md#qualification-and-limits).
 
-Managed `serve --takeover` must dispatch early to a bounded authenticated HTTP
-helper, not acquire the store lease or become a foreground server. Read only the
-existing private admin token, without logging it; use loopback without proxies.
-Record authenticated health.started_at and PID, request reload once, and succeed
-only after started_at changes, PID stays equal and new readiness is real. Reject
-overlap/stopping. The helper deadline is 55 seconds, below the unit's 90-second
-reload timeout. A timeout reports failure; it does not imply cancellation.
+Extract your downloaded release tarball and enter its directory. Replace the
+example filename with your artifact's name; the directory must contain
+`quota-baton` and `packaging/linux/`.
 
-The main process completes ordinary admission stop, accepted-work drain, scheduler
-and login cancellation, durable shutdown refreshes and binding/replay/observability
-flushes BEFORE exec. Retain original validated bank FDs 3/4, CLOEXEC during normal
-execution; clear CLOEXEC only on these originals immediately before exec. Server
-duplicates close; never shutdown() a shared listening socket. Restore LISTEN_PID,
-LISTEN_FDS=2 and matching LISTEN_FDNAMES, retaining systemd credential/runtime env.
-Exec the absolute ORIGINAL argv[0], `/usr/local/bin/quota-baton`, with `serve`.
-Never use current_exe()/proc/self/exe after atomic replacement: it can refer to
-the old deleted inode. New initialization must emit actual READY again.
+```bash
+tar -xzf /path/to/quota-baton-release.tar.gz
+cd /path/to/extracted-release
+```
 
-Exec refusal after cleanup exits nonzero for Restart=on-failure; helper fails.
-Failed initialization or fallback restart changing PID also fails the helper.
-Inspect state after helper timeout: an accepted request can still be draining or
-completing. The helper deadline never cancels durable cleanup. A 45-second reload
-budget prohibits re-exec after that budget, but login cancellation, token-save
-retry and durable binding/observation flush finish while the lease remains held
-before failure is reported. Storage failure can therefore keep shutdown waiting;
-fix the storage problem instead of forcing success. The unit's 35-minute stop
-limit is an administrator kill boundary, not a guarantee that arbitrary failed
-storage will recover. Never skip flushes to meet a timeout.
-Standalone Linux behavior and Windows behavior remain unchanged.
-
-## Socket lifetime and stop policy
-
-Enable ONLY the service. Its Requires/After and Sockets explicitly bring up both
-listeners. Each socket has one-way PartOf=service, propagating stop/restart but
-not reload. Neither socket requires or orders itself after the service: sockets
-already order before it, so such reverse ordering would create a cycle.
-NonBlocking belongs on the service. No independent sockets.target enablement.
-
-Do not add BindsTo=service, which would close listeners on spontaneous service
-loss, or StopWhenUnneeded=yes, which could discard the bank during recovery.
-Reload leaves socket units open; restart restarts them. Backlog=4096 is finite
-and kernel-capped. This is not a guarantee for every connection or active stream.
-
-The systemd 255 gate verified service-only stop under continuous connections:
-both sockets became inactive and later connects did not reactivate the service.
-Maintenance commands below explicitly stop all three units in one transaction.
-
-## Installation after qualification
-
-Run from a qualified release directory containing `./quota-baton` and
-`packaging/linux/`. Use an Ubuntu 24.04-compatible artifact; a Debian 13 glibc 2.41
-binary is not assumed compatible with Ubuntu 24.04 glibc 2.39. These first-time
-account/credential steps must not replace an existing master key on upgrade.
+For a first installation, create the service user and encrypt a new master key.
+Do this once: keep the existing key and state when upgrading.
 
 ```bash
 sudo useradd --system --user-group --home-dir /var/lib/quota-baton \
@@ -83,12 +40,14 @@ ln -- "$candidate_dir/qb-master-key" /etc/credstore.encrypted/qb-master-key
 QB_PROVISION
 ```
 
-Exactly 32 RAW random bytes go directly to encryption: no hex/base64 encoding,
-passphrase or added newline. Only ciphertext is staged. Linking refuses an
-existing destination. Explicit host-key encryption works without TPM and does
-not claim TPM protection; a production TPM policy needs tested provisioning.
-Never use an absent-key fallback. Preserve the encrypted credential and host
-secret under the deployment's backup policy. No plaintext enters argv or env.
+The key is exactly 32 raw random bytes, with no encoding or newline. Only
+ciphertext is staged, and the final link refuses to replace an existing key.
+Host-key encryption works without a TPM; it does not provide TPM protection.
+Back up the encrypted credential, the systemd host secret and service state
+under your deployment's backup policy. Keep keys and tokens out of arguments,
+environment variables and logs.
+
+Install the binary and units, then start the service:
 
 ```bash
 sudo install -o root -g root -m 0755 ./quota-baton /usr/local/bin/quota-baton
@@ -100,6 +59,16 @@ sudo systemd-analyze verify /etc/systemd/system/quota-baton.service \
   /etc/systemd/system/quota-baton-admin.socket
 sudo systemctl daemon-reload
 sudo systemctl enable --now quota-baton.service
+```
+
+Enable only the service; it starts both sockets. Systemd keeps state in
+`/var/lib/quota-baton` and runtime files in `/run/quota-baton`, with private
+0700 directories, and delivers the decrypted key through its credential directory.
+The direct binary install above assumes there is no running installation.
+
+Check all three units and the application:
+
+```bash
 for unit in quota-baton.service quota-baton-data.socket quota-baton-admin.socket; do
   sudo systemctl is-active --quiet "$unit" || exit 1
 done
@@ -108,16 +77,12 @@ sudo -u quota-baton env QB_HOME=/var/lib/quota-baton \
   /usr/local/bin/quota-baton status
 ```
 
-Systemd creates private state/runtime directories mode 0700, UMask=0077, and
-delivers the decrypted credential in its private credential directory. Do not
-print keys/tokens or put them into command arguments. Never enable either socket
-separately. The direct binary install above assumes no running installation.
+## Upgrade
 
-## Binary upgrade and bounded reload
-
-Only one administrator upgrades at a time. Use a qualified binary supporting the
-same endpoint/configuration contract. Save the previous binary and atomically
-replace its installed name on the same filesystem, never overwrite in place:
+Use a compatible release with the same endpoint configuration. Have one
+administrator perform the upgrade at a time. From the new release directory,
+save the old binary and replace the installed name atomically on the same
+filesystem:
 
 ```bash
 sudo cp --preserve=mode,ownership,timestamps -- /usr/local/bin/quota-baton \
@@ -133,98 +98,65 @@ sudo -u quota-baton env QB_HOME=/var/lib/quota-baton \
   /usr/local/bin/quota-baton status
 ```
 
-Equal PID alone proves nothing: native helper success requires changed authenticated
-started_at and readiness. A binary replacement needs no daemon-reload. Changed
-units/endpoints/policy require separately qualified maintenance stop/start; restart
-is not a reload and does not promise socket continuity.
+Reload success checks that the new application is ready with the same PID.
+Listeners stay open, but active streams and every connection are not guaranteed
+to survive. A binary swap needs no `daemon-reload`. Unit, endpoint or policy
+changes need a separately validated maintenance stop/start. If reload fails,
+inspect the service before retrying; see [recovery](linux-internals.md#intentional-stop-and-recovery).
 
-## Intentional stop and recovery
+## Log in without a server browser
 
-```bash
-sudo systemctl stop quota-baton.service quota-baton-data.socket quota-baton-admin.socket
-for unit in quota-baton.service quota-baton-data.socket quota-baton-admin.socket; do
-  state=$(sudo systemctl show "$unit" -p ActiveState --value)
-  test "$state" = inactive || exit 1
-done
-```
-
-Both ports must refuse connections without reactivation; prove it in the actual
-gate, including service-only stop. Also `sudo systemctl disable quota-baton.service`
-to keep it off after boot. Resume with `sudo systemctl start quota-baton.service`;
-its requirements start both sockets.
-
-After failed-upgrade inspection, perform the full stop above before rollback:
+Start the service first. Run login as the service user with its data home:
 
 ```bash
-sudo install -o root -g root -m 0755 /usr/local/bin/.quota-baton.previous \
-  /usr/local/bin/.quota-baton.next
-sudo mv -T -- /usr/local/bin/.quota-baton.next /usr/local/bin/quota-baton
-if sudo systemctl is-failed --quiet quota-baton.service; then
-  sudo systemctl reset-failed quota-baton.service
-fi
-sudo systemctl start quota-baton.service
-for unit in quota-baton.service quota-baton-data.socket quota-baton-admin.socket; do
-  sudo systemctl is-active --quiet "$unit" || exit 1
-done
+sudo -u quota-baton env QB_HOME=/var/lib/quota-baton \
+  /usr/local/bin/quota-baton accounts login claude --no-browser
+sudo -u quota-baton env QB_HOME=/var/lib/quota-baton \
+  /usr/local/bin/quota-baton accounts login codex --no-browser
 ```
 
-Keep key/state unchanged. The previous binary must understand current durable
-data; this does not claim schema downgrade compatibility.
+For Claude, open the printed authorization URL on a computer with a browser.
+Paste the displayed code, including its state suffix, into the waiting CLI.
 
-## Browserless account login
-
-Start the managed service first. From a host terminal, run the CLI as its service
-user with the same data home. It uses the authenticated admin API; a standalone
-login additionally needs credential delivery and the account store's exclusive
-lease. The server creates its own OAuth sessions: do not transfer the PC's
-account store, and keep the designated PC-only Codex login on the PC.
-
-```bash
-sudo -u quota-baton env QB_HOME=/var/lib/quota-baton /usr/local/bin/quota-baton accounts login claude --no-browser
-sudo -u quota-baton env QB_HOME=/var/lib/quota-baton /usr/local/bin/quota-baton accounts login codex --no-browser
-```
-
-Codex defaults to device-code login: open the printed verification URL on a
-computer with a browser and enter the displayed user code. The core polls at the
-server's interval and shows the remaining expiry, at most fifteen minutes. It
-does not automatically request another code after expiry or a rate limit.
+Codex defaults to device-code login. Open the printed verification URL on a
+computer with a browser and enter the user code. Complete login before the
+shown expiry, at most fifteen minutes. No new code is requested automatically
+after expiry or a rate limit.
 
 If device-code login is unavailable, enable it in your personal ChatGPT Security
-settings, or ask your workspace admin to allow it. You can press Enter while
-waiting to switch immediately to paste-redirect login; unavailable or rate-limited
-starts also offer this fallback. The old login is cancelled and checked first.
-If it completed just before cancellation, the CLI reports success instead of
-starting another login.
-
-For the Codex paste fallback, open its authorization URL and copy the final
+settings or ask your workspace admin to allow it. Press Enter while waiting to
+switch to paste-redirect login; unavailable or rate-limited starts also offer
+this fallback. Open the fallback authorization URL, then copy the final
 `http://localhost:1455/auth/callback?...` address from the browser address bar,
-even if that local page cannot connect, then paste it into the waiting CLI.
-Claude continues to use its authorization URL and displayed code (including the
-state suffix). Neither paste flow needs a callback listener on the headless core.
-Treat pasted codes and final redirect URLs as secrets; do not put them into shell
-commands, tickets or logs. The device user code is displayed only for this login;
-access and refresh tokens are never printed.
+even if that page cannot connect. Paste it into the waiting CLI.
 
-Each paste login expires after ten minutes and accepts one submission. State and
-PKCE checks are shared with the browser flow. Invalid or reused input requires a
-new login. An explicitly requested paste fallback gets a new ten-minute budget;
-device polling never extends the device code's expiry. Ctrl+C cancels the pending
-login and releases a standalone CLI's account-store lease.
-If standard input closes without a code, the CLI cancels the pending login and
-says that no code was entered and account information was unchanged once
-cancellation is confirmed. If authentication completed first, it reports success.
-The usual login without `--no-browser` retains the browser and loopback callback
-flow.
+Paste login needs no callback listener on the server. It expires after ten
+minutes and accepts one submission; invalid or reused input needs a new login.
+Ctrl+C cancels a pending login. Treat codes and final redirect URLs as secrets;
+do not paste them into shell commands or logs. The server creates its own
+sessions: do not copy a PC's account store, and leave any designated PC-only
+Codex login on that PC.
 
-## Per-box keys and optional listeners
+## Give each box its own key
 
-A box is identified by its own client key. Enrollment does not require a
-listener declaration. A key-only box can authenticate on the core's existing
-loopback data port; the admin port always requires the host admin credential.
-Keep that port private to the host unless a separately trusted proxy exposes it.
+Use the authenticated host admin API from your orchestrator. Enrollment needs
+only a name; a listener declaration is optional.
 
-For an Incus system container, declare its optional Unix listener in the host
-configuration before enrolling it:
+| Method and path | Operation |
+| --- | --- |
+| `GET /admin/v1/boxes` | List names, epochs and revocation state, without keys. |
+| `POST /admin/v1/boxes` | Enroll `{"name":"sample-box"}` and return its key once. |
+| `POST /admin/v1/boxes/sample-box/launches` | Register a Codex launch with the usual launch options and return its scoped lease URL. |
+
+Keep the enrollment response private. Deliver only that box's key and scoped
+lease URL to it; keep the admin credential on the host. A box-scoped lease also
+requires its box's key. Claude uses its box key on the regular data routes.
+A key-only box can use the existing loopback data port through a trusted proxy.
+Keep both host ports private; the admin port always requires the host credential.
+
+For an Incus system container, add this optional listener to
+`/var/lib/quota-baton/config.toml` before enrollment. Apply the configuration
+with a maintenance stop/start using the [stop steps](linux-internals.md#intentional-stop-and-recovery):
 
 ```toml
 [[boxes]]
@@ -232,9 +164,9 @@ name = "sample-box"
 listen = "unix"
 ```
 
-The managed service creates `/run/quota-baton/boxes/sample-box.sock` when that
-name is enrolled. The socket accepts only that box's key. Through an Incus proxy,
-the client still uses a loopback URL and sends its own key:
+When the name is enrolled, the managed service creates
+`/run/quota-baton/boxes/sample-box.sock`, which accepts only that box's key.
+On the Incus host, add the proxy device:
 
 ```bash
 incus config device add sample-box qb proxy \
@@ -242,49 +174,57 @@ incus config device add sample-box qb proxy \
   connect=unix:/run/quota-baton/boxes/sample-box.sock bind=instance
 ```
 
-`bind=instance` puts the listening TCP endpoint inside the container. Keep its
-visible port equal to the configured data port so Host validation stays exact.
-`listen = "tcp:127.0.0.1:<port>"` is reserved for later VM support; this build
-refuses that listener kind rather than silently substituting another transport.
+`bind=instance` puts the TCP listener inside the container. Its client uses
+`http://127.0.0.1:10200` and sends its own key. Keep the visible port equal to the
+configured data port for Host validation. Per-box `listen = "tcp:127.0.0.1:<port>"`
+is reserved for VM support and is refused by this build.
 
-The orchestrator uses the authenticated host admin API:
+## Revoke a box
 
-| Method and path | Operation |
-| --- | --- |
-| `GET /admin/v1/boxes` | List names, epochs and revocation state; never keys. |
-| `POST /admin/v1/boxes` | Enroll `{"name":"sample-box"}`; return its key once. |
-| `POST /admin/v1/boxes/sample-box/revoke` | Revoke this epoch and close its active streams. |
-| `POST /admin/v1/boxes/sample-box/launches` | Register a Codex launch using the usual launch options; return its scoped lease URL. |
+Send `POST /admin/v1/boxes/sample-box/revoke` through the authenticated host admin
+API. This revokes the current epoch, blocks new requests and interrupts its
+active response streams and upgrades. Already admitted durable credential writes
+finish. An idle keepalive may stay open, but subsequent requests are refused.
 
-Store the enrollment response privately and deliver only the box's own client
-key and lease URL to that box. Do not put keys in command arguments, shell
-history or logs. A lease issued for one box cannot be used by another box or an
-ordinary global client. Claude can use its box key on the regular data routes.
-The orchestrator retains the admin credential; boxes never need it.
+## Uninstall
 
-An authenticated box may send `x-qb-root-session` as a placement preference.
-Normal eligibility and capacity rules still apply, and the header is removed
-before forwarding upstream. A header alone never establishes box identity.
-Revocation stops fresh admission and interrupts the revoked box's response
-streams and upgrades, while already admitted durable credential writes finish
-under the retained service lease. An idle shared HTTP keepalive may remain open;
-every subsequent request must authenticate again and is refused after revocation.
+Stop all three units and disable the service before removing its files:
 
-## Qualification and limits
+```bash
+sudo systemctl stop quota-baton.service quota-baton-data.socket quota-baton-admin.socket || exit 1
+sudo systemctl disable quota-baton.service
+sudo rm -f -- /etc/systemd/system/quota-baton.service \
+  /etc/systemd/system/quota-baton-data.socket \
+  /etc/systemd/system/quota-baton-admin.socket
+sudo systemctl daemon-reload
+sudo rm -f -- /usr/local/bin/quota-baton \
+  /usr/local/bin/.quota-baton.previous /usr/local/bin/.quota-baton.next
+```
 
-The P2 fixture used systemd 255 and glibc 2.39. Reload retained the same PID and
-InvocationID, changed authenticated health.started_at and loaded the replacement
-installed pathname. Each loopback port had 2,380 successful connects and zero
-failures over 25 seconds. The replacement used the same ELF plus an inert trailing
-marker to isolate re-exec ownership; this does not certify schema downgrades,
-arbitrary upgrades or uninterrupted active streams. The gate also verified crash
-restart, missing-credential refusal/recovery and service-only stop under load.
-Real-server login, per-box access and reboot acceptance remain separate.
+If you added the example Incus device, remove it with
+`incus config device remove sample-box qb`. These steps retain the service user,
+`/var/lib/quota-baton` and `/etc/credstore.encrypted/qb-master-key` for recovery.
+Delete them separately only when you intend to discard the stored accounts.
+Do not delete a shared systemd host secret.
 
-Primary sources: [socket units](https://www.freedesktop.org/software/systemd/man/255/systemd.socket.html),
-[unit dependencies](https://www.freedesktop.org/software/systemd/man/255/systemd.unit.html),
-[service readiness/reload and socket flags](https://www.freedesktop.org/software/systemd/man/255/systemd.service.html),
-[activation FDs](https://www.freedesktop.org/software/systemd/man/255/sd_listen_fds.html),
-[credential/directory handling](https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html),
-[credential encryption](https://www.freedesktop.org/software/systemd/man/255/systemd-creds.html),
-and [v255 socket stop-job check](https://github.com/systemd/systemd/blob/v255/src/core/socket.c).
+## Troubleshooting
+
+```bash
+sudo systemctl status quota-baton.service quota-baton-data.socket quota-baton-admin.socket
+sudo journalctl -u quota-baton.service -n 100 --no-pager
+```
+
+If startup fails, check the release's architecture/glibc compatibility, the unit
+verification output and credential provisioning. A missing credential must fail
+startup; do not generate a replacement key for an existing account store.
+
+If reload times out, inspect the journal and application status before retrying.
+The accepted reload may still be draining or saving state. Fix storage failures
+so durable writes can finish. See [reload internals](linux-internals.md#managed-lifecycle)
+and the [stop and rollback steps](linux-internals.md#intentional-stop-and-recovery).
+Rollback requires a binary that understands the current durable data.
+
+If a box cannot connect, check enrollment, its listener declaration, the Incus
+device's `bind=instance` setting, the visible data port and the box's own key.
+For login problems, try the Codex paste fallback or start a new paste session
+after invalid input or expiry. Keep secrets out of any shared diagnostic output.
