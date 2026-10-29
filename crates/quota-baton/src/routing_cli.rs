@@ -1,6 +1,34 @@
 use clap::Subcommand;
 use std::{path::Path, time::Duration};
 
+const ERROR_BODY_LIMIT: usize = 8192;
+const ERROR_MESSAGE_LIMIT: usize = 512;
+const REQUEST_BUDGET: Duration = Duration::from_secs(10);
+const HANDOFF_DELAYS: [Duration; 4] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
+
+#[derive(Debug)]
+pub(crate) struct RoutingCliError {
+    status: u16,
+    reason: String,
+}
+
+impl std::fmt::Display for RoutingCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "계정 전환 정책 요청을 완료하지 못했습니다 (마지막 HTTP {}): {}",
+            self.status, self.reason
+        )
+    }
+}
+
+impl std::error::Error for RoutingCliError {}
+
 #[derive(Subcommand)]
 pub enum RoutingCommand {
     #[command(about = "프로젝트와 루트 세션의 계정 전환 정책을 확인합니다")]
@@ -63,10 +91,7 @@ pub async fn run(
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(crate::accounts_cli::AccountCliError(
-                "기존 세션 정책을 조회하지 못했습니다.",
-            )
-            .into());
+            return Err(response_error(response, &secrets.admin_token).await.into());
         }
         let value = routing_value(&response.bytes().await?)?;
         Some(
@@ -165,31 +190,137 @@ async fn send_request(
     admin_token: &str,
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let is_read = body.is_none();
-    let response = if let Some(body) = body {
-        client
-            .post(url)
-            .bearer_auth(admin_token)
-            .json(&body)
-            .send()
-            .await?
-    } else {
-        client.get(url).bearer_auth(admin_token).send().await?
-    };
-    if !response.status().is_success() {
-        return Err(crate::accounts_cli::AccountCliError(
-            "계정 전환 정책 요청이 거절되었습니다. 코어 버전과 식별자·대기 시간을 확인해 주세요.",
-        )
-        .into());
-    }
-    let bytes = response.bytes().await?;
-    let value: serde_json::Value = if is_read {
-        routing_value(&bytes)?
-    } else {
-        serde_json::from_slice(&bytes)?
-    };
+    let value = request_value(client, url, admin_token, body.as_ref(), &HANDOFF_DELAYS).await?;
     crate::print_stdout(format_args!("{}", serde_json::to_string_pretty(&value)?))?;
     Ok(())
+}
+
+async fn request_value(
+    client: &reqwest::Client,
+    url: &str,
+    admin_token: &str,
+    body: Option<&serde_json::Value>,
+    retry_delays: &[Duration],
+) -> anyhow::Result<serde_json::Value> {
+    let is_read = body.is_none();
+    // Urgency sets one absolute value. Other mutations may create a project or
+    // carry an inherited setting, so they must not be replayed automatically.
+    let retry_urgent = body.is_some_and(|body| {
+        body["kind"] == "urgent"
+            && body["id"].as_str().is_some_and(|id| !id.is_empty())
+            && matches!(body["on_5h_limit"].as_str(), Some("wait" | "move"))
+    });
+    let deadline = tokio::time::Instant::now() + REQUEST_BUDGET;
+    let mut retries = retry_delays.iter();
+    let mut last_conflict: Option<RoutingCliError> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(match last_conflict {
+                Some(error) => error.into(),
+                None => crate::accounts_cli::AccountCliError(
+                    "정책 요청 대기 시간이 지났습니다. 코어 상태를 확인해 주세요.",
+                )
+                .into(),
+            });
+        }
+        let request = match body {
+            Some(body) => client.post(url).json(body),
+            None => client.get(url),
+        };
+        // A retry must connect to the successor, not keep using the incumbent's
+        // draining keep-alive connection. Never retry an ambiguous send error.
+        let response = request
+            .header(reqwest::header::CONNECTION, "close")
+            .bearer_auth(admin_token)
+            .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if retry_urgent && error.is_connect() => {
+                // After a confirmed handoff refusal the old listener may close
+                // before the successor binds. A connect failure sent no HTTP
+                // bytes, so the same absolute edit can safely wait for it.
+                if let Some(conflict) = last_conflict.take() {
+                    if let Some(delay) = retries.next()
+                        && *delay < deadline.saturating_duration_since(tokio::time::Instant::now())
+                    {
+                        last_conflict = Some(conflict);
+                        tokio::time::sleep(*delay).await;
+                        continue;
+                    }
+                    return Err(conflict.into());
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if response.status().is_success() {
+            let bytes = response.bytes().await?;
+            return if is_read {
+                routing_value(&bytes)
+            } else {
+                Ok(serde_json::from_slice(&bytes)?)
+            };
+        }
+        let conflict = response.status() == reqwest::StatusCode::CONFLICT;
+        let error = response_error(response, admin_token).await;
+        if retry_urgent
+            && conflict
+            && let Some(delay) = retries.next()
+            && *delay < deadline.saturating_duration_since(tokio::time::Instant::now())
+        {
+            last_conflict = Some(error);
+            tokio::time::sleep(*delay).await;
+            continue;
+        }
+        return Err(error.into());
+    }
+}
+
+async fn response_error(mut response: reqwest::Response, admin_token: &str) -> RoutingCliError {
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    let readable = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= ERROR_BODY_LIMIT - bytes.len() => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break true,
+            _ => break false,
+        }
+    };
+    let message = readable
+        .then(|| {
+            serde_json::from_slice::<qb_proto::admin_error::AdminErrorReply>(&bytes)
+                .map(|reply| reply.error.message)
+                .or_else(|_| {
+                    serde_json::from_slice::<qb_proto::admin_error::HttpErrorReply>(&bytes)
+                        .map(|reply| reply.error.message)
+                })
+                .ok()
+        })
+        .flatten();
+    let message = message
+        .map(|message| {
+            let redacted = if admin_token.is_empty() {
+                message
+            } else {
+                message.replace(admin_token, "<redacted>")
+            };
+            let bounded: String = redacted
+                .chars()
+                .take(ERROR_MESSAGE_LIMIT)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            bounded.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        .filter(|message| !message.is_empty());
+    RoutingCliError {
+        status,
+        reason: message.unwrap_or_else(|| "코어 오류 응답을 확인하지 못했습니다.".into()),
+    }
 }
 
 // Validate the complete GET graph before existing Value-based presentation.
@@ -213,6 +344,8 @@ fn current_wait(value: &serde_json::Value, id: &str) -> Option<u64> {
         .or_else(|| value["defaults"]["reset_wait_secs"].as_u64())
         .filter(|n| *n <= 120)
 }
+#[cfg(test)]
+mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
