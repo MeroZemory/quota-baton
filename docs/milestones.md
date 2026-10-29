@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N7-L 독립 producer 관문 (N6r-T Unit1 insufficient·병합 없음)
-목표: native 예측 입력·정시 관측 로그를 설치 가능한 독립 단위로 검증하고 7일 log 전 모델 작업을 하지 않기
+현재 마일스톤: N7-L 관문 완료·설치 인계 (다음 N6r-T raw-fact/permit slice1)
+목표: 설치 후 7일 관측 log를 모으는 동안 채택된 N6r-T slice1을 진행; 모델 작업은 7일 log 뒤
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
 사용자 대기: 없음
-갱신: 2026-10-29 06:21 KST (N6r-T 실제 두 artifact paired insufficient·재생 수 null·WIP 보존; N7-L 독립 관문 다음)
+갱신: 2026-10-29 09:08 KST (N7-L Windows/Linux 관문 완료·기존 takeover 실패 보존; N6r-T Unit1 insufficient 유지)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: N6r-T Unit1 closed with an actual paired insufficient verdict: ten captured decisions/one observed move/loss0; both evaluator builds refused all ten incomplete inputs, identity/power unavailable and replayed move totals null. Preserve impl/n6r-tape without merge; no further N6r work until the design session adopts the required stagnation review. Old impl/r14-replay remains stopped. Next independent node: N7-L on impl/n7-log, a small durable producer gate; no model work before seven days of logs. R15.UI merged e4b4a132 and handed off for install. R19 installed3788c36; R18 installed; R2 closed. L1 fix briefs retain priority; N12 unready.
+**Current S1 order**: N7-L installable producer gate is complete; installation and the seven-day log clock belong to S2. No N7 model work before seven days of logs. Next on impl/n6r-tape: the adopted shared raw-fact DecisionInputs kernel and permit entry, old/kernel side-by-side before switching, identity on the dated fixture and a scripted hour, and two independent candidate power faults. Selection is slice2. Unit1 remains an accepted insufficient verdict: ten captured decisions/one observed move/loss0; both evaluator builds refused all ten incomplete inputs and replayed move totals remain null. Do not merge that WIP or continue old impl/r14-replay. R15.UI merged e4b4a132 and handed off for install. R19 installed3788c36; R18 installed; R2 closed. L1 fix briefs retain priority; N12 unready.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 

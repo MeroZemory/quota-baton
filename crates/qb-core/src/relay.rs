@@ -369,8 +369,6 @@ impl RelayState {
     pub fn start_memory_guard(&self) -> tokio::task::JoinHandle<()> {
         let guard = self.memory_guard.clone();
         let obs = self.observability.clone();
-        let accounts = self.accounts.clone();
-        let bindings = self.bindings.clone();
         crate::boxes::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -384,30 +382,45 @@ impl RelayState {
                     crate::guard::MemoryGuardTransition::Off => obs.record_guard("guard_off"),
                     crate::guard::MemoryGuardTransition::Unchanged => {}
                 }
-                if let Some(log) = obs.forecast_log()
-                    && log.due(chrono::Utc::now())
-                {
-                    match accounts.typed_views_with_bindings(&bindings).await {
-                        Ok(views) => {
-                            let result = crate::boxes::spawn_blocking(move || {
-                                log.sample(chrono::Utc::now(), &views)
-                            })
-                            .await;
-                            if !matches!(result, Ok(Ok(()))) {
-                                tracing::warn!(
-                                    code = "forecast_log_sample_failed",
-                                    "Forecast log sample unavailable"
-                                );
-                            }
-                        }
-                        Err(()) => tracing::warn!(
-                            code = "forecast_log_views_failed",
-                            "Forecast log input snapshot unavailable"
-                        ),
-                    }
-                }
             }
         })
+    }
+
+    /// Periodic log IO has its own owner; it cannot delay memory-guard sampling.
+    /// The caller aborts/awaits this task and closes the logger before lease handover.
+    pub fn start_forecast_log_sampler(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let log = self.observability.forecast_log()?;
+        let accounts = self.accounts.clone();
+        let bindings = self.bindings.clone();
+        Some(crate::boxes::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !log.due(chrono::Utc::now()) {
+                    continue;
+                }
+                match accounts.typed_views_with_bindings(&bindings).await {
+                    Ok(views) => {
+                        let writer = log.clone();
+                        let result = crate::boxes::spawn_blocking(move || {
+                            writer.sample(chrono::Utc::now(), &views)
+                        })
+                        .await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            tracing::warn!(
+                                code = "forecast_log_sample_failed",
+                                "Forecast log sample unavailable"
+                            );
+                        }
+                    }
+                    Err(()) => tracing::warn!(
+                        code = "forecast_log_views_failed",
+                        "Forecast log input snapshot unavailable"
+                    ),
+                }
+            }
+        }))
     }
 
     #[cfg(feature = "testkit")]

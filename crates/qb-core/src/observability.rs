@@ -291,12 +291,21 @@ impl Observability {
             return Ok(());
         }
         let mut slot = self.replay.lock().unwrap_or_else(|e| e.into_inner());
-        anyhow::ensure!(slot.is_none(), "routing_replay_already_configured");
+        anyhow::ensure!(
+            slot.is_none()
+                && self
+                    .forecast_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none(),
+            "routing_replay_already_configured"
+        );
         match forecast_log::ForecastLog::open(home) {
             Ok(log) => {
                 if let Ok(status) = log.status() {
                     tracing::info!(
                         code = "forecast_log_open",
+                        stopped = status.stopped,
                         origins = status.origins,
                         losses = status.losses,
                         "Forecast log restored"
@@ -720,7 +729,7 @@ impl Observability {
         );
         #[cfg(all(feature = "shape-capture", debug_assertions))]
         let capture = capture.map(crate::capture::Capture::new).transpose()?;
-        fs::create_dir_all(home.join("state"))?;
+        crate::platform::prepare_observation_directory(&home.join("state"))?;
         fs::create_dir_all(home.join("ledger"))?;
         prune(&home.join("ledger"));
         // 손상된 캐시는 격리하고 빈 상태로 시작한다. 원문 오류는 로그에 남기지 않는다.

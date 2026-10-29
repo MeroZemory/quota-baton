@@ -47,12 +47,18 @@ struct User {
     provider: String,
     state: AdminUserState,
     drain: bool,
+    allow_credits: bool,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Users {
     accounts: BTreeMap<String, User>,
     revisions: BTreeMap<String, u64>,
+    // Missing legacy witnesses remain unknown, never an invented generation zero.
+    #[serde(default)]
+    generations: BTreeMap<String, u64>,
+    #[serde(skip)]
+    session_seen: BTreeSet<String>,
     losses: u64,
 }
 impl Users {
@@ -110,6 +116,7 @@ struct Input {
     user_state: AdminUserState,
     native_usable: bool,
     drain: bool,
+    allow_credits: bool,
     probe_pending: bool,
     refresh_attention: bool,
     takeover_pending: bool,
@@ -263,7 +270,7 @@ impl ForecastLog {
             now.timestamp() >= next || now.timestamp() < next.saturating_sub(60)
         }
     }
-    /// Store observer; bounded memory only. Do not include automatic health or token generation.
+    /// Store observer; bounded memory only. Generation checks continuity only on first observation.
     pub fn observe_account(&self, account: &crate::accounts::Account) -> Result<()> {
         self.account_state(
             &account.id,
@@ -274,6 +281,8 @@ impl ForecastLog {
                 crate::accounts::UserState::Disabled => AdminUserState::Disabled,
             },
             account.drain,
+            account.allow_credits,
+            Some(account.generation),
         )
     }
     fn account_state(
@@ -282,6 +291,8 @@ impl ForecastLog {
         provider: &str,
         state: AdminUserState,
         drain: bool,
+        allow_credits: bool,
+        generation: Option<u64>,
     ) -> Result<()> {
         ensure!(
             !self.closed.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
@@ -295,16 +306,30 @@ impl ForecastLog {
             !self.closed.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
             "forecast_log_not_open"
         );
-        let result = users.put(
-            id,
-            User {
-                provider: provider.into(),
-                state,
-                drain,
-            },
-        );
+        let user = User {
+            provider: provider.into(),
+            state,
+            drain,
+            allow_credits,
+        };
+        // Compare the prior durable witness before replacing it. A closed gap
+        // cannot classify a generation change as a definite user edit.
+        let continuity_gap = generation.is_some_and(|generation| {
+            !users.session_seen.contains(id)
+                && users.accounts.get(id) == Some(&user)
+                && users.generations.get(id).copied() != Some(generation)
+        });
+        let result = users.put(id, user);
         if result.is_err() {
             users.losses = users.losses.saturating_add(1);
+        } else if let Some(generation) = generation {
+            if continuity_gap {
+                users.losses = users.losses.saturating_add(1);
+            }
+            // Automatic online updates refresh the next handover witness, but
+            // generation never participates in User equality or revisions.
+            users.generations.insert(id.into(), generation);
+            users.session_seen.insert(id.into());
         }
         result
     }
@@ -364,6 +389,7 @@ impl ForecastLog {
                     provider: provider(account.provider).into(),
                     state: account.user_state,
                     drain: account.drain,
+                    allow_credits: account.allow_credits,
                 };
                 users
                     .accounts
@@ -378,6 +404,7 @@ impl ForecastLog {
                             provider: provider(account.provider).into(),
                             state: account.user_state,
                             drain: account.drain,
+                            allow_credits: account.allow_credits,
                         },
                     )?;
                 }
@@ -389,6 +416,8 @@ impl ForecastLog {
                     .collect();
                 for id in removed {
                     let old = users.accounts.remove(&id).expect("listed user");
+                    users.generations.remove(&id);
+                    users.session_seen.remove(&id);
                     let revision = users.revisions.entry(old.provider).or_default();
                     *revision = revision
                         .checked_add(1)
@@ -848,6 +877,7 @@ fn input(a: &AdminAccount, now: i64) -> Result<Input> {
         user_state: a.user_state,
         native_usable: usable(a),
         drain: a.drain,
+        allow_credits: a.allow_credits,
         probe_pending: a.probe_pending,
         refresh_attention: a.refresh_attention,
         takeover_pending: a.takeover_pending,
@@ -930,6 +960,8 @@ fn validate_checkpoint(c: &Checkpoint) -> Result<()> {
     ensure!(
         c.schema == 1
             && c.users.accounts.len() <= ACCOUNTS
+            && c.users.generations.len() <= ACCOUNTS
+            && c.users.session_seen.len() <= ACCOUNTS
             && c.pending.len() <= PENDING
             && c.outbox.len() <= 32,
         "forecast_log_checkpoint_bounds"
@@ -947,6 +979,14 @@ fn validate_checkpoint(c: &Checkpoint) -> Result<()> {
             "forecast_log_checkpoint_identity"
         );
     }
+    ensure!(
+        c.users
+            .generations
+            .keys()
+            .chain(c.users.session_seen.iter())
+            .all(|id| c.users.accounts.contains_key(id)),
+        "forecast_log_checkpoint_generation_identity"
+    );
     for o in &c.pending {
         validate_origin(o)?;
     }
