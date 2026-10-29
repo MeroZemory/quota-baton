@@ -15,6 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) mod permit;
 pub use permit::{PermitDecision, PermitDenied, PermitInputs, PreparedMove, decide_move};
+pub(crate) mod selection;
+pub(super) mod selection_affinity;
+pub(super) mod selection_metrics;
+pub use selection::{SelectionInputs, SelectionReturnInput};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +63,47 @@ pub struct DecisionInputs {
     #[serde(default)]
     pub outside_failure: bool,
     pub permit: Option<PermitInputs>,
+    /// Selection has its own raw read set; permit-only archives omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<Box<SelectionInputs>>,
+}
+
+fn helper_facts(
+    inputs: &DecisionInputs,
+    accounts: BTreeMap<String, CandidateInput>,
+    model: Option<&str>,
+) -> DecisionInputs {
+    DecisionInputs {
+        now: inputs.now,
+        model: model.map(str::to_owned),
+        key: inputs.key.clone(),
+        from: inputs.from.clone(),
+        to: inputs.to.clone(),
+        accounts,
+        traffic: inputs.traffic.clone(),
+        pending: inputs.pending.clone(),
+        groups: inputs.groups.clone(),
+        bindings: inputs.bindings.clone(),
+        accepted_unbound: inputs.accepted_unbound.clone(),
+        sticky: inputs.sticky.clone(),
+        outside_failure: inputs.outside_failure,
+        permit: None,
+        selection: None,
+    }
+}
+
+/// Ordered native collections can contain the same ID with different supplied
+/// rows. Interpret this exact row rather than substituting a same-ID peer.
+pub(super) fn candidate_facts(
+    inputs: &DecisionInputs,
+    candidate: &CandidateInput,
+    model: Option<&str>,
+) -> DecisionInputs {
+    helper_facts(
+        inputs,
+        BTreeMap::from([(candidate.account.id.clone(), candidate.clone())]),
+        model,
+    )
 }
 
 pub fn stale_window(inputs: &DecisionInputs, id: &str, window: &Value) -> Option<bool> {

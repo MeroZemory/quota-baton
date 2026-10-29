@@ -1,5 +1,5 @@
 //! Conservative syntax boundary for the whole decision kernel, including the
-//! raw helpers and permit module. This is an exact allowlist, not a proof of
+//! raw helpers, permit and selection family. This is a closed allowlist, not a proof of
 //! arbitrary Rust. The readset check below closes the captured-value boundary;
 //! native differential tests separately establish behavior.
 use quote::ToTokens;
@@ -34,6 +34,7 @@ const IMPORTS: &[&str] = &[
     "pub use permit::{PermitDecision, PermitDenied, PermitInputs, PreparedMove, decide_move};",
     "pub use permit::{decide_move, PermitDecision, PermitDenied, PermitInputs, PreparedMove};",
     "use sha2::{Digest, Sha256};",
+    "pub use selection::{SelectionInputs, SelectionReturnInput};",
 ];
 
 const PERMIT_IMPORTS: &[&str] = &[
@@ -303,7 +304,7 @@ fn guard(source: &str) -> Vec<String> {
         ("AcceptanceBinding", "pub accepted: Option<bool>,"),
         (
             "DecisionInputs",
-            "pub now: DateTime<Utc>, pub model: Option<String>, pub key: Option<String>, pub from: Option<String>, pub to: String, pub accounts: BTreeMap<String, CandidateInput>, pub traffic: BTreeMap<String, DateTime<Utc>>, pub pending: BTreeMap<String, usize>, pub groups: BTreeMap<String, AcceptanceGroup>, pub bindings: BTreeMap<String, AcceptanceBinding>, pub accepted_unbound: BTreeSet<String>, pub sticky: BTreeMap<String, String>, pub outside_failure: bool, pub permit: Option<PermitInputs>,",
+            "pub now: DateTime<Utc>, pub model: Option<String>, pub key: Option<String>, pub from: Option<String>, pub to: String, pub accounts: BTreeMap<String, CandidateInput>, pub traffic: BTreeMap<String, DateTime<Utc>>, pub pending: BTreeMap<String, usize>, pub groups: BTreeMap<String, AcceptanceGroup>, pub bindings: BTreeMap<String, AcceptanceBinding>, pub accepted_unbound: BTreeSet<String>, pub sticky: BTreeMap<String, String>, pub outside_failure: bool, pub permit: Option<PermitInputs>, pub selection: Option<Box<SelectionInputs>>,",
         ),
     ];
     let mut seen = BTreeSet::new();
@@ -317,6 +318,25 @@ fn guard(source: &str) -> Vec<String> {
                 };
                 boundary.visit_item_use(&item);
                 errors.extend(boundary.errors);
+            }
+            Item::Fn(mut item)
+                if matches!(
+                    item.sig.ident.to_string().as_str(),
+                    "facts_with_model" | "helper_facts" | "candidate_facts"
+                ) =>
+            {
+                seen.insert(item.sig.ident.to_string());
+                // Closed bridges: pin bodies as well as signatures. A native
+                // fallback hidden behind an otherwise pure name must fail.
+                item.attrs.retain(|a| !a.path().is_ident("doc"));
+                let expected = syn::parse_file(SELECTION_BRIDGES).expect("bridge syntax");
+                if !expected
+                    .items
+                    .iter()
+                    .any(|f| compact(&tokens(f)) == compact(&tokens(&item)))
+                {
+                    errors.push("changed selection facts bridge".into());
+                }
             }
             Item::Fn(item) => {
                 let signature = compact(&(tokens(&item.vis) + &tokens(&item.sig)));
@@ -356,10 +376,17 @@ fn guard(source: &str) -> Vec<String> {
                 }
             }
             Item::Mod(item)
-                if item.ident == "permit"
-                    && item.content.is_none()
+                if matches!(
+                    item.ident.to_string().as_str(),
+                    "permit" | "selection_affinity" | "selection_metrics"
+                ) && item.content.is_none()
                     && item.attrs.is_empty()
                     && compact(&tokens(&item.vis)) == "pub(super)" => {}
+            Item::Mod(item)
+                if item.ident == "selection"
+                    && item.content.is_none()
+                    && item.attrs.is_empty()
+                    && compact(&tokens(&item.vis)) == "pub(crate)" => {}
             Item::Mod(item)
                 if item.ident == "raw_tests"
                     && item.content.is_none()
@@ -373,6 +400,13 @@ fn guard(source: &str) -> Vec<String> {
                         .iter()
                         .any(|a| compact(&tokens(a)) == "#[path=\"kernel/raw_tests.rs\"]") => {}
             _ => errors.push("external module / state / item".into()),
+        }
+    }
+    // facts_with_model is an optional unused convenience wrapper; when present,
+    // its complete signature/body still must match the reviewed bridge above.
+    for name in ["helper_facts", "candidate_facts"] {
+        if !seen.contains(name) {
+            errors.push(format!("missing selection facts bridge: {name}"));
         }
     }
     for signature in signatures {
@@ -1570,6 +1604,10 @@ fn kernel_readset(source: &str, permit: bool) -> Vec<String> {
                 ],
                 "group" => vec![("key", Scalar)],
                 "date" => vec![("value", Shape::JsonScalar)],
+                "facts_with_model" | "helper_facts" | "candidate_facts" if !permit => {
+                    // guard() pins these complete ASTs to SELECTION_BRIDGES.
+                    continue;
+                }
                 "decide_move" if permit => vec![("inputs", Object("DecisionInputs"))],
                 _ => {
                     errors.push("unreviewed kernel readset root".into());
@@ -2307,5 +2345,649 @@ fn planted_shadowed_capture_closure_account_serialization_fails_readset() {
     assert!(
         !guard(&fixture).is_empty(),
         "shadowed_closure_capture_account_serialization_escaped_guard"
+    );
+}
+
+// Selection uses a separate closed syntax vocabulary. Public entry signatures
+// accept DecisionInputs plus scalar/value arguments, never native owners.
+// PolicyStore::selection_inputs and PolicyRowsInput::capture are snapshot code
+// outside evaluation; their locks are intentionally outside this guard.
+const SELECTION_SOURCE: &str = include_str!("../src/bindings/kernel/selection.rs");
+
+const SELECTION_SIGNATURES: &[&str] = &[
+    "pub fn select(inputs: &DecisionInputs) -> Result<SelectionEvaluation, SelectionInputError>",
+    "fn return_blocked(inputs: &DecisionInputs, row: &CandidateInput) -> bool",
+    "fn rebind_budget_source(inputs: &DecisionInputs, to: &str) -> Option<String>",
+    "fn select_ordered(inputs: &DecisionInputs, candidates: &[CandidateInput]) -> SelectionEvaluation",
+    "fn prefer<T>(pool: &mut Vec<(&CandidateInput, T)>, preference: Option<&PreferenceInput>)",
+    "fn prefer_root_hint<T>(pool: &mut Vec<(&CandidateInput, T)>, account: Option<&str>)",
+    "fn prefer_pacing_and_evidence( pool: &mut Vec<(&CandidateInput, &m::Metrics)>, inputs: &DecisionInputs, )",
+    "fn effective_for(inputs: &DecisionInputs, row: &CandidateInput, model: Option<&str>) -> Account",
+    "fn policy_key(inputs: &DecisionInputs) -> Option<&str>",
+    "fn account_cmp(inputs: &DecisionInputs, a: &str, b: &str) -> std::cmp::Ordering",
+    "fn idle(now: DateTime<Utc>, last: DateTime<Utc>) -> u64",
+    "fn protected(inputs: &DecisionInputs, key: &str) -> bool",
+    "fn select_ranked( inputs: &DecisionInputs, candidates: &[CandidateInput], plan: &crate::routing::Plan, hinted_account: Option<&str>, diagnostics: &mut Vec<HoldDiagnostic>, ) -> (SelectionChoice, SelectionLabel)",
+];
+
+const SELECTION_IMPORTS: &[&str] = &[
+    "use super::selection_metrics::MetricInputs;",
+    "use super::{CandidateInput, permit::MovementInput, selection_affinity::AffinityInput};",
+    "use crate::accounts::Provider;",
+    "pub use crate::routing::selection_inputs::SelectionPolicyInput;",
+    "use chrono::{DateTime, Utc};",
+    "use serde::{Deserialize, Serialize};",
+    "use std::collections::{BTreeMap, BTreeSet};",
+    "use super::{DecisionInputs, group, selection_affinity as affinity, selection_metrics as m};",
+    "use crate::accounts::{Account, Health, HealthReason, UserState};",
+    "use std::time::Duration;",
+];
+
+const AFFINITY_SOURCE: &str = include_str!("../src/bindings/kernel/selection_affinity.rs");
+
+const AFFINITY_SIGNATURES: &[&str] = &[
+    "pub fn retained_binding<'a>( inputs: &'a super::DecisionInputs, key: &str, ) -> Option<&'a BindingInput>",
+    "pub fn protected_source( inputs: &super::DecisionInputs, key: Option<&str>, anchor: Option<&str>, ) -> Option<String>",
+    "fn idle(now: DateTime<Utc>, last: DateTime<Utc>) -> u64",
+    "fn launch_retained(inputs: &AffinityInput, key: &str, now: DateTime<Utc>) -> bool",
+    "fn retained<'a>( inputs: &'a AffinityInput, key: &str, now: DateTime<Utc>, ) -> Option<&'a BindingInput>",
+    "fn source( inputs: &AffinityInput, key: Option<&str>, anchor: Option<&str>, now: DateTime<Utc>, ) -> Option<String>",
+];
+
+const AFFINITY_IMPORTS: &[&str] = &[
+    "use crate::bindings::{CAPACITY, launch::IDLE_SECS};",
+    "use chrono::{DateTime, Utc};",
+    "use serde::{Deserialize, Serialize};",
+    "use std::collections::{BTreeMap, BTreeSet};",
+];
+
+const METRICS_SOURCE: &str = include_str!("../src/bindings/kernel/selection_metrics.rs");
+
+const METRICS_SIGNATURES: &[&str] = &[
+    "pub fn metrics(inputs: &DecisionInputs, id: &str) -> Option<Metrics>",
+    "pub(super) fn metrics_for( inputs: &DecisionInputs, c: &CandidateInput, without_charge: bool, ) -> Option<Metrics>",
+    "fn placement_state(c: &CandidateInput, raw: &MetricInputs) -> PlacementState",
+    "fn evidence( c: &CandidateInput, raw: &MetricInputs, now: DateTime<Utc>, ) -> (PlacementEvidence, usize)",
+    "pub(super) fn placement_evidence_for( inputs: &DecisionInputs, c: &CandidateInput, ) -> Option<(PlacementEvidence, usize)>",
+    "pub(super) fn placement_capped_for(inputs: &DecisionInputs, c: &CandidateInput) -> Option<bool>",
+    "fn activity(raw: &MetricInputs, active: &BTreeSet<String>, id: &str, now: DateTime<Utc>) -> usize",
+    "pub fn active_sessions(inputs: &DecisionInputs, id: &str) -> Option<usize>",
+    "fn reservations(raw: &MetricInputs, id: &str, except: Option<&str>, now: DateTime<Utc>) -> usize",
+    "pub fn reserved(inputs: &DecisionInputs, id: &str, except: Option<&str>) -> Option<usize>",
+    "fn threshold(raw: &MetricInputs, id: &str) -> usize",
+    "pub fn spread_threshold(inputs: &DecisionInputs, id: &str) -> Option<usize>",
+    "pub fn has_overload_mark(inputs: &DecisionInputs, key: &str) -> Option<bool>",
+    "pub(super) fn rebalance_target_waiting_for( inputs: &DecisionInputs, source: &str, c: &CandidateInput, except: Option<&str>, ) -> Option<bool>",
+    "fn waiting( raw: &MetricInputs, c: &CandidateInput, m: &Metrics, eligible: bool, target: usize, source_count: usize, except: Option<&str>, now: DateTime<Utc>, ) -> bool",
+    "pub(super) fn rebalance_target_base_for( inputs: &DecisionInputs, source: &str, c: &CandidateInput, except: Option<&str>, ) -> Option<bool>",
+    "pub(super) fn rebalance_target_for( inputs: &DecisionInputs, source: &str, c: &CandidateInput, except: Option<&str>, ) -> Option<bool>",
+    "pub fn compare_gated( inputs: &DecisionInputs, a: &str, x: &Metrics, b: &str, y: &Metrics, anchor: Option<DateTime<Utc>>, ) -> Option<Ordering>",
+    "fn compare_in_order( order: &[String], a: &str, x: &Metrics, b: &str, y: &Metrics, anchor: Option<DateTime<Utc>>, ) -> Option<Ordering>",
+    "fn calculate( c: &CandidateInput, raw: &MetricInputs, cfg: &RoutingConfig, pending: usize, now: DateTime<Utc>, stale: impl Fn(&Value) -> bool, ) -> Metrics",
+];
+
+const METRICS_IMPORTS: &[&str] = &[
+    "use super::{CandidateInput, DecisionInputs, date};",
+    "use crate::bindings::{ PlacementEvidence, PlacementState, PlacementWindow, UsageObservationAsOf, account_window, };",
+    "use crate::config::RoutingConfig;",
+    "use chrono::{DateTime, Utc};",
+    "use serde::{Deserialize, Serialize};",
+    "use serde_json::Value;",
+    "use std::{ cmp::Ordering, collections::{BTreeMap, BTreeSet}, };",
+];
+
+const POLICY_SOURCE: &str = include_str!("../src/routing/selection_inputs.rs");
+
+const POLICY_SIGNATURES: &[&str] = &[
+    "fn settings(&self, defaults: &Settings) -> Settings",
+    "fn policy_id<'a>(&self, scope: &'a PolicyKeyInput) -> &'a str",
+    "fn selected_id(&self) -> &str",
+    "pub fn plan(&self) -> Plan",
+    "pub fn placement_plan(&self) -> (Plan, bool)",
+    "pub fn permits_dispatch(&self, account: &str) -> bool",
+    "pub fn discretionary_allowed(&self, target: Option<&str>, now: DateTime<Utc>,) -> Result<bool, PolicyInputRefusal>",
+];
+
+const POLICY_IMPORTS: &[&str] = &[
+    "use super::{ ChurnLimits, Mode, On5hLimit, Plan, PolicyStore, Settings, State, pool_id, session_id, };",
+    "use chrono::{DateTime, Utc};",
+    "use serde::{Deserialize, Serialize};",
+    "use std::{ collections::{BTreeMap, BTreeSet}, sync::atomic::Ordering, };",
+];
+
+const SELECTION_BRIDGES: &str = r#"
+pub(super) fn facts_with_model(inputs: &DecisionInputs, model: Option<&str>) -> DecisionInputs {
+    helper_facts(inputs, inputs.accounts.clone(), model)
+}
+
+fn helper_facts(
+    inputs: &DecisionInputs,
+    accounts: BTreeMap<String, CandidateInput>,
+    model: Option<&str>,
+) -> DecisionInputs {
+    DecisionInputs {
+        now: inputs.now,
+        model: model.map(str::to_owned),
+        key: inputs.key.clone(),
+        from: inputs.from.clone(),
+        to: inputs.to.clone(),
+        accounts,
+        traffic: inputs.traffic.clone(),
+        pending: inputs.pending.clone(),
+        groups: inputs.groups.clone(),
+        bindings: inputs.bindings.clone(),
+        accepted_unbound: inputs.accepted_unbound.clone(),
+        sticky: inputs.sticky.clone(),
+        outside_failure: inputs.outside_failure,
+        permit: None,
+        selection: None,
+    }
+}
+
+pub(super) fn candidate_facts(
+    inputs: &DecisionInputs,
+    candidate: &CandidateInput,
+    model: Option<&str>,
+) -> DecisionInputs {
+    helper_facts(
+        inputs,
+        BTreeMap::from([(candidate.account.id.clone(), candidate.clone())]),
+        model,
+    )
+}
+"#;
+
+// Closed reviewed external value seams: Account health eligibility / evidence
+// (checked above), Provider::as_str, routing Settings/Plan/ChurnLimits values,
+// RoutingConfig values, account_window, PlacementState::{default, observe,
+// weak, count, charge_count}, PlacementWindow and UsageObservationAsOf values,
+// and canonical CAPACITY / launch::IDLE_SECS constants. PlacementState's
+// methods operate on a locally reconstructed ownerless value. Their transitive
+// implementation and std/chrono/serde value semantics remain trusted here;
+// this syntax guard does NOT prove purity of infinitely many possible callees.
+// No native BindingTable/Data/PolicyStore type is allowed inside evaluation.
+const SELECTION_TYPES: &str = "Account AffinityInput BindingInput BTreeMap BTreeSet CandidateInput ChurnLimits DateTime DecisionInputs GroupInput Health HealthReason HoldDiagnostic LaunchInput MetricInputs Metrics Mode MovementInput On5hLimit Option Ordering OverloadInput PlacementAsOfInput PlacementEvidence PlacementInput PlacementState PlacementWindow PlacementWindowInput Plan PolicyInputRefusal PolicyKeyInput PolicyRowsInput PreferenceInput Provider Result RootHintInput RoutingConfig SelectionBinding SelectionChoice SelectionDecision SelectionEntry SelectionEvaluation SelectionEvidence SelectionInputError SelectionInputs SelectionLabel SelectionPolicyInput SelectionReturnInput SessionInput Settings String T UsageObservationAsOf UserState Utc Value Vec bool f64 i64 str u64 usize super::DecisionInputs super::permit::SoleTargetInput m::Metrics crate::routing::Plan std::cmp::Ordering";
+const SELECTION_PATHS: &str = "Some None Ok Err self CAPACITY IDLE_SECS Duration::from_secs Health::Cooling HealthReason::Quota SelectionChoice::Hold SelectionChoice::None SelectionChoice::Selected SelectionEntry::Ordered SelectionEntry::ReturnGuard SelectionInputError::AccountOrder SelectionInputError::MissingPool SelectionInputError::MissingReturnHistory SelectionInputError::MissingSelection SelectionInputError::PolicyScope SelectionLabel::ColdRebalance SelectionLabel::Forced SelectionLabel::Inherited SelectionLabel::MarkWait SelectionLabel::New SelectionLabel::Overload UserState::Active Vec::new affinity::protected_source affinity::retained_binding chrono::Duration::minutes chrono::Duration::seconds crate::accounts::health::UnusableEvidence::observe crate::routing::Mode::Rebalance crate::routing::Mode::Strict f64::total_cmp f64::INFINITY m::active_sessions m::compare_gated m::has_overload_mark m::metrics_for m::placement_capped_for m::placement_evidence_for m::rebalance_target_base_for m::rebalance_target_for m::rebalance_target_waiting_for m::reserved m::spread_threshold super::accepted_in super::candidate_facts super::effective_account super::semantic_evidence super::stale_window super::group String::as_str str::to_owned PlacementEvidence::Fresh PlacementEvidence::Weak PlacementState::default usize::from Mode::Rebalance Mode::Strict PolicyInputRefusal::MissingTargetPool";
+const SELECTION_METHODS: &str = "and_then any append as_array as_deref as_f64 as_ref as_str checked_sub clone cloned cmp collect contains contains_key copied count discretionary_allowed eligible_at expect filter filter_map find first flatten get get_or_insert_with into into_iter is_empty is_err is_finite is_none is_none_or is_ok_and is_some is_some_and iter len map map_or map_or_else max min min_by num_seconds observe charge_count weak ok_or or or_else permits_dispatch placement_plan plan policy_id position push retain rev saturating_add selected_id settings signed_duration_since sort_by strip_prefix then then_with to_owned to_std total_cmp transpose unwrap_or";
+
+fn listed(list: &str, name: &str) -> bool {
+    list.split_whitespace().any(|allowed| allowed == name)
+}
+
+fn path_name(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+struct SelectionBoundary<'a> {
+    signatures: &'a [&'a str],
+    imports: &'a [&'a str],
+    locals: BTreeSet<String>,
+    errors: Vec<String>,
+    seen: BTreeSet<String>,
+    pure_policy_receiver: bool,
+}
+
+impl SelectionBoundary<'_> {
+    fn function(
+        &mut self,
+        vis: &syn::Visibility,
+        sig: &syn::Signature,
+        block: &syn::Block,
+        attrs: &[syn::Attribute],
+    ) {
+        let signature = compact(&(tokens(vis) + &tokens(sig)));
+        if !self
+            .signatures
+            .iter()
+            .any(|expected| compact(expected) == signature)
+        {
+            self.errors
+                .push(format!("non-input selection signature: {signature}"));
+        }
+        if !self.seen.insert(signature) {
+            self.errors.push("duplicate selection function".into());
+        }
+        let mut locals = Locals::default();
+        locals.visit_signature(sig);
+        locals.visit_block(block);
+        self.locals = locals.0;
+        for attr in attrs {
+            // The metrics ID wrapper may be test-only; its signature and body
+            // are still checked. No general cfg or attribute admission.
+            if self.imports == METRICS_IMPORTS
+                && sig.ident == "metrics"
+                && compact(&tokens(attr)) == "#[cfg(test)]"
+            {
+                continue;
+            }
+            self.visit_attribute(attr);
+        }
+        self.visit_signature(sig);
+        self.visit_block(block);
+    }
+}
+
+impl<'ast> Visit<'ast> for SelectionBoundary<'_> {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        // Also covers Stmt::Macro: a standalone macro is not Expr::Macro.
+        use syn::parse::Parser;
+        if !mac.path.is_ident("matches") {
+            self.errors.push("unreviewed selection macro".into());
+            return;
+        }
+        let parser = |input: syn::parse::ParseStream<'_>| {
+            let value: Expr = input.parse()?;
+            input.parse::<syn::Token![,]>()?;
+            let pattern = Pat::parse_multi_with_leading_vert(input)?;
+            if !input.is_empty() {
+                return Err(input.error("unreviewed matches guard"));
+            }
+            Ok((value, pattern))
+        };
+        match parser.parse2(mac.tokens.clone()) {
+            Ok((value, pattern)) => {
+                self.visit_expr(&value);
+                self.visit_pat(&pattern);
+            }
+            Err(_) => self.errors.push("unreviewed selection macro".into()),
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'ast Pat) {
+        let path = match pat {
+            Pat::Path(p) => Some(&p.path),
+            Pat::Struct(p) => Some(&p.path),
+            Pat::TupleStruct(p) => Some(&p.path),
+            _ => None,
+        };
+        if let Some(path) = path
+            && (path.leading_colon.is_some() || !listed(SELECTION_PATHS, &path_name(path)))
+        {
+            self.errors
+                .push("unreviewed selection pattern value".into());
+        }
+        visit::visit_pat(self, pat);
+    }
+
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if attr.path().is_ident("doc") {
+            return;
+        }
+        let allowed = [
+            "#[derive(Clone, Debug, Serialize, Deserialize)]",
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]",
+            "#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]",
+            "#[derive(Clone, Debug, PartialEq, Eq)]",
+            "#[derive(Clone, Copy, Debug)]",
+            "#[serde(deny_unknown_fields)]",
+            "#[serde(rename_all = \"snake_case\")]",
+            "#[serde(tag = \"kind\", rename_all = \"snake_case\", deny_unknown_fields)]",
+            "#[allow(clippy::too_many_arguments)]",
+        ];
+        if !allowed.iter().any(|a| compact(a) == compact(&tokens(attr))) {
+            self.errors.push("unreviewed selection attribute".into());
+        }
+    }
+
+    fn visit_item(&mut self, item: &'ast Item) {
+        // Only this reviewed local value declaration is allowed in a body.
+        let expected: Item = syn::parse_str(
+            "struct SelectionBinding { key: String, account: String, last_used: DateTime<Utc>, }",
+        )
+        .unwrap();
+        if compact(&tokens(item)) != compact(&tokens(&expected)) {
+            self.errors
+                .push("nested selection item / state / import".into());
+        }
+    }
+
+    fn visit_type_path(&mut self, ty: &'ast syn::TypePath) {
+        if ty.qself.is_some()
+            || ty.path.leading_colon.is_some()
+            || !(listed(SELECTION_TYPES, &path_name(&ty.path))
+                || (self.pure_policy_receiver && ty.path.is_ident("Self")))
+        {
+            self.errors.push(format!(
+                "native / unreviewed selection type: {}",
+                tokens(ty)
+            ));
+        }
+        visit::visit_type_path(self, ty);
+    }
+
+    fn visit_type(&mut self, ty: &'ast syn::Type) {
+        if matches!(
+            ty,
+            syn::Type::BareFn(_)
+                | syn::Type::Macro(_)
+                | syn::Type::Ptr(_)
+                | syn::Type::TraitObject(_)
+        ) {
+            self.errors.push("selection capability type".into());
+        }
+        visit::visit_type(self, ty);
+    }
+
+    fn visit_trait_bound(&mut self, bound: &'ast syn::TraitBound) {
+        // The sole callback seam is calculate's supplied stale-window closure.
+        if path_name(&bound.path) != "Fn" {
+            self.errors.push("unreviewed selection trait bound".into());
+        }
+        visit::visit_trait_bound(self, bound);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        match expr {
+            Expr::Path(p) => {
+                let name = path_name(&p.path);
+                let helpers = "select return_blocked rebind_budget_source select_ordered prefer prefer_root_hint prefer_pacing_and_evidence effective_for policy_key account_cmp idle protected select_ranked retained_binding protected_source launch_retained retained source metrics metrics_for placement_state evidence placement_evidence_for placement_capped_for activity active_sessions reservations reserved threshold spread_threshold has_overload_mark rebalance_target_waiting_for waiting rebalance_target_base_for rebalance_target_for compare_gated compare_in_order calculate account_window date group";
+                if p.qself.is_some()
+                    || p.path.leading_colon.is_some()
+                    || (!self.locals.contains(&name)
+                        && !listed(SELECTION_PATHS, &name)
+                        && !listed(helpers, &name))
+                {
+                    self.errors
+                        .push(format!("external selection value / getter: {}", tokens(p)));
+                }
+            }
+            Expr::MethodCall(c) => {
+                if !listed(SELECTION_METHODS, &c.method.to_string()) {
+                    self.errors
+                        .push(format!("unreviewed selection method: {}", c.method));
+                }
+                // Pin the native value seam to the locally reconstructed value.
+                let receiver = compact(&tokens(&c.receiver));
+                if listed("observe weak charge_count", &c.method.to_string()) && receiver != "state"
+                {
+                    self.errors.push("nonlocal PlacementState receiver".into());
+                }
+            }
+            Expr::Struct(s) => {
+                if s.qself.is_some()
+                    || s.path.leading_colon.is_some()
+                    || !listed(
+                        "SelectionEvaluation SelectionDecision SelectionEvidence SelectionBinding HoldDiagnostic SelectionChoice::Selected SelectionChoice::Hold super::permit::SoleTargetInput PlacementState PlacementWindow UsageObservationAsOf Metrics Plan",
+                        &path_name(&s.path),
+                    )
+                {
+                    self.errors.push("unreviewed selection construction".into());
+                }
+            }
+            Expr::Field(f) if matches!(&f.member, syn::Member::Named(n) if n == "data") => {
+                self.errors.push("selection owner data read".into());
+            }
+            Expr::Call(c) => {
+                // Local function values are not a generic escape hatch. These
+                // four names are the reviewed inline closure seams only.
+                match &*c.func {
+                    Expr::Path(p)
+                        if !self.locals.contains(&path_name(&p.path))
+                            || listed("at ratio cohort stale", &path_name(&p.path)) => {}
+                    _ => self.errors.push("indirect selection call".into()),
+                }
+            }
+            Expr::Macro(m) => {
+                self.visit_macro(&m.mac);
+                return;
+            }
+            Expr::Unsafe(_) => self.errors.push("selection unsafe read".into()),
+            _ => {}
+        }
+        visit::visit_expr(self, expr);
+    }
+}
+
+fn selection_guard(
+    source: &str,
+    signatures: &[&str],
+    imports: &[&str],
+    policy: bool,
+) -> Vec<String> {
+    let file = syn::parse_file(source).expect("selection guard syntax");
+    let mut boundary = SelectionBoundary {
+        signatures,
+        imports,
+        locals: BTreeSet::new(),
+        errors: Vec::new(),
+        seen: BTreeSet::new(),
+        pure_policy_receiver: false,
+    };
+    for item in &file.items {
+        match item {
+            Item::Use(u) => {
+                if !boundary
+                    .imports
+                    .iter()
+                    .any(|expected| compact(expected) == compact(&tokens(u)))
+                {
+                    boundary.errors.push("unreviewed selection import".into());
+                }
+            }
+            Item::Fn(f) if !policy => boundary.function(&f.vis, &f.sig, &f.block, &f.attrs),
+            Item::Struct(s) => {
+                if !listed(SELECTION_TYPES, &s.ident.to_string()) || !s.generics.params.is_empty() {
+                    boundary
+                        .errors
+                        .push("unreviewed selection value declaration".into());
+                }
+                boundary.visit_item_struct(s);
+            }
+            Item::Enum(e) => {
+                if !listed(SELECTION_TYPES, &e.ident.to_string()) || !e.generics.params.is_empty() {
+                    boundary.errors.push("unreviewed selection enum".into());
+                }
+                boundary.visit_item_enum(e);
+            }
+            Item::Impl(i) if policy && i.trait_.is_none() && i.generics.params.is_empty() => {
+                let owner = compact(&tokens(&i.self_ty));
+                // Snapshot ownership is excluded by exact owner + method name,
+                // never by broadly skipping an impl containing native locks.
+                for member in &i.items {
+                    match member {
+                        syn::ImplItem::Fn(f)
+                            if (owner == "PolicyStore" && f.sig.ident == "selection_inputs")
+                                || (owner == "PolicyRowsInput" && f.sig.ident == "capture") => {}
+                        syn::ImplItem::Fn(f)
+                            if listed(
+                                "SessionInput PolicyRowsInput SelectionPolicyInput",
+                                &owner,
+                            ) =>
+                        {
+                            // syn represents an implicit &self receiver using
+                            // Type::Path(Self). Only these value impls own it.
+                            boundary.pure_policy_receiver = true;
+                            boundary.function(&f.vis, &f.sig, &f.block, &f.attrs);
+                            boundary.pure_policy_receiver = false;
+                        }
+                        _ => boundary
+                            .errors
+                            .push("unreviewed policy evaluation item".into()),
+                    }
+                }
+            }
+            Item::Mod(m)
+                if m.ident == "tests"
+                    && m.content.is_none()
+                    && matches!(m.vis, syn::Visibility::Inherited)
+                    && m.attrs
+                        .iter()
+                        .any(|a| compact(&tokens(a)) == "#[cfg(test)]")
+                    && m.attrs.iter().all(|a| {
+                        [
+                            "#[cfg(test)]",
+                            "#[path=\"selection/tests.rs\"]",
+                            "#[path=\"selection_affinity/tests.rs\"]",
+                        ]
+                        .contains(&compact(&tokens(a)).as_str())
+                    }) => {}
+            _ => boundary
+                .errors
+                .push("selection external module / state / item".into()),
+        }
+    }
+    for expected in signatures {
+        if !boundary.seen.contains(&compact(expected)) {
+            boundary
+                .errors
+                .push(format!("missing selection signature: {expected}"));
+        }
+    }
+    boundary.errors
+}
+
+fn selection_sources() -> [(
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+    bool,
+); 4] {
+    [
+        (
+            SELECTION_SOURCE,
+            SELECTION_SIGNATURES,
+            SELECTION_IMPORTS,
+            false,
+        ),
+        (
+            AFFINITY_SOURCE,
+            AFFINITY_SIGNATURES,
+            AFFINITY_IMPORTS,
+            false,
+        ),
+        (METRICS_SOURCE, METRICS_SIGNATURES, METRICS_IMPORTS, false),
+        (POLICY_SOURCE, POLICY_SIGNATURES, POLICY_IMPORTS, true),
+    ]
+}
+
+#[test]
+fn selection_family_has_only_reviewed_value_inputs_and_callees() {
+    for (source, signatures, imports, policy) in selection_sources() {
+        assert_eq!(
+            selection_guard(source, signatures, imports, policy),
+            Vec::<String>::new()
+        );
+    }
+}
+
+#[test]
+fn planted_selection_native_global_clock_and_io_reads_fail_guard() {
+    for (source, signatures, imports, policy) in selection_sources() {
+        let needle = if policy {
+            "fn selected_id(&self) -> &str {"
+        } else if source == SELECTION_SOURCE {
+            "pub fn select(inputs: &DecisionInputs) -> Result<SelectionEvaluation, SelectionInputError> {"
+        } else if source == AFFINITY_SOURCE {
+            "fn idle(now: DateTime<Utc>, last: DateTime<Utc>) -> u64 {"
+        } else {
+            "pub fn metrics(inputs: &DecisionInputs, id: &str) -> Option<Metrics> {"
+        };
+        for planted in [
+            "let _x = crate::bindings::native_snapshot();",
+            "let _x = GLOBAL.load(std::sync::atomic::Ordering::Relaxed);",
+            "let _x = Utc::now();",
+            "let _x = std::fs::read(\"live\");",
+            "let _x = self.data.lock();",
+            "let _x = inputs.native_getter();",
+            "let _x: &crate::bindings::BindingTable = inputs;",
+            "let _x: &Data = inputs;",
+            "let _x: &PolicyStore = inputs;",
+            "let _x = matches!(Utc::now(), Some(_));",
+            "native_read!();",
+            "let _x = matches!(inputs.now, crate::GLOBAL);",
+            "fn escape() { let _x = GLOBAL; }",
+            "let escape = crate::bindings::native_snapshot; escape();",
+            "let _x = <PolicyStore>::default();",
+        ] {
+            let fixture = plant_after(source, needle, planted);
+            assert!(
+                !selection_guard(&fixture, signatures, imports, policy).is_empty(),
+                "selection plant escaped: {planted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn selection_signatures_and_value_fields_reject_native_capabilities() {
+    let fixture = plant_after(
+        METRICS_SOURCE,
+        "pub fn metrics(inputs: &DecisionInputs, id: &str) -> Option<Metrics> {",
+        "let _owner: &Self = inputs;",
+    );
+    assert!(!selection_guard(&fixture, METRICS_SIGNATURES, METRICS_IMPORTS, false).is_empty());
+    let fixture = SELECTION_SOURCE.replacen("pub fn select(", "#[cfg(test)] pub fn select(", 1);
+    assert_ne!(fixture, SELECTION_SOURCE);
+    assert!(!selection_guard(&fixture, SELECTION_SIGNATURES, SELECTION_IMPORTS, false).is_empty());
+    let fixture = SELECTION_SOURCE.replacen(
+        "pub fn select(inputs: &DecisionInputs)",
+        "pub fn select(inputs: &BindingTable)",
+        1,
+    );
+    assert_ne!(fixture, SELECTION_SOURCE);
+    assert!(!selection_guard(&fixture, SELECTION_SIGNATURES, SELECTION_IMPORTS, false).is_empty());
+    let fixture = SELECTION_SOURCE.replacen(
+        "pub struct SelectionInputs {",
+        "pub struct SelectionInputs { pub owner: std::sync::Mutex<Data>,",
+        1,
+    );
+    assert_ne!(fixture, SELECTION_SOURCE);
+    assert!(!selection_guard(&fixture, SELECTION_SIGNATURES, SELECTION_IMPORTS, false).is_empty());
+}
+
+#[test]
+fn selection_facts_bridge_rejects_native_fallback_and_signature_escape() {
+    for (needle, planted) in [
+        (
+            "BTreeMap::from([(candidate.account.id.clone(), candidate.clone())]),",
+            "crate::bindings::native_snapshot(),",
+        ),
+        ("        accounts,", "        accounts: GLOBAL.snapshot(),"),
+        ("candidate: &CandidateInput,", "candidate: &BindingTable,"),
+    ] {
+        let fixture = SOURCE.replacen(needle, planted, 1);
+        assert_ne!(fixture, SOURCE, "stale bridge fixture: {needle}");
+        assert!(
+            guard(&fixture)
+                .iter()
+                .any(|e| e == "changed selection facts bridge"),
+            "selection bridge escaped: {planted}"
+        );
+    }
+}
+
+#[test]
+fn selection_bridge_and_ownerless_placement_constants_remain_allowed() {
+    // The whole current family is positive evidence, including native snapshot
+    // locks outside the boundary and local PlacementState value helper calls.
+    assert_eq!(guard(SOURCE), Vec::<String>::new());
+    // Both forms of the reviewed ID wrapper remain fully inspected.
+    let fixture = METRICS_SOURCE.replacen("pub fn metrics(", "#[cfg(test)] pub fn metrics(", 1);
+    assert_ne!(fixture, METRICS_SOURCE);
+    assert_eq!(
+        selection_guard(&fixture, METRICS_SIGNATURES, METRICS_IMPORTS, false),
+        Vec::<String>::new()
+    );
+    let fixture = plant_after(
+        AFFINITY_SOURCE,
+        "fn idle(now: DateTime<Utc>, last: DateTime<Utc>) -> u64 {",
+        "let _capacity = CAPACITY; let _idle = IDLE_SECS;",
+    );
+    assert_eq!(
+        selection_guard(&fixture, AFFINITY_SIGNATURES, AFFINITY_IMPORTS, false),
+        Vec::<String>::new()
+    );
+    let fixture = plant_after(
+        METRICS_SOURCE,
+        "fn placement_state(c: &CandidateInput, raw: &MetricInputs) -> PlacementState {",
+        "let mut state = PlacementState::default(); if let Some(snapshot) = &c.quota { state.observe(snapshot); }",
+    );
+    assert_eq!(
+        selection_guard(&fixture, METRICS_SIGNATURES, METRICS_IMPORTS, false),
+        Vec::<String>::new()
     );
 }

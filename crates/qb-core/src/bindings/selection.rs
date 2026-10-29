@@ -176,7 +176,47 @@ impl BindingTable {
         preference: Option<&launch::SelectionPreference<'_>>,
         root_hint: Option<&crate::boxes::RootHint>,
     ) -> (PreviewDecision, SelectionReason, Option<SoleEligibleTarget>) {
-        let selected = self.select_ordered_and_root_hint(
+        let inputs = super::kernel_shell::selection_snapshot(
+            self,
+            d,
+            super::kernel::selection::SelectionEntry::ReturnGuard,
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            sources,
+            entitled_targets,
+            observations,
+            pinned,
+            now,
+            hold_allowed,
+            preference,
+            root_hint,
+        );
+        self.selection_from_snapshot(inputs)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn legacy_select_with_return_guard_and_root_hint(
+        &self,
+        d: &Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        sources: &[Candidate],
+        entitled_targets: Option<&BTreeSet<String>>,
+        observations: MoveObservations,
+        pinned: Option<&str>,
+        now: DateTime<Utc>,
+        hold_allowed: bool,
+        preference: Option<&launch::SelectionPreference<'_>>,
+        root_hint: Option<&crate::boxes::RootHint>,
+    ) -> (PreviewDecision, SelectionReason, Option<SoleEligibleTarget>) {
+        let selected = self.legacy_select_ordered_and_root_hint(
             d,
             provider,
             key,
@@ -272,7 +312,7 @@ impl BindingTable {
             });
         drop(guard);
         if selected_blocked && !alternatives.is_empty() {
-            let alternative = self.select_ordered_and_root_hint(
+            let alternative = self.legacy_select_ordered_and_root_hint(
                 d,
                 provider,
                 key,
@@ -334,6 +374,109 @@ impl BindingTable {
         preference: Option<&launch::SelectionPreference<'_>>,
         root_hint: Option<&crate::boxes::RootHint>,
     ) -> (PreviewDecision, SelectionReason) {
+        let inputs = super::kernel_shell::selection_snapshot(
+            self,
+            d,
+            super::kernel::selection::SelectionEntry::Ordered,
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            &[],
+            None,
+            MoveObservations::untracked(),
+            pinned,
+            now,
+            hold_allowed,
+            preference,
+            root_hint,
+        );
+        let (choice, reason, _) = self.selection_from_snapshot(inputs);
+        (choice, reason)
+    }
+
+    /// Called at the existing native selection point, after caller mutations.
+    /// Raw decisions become native authority only here, within that transaction.
+    fn selection_from_snapshot(
+        &self,
+        inputs: Result<
+            super::kernel::DecisionInputs,
+            super::kernel_shell::SelectionSnapshotRefusal,
+        >,
+    ) -> (PreviewDecision, SelectionReason, Option<SoleEligibleTarget>) {
+        let evaluated = inputs.ok().and_then(|inputs| {
+            super::kernel::selection::select(&inputs)
+                .ok()
+                .map(|evaluation| (inputs, evaluation))
+        });
+        let Some((inputs, evaluation)) = evaluated else {
+            // No legacy fallback: a refused read set must not mint a decision
+            // or move proof. The tape hook handles only the active trace.
+            super::decision_tape::selection_refused(self);
+            return (
+                PreviewDecision::None,
+                SelectionReason {
+                    code: SelectionCode::New,
+                    evidence: None,
+                },
+                None,
+            );
+        };
+        super::decision_tape::observe_selection(self, &inputs, &evaluation.decision);
+        for diagnostic in evaluation.diagnostics {
+            tracing::debug!(
+                account = %diagnostic.account,
+                reason = diagnostic.reason,
+                "reset hold skipped"
+            );
+        }
+        let decision = evaluation.decision;
+        let choice = match decision.choice {
+            super::kernel::selection::SelectionChoice::Selected { account } => {
+                PreviewDecision::Selected { account }
+            }
+            super::kernel::selection::SelectionChoice::Hold { until } => {
+                PreviewDecision::Hold { until }
+            }
+            super::kernel::selection::SelectionChoice::None => PreviewDecision::None,
+        };
+        let reason = SelectionReason {
+            code: selection_code(decision.label),
+            evidence: decision.rebalance.map(|proof| RebalanceEvidence {
+                kind: selection_code(proof.kind),
+                key: proof.key,
+                from: proof.from,
+                to: proof.to,
+                model: proof.model,
+                at: proof.at,
+            }),
+        };
+        let sole = decision.sole_target.map(|proof| SoleEligibleTarget {
+            from: proof.from,
+            to: proof.to,
+            model: proof.model,
+            at: proof.at,
+        });
+        (choice, reason, sole)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn legacy_select_ordered_and_root_hint(
+        &self,
+        d: &Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        now: DateTime<Utc>,
+        hold_allowed: bool,
+        preference: Option<&launch::SelectionPreference<'_>>,
+        root_hint: Option<&crate::boxes::RootHint>,
+    ) -> (PreviewDecision, SelectionReason) {
         let (plan, policy_exists) = if root_hint.is_some() {
             self.policies.placement_plan(launch::policy_key(d, key))
         } else {
@@ -364,7 +507,7 @@ impl BindingTable {
             self.retained_binding(d, hint.for_provider(provider)?, now)
                 .map(|binding| binding.account.as_str())
         });
-        let (choice, code) = self.select_ranked(
+        let (choice, code) = self.legacy_select_ranked(
             d,
             provider,
             key,
@@ -407,8 +550,9 @@ impl BindingTable {
         };
         (choice, SelectionReason { code, evidence })
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn select_ranked(
+    fn legacy_select_ranked(
         &self,
         d: &Data,
         provider: Provider,
@@ -865,6 +1009,7 @@ impl BindingTable {
 }
 
 // Advisory narrowing only: never introduce an account discarded by native gates.
+#[cfg(test)]
 fn prefer_root_hint<T>(pool: &mut Vec<(&Candidate, T)>, account: Option<&str>) {
     if let Some(account) = account
         && pool
@@ -874,6 +1019,22 @@ fn prefer_root_hint<T>(pool: &mut Vec<(&Candidate, T)>, account: Option<&str>) {
         pool.retain(|(candidate, _)| candidate.account.id == account);
     }
 }
+
+fn selection_code(label: super::kernel::selection::SelectionLabel) -> SelectionCode {
+    use super::kernel::selection::SelectionLabel;
+    match label {
+        SelectionLabel::New => SelectionCode::New,
+        SelectionLabel::Forced => SelectionCode::Forced,
+        SelectionLabel::Inherited => SelectionCode::Inherited,
+        SelectionLabel::MarkWait => SelectionCode::MarkWait,
+        SelectionLabel::ColdRebalance => SelectionCode::ColdRebalance,
+        SelectionLabel::Overload => SelectionCode::Overload,
+    }
+}
+
+#[cfg(test)]
+#[path = "selection/kernel_bridge_tests.rs"]
+mod kernel_bridge_tests;
 
 #[cfg(test)]
 mod tests {

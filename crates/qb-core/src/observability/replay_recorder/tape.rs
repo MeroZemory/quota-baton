@@ -1,4 +1,4 @@
-//! Schema 6 decision tape (with read-only schema 5 compatibility). Earlier roots are never rewritten.
+//! Schema 7 selection tape (with read-only schema 5/6 compatibility). Earlier roots are never rewritten.
 //! Producers only enqueue bounded typed metadata. The sole writer compresses and syncs.
 use super::*;
 use crate::bindings::decision_tape::DecisionRecord;
@@ -8,7 +8,7 @@ use std::{
     io::{BufRead, Read},
 };
 
-pub(super) const TAPE_SCHEMA: u16 = 6;
+pub(super) const TAPE_SCHEMA: u16 = 7;
 const RECORD_BYTES: usize = 256 * 1024;
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const HOUR_BYTES: u64 = 20_000_000;
@@ -83,6 +83,7 @@ pub enum ProducerFailureReason {
     MetadataCursorExhausted,
     DecisionCursorExhausted,
     PermitCursorExhausted,
+    SelectionCursorExhausted,
     CommitCursorExhausted,
     CommitWithoutProposal,
     StartupActiveState,
@@ -102,6 +103,12 @@ pub struct Manifest {
     pub persisted: u64,
     pub deduplicated: u64,
     pub permit_records: u64,
+    #[serde(default)]
+    pub selection_records: u64,
+    #[serde(default)]
+    pub selection_not_comparable: u64,
+    #[serde(default)]
+    pub selection_not_comparable_reasons: BTreeMap<WireRefusal, u64>,
     pub permit_not_comparable: u64,
     // Defaults admit the unchanged schema 5 manifest only; schema 6 requires both.
     #[serde(default)]
@@ -122,8 +129,17 @@ pub struct Manifest {
 pub enum Payload {
     DecisionTape(Box<DecisionRecord>),
     PermitTape(Box<PermitEnvelope>),
+    SelectionTape(Box<SelectionEnvelope>),
     PermitCommit { proposal: u64 },
     Metadata(Box<Event>),
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionEnvelope {
+    pub capture_id: u64,
+    pub entry: crate::bindings::decision_tape::Entry,
+    pub invocation: u64,
+    pub(crate) record: permit_tape::selection::SelectionRecord,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +253,9 @@ pub(crate) fn open_with_provenance(
         persisted: 0,
         deduplicated: 0,
         permit_records: 0,
+        selection_records: 0,
+        selection_not_comparable: 0,
+        selection_not_comparable_reasons: BTreeMap::new(),
         permit_not_comparable: 0,
         permit_not_comparable_reasons: BTreeMap::new(),
         producer_failure_reasons: BTreeMap::new(),
@@ -346,6 +365,68 @@ impl Producer {
             Payload::DecisionTape(Box::new(record)),
         )
     }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn selection(
+        &self,
+        at: Stamp,
+        cursor: u64,
+        entry: crate::bindings::decision_tape::Entry,
+        capture_id: u64,
+        invocation: u64,
+        inputs: &crate::bindings::kernel::DecisionInputs,
+        actual: &crate::bindings::kernel::selection::SelectionDecision,
+    ) -> Option<u64> {
+        let mapper = |kind, raw: &str| {
+            let domain = match kind {
+                permit_tape::IdKind::Account => IdentityDomain::Account,
+                permit_tape::IdKind::Session => IdentityDomain::Session,
+            };
+            let id = pseudonym(&self.shared.key, domain, raw.as_bytes());
+            id.0[..16]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let record = match permit_tape::selection::capture(inputs, actual, mapper) {
+            Ok(record) => record,
+            Err(reason) => match permit_tape::selection::refused_record(actual, reason, mapper) {
+                Ok(record) => record,
+                Err(_) => {
+                    self.invalid();
+                    return None;
+                }
+            },
+        };
+        let refusal = record.refusal;
+        let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ordinal = self.enqueue_locked(
+            &mut s,
+            at,
+            Owner::Bindings,
+            cursor,
+            None,
+            Payload::SelectionTape(Box::new(SelectionEnvelope {
+                capture_id,
+                entry,
+                invocation,
+                record,
+            })),
+        )?;
+        s.manifest.selection_records += 1;
+        if let Some(reason) = refusal {
+            let m = &mut s.manifest;
+            increment(&mut m.selection_not_comparable, &mut m.losses.saturated, 1);
+            increment(
+                m.selection_not_comparable_reasons
+                    .entry(reason)
+                    .or_default(),
+                &mut m.losses.saturated,
+                1,
+            );
+        }
+        Some(ordinal)
+    }
+
     pub(crate) fn permit(
         &self,
         at: Stamp,
@@ -536,6 +617,9 @@ impl Producer {
         if let Payload::DecisionTape(record) = &mut event {
             record.ordinal = sequence;
         }
+        if let Payload::SelectionTape(envelope) = &mut event {
+            envelope.record.ordinal = sequence;
+        }
         if let Payload::PermitTape(envelope) = &mut event {
             envelope.record.ordinal = sequence;
         }
@@ -594,6 +678,7 @@ fn identities(
     let DecisionRecord {
         schema: _,
         ordinal: _,
+        capture_id: _,
         inputs,
         state,
         answers: _,
@@ -601,6 +686,8 @@ fn identities(
         outcome,
         capture_aborted: _,
         read_state_complete: _,
+        selection_ordinals: _,
+        selection_refusals: _,
     } = r;
     let Inputs {
         entry: _,
@@ -999,7 +1086,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     }
     let epoch_bytes = bounded_file(&path.join("epoch.json"), CONTROL_BYTES)?;
     let epoch: EpochHeader = serde_json::from_slice(&epoch_bytes).map_err(|_| fail())?;
-    if !matches!(epoch.schema, 5 | TAPE_SCHEMA) {
+    if !matches!(epoch.schema, 5 | 6 | TAPE_SCHEMA) {
         return Err(io::Error::other("decision_tape_unsupported_schema"));
     }
     let header_bytes = bounded_file(&path.join("header.json"), CONTROL_BYTES)?;
@@ -1020,7 +1107,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     {
         return Err(fail());
     }
-    if epoch.schema == TAPE_SCHEMA {
+    if epoch.schema >= 6 {
         // serde defaults exist exclusively for old manifests. New manifests must
         // explicitly carry both finite maps, even when the aggregates are zero.
         let fields: serde_json::Value =
@@ -1033,11 +1120,29 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
             return Err(fail());
         }
     }
+    if epoch.schema >= 7 {
+        let fields: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).map_err(|_| fail())?;
+        if [
+            "selection_records",
+            "selection_not_comparable",
+            "selection_not_comparable_reasons",
+        ]
+        .iter()
+        .any(|key| fields.get(*key).is_none())
+            || checked_reason_sum(&m.selection_not_comparable_reasons)
+                != Some(m.selection_not_comparable)
+        {
+            return Err(fail());
+        }
+    }
     let mut hash = Sha256::new();
     hash.update(if epoch.schema == 5 {
         b"quota-baton/decision-tape-v5/epoch\0"
-    } else {
+    } else if epoch.schema == 6 {
         b"quota-baton/decision-tape-v6/epoch\0"
+    } else {
+        b"quota-baton/decision-tape-v7/epoch\0"
     });
     for bytes in [&epoch_bytes, &header_bytes] {
         hash.update((bytes.len() as u64).to_be_bytes());
@@ -1051,6 +1156,8 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     let mut compressed = 0u64;
     let mut decisions = Vec::new();
     let mut permits = Vec::new();
+    let mut selections = Vec::new();
+    let mut selection_refusals = BTreeMap::new();
     let mut quota_dictionary = BTreeMap::new();
     let mut quota_dictionary_bytes = 0usize;
     let mut allowed_proposals = BTreeSet::new();
@@ -1183,6 +1290,23 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
                     }
                     permits.push(envelope.record);
                 }
+                Payload::SelectionTape(envelope) => {
+                    if epoch.schema < 7
+                        || envelope.record.ordinal != sequence
+                        || envelope.invocation == 0
+                        || envelope.capture_id == 0
+                    {
+                        return Err(fail());
+                    }
+                    permit_tape::selection::validate(&envelope.record).map_err(|_| fail())?;
+                    if let Some(reason) = envelope.record.refusal {
+                        *selection_refusals.entry(reason).or_insert(0u64) += 1;
+                    }
+                    if witnesses == 0 {
+                        witness_before_decisions = false;
+                    }
+                    selections.push(*envelope);
+                }
                 Payload::PermitCommit { proposal } => {
                     if record.cause != Some(proposal)
                         || proposal >= sequence
@@ -1209,7 +1333,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
                     decisions.push(*decision);
                 }
                 Payload::Metadata(event) if matches!(*event, Event::InitialWitness { .. }) => {
-                    if !decisions.is_empty() || !permits.is_empty() {
+                    if !decisions.is_empty() || !permits.is_empty() || !selections.is_empty() {
                         witness_before_decisions = false;
                     }
                     let bytes = serde_json::to_vec(&event).map_err(|_| fail())?;
@@ -1263,10 +1387,48 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         || m.sealed && (m.accepted != m.persisted || aborted != m.losses.capture_aborted)
         || permits.len() as u64 != m.permit_records
         || not_comparable != m.permit_not_comparable
-        || epoch.schema == TAPE_SCHEMA && refusal_reasons != m.permit_not_comparable_reasons
+        || epoch.schema >= 6 && refusal_reasons != m.permit_not_comparable_reasons
+        || selections.len() as u64 != m.selection_records
+        || checked_reason_sum(&selection_refusals) != Some(m.selection_not_comparable)
+        || selection_refusals != m.selection_not_comparable_reasons
     {
         return Err(fail());
     }
+    let mut linked = BTreeSet::new();
+    let mut capture_ids = BTreeSet::new();
+    let mut selection_links_valid = true;
+    for decision in &decisions {
+        if let Some(id) = decision.capture_id
+            && (id == 0 || !capture_ids.insert(id))
+        {
+            return Err(fail());
+        }
+        let mut previous_invocation = 0;
+        for (index, ordinal) in decision.selection_ordinals.iter().enumerate() {
+            let found = selections
+                .binary_search_by_key(ordinal, |s| s.record.ordinal)
+                .ok()
+                .map(|i| &selections[i]);
+            let maximum = (decision.selection_ordinals.len() as u64)
+                .checked_add(decision.selection_refusals)
+                .ok_or_else(fail)?;
+            if *ordinal >= decision.ordinal
+                || !linked.insert(*ordinal)
+                || found.is_none_or(|s| {
+                    s.entry != decision.inputs.entry
+                        || Some(s.capture_id) != decision.capture_id
+                        || s.invocation <= previous_invocation
+                        || s.invocation > maximum
+                        || decision.selection_refusals == 0 && s.invocation != index as u64 + 1
+                })
+            {
+                return Err(fail());
+            }
+            previous_invocation = found.unwrap().invocation;
+        }
+        selection_links_valid &= decision.selection_refusals == 0 && !decision.capture_aborted;
+    }
+    selection_links_valid &= linked.len() == selections.len();
     let losses = m.losses.total();
     let producer_build = header
         .build
@@ -1290,7 +1452,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         && witness_before_decisions
         && !permits.is_empty();
     Ok(crate::observability::decision_reader::Epoch {
-        producer_build,
+        producer_build: producer_build.clone(),
         tape_sha256: format!("{:x}", hash.finalize()),
         initial_witness: if witnesses == 0 {
             String::new()
@@ -1302,6 +1464,16 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         decisions,
         permits,
         permit_complete,
+        selection_complete: m.sealed
+            && losses == 0
+            && m.accepted == m.persisted
+            && producer_build.is_some()
+            && encoded == m.encoded_bytes
+            && witnesses > 0
+            && witness_before_decisions
+            && selection_links_valid
+            && !selections.is_empty(),
+        selections,
         permit_commits: committed_proposals.len() as u64,
         provenance: header.provenance,
         capture_started_utc_ns: header.start.utc_ns,

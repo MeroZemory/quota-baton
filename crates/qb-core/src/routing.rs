@@ -2407,6 +2407,7 @@ impl PolicyStore {
 
     /// Coherent native plan/row-presence view for advisory new placement only.
     /// Presence includes recovery witnesses even when their settings are global.
+    #[cfg(test)]
     pub(crate) fn placement_plan(&self, key: Option<&str>) -> (Plan, bool) {
         let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
         let state = self.snapshot();
@@ -6380,3 +6381,5 @@ mod issue_operation_writer_tests {
         assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
     }
 }
+
+pub(crate) mod selection_inputs;

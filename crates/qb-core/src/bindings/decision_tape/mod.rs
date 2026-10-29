@@ -6,6 +6,18 @@ use crate::observability::decision_comparison::{Outcome, OutcomeKind};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 
+pub(crate) type SelectionRecorder = Arc<
+    dyn Fn(
+            Entry,
+            u64,
+            u64,
+            &kernel::DecisionInputs,
+            &kernel::selection::SelectionDecision,
+        ) -> Option<u64>
+        + Send
+        + Sync,
+>;
+
 pub type Recorder = Arc<dyn Fn(&DecisionRecord) -> Option<u64> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +147,8 @@ pub struct DecisionRecord {
     pub schema: u16,
     /// Writer sets the archive ordinal returned by the producer callback.
     pub ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<u64>,
     pub inputs: Inputs,
     pub state: Option<ReadState>,
     pub answers: Vec<Answer>,
@@ -142,6 +156,10 @@ pub struct DecisionRecord {
     pub outcome: Outcome,
     pub capture_aborted: bool,
     pub read_state_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selection_ordinals: Vec<u64>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub selection_refusals: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -180,6 +198,10 @@ pub fn replay_record(record: &DecisionRecord) -> Result<Outcome, ReplayRefusal> 
     }
     Err(ReplayRefusal::Unsupported)
 }
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 struct Trace {
     id: u64,
     table: usize,
@@ -187,6 +209,8 @@ struct Trace {
     state: Option<ReadState>,
     answers: Vec<Answer>,
     rebind: RebindMarker,
+    selection_ordinals: Vec<u64>,
+    selection_refusals: u64,
 }
 thread_local! { static ACTIVE: RefCell<Vec<Trace>> = const { RefCell::new(Vec::new()) }; }
 static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(1);
@@ -214,6 +238,8 @@ impl<'a> Capture<'a> {
                 state: None,
                 answers: Vec::new(),
                 rebind: RebindMarker::default(),
+                selection_ordinals: Vec::new(),
+                selection_refusals: 0,
             })
         });
         Some(Self {
@@ -232,6 +258,7 @@ impl<'a> Capture<'a> {
         let record = DecisionRecord {
             schema: 1,
             ordinal: self.id,
+            capture_id: Some(self.id),
             inputs: self.inputs.clone(),
             state: trace.state,
             answers: trace.answers,
@@ -239,6 +266,8 @@ impl<'a> Capture<'a> {
             outcome: result,
             capture_aborted: false,
             read_state_complete: false,
+            selection_ordinals: trace.selection_ordinals,
+            selection_refusals: trace.selection_refusals,
         };
         self.publish(&record);
     }
@@ -276,13 +305,20 @@ impl Drop for Capture<'_> {
             let record = DecisionRecord {
                 schema: 1,
                 ordinal: self.id,
+                capture_id: Some(self.id),
                 inputs: self.inputs.clone(),
                 state: trace.as_ref().and_then(|t| t.state.clone()),
                 answers: trace.as_ref().map_or_else(Vec::new, |t| t.answers.clone()),
-                rebind: trace.map_or_else(RebindMarker::default, |t| t.rebind),
+                rebind: trace
+                    .as_ref()
+                    .map_or_else(RebindMarker::default, |t| t.rebind.clone()),
                 outcome: aborted,
                 capture_aborted: true,
                 read_state_complete: false,
+                selection_ordinals: trace
+                    .as_ref()
+                    .map_or_else(Vec::new, |t| t.selection_ordinals.clone()),
+                selection_refusals: trace.as_ref().map_or(0, |t| t.selection_refusals),
             };
             self.publish(&record);
         }
@@ -297,6 +333,60 @@ fn trace(table: &BindingTable, f: impl FnOnce(&mut Trace)) {
             f(trace);
         }
     });
+}
+/// Only an actual synchronous chooser/launch capture may publish a selection.
+pub(super) fn observe_selection(
+    table: &BindingTable,
+    inputs: &kernel::DecisionInputs,
+    actual: &kernel::selection::SelectionDecision,
+) {
+    let context = ACTIVE.with_borrow(|stack| {
+        stack
+            .last()
+            .filter(|t| t.table == table as *const _ as usize)
+            .map(|t| {
+                (
+                    t.id,
+                    t.inputs.entry,
+                    t.selection_ordinals.len() as u64 + t.selection_refusals + 1,
+                )
+            })
+    });
+    let Some((capture_id, entry, invocation)) = context else {
+        return;
+    };
+    let recorder = table
+        .selection_recorder
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(recorder) = recorder else { return };
+    let ordinal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        recorder(entry, capture_id, invocation, inputs, actual)
+    }))
+    .ok()
+    .flatten();
+    ACTIVE.with_borrow_mut(|stack| {
+        if let Some(trace) = stack
+            .last_mut()
+            .filter(|t| t.id == capture_id && t.table == table as *const _ as usize)
+        {
+            if let Some(ordinal) = ordinal {
+                trace.selection_ordinals.push(ordinal);
+            } else {
+                trace.selection_refusals += 1;
+                table
+                    .decision_capture_losses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+pub(super) fn selection_refused(table: &BindingTable) {
+    trace(table, |t| t.selection_refusals += 1);
+    table
+        .decision_capture_losses
+        .fetch_add(1, Ordering::Relaxed);
 }
 pub(super) fn check(table: &BindingTable, check: Check, value: bool) -> bool {
     trace(table, |t| t.answers.push(Answer { check, value }));

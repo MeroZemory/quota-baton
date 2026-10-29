@@ -15,6 +15,8 @@ pub struct Epoch {
     pub decisions: Vec<DecisionRecord>,
     pub permits: Vec<crate::bindings::permit_tape::PermitRecord>,
     pub permit_complete: bool,
+    pub(crate) selections: Vec<super::replay_recorder::tape::SelectionEnvelope>,
+    pub(crate) selection_complete: bool,
     pub permit_commits: u64,
     pub provenance: super::replay_recorder::Provenance,
     pub capture_started_utc_ns: i64,
@@ -246,6 +248,8 @@ mod tests {
             complete: true,
             permits: Vec::new(),
             permit_complete: false,
+            selections: Vec::new(),
+            selection_complete: false,
             permit_commits: 0,
             provenance: super::super::replay_recorder::Provenance::Synthetic,
             capture_started_utc_ns: 0,
@@ -253,6 +257,7 @@ mod tests {
             decisions: vec![DecisionRecord {
                 schema: 1,
                 ordinal: 1,
+                capture_id: None,
                 inputs: Inputs {
                     entry: Entry::Chooser,
                     at: DateTime::parse_from_rfc3339("2026-10-29T00:00:00Z")
@@ -283,6 +288,8 @@ mod tests {
                 },
                 capture_aborted: false,
                 read_state_complete: false,
+                selection_ordinals: Vec::new(),
+                selection_refusals: 0,
             }],
         }
     }

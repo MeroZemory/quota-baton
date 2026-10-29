@@ -43,6 +43,42 @@ pub enum DebugCommand {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(about = "Execute the shared selection kernel on a verified epoch")]
+    SelectionRun {
+        #[arg(long)]
+        epoch: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(about = "Check selection identity, built raw-fact power and margin-zero proposals")]
+    SelectionCompare {
+        #[arg(long)]
+        epoch: PathBuf,
+        #[arg(long)]
+        reference: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+        #[arg(long)]
+        power: PathBuf,
+        #[arg(long)]
+        reference_build: String,
+        #[arg(long)]
+        candidate_build: String,
+        #[arg(long)]
+        power_build: String,
+        #[arg(long)]
+        fault_ordinal: u64,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[cfg(feature = "testkit")]
+    #[command(hide = true)]
+    SelectionFixture {
+        #[arg(long)]
+        fixture_home: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     #[command(about = "Execute the raw-fact permit kernel on a verified epoch")]
     PermitRun {
         #[arg(long)]
@@ -89,6 +125,58 @@ pub enum DebugCommand {
 
 pub async fn run(home: &Path, command: DebugCommand) -> anyhow::Result<()> {
     match command {
+        DebugCommand::SelectionRun { epoch, out } => {
+            let result = std::thread::Builder::new()
+                .name("qb-selection-reader".into())
+                .spawn(move || -> anyhow::Result<_> {
+                    let capture = qb_core::observability::decision_reader::load(&epoch)?;
+                    Ok(qb_core::observability::selection_reader::execute(
+                        &capture,
+                        executable_digest()?,
+                    ))
+                })?
+                .join()
+                .map_err(|_| anyhow::anyhow!("selection reader thread failed"))?;
+            write_verdict(&out, result)
+        }
+        DebugCommand::SelectionCompare {
+            epoch,
+            reference,
+            candidate,
+            power,
+            reference_build,
+            candidate_build,
+            power_build,
+            fault_ordinal,
+            out,
+        } => {
+            let result = (|| -> anyhow::Result<_> {
+                let capture = qb_core::observability::decision_reader::load(&epoch)?;
+                Ok(qb_core::observability::selection_reader::compare(
+                    &capture,
+                    &read_execution(&reference)?,
+                    &read_execution(&candidate)?,
+                    &read_execution(&power)?,
+                    [&reference_build, &candidate_build, &power_build],
+                    fault_ordinal,
+                )?)
+            })();
+            let passed = result.as_ref().is_ok_and(|r| {
+                r.verdict == qb_core::observability::decision_comparison::Verdict::Pass
+            });
+            write_verdict(&out, result)?;
+            anyhow::ensure!(passed, "selection tape verdict did not pass");
+            Ok(())
+        }
+        #[cfg(feature = "testkit")]
+        DebugCommand::SelectionFixture { fixture_home, out } => {
+            let result = std::thread::Builder::new()
+                .name("qb-selection-fixture".into())
+                .spawn(move || qb_core::bindings::selection_fixture::capture(&fixture_home))?
+                .join()
+                .map_err(|_| anyhow::anyhow!("selection fixture thread failed"))?;
+            write_verdict(&out, result)
+        }
         DebugCommand::PermitRun { epoch, out } => {
             let result = std::thread::Builder::new()
                 .name("qb-permit-reader".into())
