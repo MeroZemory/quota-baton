@@ -21,6 +21,7 @@ fn candidate() -> Candidate {
 
 fn inputs(c: &Candidate, d: &Data, key: Option<&str>, model: Option<&str>) -> DecisionInputs {
     DecisionInputs {
+        selection: None,
         now: now(),
         model: model.map(str::to_owned),
         key: key.map(str::to_owned),

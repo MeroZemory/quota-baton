@@ -77,7 +77,7 @@ fn account(id: &str, provider: Provider) -> Account {
     }
 }
 
-fn candidate(id: &str, provider: Provider) -> Candidate {
+pub(super) fn candidate(id: &str, provider: Provider) -> Candidate {
     Candidate {
         account: account(id, provider),
         quota: None,
@@ -213,7 +213,7 @@ pub fn capture(home: &Path) -> Result<CaptureSummary> {
         .context("prepare private synthetic fixture state")?;
 
     let table = BindingTable::new(home, RoutingConfig::default())?;
-    let root = home.join("state/decision-tape-v6");
+    let root = home.join("state/decision-tape-v7");
     let runtime = Shutdown(Arc::new(ReplayRuntime::start_synthetic_tape(&root, 32)?));
     let initial_accounts: Vec<Account> = candidates().into_iter().map(|c| c.account).collect();
     table.attach_tape(runtime.0.clone(), &initial_accounts)?;

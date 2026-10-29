@@ -238,7 +238,7 @@
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::new",
-      "expression": "call: Arc :Joint :Alone new Parenthesis( Self Brace( policies ,Alone path ,Alone config ,Alone thresholds :Alone Mutex :Joint :Alone new Parenthesis( BTreeMap :Joint :Alone new Parenthesis( ) ) ,Alone data :Alone Mutex :Joint :Alone new Parenthesis( data ) ,Alone writer :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone mutations :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone #Alone Bracket( cfg Parenthesis( test ) ) wait_before_publication :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_guard :Alone Mutex :Joint :Alone new Parenthesis( move_guard :Joint :Alone Breaker :Joint :Alone default Parenthesis( ) ) ,Alone move_guard_observer :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_accounting :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone writes_stopped :Alone AtomicBool :Joint :Alone new Parenthesis( false ) ,Alone unknown_cost_skips :Alone AtomicUsize :Joint :Alone new Parenthesis( 0 ) ,Alone usage_sequence :Alone AtomicU64 :Joint :Alone new Parenthesis( 0 ) ,Alone decision_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone permit_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone permit_commit_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone decision_capture_losses :Alone AtomicU64 :Joint :Alone new Parenthesis( 0 ) ,Alone ) )",
+      "expression": "call: Arc :Joint :Alone new Parenthesis( Self Brace( policies ,Alone path ,Alone config ,Alone thresholds :Alone Mutex :Joint :Alone new Parenthesis( BTreeMap :Joint :Alone new Parenthesis( ) ) ,Alone data :Alone Mutex :Joint :Alone new Parenthesis( data ) ,Alone writer :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone mutations :Alone Mutex :Joint :Alone new Parenthesis( Parenthesis( ) ) ,Alone #Alone Bracket( cfg Parenthesis( test ) ) wait_before_publication :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_guard :Alone Mutex :Joint :Alone new Parenthesis( move_guard :Joint :Alone Breaker :Joint :Alone default Parenthesis( ) ) ,Alone move_guard_observer :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone move_accounting :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone writes_stopped :Alone AtomicBool :Joint :Alone new Parenthesis( false ) ,Alone unknown_cost_skips :Alone AtomicUsize :Joint :Alone new Parenthesis( 0 ) ,Alone usage_sequence :Alone AtomicU64 :Joint :Alone new Parenthesis( 0 ) ,Alone decision_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone permit_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone selection_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone permit_commit_recorder :Alone Mutex :Joint :Alone new Parenthesis( None ) ,Alone decision_capture_losses :Alone AtomicU64 :Joint :Alone new Parenthesis( 0 ) ,Alone ) )",
       "count": 1
     },
     {
@@ -873,12 +873,6 @@
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "semantic_evidence",
-      "expression": "call: Data :Joint :Alone default Parenthesis( )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
       "function": "snapshot",
       "expression": "construction: Snapshot Brace( schema :Alone 1 ,Alone bindings :Alone d .Alone bindings .Alone values Parenthesis( ) .Alone cloned Parenthesis( ) .Alone collect Parenthesis( ) ,Alone launches :Alone d .Alone launches .Alone clone Parenthesis( ) ,Alone launch_anchors :Alone d .Alone launch_anchors .Alone clone Parenthesis( ) ,Alone launch_aliases :Alone d .Alone launch_aliases .Alone clone Parenthesis( ) ,Alone )",
       "count": 1
@@ -1082,6 +1076,60 @@
       "count": 1
     },
     {
+      "path": "crates/qb-core/src/bindings/kernel/selection.rs",
+      "function": "select_ranked",
+      "expression": "assignment: b .Alone account =Alone anchor .Alone clone Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection.rs",
+      "function": "select_ranked",
+      "expression": "compound-assignment: *Alone eligible &Joint =Alone candidate .Alone account .Alone id =Joint =Alone source |Joint |Alone Parenthesis( !Alone outside_unknown &Joint &Alone !Alone s .Alone outside_used .Alone contains Parenthesis( &Alone candidate .Alone account .Alone id ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection_affinity.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use crate :Joint :Alone bindings :Joint :Alone Brace( CAPACITY ,Alone launch :Joint :Alone IDLE_SECS ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection_metrics.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use crate :Joint :Alone bindings :Joint :Alone Brace( PlacementEvidence ,Alone PlacementState ,Alone PlacementWindow ,Alone UsageObservationAsOf ,Alone account_window ,Alone ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection_metrics.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use serde_json :Joint :Alone Value ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection_metrics.rs",
+      "function": "calculate",
+      "expression": "assignment: *Alone previous =Alone Some Parenthesis( projected )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection_metrics.rs",
+      "function": "calculate",
+      "expression": "assignment: *Alone slot =Alone match Parenthesis( *Alone slot ,Alone reset ) Brace( Parenthesis( Some Parenthesis( a ) ,Alone Some Parenthesis( b ) ) =Joint >Alone Some Parenthesis( a .Alone min Parenthesis( b ) ) ,Alone Parenthesis( a ,Alone b ) =Joint >Alone a .Alone or Parenthesis( b ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection_metrics.rs",
+      "function": "calculate",
+      "expression": "assignment: *Alone slot =Alone reset",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel_shell.rs",
+      "function": "BindingTable::attach_tape",
+      "expression": "assignment: *Alone self .Alone selection_recorder .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) =Alone Some Parenthesis( Arc :Joint :Alone new Parenthesis( move |Alone entry ,Alone capture_id ,Alone invocation ,Alone inputs ,Alone actual |Alone Brace( selections .Alone record_selection Parenthesis( entry ,Alone capture_id ,Alone invocation ,Alone inputs ,Alone actual ) ) ,Alone ) )",
+      "count": 1
+    },
+    {
       "path": "crates/qb-core/src/bindings/kernel_shell.rs",
       "function": "BindingTable::attach_tape",
       "expression": "call: Parenthesis( |Alone |Alone -Joint >Alone Result <Alone Parenthesis( ) ,Alone StartupWitnessFailure >Alone Brace( use crate :Joint :Alone observability :Joint :Alone replay_recorder :Joint :Alone Brace( Event ,Alone Fingerprint ,Alone Owner ) ;Alone use sha2 :Joint :Alone Brace( Digest ,Alone Sha256 ) ;Alone let image =Alone self .Alone decision_tape_initial_image Parenthesis( ) .Alone map_err Parenthesis( |Alone error |Alone Brace( error .Alone downcast_ref :Joint :Alone <Alone StartupWitnessFailure >Alone Parenthesis( ) .Alone copied Parenthesis( ) .Alone unwrap_or Parenthesis( StartupWitnessFailure :Joint :Alone ImageSerialization ) ) ) ?Alone ;Alone let bytes =Alone serde_json :Joint :Alone to_vec Parenthesis( &Alone Parenthesis( &Alone image ,Alone initial_accounts ) ) .Alone map_err Parenthesis( |Alone _ |Alone StartupWitnessFailure :Joint :Alone AccountsSerialization ) ?Alone ;Alone let digest =Alone Fingerprint Parenthesis( Sha256 :Joint :Alone digest Parenthesis( bytes ) .Alone into Parenthesis( ) ) ;Alone if producer .Alone record Parenthesis( Owner :Joint :Alone Bindings ,Alone None ,Alone Event :Joint :Alone InitialWitness Brace( component :Alone Owner :Joint :Alone Bindings ,Alone revision :Alone image .Alone revision ,Alone cursor :Alone 0 ,Alone rows :Alone image .Alone bindings_rows ,Alone digest ,Alone ) ,Alone ) .Alone is_none Parenthesis( ) Brace( return Err Parenthesis( StartupWitnessFailure :Joint :Alone Publication ) ;Alone ) Ok Parenthesis( Parenthesis( ) ) ) ) Parenthesis( )",
@@ -1103,6 +1151,12 @@
       "path": "crates/qb-core/src/bindings/kernel_shell.rs",
       "function": "BindingTable::set_permit_recorder",
       "expression": "assignment: *Alone self .Alone permit_recorder .Alone lock Parenthesis( ) .Alone unwrap_or_else Parenthesis( |Alone e |Alone e .Alone into_inner Parenthesis( ) ) =Alone Some Parenthesis( recorder )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel_shell/selection.rs",
+      "function": "snapshot",
+      "expression": "method: accounts .Alone entry Parenthesis( candidate .Alone account .Alone id .Alone clone Parenthesis( ) ) .Alone or_insert_with Parenthesis( |Alone |Alone row Parenthesis( candidate ) )",
       "count": 1
     },
     {
@@ -1658,6 +1712,144 @@
       "count": 1
     },
     {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use crate :Joint :Alone bindings :Joint :Alone kernel :Joint :Alone Brace( selection :Joint :Alone Brace( LaunchInput ,Alone PreferenceInput ,Alone RootHintInput ,Alone SelectionChoice ,Alone SelectionDecision ,Alone SelectionEntry ,Alone SelectionInputs ,Alone SelectionPolicyInput ,Alone SelectionReturnInput ,Alone ) ,Alone selection_affinity :Joint :Alone AffinityInput ,Alone selection_metrics :Joint :Alone MetricInputs ,Alone ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "WireSelectionInputs::to_inputs",
+      "expression": "call: serde_json :Joint :Alone to_value Parenthesis( &Alone w )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "WireSelectionInputs::to_inputs",
+      "expression": "call: serde_json :Joint :Alone to_value Parenthesis( self )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "capture",
+      "expression": "mutable-escape: &Alone mut identity",
+      "count": 3
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "keys",
+      "expression": "assignment: *Alone v =Alone mapped",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "optional",
+      "expression": "assignment: *Alone id =Alone map Parenthesis( kind ,Alone id ) ?Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "assignment: *Alone id =Alone map Parenthesis( A ,Alone id ) ?Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "assignment: *Alone id =Alone map Parenthesis( S ,Alone id ) ?Alone",
+      "count": 3
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "assignment: *Alone pool =Alone map Parenthesis( A ,Alone pool ) ?Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "assignment: b .Alone account =Alone map Parenthesis( A ,Alone &Alone b .Alone account ) ?Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "assignment: g .Alone account =Alone map Parenthesis( A ,Alone &Alone g .Alone account ) ?Alone",
+      "count": 2
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "assignment: row .Alone account .Alone id =Alone map Parenthesis( A ,Alone &Alone row .Alone account .Alone id ) ?Alone",
+      "count": 2
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "method: a .Alone bindings .Alone values_mut Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "method: a .Alone groups .Alone values_mut Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "method: w .Alone groups .Alone values_mut Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "mutable-escape: &Alone mut a .Alone bindings",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "mutable-escape: &Alone mut a .Alone groups",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "mutable-escape: &Alone mut p .Alone account",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "mutable-escape: &Alone mut w .Alone bindings",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap",
+      "expression": "mutable-escape: &Alone mut w .Alone groups",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "remap_actual",
+      "expression": "assignment: *Alone account =Alone map Parenthesis( IdKind :Joint :Alone Account ,Alone account ) ?Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "set",
+      "expression": "assignment: *Alone v =Alone v .Alone iter Parenthesis( ) .Alone map Parenthesis( |Alone id |Alone map Parenthesis( kind ,Alone id ) ) .Alone collect :Joint :Alone <Alone Result <Alone _ ,Alone _ >Alone >Alone Parenthesis( ) ?Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/permit_tape/selection.rs",
+      "function": "strings",
+      "expression": "assignment: *Alone id =Alone map Parenthesis( kind ,Alone id ) ?Alone",
+      "count": 1
+    },
+    {
       "path": "crates/qb-core/src/bindings/quota_wait.rs",
       "function": "<module>",
       "expression": "sensitive-import: use serde_json :Joint :Alone Value ;Alone",
@@ -1821,20 +2013,14 @@
     },
     {
       "path": "crates/qb-core/src/bindings/selection.rs",
-      "function": "BindingTable::select_ranked",
-      "expression": "assignment: b .Alone account =Alone anchor .Alone clone Parenthesis( )",
+      "function": "BindingTable::selection_from_snapshot",
+      "expression": "opaque-macro: tracing :Joint :Alone debug !Alone Parenthesis( account =Alone %Alone diagnostic .Alone account ,Alone reason =Alone diagnostic .Alone reason ,Alone \"reset hold skipped\" )",
       "count": 1
     },
     {
-      "path": "crates/qb-core/src/bindings/selection.rs",
-      "function": "BindingTable::select_ranked",
-      "expression": "compound-assignment: *Alone eligible &Joint =Alone candidate .Alone account .Alone id =Joint =Alone source |Joint |Alone Parenthesis( !Alone outside_unknown &Joint &Alone !Alone d .Alone outside_used .Alone contains Parenthesis( &Alone candidate .Alone account .Alone id ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/selection.rs",
-      "function": "BindingTable::select_ranked",
-      "expression": "opaque-macro: tracing :Joint :Alone debug !Alone Parenthesis( account =Alone %Alone b .Alone account ,Alone reason =Alone skip_reason ,Alone \"reset hold skipped\" )",
+      "path": "crates/qb-core/src/bindings/selection_fixture.rs",
+      "function": "selected",
+      "expression": "opaque-macro: assert_eq !Alone Parenthesis( account ,Alone expected ,Alone \"independent schedule account\" )",
       "count": 1
     }
   ],

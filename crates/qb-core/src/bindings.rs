@@ -41,6 +41,8 @@ pub mod permit_tape;
 pub(crate) mod quota_wait;
 mod rebind;
 mod selection;
+#[cfg(any(test, feature = "testkit"))]
+pub mod selection_fixture;
 pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
 };
@@ -585,6 +587,7 @@ pub struct BindingTable {
     usage_sequence: AtomicU64,
     decision_recorder: Mutex<Option<decision_tape::Recorder>>,
     permit_recorder: Mutex<Option<kernel_shell::Recorder>>,
+    selection_recorder: Mutex<Option<decision_tape::SelectionRecorder>>,
     permit_commit_recorder: Mutex<Option<kernel_shell::CommitRecorder>>,
     decision_capture_losses: AtomicU64,
 }
@@ -844,6 +847,7 @@ fn legacy_semantic_evidence(candidate: Option<&Account>) -> u64 {
     u64::from_be_bytes(Sha256::digest(value)[..8].try_into().unwrap())
 }
 
+#[cfg(test)]
 fn semantic_evidence(candidate: Option<&Account>) -> u64 {
     let Some(account) = candidate else {
         return 0;
@@ -1484,6 +1488,7 @@ impl BindingTable {
             usage_sequence: AtomicU64::new(0),
             decision_recorder: Mutex::new(None),
             permit_recorder: Mutex::new(None),
+            selection_recorder: Mutex::new(None),
             permit_commit_recorder: Mutex::new(None),
             decision_capture_losses: AtomicU64::new(0),
         });
@@ -1946,6 +1951,7 @@ impl BindingTable {
         // Pacing remains the ordinary C7 preference, not a hard move veto.
         self.rebalance_target_waiting(d, source, c, except, now)
     }
+    #[cfg(test)]
     fn rebalance_target(
         &self,
         d: &Data,
@@ -3429,6 +3435,7 @@ fn prefer_non_pacing<T>(pool: &mut Vec<(&Candidate, T)>, d: &Data) {
 }
 // Call separately for the step-4 gate-passing set or step-5 fallback set,
 // after that step's room/ratio partition. This helper never admits a candidate.
+#[cfg(test)]
 fn prefer_pacing_and_evidence(
     pool: &mut Vec<(&Candidate, &Metrics)>,
     d: &Data,
@@ -3468,6 +3475,7 @@ fn placement_evidence(c: &Candidate, d: &Data, now: DateTime<Utc>) -> (Placement
         state.count(),
     )
 }
+#[cfg(test)]
 fn metrics_without_placement_charge(
     c: &Candidate,
     d: &Data,

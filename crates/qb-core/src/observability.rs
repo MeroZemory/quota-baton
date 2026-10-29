@@ -6,6 +6,7 @@ pub mod permit_reader;
 mod replay_projection;
 pub mod replay_recorder;
 mod replay_runtime;
+pub mod selection_reader;
 pub(crate) use replay_runtime::Runtime as ReplayRuntime;
 pub mod reread_accounting;
 use axum::http::HeaderMap;
@@ -345,7 +346,7 @@ impl Observability {
             }
         }
         match replay_runtime::Runtime::start_tape(
-            &home.join("state/decision-tape-v6"),
+            &home.join("state/decision-tape-v7"),
             config.disk_limit_mib,
         ) {
             Ok(runtime) => *slot = Some(Arc::new(runtime)),

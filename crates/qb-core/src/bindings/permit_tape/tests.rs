@@ -55,6 +55,7 @@ fn inputs() -> DecisionInputs {
     let root = "claude:private-root-id";
     let child = "claude:private-root-id:agent:private-child-id";
     DecisionInputs {
+        selection: None,
         now: now(),
         model: Some("opus".into()),
         key: Some(child.into()),

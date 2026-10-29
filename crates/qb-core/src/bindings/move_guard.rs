@@ -92,6 +92,7 @@ impl Observation {
         }
     }
 
+    #[cfg(test)]
     fn after(self, committed: Instant) -> bool {
         self.started.is_some_and(|started| started > committed)
     }
@@ -351,6 +352,45 @@ impl Breaker {
         })
     }
 
+    /// Selection reads return history without pruning, tripping or advancing
+    /// the breaker clock. One relative anchor preserves strict Instant order.
+    pub(super) fn selection_return_inputs(
+        &self,
+        key: &str,
+        observations: Observations,
+    ) -> Option<super::kernel::SelectionReturnInput> {
+        let history = self.sessions.get(key);
+        let anchor = history
+            .into_iter()
+            .flatten()
+            .map(|movement| movement.committed)
+            .chain(observations.target.started)
+            .fold(Instant::now(), std::cmp::max);
+        let age = |instant: Instant| u64::try_from(anchor.duration_since(instant).as_nanos()).ok();
+        Some(super::kernel::SelectionReturnInput {
+            last_now: self.last_now,
+            target_observation_age_ns: match observations.target.started {
+                Some(instant) => Some(age(instant)?),
+                None => None,
+            },
+            history: history
+                .into_iter()
+                .flatten()
+                .map(|movement| {
+                    Some(super::kernel::permit::MovementInput {
+                        at: movement.at,
+                        committed_age_ns: age(movement.committed)?,
+                        from: movement.from.clone(),
+                        departure_evidence: movement.departure_evidence,
+                        to: movement.to.clone(),
+                        destination_evidence: movement.destination_evidence,
+                        emergency_return: movement.emergency_return,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
+
     fn prune(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let now = self.last_now.map_or(now, |prior| now.max(prior));
         self.last_now = Some(now);
@@ -558,6 +598,7 @@ impl Breaker {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn return_blocked(
         &self,
         key: &str,

@@ -2,7 +2,7 @@
 //! stored here: anchors and aliases address the ordinary authoritative group.
 use super::*;
 
-const IDLE_SECS: u64 = 24 * 60 * 60;
+pub(super) const IDLE_SECS: u64 = 24 * 60 * 60;
 const KEY_BYTES: usize = 256;
 const MODEL_BYTES: usize = 256;
 const MODEL_COUNT: usize = 2048;
@@ -191,6 +191,7 @@ pub(super) struct SelectionPreference<'a> {
     pub model_move: bool,
 }
 
+#[cfg(test)]
 pub(super) fn prefer<T>(
     pool: &mut Vec<(&Candidate, T)>,
     preference: Option<&SelectionPreference<'_>>,
@@ -347,6 +348,17 @@ pub(super) fn policy_key<'a>(d: &'a Data, key: Option<&'a str>) -> Option<&'a st
             .get(group(key))
             .map_or(key, |m| m.policy_key.as_str())
     })
+}
+
+/// Exact read-only owner row for the selection input snapshot. Private launch
+/// metadata and mutation authority remain inside the launch module.
+pub(super) fn selection_metadata(d: &Data, key: &str) -> Option<kernel::selection::LaunchInput> {
+    d.launches
+        .get(key)
+        .map(|metadata| kernel::selection::LaunchInput {
+            policy_key: metadata.policy_key.clone(),
+            idle_placement: metadata.idle_placement,
+        })
 }
 pub(super) fn touch(d: &mut Data, key: &str, now: DateTime<Utc>) {
     if !d.launch_retention.contains_key(key) {
