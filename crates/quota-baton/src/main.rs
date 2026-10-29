@@ -506,6 +506,11 @@ async fn run() -> anyhow::Result<()> {
             let refreshing = relay.start_refresh_scheduler();
             let catalogs = relay.start_catalog_scheduler();
             let memory_guard = relay.start_memory_guard();
+            let forecast_sampler = if startup_failure.is_none() {
+                relay.start_forecast_log_sampler()
+            } else {
+                None
+            };
             if startup_failure.is_none() {
                 qb_core::service::wait_for_shutdown(relay.clone()).await?;
             }
@@ -515,10 +520,16 @@ async fn run() -> anyhow::Result<()> {
                 refreshing.abort();
                 catalogs.abort();
                 memory_guard.abort();
+                if let Some(sampler) = &forecast_sampler {
+                    sampler.abort();
+                }
                 let _ = polling.await;
                 let _ = refreshing.await;
                 let _ = catalogs.await;
                 let _ = memory_guard.await;
+                if let Some(sampler) = forecast_sampler {
+                    let _ = sampler.await;
+                }
                 // Stop accepting new connections before handing the credential
                 // lease to the successor. Existing handlers remain alive under
                 // axum's graceful-shutdown drain.
