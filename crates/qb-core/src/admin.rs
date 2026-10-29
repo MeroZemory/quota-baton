@@ -1326,3 +1326,6 @@ mod source_features;
 #[cfg(unix)]
 #[path = "admin/source_features_unix.rs"]
 mod source_features;
+
+#[cfg(test)]
+mod routing_handoff_tests;

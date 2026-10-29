@@ -214,6 +214,9 @@ fn friendly_error(error: &anyhow::Error) -> String {
     if let Some(error) = error.downcast_ref::<accounts_cli::AccountCliError>() {
         return error.to_string();
     }
+    if let Some(error) = error.downcast_ref::<routing_cli::RoutingCliError>() {
+        return error.to_string();
+    }
     if let Some(error) = error.downcast_ref::<qb_core::relay::ManualRefreshError>() {
         return error.to_string();
     }
