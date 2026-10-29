@@ -25,6 +25,11 @@ exclude affected pending origins. Missing or stale observations remain
 unavailable rather than zero. Unclean restarts mark pending observations as
 restart gaps.
 
+Codex `0m` and durationless `primary`/`secondary` slots are not capacity
+windows and are excluded from remaining-capacity arithmetic. Positive native
+durations, including `43200m` (30 days), retain their exact window identity.
+An account with no capacity windows is unavailable, never assumed full.
+
 A clean restart also checks the saved native account generation. If it changed
 while collection was stopped, matching final settings cannot prove an unchanged
 cohort: pending observations are excluded and counted as an observation gap.
@@ -43,18 +48,24 @@ Startup or sample failures use `forecast_log_start_failed` or
 deleting it discards pending observations and continuity evidence.
 
 Warnings include finite `phase` and `reason` values, without raw errors or account
-names. The checkpoint's `last_failure` retains the first sample failure even if
-later observations are refused because collection has stopped. The message
+names. The checkpoint's `last_failure` retains the first diagnostic. An invalid
+input sample increments `unavailable` and is retried on the ordinary sampling
+schedule; it must not stop all future collection or manufacture an origin.
+Storage, bounded journal capacity and persistence failures remain explicit
+collection failures. The message
 `Forecast log first sample recorded` confirms the first committed sample.
 
-An upgrade can preserve an old, uncoded stopped capture that has no origins,
+An upgrade can preserve an old stopped capture that has no origins,
 outcomes, sequence, sample, pending work or journal. While holding the Store
 lease after the old writer closed, it renames that checkpoint-only directory
 to a sibling `forecast-log.failed-*` archive and creates a fresh capture. The
 new checkpoint's `recovery` records the archive name and prior losses. Both
 clean and unclean old checkpoints qualify; no earlier observations are filled
-in. Captures containing history or a recorded failure reason are not reset
-automatically. Keep the sibling archive when exporting recovery evidence.
+in. The known empty `sample/window_name` failure may also be preserved and
+restarted, including its prior recovery receipt; that original receipt remains
+inside the archived checkpoint. Captures containing history or other recorded
+failure reasons are not reset automatically. Keep the sibling archives when
+exporting recovery evidence.
 
 Persistence is bounded to a 16 MiB checkpoint and 64 MiB total journal. During
 active sampling, whole daily segments are pruned once their end is at least

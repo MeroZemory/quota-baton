@@ -176,6 +176,10 @@ pub struct Forecasts {
 }
 
 impl Forecasts {
+    pub(crate) fn retain_accounts(&mut self, known: &std::collections::BTreeSet<String>) {
+        self.accounts.retain(|id, _| known.contains(id));
+    }
+
     pub fn observe(
         &mut self,
         id: &str,

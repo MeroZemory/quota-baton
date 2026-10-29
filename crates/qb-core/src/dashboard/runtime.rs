@@ -569,6 +569,15 @@ impl Runtime {
         });
     }
     /// Called under the account store transaction before enabling its observer.
+    pub(crate) fn retain_accounts(&self, known: &BTreeSet<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.usage.retain_accounts(known);
+        state.usage_forecasts.retain_accounts(known);
+        state.accounts.retain(|id, _| known.contains(id.as_str()));
+        state.credits.retain(|id, _| known.contains(id.as_str()));
+    }
+
+    /// Called under the account store transaction before enabling its observer.
     /// Startup facts emit no actions, and cannot overwrite an already observed value.
     pub(crate) fn baseline_accounts(&self, accounts: &[crate::accounts::Account]) {
         let Some(mut state) = self.writable() else {
