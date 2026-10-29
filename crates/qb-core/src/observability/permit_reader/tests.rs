@@ -22,6 +22,7 @@ fn mapper(kind: permit_tape::IdKind, raw: &str) -> String {
 
 fn epoch() -> Epoch {
     let inputs = DecisionInputs {
+        selection: None,
         now: now(),
         model: None,
         key: None,
@@ -56,6 +57,8 @@ fn epoch() -> Epoch {
             })
             .collect(),
         permit_complete: true,
+        selections: Vec::new(),
+        selection_complete: false,
         permit_commits: 0,
         provenance: Provenance::Synthetic,
         capture_started_utc_ns: 1_000,

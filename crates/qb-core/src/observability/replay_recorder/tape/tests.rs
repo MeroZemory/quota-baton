@@ -36,6 +36,7 @@ fn permit_inputs() -> crate::bindings::kernel::DecisionInputs {
         token_meta: TokenMeta::default(),
     };
     DecisionInputs {
+        selection: None,
         now,
         model: None,
         key: Some("codex:private-session-canary".into()),
@@ -286,6 +287,7 @@ fn decision() -> DecisionRecord {
     DecisionRecord {
         schema: 1,
         ordinal: 999,
+        capture_id: None,
         inputs: Inputs {
             entry: Entry::Chooser,
             at: chrono::Utc::now(),
@@ -321,6 +323,8 @@ fn decision() -> DecisionRecord {
         },
         capture_aborted: false,
         read_state_complete: false,
+        selection_ordinals: Vec::new(),
+        selection_refusals: 0,
     }
 }
 fn witness(p: &Producer) {
@@ -776,7 +780,7 @@ fn schema6_producer_failure_reasons_count_once_even_after_disable() {
     }
     writer.close(at(1)).unwrap();
     let m = manifest(&path);
-    assert_eq!(m.schema, 6);
+    assert_eq!(m.schema, TAPE_SCHEMA);
     assert_eq!(m.losses.producer_failure, reasons.len() as u64);
     assert_eq!(m.producer_failure_reasons.len(), reasons.len());
     for reason in reasons {
@@ -1027,6 +1031,115 @@ fn unchanged_legacy5_bytes_keep_the_frozen_hash_without_new_diagnostics() {
         "d7fec5cebdcc37123c05a115e5d5848bbde4e6f0605860e6cb6b80ff76b8410a"
     );
     assert_ne!(loaded6.tape_sha256, loaded.tape_sha256);
+}
+
+fn rewrite_selection_fixture(path: &Path, change: impl FnOnce(&mut [Record])) {
+    let mut m = manifest(path);
+    assert_eq!(m.segments.len(), 1);
+    let segment = path.join(segment_name(0));
+    let raw = zstd::stream::decode_all(fs::read(&segment).unwrap().as_slice()).unwrap();
+    let mut rows: Vec<Record> = raw
+        .split(|b| *b == b'\n')
+        .filter(|r| !r.is_empty())
+        .map(|r| serde_json::from_slice(r).unwrap())
+        .collect();
+    change(&mut rows);
+    let mut raw = Vec::new();
+    for row in rows {
+        serde_json::to_writer(&mut raw, &row).unwrap();
+        raw.push(b'\n');
+    }
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    fs::write(segment, &compressed).unwrap();
+    m.segments[0].sha256 = digest(&compressed);
+    m.segments[0].compressed_bytes = compressed.len() as u64;
+    m.segments[0].encoded_bytes = raw.len() as u64;
+    m.compressed_bytes = compressed.len() as u64;
+    m.encoded_bytes = raw.len() as u64;
+    m.budget_window_used = raw.len() as u64;
+    fs::write(path.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+}
+
+fn linked_refused_selections() -> (tempfile::TempDir, PathBuf) {
+    use crate::bindings::kernel::selection::{SelectionChoice, SelectionDecision, SelectionLabel};
+    let (directory, producer, writer) = fixture();
+    let path = writer.root.clone();
+    witness(&producer);
+    let actual = SelectionDecision {
+        choice: SelectionChoice::None,
+        label: SelectionLabel::New,
+        rebalance: None,
+        sole_target: None,
+        budget_source: None,
+    };
+    // This native input intentionally lacks a selection read set. The producer
+    // emits a typed Shape refusal rather than fabricating a comparable input.
+    let inputs = permit_inputs();
+    assert_eq!(
+        producer.selection(at(2), 1, Entry::Chooser, 101, 1, &inputs, &actual),
+        Some(2)
+    );
+    assert_eq!(
+        producer.selection(at(3), 2, Entry::Chooser, 102, 1, &inputs, &actual),
+        Some(3)
+    );
+    for (cursor, id, ordinal) in [(3, 101, 2), (4, 102, 3)] {
+        let mut parent = decision();
+        parent.capture_id = Some(id);
+        parent.selection_ordinals = vec![ordinal];
+        assert!(producer.decision(at(cursor + 1), cursor, &parent).is_some());
+    }
+    writer.close(at(6)).unwrap();
+    let epoch = read_epoch(&path).unwrap();
+    assert!(epoch.selection_complete);
+    assert_eq!(epoch.selections.len(), 2);
+    assert!(
+        epoch
+            .selections
+            .iter()
+            .all(|s| s.record.refusal == Some(WireRefusal::Shape))
+    );
+    (directory, path)
+}
+
+#[test]
+fn schema7_refused_selection_still_requires_inner_schema_and_projected_actual() {
+    for malformed_schema in [true, false] {
+        let (_directory, path) = linked_refused_selections();
+        rewrite_selection_fixture(&path, |rows| {
+            let Payload::SelectionTape(envelope) = &mut rows[1].event else {
+                panic!("selection missing")
+            };
+            if malformed_schema {
+                envelope.record.schema = 99;
+            } else {
+                envelope.record.actual.budget_source = Some("raw-private-account-canary".into());
+            }
+        });
+        assert!(
+            read_epoch(&path).is_err(),
+            "matching compressed hashes must not waive codec validation"
+        );
+    }
+}
+
+#[test]
+fn schema7_selection_links_reject_cross_capture_exchange() {
+    let (_directory, path) = linked_refused_selections();
+    rewrite_selection_fixture(&path, |rows| {
+        let Payload::DecisionTape(first) = &mut rows[3].event else {
+            panic!("first parent missing")
+        };
+        first.selection_ordinals = vec![3];
+        let Payload::DecisionTape(second) = &mut rows[4].event else {
+            panic!("second parent missing")
+        };
+        second.selection_ordinals = vec![2];
+    });
+    assert!(
+        read_epoch(&path).is_err(),
+        "entry and invocation equality alone do not prove parent identity"
+    );
 }
 
 #[test]

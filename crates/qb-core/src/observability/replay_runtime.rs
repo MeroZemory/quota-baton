@@ -55,7 +55,7 @@ impl Runtime {
             worker: Mutex::new(Some(worker)),
         })
     }
-    /// Main supplies the separate state/decision-tape-v6 root. Legacy roots are
+    /// Main supplies the separate state/decision-tape-v7 root. Legacy roots are
     /// neither inspected nor removed, even when their disk cap was exhausted.
     pub(crate) fn start_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
         Self::start_tape_with_provenance(
@@ -198,6 +198,33 @@ impl Runtime {
         };
         *cursor = next;
         tape.decision(self.stamp(), next, record)
+    }
+
+    pub(crate) fn record_selection(
+        &self,
+        entry: crate::bindings::decision_tape::Entry,
+        capture_id: u64,
+        invocation: u64,
+        inputs: &crate::bindings::kernel::DecisionInputs,
+        actual: &crate::bindings::kernel::selection::SelectionDecision,
+    ) -> Option<u64> {
+        let tape = self.tape.as_ref()?;
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = &mut cursors[Owner::Bindings as usize];
+        let Some(next) = cursor.checked_add(1) else {
+            tape.failed(ProducerFailureReason::SelectionCursorExhausted);
+            return None;
+        };
+        *cursor = next;
+        tape.selection(
+            self.stamp(),
+            next,
+            entry,
+            capture_id,
+            invocation,
+            inputs,
+            actual,
+        )
     }
 
     pub(crate) fn record_permit(
@@ -521,6 +548,7 @@ mod tests {
         let runtime = Runtime::start_synthetic_tape(&root, 16).unwrap();
         let now = chrono::Utc::now();
         let inputs = DecisionInputs {
+            selection: None,
             now,
             model: None,
             key: None,
@@ -539,6 +567,7 @@ mod tests {
         let decision = DecisionRecord {
             schema: 1,
             ordinal: 0,
+            capture_id: None,
             inputs: Inputs {
                 entry: Entry::Chooser,
                 at: now,
@@ -567,6 +596,8 @@ mod tests {
             },
             capture_aborted: false,
             read_state_complete: false,
+            selection_ordinals: Vec::new(),
+            selection_refusals: 0,
         };
         runtime
             .next_id
