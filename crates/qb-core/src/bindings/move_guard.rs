@@ -43,9 +43,9 @@ impl Limits {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Refusal {
+pub enum Refusal {
     SessionTenMinutes,
     SessionHour,
     PingPong,
