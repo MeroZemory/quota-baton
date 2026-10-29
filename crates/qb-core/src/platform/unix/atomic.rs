@@ -24,6 +24,25 @@ pub(crate) fn atomic_write_observation(path: &Path, bytes: &[u8]) -> io::Result<
 pub(crate) fn prepare_observation_directory(path: &Path) -> io::Result<()> {
     private_fs::prepare_private_directory(path).map(drop)
 }
+pub(crate) fn create_private_directory_new(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "new directory is not private",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "atomic/private_directory_tests.rs"]
+mod private_directory_tests;
 pub(crate) fn read_takeover_bytes(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
     match read_private_bytes(path, 4 * 1024 * 1024) {
         Ok(bytes) => Ok(Some(bytes)),

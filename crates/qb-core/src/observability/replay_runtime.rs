@@ -54,9 +54,30 @@ impl Runtime {
             worker: Mutex::new(Some(worker)),
         })
     }
-    /// Main supplies the separate state/decision-tape-v4 root. Legacy roots are
+    /// Main supplies the separate state/decision-tape-v5 root. Legacy roots are
     /// neither inspected nor removed, even when their disk cap was exhausted.
     pub(crate) fn start_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
+        Self::start_tape_with_provenance(
+            root,
+            disk_limit_mib,
+            super::replay_recorder::Provenance::OperatorOptIn,
+        )
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub(crate) fn start_synthetic_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
+        Self::start_tape_with_provenance(
+            root,
+            disk_limit_mib,
+            super::replay_recorder::Provenance::Synthetic,
+        )
+    }
+
+    fn start_tape_with_provenance(
+        root: &Path,
+        disk_limit_mib: u64,
+        provenance: super::replay_recorder::Provenance,
+    ) -> io::Result<Self> {
         let start = Instant::now();
         let start_utc_ns = chrono::Utc::now()
             .timestamp_nanos_opt()
@@ -66,13 +87,14 @@ impl Runtime {
                 .checked_mul(1024 * 1024)
                 .ok_or_else(|| io::Error::other("decision_tape_disk_limit"))?,
         )?;
-        let (tape, archive) = super::replay_recorder::tape::open(
+        let (tape, archive) = super::replay_recorder::tape::open_with_provenance(
             root,
             limits,
             Stamp {
                 utc_ns: start_utc_ns,
                 monotonic_ns: 0,
             },
+            provenance,
         )?;
         let (stop, stopped) = mpsc::channel();
         let worker = thread::Builder::new()
@@ -162,6 +184,38 @@ impl Runtime {
         };
         *cursor = next;
         tape.decision(self.stamp(), next, record)
+    }
+
+    pub(crate) fn record_permit(
+        &self,
+        inputs: &crate::bindings::kernel::DecisionInputs,
+        actual: &crate::bindings::kernel::PermitDecision,
+    ) -> Option<u64> {
+        let tape = self.tape.as_ref()?;
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = &mut cursors[Owner::Bindings as usize];
+        let Some(next) = cursor.checked_add(1) else {
+            tape.failed();
+            return None;
+        };
+        *cursor = next;
+        tape.permit(self.stamp(), next, inputs, actual)
+    }
+
+    pub(crate) fn record_permit_commit(&self, proposal: Option<u64>) -> Option<u64> {
+        let tape = self.tape.as_ref()?;
+        let Some(proposal) = proposal else {
+            tape.failed();
+            return None;
+        };
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = &mut cursors[Owner::Bindings as usize];
+        let Some(next) = cursor.checked_add(1) else {
+            tape.failed();
+            return None;
+        };
+        *cursor = next;
+        tape.permit_commit(self.stamp(), next, proposal)
     }
     pub(crate) fn disable(&self) {
         self.recorder.disable();

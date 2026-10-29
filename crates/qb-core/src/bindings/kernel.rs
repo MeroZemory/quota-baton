@@ -1,5 +1,9 @@
 //! Pure move-decision read facts shared with native selection.
 //!
+//! These helpers read only supplied account/quota and affinity observations.
+//! `outside_failure` is retained as a raw atomic observation for selection;
+//! these five helpers do not consume it.
+//!
 //! `Account` is deliberately retained here to execute native health semantics.
 //! This in-memory input is NOT a privacy-approved archive DTO: the producer must
 //! audit its wire projection before serializing account metadata.
@@ -9,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-mod permit;
+pub(super) mod permit;
 pub use permit::{PermitDecision, PermitDenied, PermitInputs, PreparedMove, decide_move};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +55,9 @@ pub struct DecisionInputs {
     pub bindings: BTreeMap<String, AcceptanceBinding>,
     pub accepted_unbound: BTreeSet<String>,
     pub sticky: BTreeMap<String, String>,
+    /// Raw external-capacity failure observation, not computed eligibility.
+    #[serde(default)]
+    pub outside_failure: bool,
     pub permit: Option<PermitInputs>,
 }
 
@@ -58,8 +65,17 @@ pub fn stale_window(inputs: &DecisionInputs, id: &str, window: &Value) -> Option
     let c = inputs.accounts.get(id)?;
     Some(date(&window["observed_at"]).is_some_and(|observed| {
         (inputs.now - observed).num_seconds() > 900
-            && (inputs.traffic.get(&c.account.id).is_some_and(|t| *t > observed)
-                || inputs.pending.get(&c.account.id).copied().unwrap_or(0).max(c.inflight) > 0)
+            && (inputs
+                .traffic
+                .get(&c.account.id)
+                .is_some_and(|t| *t > observed)
+                || inputs
+                    .pending
+                    .get(&c.account.id)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(c.inflight)
+                    > 0)
     }))
 }
 
@@ -97,18 +113,26 @@ pub fn accepted_in(inputs: &DecisionInputs, id: &str) -> bool {
         return inputs.accepted_unbound.contains(id)
             && inputs.sticky.values().any(|sticky| sticky == id);
     }
-    key.and_then(|key| inputs.groups.get(group(key))).is_some_and(|g| {
-        g.account == id
-            && g.keys.iter().any(|k| {
-                inputs.bindings.get(k).is_some_and(|b| b.accepted != Some(false))
-            })
-    })
+    key.and_then(|key| inputs.groups.get(group(key)))
+        .is_some_and(|g| {
+            g.account == id
+                && g.keys.iter().any(|k| {
+                    inputs
+                        .bindings
+                        .get(k)
+                        .is_some_and(|b| b.accepted != Some(false))
+                })
+        })
 }
 
 pub fn semantic_evidence(inputs: &DecisionInputs, id: Option<&str>) -> u64 {
     use sha2::{Digest, Sha256};
     let candidate = id.and_then(|id| effective_account(inputs, id));
-    let Some(c) = candidate.as_ref() else { return 0; };
+    let Some(c) = candidate.as_ref() else {
+        return 0;
+    };
+    // Keep the native semantic projection: poll times, token generations and
+    // quota started_at are deliberately excluded.
     let reset = c.quota_cooling.as_ref().map(|q| (&q.window, q.reset_at));
     let value = serde_json::to_vec(&(
         &c.user_state,
@@ -117,13 +141,17 @@ pub fn semantic_evidence(inputs: &DecisionInputs, id: Option<&str>) -> u64 {
         c.drain,
         c.allow_credits,
         reset,
-    )).expect("account health serializes");
+    ))
+    .expect("account health serializes");
     u64::from_be_bytes(Sha256::digest(value)[..8].try_into().unwrap())
 }
 
 pub fn move_source_usable(inputs: &DecisionInputs, id: &str) -> bool {
-    let Some(candidate) = inputs.accounts.get(id) else { return false; };
-    effective_account(inputs, id).is_some_and(|account| account.eligible_at(inputs.model.as_deref(), inputs.now))
+    let Some(candidate) = inputs.accounts.get(id) else {
+        return false;
+    };
+    effective_account(inputs, id)
+        .is_some_and(|account| account.eligible_at(inputs.model.as_deref(), inputs.now))
         && (!candidate.account.drain || accepted_in(inputs, &candidate.account.id))
 }
 
@@ -136,7 +164,10 @@ fn group(key: &str) -> &str {
 }
 
 fn date(value: &Value) -> Option<DateTime<Utc>> {
-    value.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc))
+    value
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
 }
 
 #[cfg(test)]

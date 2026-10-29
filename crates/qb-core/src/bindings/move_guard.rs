@@ -151,6 +151,7 @@ pub(crate) struct Breaker {
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct Permit {
+    recorded_ordinal: Option<u64>,
     revision: u64,
     shared_incident: Option<(String, u64)>,
     key: String,
@@ -186,6 +187,28 @@ impl CommittedMove {
 }
 
 impl Permit {
+    pub(super) fn record_ordinal(&mut self, ordinal: Option<u64>) {
+        self.recorded_ordinal = ordinal;
+    }
+
+    pub(super) fn recorded_ordinal(&self) -> Option<u64> {
+        self.recorded_ordinal
+    }
+
+    pub(super) fn decision(&self) -> super::kernel::PermitDecision {
+        super::kernel::PermitDecision::Allowed(super::kernel::PreparedMove {
+            revision: self.revision,
+            shared_incident: self.shared_incident.clone(),
+            key: self.key.clone(),
+            at: self.at,
+            from: self.from.clone(),
+            to: self.to.clone(),
+            departure_evidence: self.departure_evidence,
+            destination_evidence: self.destination_evidence,
+            emergency_return: self.emergency_return,
+        })
+    }
+
     pub(super) fn emergency_return(&self) -> bool {
         self.emergency_return
     }
@@ -195,6 +218,72 @@ impl Permit {
 }
 
 impl Breaker {
+    /// Snapshot after the same native pre-decision prune/clamp. Instants are
+    /// represented by exact ages from a single anchor; nothing is resampled on
+    /// replay and equality keeps the original strict observation ordering.
+    pub(super) fn decision_inputs(
+        &mut self,
+        limits: &Limits,
+        key: &str,
+        observations: Observations,
+        sole_target: Option<super::kernel::permit::SoleTargetInput>,
+        now: DateTime<Utc>,
+    ) -> Option<super::kernel::PermitInputs> {
+        use super::kernel::permit::{IncidentInput, MovementInput, PermitInputs};
+        let now = self.prune(now);
+        let history = self.sessions.get(key);
+        let anchor = history
+            .into_iter()
+            .flatten()
+            .map(|m| m.committed)
+            .chain(observations.source.started)
+            .chain(observations.target.started)
+            .fold(Instant::now(), std::cmp::max);
+        let age = |at: Instant| u64::try_from(anchor.duration_since(at).as_nanos()).ok();
+        let source_observation_age_ns = match observations.source.started {
+            Some(at) => Some(age(at)?),
+            None => None,
+        };
+        let target_observation_age_ns = match observations.target.started {
+            Some(at) => Some(age(at)?),
+            None => None,
+        };
+        Some(PermitInputs {
+            limits: limits.clone(),
+            now,
+            history: history
+                .into_iter()
+                .flatten()
+                .map(|m| {
+                    Some(MovementInput {
+                        at: m.at,
+                        committed_age_ns: age(m.committed)?,
+                        from: m.from.clone(),
+                        departure_evidence: m.departure_evidence,
+                        to: m.to.clone(),
+                        destination_evidence: m.destination_evidence,
+                        emergency_return: m.emergency_return,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            global: self
+                .global
+                .iter()
+                .map(|i| IncidentInput {
+                    at: i.at,
+                    shared: i.shared.clone(),
+                })
+                .collect(),
+            session_count: self.sessions.len(),
+            session_exists: self.sessions.contains_key(key),
+            tripped_until: self.tripped_until,
+            revision: self.revision,
+            source_observation_age_ns,
+            target_observation_age_ns,
+            sole_target,
+        })
+    }
+
     fn prune(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let now = self.last_now.map_or(now, |prior| now.max(prior));
         self.last_now = Some(now);
@@ -387,6 +476,7 @@ impl Breaker {
             }
         }
         Ok(Permit {
+            recorded_ordinal: None,
             revision: self.revision,
             shared_incident,
             key: key.into(),

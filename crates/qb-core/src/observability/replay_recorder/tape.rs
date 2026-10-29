@@ -1,13 +1,14 @@
-//! Schema 4 decision tape. Independent root; schema 3 is never rewritten.
+//! Schema 5 decision tape. Earlier roots are never rewritten.
 //! Producers only enqueue bounded typed metadata. The sole writer compresses and syncs.
 use super::*;
 use crate::bindings::decision_tape::DecisionRecord;
+use crate::bindings::permit_tape::{self, PermitRecord, QuotaKey, QuotaSnapshot};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead, Read},
 };
 
-pub(super) const TAPE_SCHEMA: u16 = 4;
+pub(super) const TAPE_SCHEMA: u16 = 5;
 const RECORD_BYTES: usize = 256 * 1024;
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const HOUR_BYTES: u64 = 20_000_000;
@@ -15,6 +16,8 @@ const DECODED_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const GROUP_BYTES: usize = 1024 * 1024;
 const MAX_ACCOUNTS: usize = 4096;
 const MAX_RECORDS: usize = 1_000_000;
+const MAX_QUOTA_SNAPSHOTS: usize = 16_384;
+const MAX_QUOTA_DICTIONARY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +84,8 @@ pub struct Manifest {
     pub accepted: u64,
     pub persisted: u64,
     pub deduplicated: u64,
+    pub permit_records: u64,
+    pub permit_not_comparable: u64,
     pub encoded_bytes: u64,
     pub compressed_bytes: u64,
     pub hourly_encoded_byte_limit: u64,
@@ -94,7 +99,15 @@ pub struct Manifest {
 #[serde(tag = "kind", content = "facts", deny_unknown_fields)]
 pub enum Payload {
     DecisionTape(Box<DecisionRecord>),
+    PermitTape(Box<PermitEnvelope>),
+    PermitCommit { proposal: u64 },
     Metadata(Box<Event>),
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermitEnvelope {
+    pub record: PermitRecord,
+    pub quotas: Vec<QuotaSnapshot>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,6 +134,8 @@ struct TapeState {
     queued_bytes: usize,
     queue: VecDeque<Queued>,
     accounts: BTreeMap<[u8; 32], [u8; 32]>,
+    quotas: BTreeSet<QuotaKey>,
+    quota_bytes: usize,
     manifest: Manifest,
 }
 struct TapeShared {
@@ -151,6 +166,15 @@ fn compact_id(id: Id) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.0)
 }
 pub(crate) fn open(root: &Path, limits: Limits, at: Stamp) -> io::Result<(Producer, Writer)> {
+    open_with_provenance(root, limits, at, Provenance::OperatorOptIn)
+}
+
+pub(crate) fn open_with_provenance(
+    root: &Path,
+    limits: Limits,
+    at: Stamp,
+    provenance: Provenance,
+) -> io::Result<(Producer, Writer)> {
     let mut executable = fs::File::open(std::env::current_exe()?)?;
     let mut executable_hash = Sha256::new();
     let mut buffer = [0u8; 8192];
@@ -178,7 +202,7 @@ pub(crate) fn open(root: &Path, limits: Limits, at: Stamp) -> io::Result<(Produc
             capture: capture.clone(),
             identity_domain_version: ID_DOMAIN_VERSION,
             build,
-            provenance: Provenance::OperatorOptIn,
+            provenance,
         },
     )?;
     let manifest = Manifest {
@@ -189,6 +213,8 @@ pub(crate) fn open(root: &Path, limits: Limits, at: Stamp) -> io::Result<(Produc
         accepted: 0,
         persisted: 0,
         deduplicated: 0,
+        permit_records: 0,
+        permit_not_comparable: 0,
         encoded_bytes: 0,
         compressed_bytes: 0,
         hourly_encoded_byte_limit: HOUR_BYTES,
@@ -212,6 +238,8 @@ pub(crate) fn open(root: &Path, limits: Limits, at: Stamp) -> io::Result<(Produc
                 queued_bytes: 0,
                 queue: VecDeque::new(),
                 accounts: BTreeMap::new(),
+                quotas: BTreeSet::new(),
+                quota_bytes: 0,
                 manifest,
             }),
         }),
@@ -288,6 +316,94 @@ impl Producer {
             Payload::DecisionTape(Box::new(record)),
         )
     }
+    pub(crate) fn permit(
+        &self,
+        at: Stamp,
+        cursor: u64,
+        inputs: &crate::bindings::kernel::DecisionInputs,
+        actual: &crate::bindings::kernel::PermitDecision,
+    ) -> Option<u64> {
+        let mapper = |kind, raw: &str| {
+            let domain = match kind {
+                permit_tape::IdKind::Account => IdentityDomain::Account,
+                permit_tape::IdKind::Session => IdentityDomain::Session,
+            };
+            let id = pseudonym(&self.shared.key, domain, raw.as_bytes());
+            id.0[..16]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let mut record = match permit_tape::capture(inputs, actual, mapper) {
+            Ok(record) => record,
+            Err(reason) => match permit_tape::refused_record(actual, reason, mapper) {
+                Ok(record) => record,
+                Err(_) => {
+                    self.invalid();
+                    return None;
+                }
+            },
+        };
+        let not_comparable = record.refusal.is_some()
+            || (inputs.from.as_deref().is_some_and(|from| from != inputs.to)
+                && inputs.permit.is_none());
+        let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let quotas = match record
+            .inputs
+            .as_mut()
+            .map(|i| i.intern_quotas(&s.quotas))
+            .transpose()
+        {
+            Ok(quotas) => quotas.unwrap_or_default(),
+            Err(_) => {
+                let l = &mut s.manifest.losses;
+                increment(&mut l.invalid, &mut l.saturated, 1);
+                return None;
+            }
+        };
+        if s.quotas.len().saturating_add(quotas.len()) > MAX_QUOTA_SNAPSHOTS {
+            let l = &mut s.manifest.losses;
+            increment(&mut l.invalid, &mut l.saturated, 1);
+            return None;
+        }
+        let quota_bytes = quotas.iter().try_fold(0usize, |total, snapshot| {
+            let bytes = serde_json::to_vec(snapshot).ok()?;
+            total.checked_add(bytes.len())
+        });
+        let Some(quota_bytes) = quota_bytes
+            .filter(|bytes| s.quota_bytes.saturating_add(*bytes) <= MAX_QUOTA_DICTIONARY_BYTES)
+        else {
+            let l = &mut s.manifest.losses;
+            increment(&mut l.invalid, &mut l.saturated, 1);
+            return None;
+        };
+        let keys: Vec<_> = quotas.iter().map(QuotaSnapshot::key).collect();
+        let sequence = self.enqueue_locked(
+            &mut s,
+            at,
+            Owner::Bindings,
+            cursor,
+            None,
+            Payload::PermitTape(Box::new(PermitEnvelope { record, quotas })),
+        )?;
+        // References become reusable only after the whole typed envelope entered
+        // the sole writer queue. A failed publication cannot strand references.
+        s.quotas.extend(keys);
+        s.quota_bytes += quota_bytes;
+        s.manifest.permit_records += 1;
+        s.manifest.permit_not_comparable += u64::from(not_comparable);
+        Some(sequence)
+    }
+
+    pub(crate) fn permit_commit(&self, at: Stamp, cursor: u64, proposal: u64) -> Option<u64> {
+        self.enqueue(
+            at,
+            Owner::Bindings,
+            cursor,
+            Some(proposal),
+            Payload::PermitCommit { proposal },
+        )
+    }
     fn protect(&self, r: &mut DecisionRecord) -> bool {
         if r.schema != 1 || !valid_refusal(r) {
             return false;
@@ -308,9 +424,22 @@ impl Producer {
         owner: Owner,
         cursor: u64,
         cause: Option<u64>,
-        mut event: Payload,
+        event: Payload,
     ) -> Option<u64> {
         let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.enqueue_locked(&mut s, at, owner, cursor, cause, event)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_locked(
+        &self,
+        s: &mut TapeState,
+        at: Stamp,
+        owner: Owner,
+        cursor: u64,
+        cause: Option<u64>,
+        mut event: Payload,
+    ) -> Option<u64> {
         if !s.enabled {
             return None;
         }
@@ -366,6 +495,9 @@ impl Producer {
         }
         if let Payload::DecisionTape(record) = &mut event {
             record.ordinal = sequence;
+        }
+        if let Payload::PermitTape(envelope) = &mut event {
+            envelope.record.ordinal = sequence;
         }
         let record = Record {
             sequence,
@@ -843,7 +975,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         return Err(fail());
     }
     let mut hash = Sha256::new();
-    hash.update(b"quota-baton/decision-tape-v4/epoch\0");
+    hash.update(b"quota-baton/decision-tape-v5/epoch\0");
     for bytes in [&epoch_bytes, &header_bytes] {
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
@@ -855,6 +987,12 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     let mut encoded = 0u64;
     let mut compressed = 0u64;
     let mut decisions = Vec::new();
+    let mut permits = Vec::new();
+    let mut quota_dictionary = BTreeMap::new();
+    let mut quota_dictionary_bytes = 0usize;
+    let mut allowed_proposals = BTreeSet::new();
+    let mut committed_proposals = BTreeSet::new();
+    let mut not_comparable = 0u64;
     let mut witness = Sha256::new();
     let mut witnesses = 0;
     let mut witness_before_decisions = true;
@@ -918,6 +1056,74 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
             count += 1;
             segment_count += 1;
             match record.event {
+                Payload::PermitTape(mut envelope) => {
+                    if envelope.record.ordinal != sequence {
+                        return Err(fail());
+                    }
+                    if witnesses == 0 {
+                        witness_before_decisions = false;
+                    }
+                    let references: BTreeSet<_> = envelope
+                        .record
+                        .inputs
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|inputs| inputs.accounts.values())
+                        .filter_map(|candidate| match &candidate.quota {
+                            permit_tape::QuotaInput::Ref { digest } => Some(QuotaKey {
+                                account: candidate.account.id.clone(),
+                                revision: candidate.revision,
+                                digest: *digest,
+                            }),
+                            _ => None,
+                        })
+                        .collect();
+                    for snapshot in envelope.quotas {
+                        let key = snapshot.key();
+                        if !references.contains(&key)
+                            || quota_dictionary.contains_key(&key)
+                            || quota_dictionary.len() >= MAX_QUOTA_SNAPSHOTS
+                        {
+                            return Err(fail());
+                        }
+                        quota_dictionary_bytes = quota_dictionary_bytes
+                            .checked_add(serde_json::to_vec(&snapshot).map_err(|_| fail())?.len())
+                            .ok_or_else(fail)?;
+                        if quota_dictionary_bytes > MAX_QUOTA_DICTIONARY_BYTES {
+                            return Err(fail());
+                        }
+                        quota_dictionary.insert(key, snapshot);
+                    }
+                    if let Some(inputs) = &mut envelope.record.inputs {
+                        inputs
+                            .resolve_quotas(&quota_dictionary)
+                            .map_err(|_| fail())?;
+                    }
+                    permit_tape::validate_record(&envelope.record).map_err(|_| fail())?;
+                    not_comparable += u64::from(
+                        envelope.record.refusal.is_some()
+                            || envelope.record.inputs.as_ref().is_some_and(|inputs| {
+                                inputs.from.as_deref().is_some_and(|from| from != inputs.to)
+                                    && inputs.permit.is_none()
+                            }),
+                    );
+                    if matches!(
+                        &envelope.record.actual,
+                        crate::bindings::kernel::PermitDecision::Allowed(_)
+                    ) {
+                        allowed_proposals.insert(sequence);
+                    }
+                    permits.push(envelope.record);
+                }
+                Payload::PermitCommit { proposal } => {
+                    if record.cause != Some(proposal)
+                        || proposal >= sequence
+                        || !allowed_proposals.contains(&proposal)
+                        || !committed_proposals.insert(proposal)
+                    {
+                        return Err(fail());
+                    }
+                }
                 Payload::DecisionTape(mut decision) => {
                     if !identities(&mut decision, |_, id| {
                         id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
@@ -935,7 +1141,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
                     decisions.push(*decision);
                 }
                 Payload::Metadata(event) if matches!(*event, Event::InitialWitness { .. }) => {
-                    if !decisions.is_empty() {
+                    if !decisions.is_empty() || !permits.is_empty() {
                         witness_before_decisions = false;
                     }
                     let bytes = serde_json::to_vec(&event).map_err(|_| fail())?;
@@ -987,6 +1193,8 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         || encoded > m.encoded_bytes
         || aborted > m.losses.capture_aborted
         || m.sealed && (m.accepted != m.persisted || aborted != m.losses.capture_aborted)
+        || permits.len() as u64 != m.permit_records
+        || not_comparable != m.permit_not_comparable
     {
         return Err(fail());
     }
@@ -1004,6 +1212,14 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         && witnesses > 0
         && witness_before_decisions
         && !decisions.is_empty();
+    let permit_complete = m.sealed
+        && losses == 0
+        && m.accepted == m.persisted
+        && producer_build.is_some()
+        && encoded == m.encoded_bytes
+        && witnesses > 0
+        && witness_before_decisions
+        && !permits.is_empty();
     Ok(crate::observability::decision_reader::Epoch {
         producer_build,
         tape_sha256: format!("{:x}", hash.finalize()),
@@ -1015,6 +1231,12 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         losses,
         complete,
         decisions,
+        permits,
+        permit_complete,
+        permit_commits: committed_proposals.len() as u64,
+        provenance: header.provenance,
+        capture_started_utc_ns: header.start.utc_ns,
+        capture_ended_utc_ns: last_stamp.utc_ns,
     })
 }
 

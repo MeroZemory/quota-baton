@@ -783,42 +783,16 @@ impl RelayState {
         for account in &initial_accounts {
             observability.forecast_account(account);
         }
-        if let Some(producer) = observability.replay() {
-            let witness = (|| -> anyhow::Result<()> {
-                use crate::observability::replay_recorder::{Event, Fingerprint, Owner};
-                use sha2::{Digest, Sha256};
-                let image = bindings.decision_tape_initial_image()?;
-                // Hash metadata in memory; no account values, identities, source paths
-                // or credentials are exported by this startup witness.
-                let bytes = serde_json::to_vec(&(&image, &initial_accounts))?;
-                let digest = Fingerprint(Sha256::digest(bytes).into());
-                anyhow::ensure!(
-                    producer
-                        .record(
-                            Owner::Bindings,
-                            None,
-                            Event::InitialWitness {
-                                component: Owner::Bindings,
-                                revision: image.revision,
-                                cursor: 0,
-                                rows: image.bindings_rows,
-                                digest,
-                            }
-                        )
-                        .is_some(),
-                    "initial decision witness was not accepted"
-                );
-                Ok(())
-            })();
-            if witness.is_err() {
-                producer.producer_failed();
-                tracing::warn!(
-                    code = "decision_tape_initial_witness_failed",
-                    "Decision tape startup state is incomplete"
-                );
-            }
-            bindings
-                .set_decision_recorder(Arc::new(move |record| producer.record_decision(record)));
+        if let Some(producer) = observability.replay()
+            && bindings
+                .attach_tape(producer.clone(), &initial_accounts)
+                .is_err()
+        {
+            producer.producer_failed();
+            tracing::warn!(
+                code = "decision_tape_initial_witness_failed",
+                "Decision tape startup state is incomplete"
+            );
         }
         Ok(Self {
             accounts,

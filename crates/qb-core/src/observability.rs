@@ -2,9 +2,11 @@ use crate::accounts::Provider;
 pub mod decision_comparison;
 pub mod decision_reader;
 pub(crate) mod forecast_log;
+pub mod permit_reader;
 mod replay_projection;
 pub mod replay_recorder;
 mod replay_runtime;
+pub(crate) use replay_runtime::Runtime as ReplayRuntime;
 pub mod reread_accounting;
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -343,7 +345,7 @@ impl Observability {
             }
         }
         match replay_runtime::Runtime::start_tape(
-            &home.join("state/decision-tape-v4"),
+            &home.join("state/decision-tape-v5"),
             config.disk_limit_mib,
         ) {
             Ok(runtime) => *slot = Some(Arc::new(runtime)),

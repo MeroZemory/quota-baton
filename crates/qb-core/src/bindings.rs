@@ -28,8 +28,13 @@ mod affinity;
 pub(crate) use admission::DispatchAdmission;
 mod capacity_spill;
 pub mod decision_tape;
+pub mod kernel;
+mod kernel_shell;
 mod launch;
 mod move_guard;
+#[cfg(any(test, feature = "testkit"))]
+pub mod permit_fixture;
+pub mod permit_tape;
 pub(crate) mod quota_wait;
 mod rebind;
 mod selection;
@@ -37,6 +42,7 @@ pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
 };
 pub use move_guard::Limits as MoveGuardLimits;
+pub use move_guard::Refusal as MoveGuardRefusal;
 pub(crate) use move_guard::{Observation as MoveObservation, Observations as MoveObservations};
 #[cfg(test)]
 #[path = "bindings/move_guard_tests.rs"]
@@ -575,6 +581,8 @@ pub struct BindingTable {
     unknown_cost_skips: AtomicUsize,
     usage_sequence: AtomicU64,
     decision_recorder: Mutex<Option<decision_tape::Recorder>>,
+    permit_recorder: Mutex<Option<kernel_shell::Recorder>>,
+    permit_commit_recorder: Mutex<Option<kernel_shell::CommitRecorder>>,
     decision_capture_losses: AtomicU64,
 }
 
@@ -680,6 +688,9 @@ impl BindingTable {
         now: DateTime<Utc>,
     ) -> Result<Option<move_guard::Permit>, move_guard::Denied> {
         let Some(from) = from.filter(|from| *from != to) else {
+            let captured =
+                kernel_shell::snapshot(d, key, from, to, source, candidates, model, now, None);
+            let _ = self.record_permit(&captured, &kernel::PermitDecision::NotRequired);
             return Ok(None);
         };
         let target = candidates.iter().find(|c| c.account.id == to);
@@ -696,22 +707,57 @@ impl BindingTable {
                 now,
             )
         });
-        let result = self
-            .move_guard
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .prepare_observed(
-                &self.config.move_guard,
-                key,
-                from,
-                to,
-                semantic_evidence(source_account.as_ref()),
-                semantic_evidence(target_account.as_ref()),
-                unusable.as_ref(),
-                sole_target.is_some_and(|proof| proof.applies_to(from, to, model, now)),
-                observations,
-                now,
+        let mut breaker = self.move_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let captured_permit = breaker.decision_inputs(
+            &self.config.move_guard,
+            key,
+            observations,
+            sole_target.map(selection::SoleEligibleTarget::decision_input),
+            now,
+        );
+        let captured = kernel_shell::snapshot(
+            d,
+            key,
+            Some(from),
+            to,
+            source,
+            candidates,
+            model,
+            now,
+            captured_permit,
+        );
+        // Keep the old owner decision authoritative during preservation checks.
+        // Only raw owner facts are supplied to the independently pure kernel.
+        let evaluated = kernel::decide_move(&captured);
+        let mut result = breaker.prepare_observed(
+            &self.config.move_guard,
+            key,
+            from,
+            to,
+            semantic_evidence(source_account.as_ref()),
+            semantic_evidence(target_account.as_ref()),
+            unusable.as_ref(),
+            sole_target.is_some_and(|proof| proof.applies_to(from, to, model, now)),
+            observations,
+            now,
+        );
+        drop(breaker);
+        let actual = kernel_shell::outcome(&result);
+        let ordinal = self.record_permit(&captured, &actual);
+        if let Ok(permit) = &mut result {
+            permit.record_ordinal(ordinal);
+        }
+        if evaluated != kernel::PermitDecision::NotComparable && evaluated != actual {
+            tracing::error!(
+                code = "move_kernel_preservation_mismatch",
+                "Move kernel differs from the native permit owner"
             );
+            #[cfg(test)]
+            assert_eq!(
+                evaluated, actual,
+                "raw-fact move kernel must preserve the native owner decision"
+            );
+        }
         match result {
             Ok(permit) => Ok(Some(permit)),
             Err(denied) => {
@@ -1389,6 +1435,8 @@ impl BindingTable {
             unknown_cost_skips: AtomicUsize::new(0),
             usage_sequence: AtomicU64::new(0),
             decision_recorder: Mutex::new(None),
+            permit_recorder: Mutex::new(None),
+            permit_commit_recorder: Mutex::new(None),
             decision_capture_losses: AtomicU64::new(0),
         });
         table.prune(
