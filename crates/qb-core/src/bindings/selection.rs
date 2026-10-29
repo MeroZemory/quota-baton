@@ -108,6 +108,7 @@ impl SoleEligibleTarget {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn applies_to(
         &self,
         from: &str,

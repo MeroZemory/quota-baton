@@ -188,6 +188,56 @@ pub(super) fn snapshot(
     }
 }
 
+/// Selection uses the same raw helper layer before its own full capture slice.
+/// The unused fields here are never serialized as a permit-entry snapshot.
+pub(super) fn candidate_inputs(
+    d: &Data,
+    candidate: &Candidate,
+    key: Option<&str>,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+) -> kernel::DecisionInputs {
+    let mut inputs = snapshot(
+        d,
+        key.unwrap_or(""),
+        None,
+        &candidate.account.id,
+        None,
+        std::slice::from_ref(candidate),
+        model,
+        now,
+        None,
+    );
+    inputs.key = key.map(str::to_owned);
+    if key.is_none() {
+        inputs.accepted_unbound = d.accepted_unbound.clone();
+        inputs.sticky = d.sticky.clone();
+    }
+    inputs
+}
+
+pub(super) fn acceptance_inputs(d: &Data, key: Option<&str>, id: &str) -> kernel::DecisionInputs {
+    let mut inputs = snapshot(
+        d,
+        key.unwrap_or(""),
+        None,
+        id,
+        None,
+        &[],
+        None,
+        DateTime::<Utc>::MIN_UTC,
+        None,
+    );
+    // accepted_in has no clock/account/quota read. This adapter does not become
+    // a tape input: the permit entry above supplies its actual native now.
+    inputs.key = key.map(str::to_owned);
+    if key.is_none() {
+        inputs.accepted_unbound = d.accepted_unbound.clone();
+        inputs.sticky = d.sticky.clone();
+    }
+    inputs
+}
+
 pub(super) fn outcome(
     result: &std::result::Result<move_guard::Permit, move_guard::Denied>,
 ) -> kernel::PermitDecision {

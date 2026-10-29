@@ -8,9 +8,9 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-const SESSIONS: usize = 20_000;
-const RECORDS: usize = 128;
-const GLOBAL_RECORDS: usize = 4096;
+pub(super) const SESSIONS: usize = 20_000;
+pub(super) const RECORDS: usize = 128;
+pub(super) const GLOBAL_RECORDS: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -118,7 +118,7 @@ impl Observations {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Movement {
     at: DateTime<Utc>,
     committed: Instant,
@@ -133,13 +133,13 @@ struct Movement {
 
 // A shared failure moves many sessions, but consumes only one global incident.
 // Unknown or usable-source moves are independent; never merge missing evidence.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Incident {
     at: DateTime<Utc>,
     shared: Option<(String, u64)>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Breaker {
     sessions: BTreeMap<String, VecDeque<Movement>>,
     global: VecDeque<Incident>,
@@ -218,6 +218,73 @@ impl Permit {
 }
 
 impl Breaker {
+    #[cfg(test)]
+    pub(super) fn assert_same_prepared_state(&self, legacy: &Self) {
+        assert_eq!(
+            self, legacy,
+            "pure permit decision must preserve native breaker mutations"
+        );
+    }
+
+    /// Only the native owner mints a live permit, from its just-captured state.
+    /// A replay result is proof-free and cannot be committed through this API.
+    pub(super) fn prepare_captured(
+        &mut self,
+        inputs: &super::kernel::DecisionInputs,
+    ) -> Result<Permit, Denied> {
+        use super::kernel::PermitDecision;
+        let denied = |reason| Denied {
+            reason,
+            until: inputs.permit.as_ref().map_or(inputs.now, |p| p.now) + Duration::minutes(10),
+            newly_tripped: false,
+        };
+        let state = inputs
+            .permit
+            .as_ref()
+            .ok_or_else(|| denied(Refusal::Capacity))?;
+        if state.revision != self.revision || self.last_now != Some(state.now) {
+            return Err(denied(Refusal::StalePermit));
+        }
+        match super::kernel::decide_move(inputs) {
+            PermitDecision::Allowed(proposal) => {
+                if proposal.revision != self.revision
+                    || Some(proposal.key.as_str()) != inputs.key.as_deref()
+                    || Some(proposal.from.as_str()) != inputs.from.as_deref()
+                    || proposal.to != inputs.to
+                    || proposal.at != state.now
+                {
+                    return Err(denied(Refusal::StalePermit));
+                }
+                Ok(Permit {
+                    recorded_ordinal: None,
+                    revision: proposal.revision,
+                    shared_incident: proposal.shared_incident,
+                    key: proposal.key,
+                    at: proposal.at,
+                    from: proposal.from,
+                    to: proposal.to,
+                    departure_evidence: proposal.departure_evidence,
+                    destination_evidence: proposal.destination_evidence,
+                    emergency_return: proposal.emergency_return,
+                })
+            }
+            PermitDecision::Denied(decision) => {
+                if decision.newly_tripped {
+                    self.tripped_until = Some(decision.until);
+                    self.revision = self.revision.saturating_add(1);
+                }
+                Err(Denied {
+                    reason: decision.reason,
+                    until: decision.until,
+                    newly_tripped: decision.newly_tripped,
+                })
+            }
+            PermitDecision::NotComparable | PermitDecision::NotRequired => {
+                Err(denied(Refusal::Capacity))
+            }
+        }
+    }
+
     /// Snapshot after the same native pre-decision prune/clamp. Instants are
     /// represented by exact ages from a single anchor; nothing is resampled on
     /// replay and equality keeps the original strict observation ordering.
@@ -304,6 +371,7 @@ impl Breaker {
     /// Production callers must supply a judgement from the health owner.
     /// A missing/filtered source or a reason string cannot mint this authority.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn prepare_observed(
         &mut self,
         limits: &Limits,
@@ -362,6 +430,7 @@ impl Breaker {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn prepare_checked(
         &mut self,
         limits: &Limits,

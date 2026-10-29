@@ -1,8 +1,10 @@
 //! C7 placement and schema-1 affinity persistence. Callers filter tried accounts,
 //! credentials, probes and volatile failures, but retain quota cooling for holds.
 //! Move evidence is carried separately from those eligibility exclusions.
+#[cfg(test)]
+use crate::accounts::HealthSignal;
 use crate::{
-    accounts::{Account, Health, HealthReason, HealthSignal, Provider, UserState},
+    accounts::{Account, Health, HealthReason, Provider, UserState},
     config::RoutingConfig,
 };
 use anyhow::{Context, Result, bail};
@@ -693,20 +695,7 @@ impl BindingTable {
             let _ = self.record_permit(&captured, &kernel::PermitDecision::NotRequired);
             return Ok(None);
         };
-        let target = candidates.iter().find(|c| c.account.id == to);
-        let source_account = source.map(|c| effective_account(c, d, &self.config, model, now));
-        let target_account = target.map(|c| effective_account(c, d, &self.config, model, now));
-        // Genuinely missing source evidence cannot grant the fresh-unusable
-        // exception. A health poll timestamp is not proof.
         let usable = source.is_some_and(|c| self.move_source_usable(d, key, c, model, now));
-        let unusable = source_account.as_ref().and_then(|account| {
-            crate::accounts::health::UnusableEvidence::observe(
-                account,
-                model,
-                Self::accepted_in(d, Some(key), &account.id),
-                now,
-            )
-        });
         let mut breaker = self.move_guard.lock().unwrap_or_else(|e| e.into_inner());
         let captured_permit = breaker.decision_inputs(
             &self.config.move_guard,
@@ -726,37 +715,54 @@ impl BindingTable {
             now,
             captured_permit,
         );
-        // Keep the old owner decision authoritative during preservation checks.
-        // Only raw owner facts are supplied to the independently pure kernel.
-        let evaluated = kernel::decide_move(&captured);
-        let mut result = breaker.prepare_observed(
-            &self.config.move_guard,
-            key,
-            from,
-            to,
-            semantic_evidence(source_account.as_ref()),
-            semantic_evidence(target_account.as_ref()),
-            unusable.as_ref(),
-            sole_target.is_some_and(|proof| proof.applies_to(from, to, model, now)),
-            observations,
-            now,
-        );
+        // Native authority now consumes the same raw input as offline replay.
+        // The pre-switch implementation remains an independent test-only oracle.
+        #[cfg(test)]
+        let (legacy_breaker, legacy_result) = {
+            let mut legacy = breaker.clone();
+            let source_account =
+                source.map(|c| legacy_effective_account(c, d, &self.config, model, now));
+            let target_account = candidates
+                .iter()
+                .find(|c| c.account.id == to)
+                .map(|c| legacy_effective_account(c, d, &self.config, model, now));
+            let unusable = source_account.as_ref().and_then(|account| {
+                crate::accounts::health::UnusableEvidence::observe(
+                    account,
+                    model,
+                    Self::legacy_accepted_in(d, Some(key), &account.id),
+                    now,
+                )
+            });
+            let result = legacy.prepare_observed(
+                &self.config.move_guard,
+                key,
+                from,
+                to,
+                legacy_semantic_evidence(source_account.as_ref()),
+                legacy_semantic_evidence(target_account.as_ref()),
+                unusable.as_ref(),
+                sole_target.is_some_and(|proof| proof.applies_to(from, to, model, now)),
+                observations,
+                now,
+            );
+            (legacy, result)
+        };
+        let mut result = breaker.prepare_captured(&captured);
+        #[cfg(test)]
+        {
+            assert_eq!(
+                kernel_shell::outcome(&result),
+                kernel_shell::outcome(&legacy_result),
+                "raw-fact move kernel must preserve the original native owner decision"
+            );
+            breaker.assert_same_prepared_state(&legacy_breaker);
+        }
         drop(breaker);
         let actual = kernel_shell::outcome(&result);
         let ordinal = self.record_permit(&captured, &actual);
         if let Ok(permit) = &mut result {
             permit.record_ordinal(ordinal);
-        }
-        if evaluated != kernel::PermitDecision::NotComparable && evaluated != actual {
-            tracing::error!(
-                code = "move_kernel_preservation_mismatch",
-                "Move kernel differs from the native permit owner"
-            );
-            #[cfg(test)]
-            assert_eq!(
-                evaluated, actual,
-                "raw-fact move kernel must preserve the native owner decision"
-            );
         }
         match result {
             Ok(permit) => Ok(Some(permit)),
@@ -789,6 +795,20 @@ impl BindingTable {
             }
         }
     }
+    #[cfg(test)]
+    fn legacy_move_source_usable(
+        &self,
+        d: &Data,
+        key: &str,
+        candidate: &Candidate,
+        model: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        legacy_effective_account(candidate, d, &self.config, model, now).eligible_at(model, now)
+            && (!candidate.account.drain
+                || Self::legacy_accepted_in(d, Some(key), &candidate.account.id))
+    }
+
     fn move_source_usable(
         &self,
         d: &Data,
@@ -797,12 +817,13 @@ impl BindingTable {
         model: Option<&str>,
         now: DateTime<Utc>,
     ) -> bool {
-        effective_account(candidate, d, &self.config, model, now).eligible_at(model, now)
-            && (!candidate.account.drain || Self::accepted_in(d, Some(key), &candidate.account.id))
+        let inputs = kernel_shell::candidate_inputs(d, candidate, Some(key), model, now);
+        kernel::move_source_usable(&inputs, &candidate.account.id)
     }
 }
 
-fn semantic_evidence(candidate: Option<&Account>) -> u64 {
+#[cfg(test)]
+fn legacy_semantic_evidence(candidate: Option<&Account>) -> u64 {
     use sha2::{Digest, Sha256};
     let Some(c) = candidate else {
         return 0;
@@ -820,6 +841,27 @@ fn semantic_evidence(candidate: Option<&Account>) -> u64 {
     ))
     .expect("account health serializes");
     u64::from_be_bytes(Sha256::digest(value)[..8].try_into().unwrap())
+}
+
+fn semantic_evidence(candidate: Option<&Account>) -> u64 {
+    let Some(account) = candidate else {
+        return 0;
+    };
+    let raw = Candidate {
+        account: account.clone(),
+        quota: None,
+        inflight: 0,
+    };
+    // This already-normalized account has no quota to re-apply; the helper's
+    // clock is unread in this domain. Actual permit snapshots use native now.
+    let inputs = kernel_shell::candidate_inputs(
+        &Data::default(),
+        &raw,
+        None,
+        None,
+        DateTime::<Utc>::MIN_UTC,
+    );
+    kernel::semantic_evidence(&inputs, Some(&account.id))
 }
 
 /// A reservation belongs to the actual upstream account, even after a forced
@@ -1237,7 +1279,8 @@ type DashboardRoutingSnapshot = BTreeMap<
 >;
 
 impl BindingTable {
-    fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
+    #[cfg(test)]
+    fn legacy_accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
         if key.is_none() {
             return d.accepted_unbound.contains(id) && d.sticky.values().any(|sticky| sticky == id);
         }
@@ -1248,6 +1291,10 @@ impl BindingTable {
                         .iter()
                         .any(|k| d.bindings.get(k).is_some_and(|b| b.accepted != Some(false)))
             })
+    }
+
+    fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
+        kernel::accepted_in(&kernel_shell::acceptance_inputs(d, key, id), id)
     }
     pub(crate) fn existing_placement(&self, key: Option<&str>, id: &str) -> bool {
         Self::accepted_in(
@@ -3251,7 +3298,8 @@ fn date(v: &Value) -> Option<DateTime<Utc>> {
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc))
 }
-fn stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool {
+#[cfg(test)]
+fn legacy_stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool {
     date(&w["observed_at"]).is_some_and(|observed| {
         (now - observed).num_seconds() > 900
             && (d.traffic.get(&c.account.id).is_some_and(|t| *t > observed)
@@ -3263,8 +3311,14 @@ fn stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool 
                     > 0)
     })
 }
+
+fn stale_window(c: &Candidate, d: &Data, w: &Value, now: DateTime<Utc>) -> bool {
+    let inputs = kernel_shell::candidate_inputs(d, c, None, None, now);
+    kernel::stale_window(&inputs, &c.account.id, w).expect("provided raw candidate")
+}
 /// Observed limits may construct C5 cooling; projection never constructs health.
-fn effective_account(
+#[cfg(test)]
+fn legacy_effective_account(
     c: &Candidate,
     d: &Data,
     _cfg: &RoutingConfig,
@@ -3279,7 +3333,7 @@ fn effective_account(
         account.quota_cooling = None;
         let mut snapshot = snapshot.clone();
         if let Some(windows) = snapshot["windows"].as_array_mut() {
-            windows.retain(|w| !stale_window(c, d, w, now));
+            windows.retain(|w| !legacy_stale_window(c, d, w, now));
         }
         snapshot["signals"] = Value::Null;
         account.apply_health_signal(
@@ -3292,6 +3346,17 @@ fn effective_account(
         );
     }
     account
+}
+
+fn effective_account(
+    c: &Candidate,
+    d: &Data,
+    _cfg: &RoutingConfig,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+) -> Account {
+    let inputs = kernel_shell::candidate_inputs(d, c, None, model, now);
+    kernel::effective_account(&inputs, &c.account.id).expect("provided raw candidate")
 }
 fn account_window(provider: Provider, w: &Value) -> Option<bool> {
     match w["name"].as_str()? {
@@ -4464,7 +4529,10 @@ mod tests {
         }
     }
     pub(super) fn fixture_dir() -> tempfile::TempDir {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
             .parent()
             .unwrap()
             .parent()
