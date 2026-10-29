@@ -407,15 +407,37 @@ impl RelayState {
                             writer.sample(chrono::Utc::now(), &views)
                         })
                         .await;
-                        if !matches!(result, Ok(Ok(()))) {
-                            tracing::warn!(
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                let failure = crate::observability::forecast_log::diagnostic(
+                                    &error,
+                                    crate::observability::forecast_log::FailurePhase::Sample,
+                                );
+                                tracing::warn!(
+                                    code = "forecast_log_sample_failed",
+                                    phase = failure.phase.as_str(),
+                                    reason = failure.reason.as_str(),
+                                    "Forecast log sample unavailable"
+                                );
+                            }
+                            Err(_) => tracing::warn!(
                                 code = "forecast_log_sample_failed",
+                                phase = crate::observability::forecast_log::FailurePhase::Sample
+                                    .as_str(),
+                                reason =
+                                    crate::observability::forecast_log::FailureReason::TaskJoin
+                                        .as_str(),
                                 "Forecast log sample unavailable"
-                            );
+                            ),
                         }
                     }
                     Err(()) => tracing::warn!(
                         code = "forecast_log_views_failed",
+                        phase = crate::observability::forecast_log::FailurePhase::Sample.as_str(),
+                        reason =
+                            crate::observability::forecast_log::FailureReason::SnapshotUnavailable
+                                .as_str(),
                         "Forecast log input snapshot unavailable"
                     ),
                 }

@@ -1,6 +1,8 @@
 //! N7-L observation-only journal. No estimator, provider requests or background task.
 //! Call sample/shutdown on the owner's blocking worker; observe_account never does IO.
-use anyhow::{Context, Result, bail, ensure};
+mod recovery;
+
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use qb_proto::admin_account::{
     AccountUsageForecast, AdminAccount, AdminHealth, AdminProvider, AdminUserState,
@@ -27,6 +29,159 @@ const RETENTION: i64 = 7 * DAY;
 // Fixed implementer criterion: at most two 60-second sampling periods late.
 // A later snapshot never stands in for a historical target observation.
 const TARGET_OBSERVATION_GRACE_SECONDS: i64 = 120;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailurePhase {
+    Open,
+    Observation,
+    Sample,
+    Checkpoint,
+    Archive,
+    Close,
+    Recovery,
+}
+impl FailurePhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Observation => "observation",
+            Self::Sample => "sample",
+            Self::Checkpoint => "checkpoint",
+            Self::Archive => "archive",
+            Self::Close => "close",
+            Self::Recovery => "recovery",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureReason {
+    WindowName,
+    DuplicateWindow,
+    Forecast,
+    Timestamp,
+    Identity,
+    DuplicateAccount,
+    Bounds,
+    Clock,
+    Sequence,
+    Storage,
+    Closed,
+    Stopped,
+    Poisoned,
+    Unknown,
+    TaskJoin,
+    SnapshotUnavailable,
+}
+impl FailureReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WindowName => "window_name",
+            Self::DuplicateWindow => "duplicate_window",
+            Self::Forecast => "forecast",
+            Self::Timestamp => "timestamp",
+            Self::Identity => "identity",
+            Self::DuplicateAccount => "duplicate_account",
+            Self::Bounds => "bounds",
+            Self::Clock => "clock",
+            Self::Sequence => "sequence",
+            Self::Storage => "storage",
+            Self::Closed => "closed",
+            Self::Stopped => "stopped",
+            Self::Poisoned => "poisoned",
+            Self::Unknown => "unknown",
+            Self::TaskJoin => "task_join",
+            Self::SnapshotUnavailable => "snapshot_unavailable",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FailureDiagnostic {
+    pub phase: FailurePhase,
+    pub reason: FailureReason,
+}
+impl std::fmt::Display for FailureDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.phase.as_str(), self.reason.as_str())
+    }
+}
+impl std::error::Error for FailureDiagnostic {}
+
+pub(crate) fn diagnostic(error: &anyhow::Error, phase: FailurePhase) -> FailureDiagnostic {
+    // A typed context preserves the original failure across later persistence errors.
+    if let Some(failure) = error.downcast_ref::<FailureDiagnostic>() {
+        return *failure;
+    }
+    for cause in error.chain() {
+        let reason = match cause.to_string().as_str() {
+            "forecast_log_window_name_invalid" | "forecast_log_window_invalid" => {
+                FailureReason::WindowName
+            }
+            "forecast_log_duplicate_window" => FailureReason::DuplicateWindow,
+            "forecast_log_forecast_invalid"
+            | "forecast_log_forecast_window_invalid"
+            | "forecast_log_forecast_rate_invalid"
+            | "forecast_log_forecast_credit_invalid"
+            | "forecast_log_checkpoint_numeric"
+            | "forecast_log_checkpoint_remaining"
+            | "forecast_log_checkpoint_origin"
+            | "forecast_log_checkpoint_window" => FailureReason::Forecast,
+            "forecast_log_timestamp_invalid" => FailureReason::Timestamp,
+            "forecast_log_invalid_identity"
+            | "forecast_log_invalid_or_duplicate_identity"
+            | "forecast_log_checkpoint_identity"
+            | "forecast_log_checkpoint_generation_identity"
+            | "forecast_log_checkpoint_input"
+            | "forecast_log_checkpoint_provider" => FailureReason::Identity,
+            "forecast_log_duplicate_account" => FailureReason::DuplicateAccount,
+            "forecast_log_account_cap"
+            | "forecast_log_window_cap"
+            | "forecast_log_forecast_window_cap"
+            | "forecast_log_pending_cap"
+            | "forecast_log_checkpoint_cap"
+            | "forecast_log_checkpoint_bounds"
+            | "forecast_log_checkpoint_cohort"
+            | "forecast_log_checkpoint_observation"
+            | "forecast_log_segment_cap"
+            | "forecast_log_log_cap"
+            | "forecast_log_read_cap"
+            | "forecast_log_size_overflow"
+            | "forecast_log_revision_overflow" => FailureReason::Bounds,
+            "forecast_log_clock_rollback"
+            | "forecast_log_time_overflow"
+            | "forecast_log_date_overflow"
+            | "forecast_log_checkpoint_horizon" => FailureReason::Clock,
+            "forecast_log_sequence_invalid"
+            | "forecast_log_sequence_overflow"
+            | "forecast_log_outbox_sequence"
+            | "forecast_log_missing_journal_tail"
+            | "forecast_log_checkpoint_behind_journal" => FailureReason::Sequence,
+            "forecast_log_checkpoint_write"
+            | "forecast_log_checkpoint_not_regular"
+            | "forecast_log_segment_not_regular"
+            | "forecast_log_torn_segment" => FailureReason::Storage,
+            "forecast_log_closed" => FailureReason::Closed,
+            "forecast_log_stopped" => FailureReason::Stopped,
+            "forecast_log_worker_poisoned" | "forecast_log_observer_poisoned" => {
+                FailureReason::Poisoned
+            }
+            "forecast_log_task_join" => FailureReason::TaskJoin,
+            "forecast_log_snapshot_unavailable" => FailureReason::SnapshotUnavailable,
+            _ => continue,
+        };
+        return FailureDiagnostic { phase, reason };
+    }
+    FailureDiagnostic {
+        phase,
+        reason: if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+            FailureReason::Storage
+        } else {
+            FailureReason::Unknown
+        },
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,6 +340,10 @@ struct Checkpoint {
     // Write-ahead outbox: append is idempotently recovered by sequence on open.
     outbox: Vec<Record>,
     status: Status,
+    #[serde(default)]
+    last_failure: Option<FailureDiagnostic>,
+    #[serde(default)]
+    recovery: Option<recovery::Receipt>,
 }
 impl Default for Checkpoint {
     fn default() -> Self {
@@ -198,6 +357,8 @@ impl Default for Checkpoint {
             pending: Vec::new(),
             outbox: Vec::new(),
             status: Status::default(),
+            last_failure: None,
+            recovery: None,
         }
     }
 }
@@ -219,10 +380,14 @@ pub struct ForecastLog {
 }
 impl ForecastLog {
     pub fn open(home: &Path) -> Result<Self> {
+        Self::open_inner(home)
+            .map_err(|error| anyhow::Error::new(diagnostic(&error, FailurePhase::Open)))
+    }
+    fn open_inner(home: &Path) -> Result<Self> {
         let root = home.join("state/forecast-log");
         crate::platform::prepare_observation_directory(&root)?;
         let path = root.join("checkpoint.json");
-        let checkpoint = match fs::symlink_metadata(&path) {
+        let mut checkpoint = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 ensure!(
                     metadata.file_type().is_file(),
@@ -235,6 +400,40 @@ impl ForecastLog {
             Err(error) => return Err(error.into()),
         };
         validate_checkpoint(&checkpoint)?;
+        // The native caller owns the Store lease; the preceding core closed its
+        // logger before releasing it. Only the old, uncoded, zero-record failure
+        // may start afresh. Keep its exact checkpoint in a sibling archive.
+        if checkpoint.status.stopped
+            && checkpoint.status.losses > 0
+            && checkpoint.status.origins == 0
+            && checkpoint.status.outcomes == 0
+            && checkpoint.sequence == 0
+            && checkpoint.last_sample.is_none()
+            && checkpoint.last_origin_hour.is_none()
+            && checkpoint.pending.is_empty()
+            && checkpoint.outbox.is_empty()
+            && checkpoint.last_failure.is_none()
+            && checkpoint.recovery.is_none()
+        {
+            let receipt =
+                recovery::archive_empty(&root, checkpoint.status.losses).map_err(|error| {
+                    let failure = diagnostic(&error, FailurePhase::Recovery);
+                    error.context(failure)
+                })?;
+            crate::platform::prepare_observation_directory(&root).context(FailureDiagnostic {
+                phase: FailurePhase::Recovery,
+                reason: FailureReason::Storage,
+            })?;
+            checkpoint = Checkpoint {
+                recovery: Some(receipt),
+                ..Checkpoint::default()
+            };
+            tracing::info!(
+                phase = FailurePhase::Recovery.as_str(),
+                reason = FailureReason::Stopped.as_str(),
+                "Empty stopped forecast capture archived; starting fresh without backfill"
+            );
+        }
         let mut worker = Worker {
             root,
             checkpoint,
@@ -284,6 +483,7 @@ impl ForecastLog {
             account.allow_credits,
             Some(account.generation),
         )
+        .map_err(|error| anyhow::Error::new(diagnostic(&error, FailurePhase::Observation)))
     }
     fn account_state(
         &self,
@@ -294,17 +494,19 @@ impl ForecastLog {
         allow_credits: bool,
         generation: Option<u64>,
     ) -> Result<()> {
+        ensure!(!self.closed.load(Ordering::Acquire), "forecast_log_closed");
         ensure!(
-            !self.closed.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
-            "forecast_log_not_open"
+            !self.stopped.load(Ordering::Acquire),
+            "forecast_log_stopped"
         );
         let mut users = self
             .users
             .lock()
             .map_err(|_| anyhow::anyhow!("forecast_log_observer_poisoned"))?;
+        ensure!(!self.closed.load(Ordering::Acquire), "forecast_log_closed");
         ensure!(
-            !self.closed.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
-            "forecast_log_not_open"
+            !self.stopped.load(Ordering::Acquire),
+            "forecast_log_stopped"
         );
         let user = User {
             provider: provider.into(),
@@ -335,9 +537,10 @@ impl ForecastLog {
     }
     /// Full native snapshot only; no provider IO. Owner serializes these calls on a blocking worker.
     pub fn sample(&self, now: DateTime<Utc>, accounts: &[AdminAccount]) -> Result<()> {
+        ensure!(!self.closed.load(Ordering::Acquire), "forecast_log_closed");
         ensure!(
-            !self.stopped.load(Ordering::Acquire) && !self.closed.load(Ordering::Acquire),
-            "forecast_log_not_open"
+            !self.stopped.load(Ordering::Acquire),
+            "forecast_log_stopped"
         );
         let now = now.timestamp();
         let mut worker = self
@@ -345,17 +548,27 @@ impl ForecastLog {
             .lock()
             .map_err(|_| anyhow::anyhow!("forecast_log_worker_poisoned"))?;
         ensure!(!self.closed.load(Ordering::Acquire), "forecast_log_closed");
+        let first_sample = worker.checkpoint.last_sample.is_none();
         let result = self.sample_inner(&mut worker, now, accounts);
         if let Err(error) = result {
+            let failure = diagnostic(&error, FailurePhase::Sample);
+            worker.checkpoint.last_failure = Some(failure);
             self.stopped.store(true, Ordering::Release);
             worker.checkpoint.status.stopped = true;
             worker.checkpoint.status.losses = worker.checkpoint.status.losses.saturating_add(1);
             // The caller receives failure even when persisting the loss also fails.
-            let persistence = worker.save();
-            if persistence.is_err() {
-                bail!("forecast_log_failed_and_loss_persistence_failed: {error:#}");
+            if let Err(persistence) = worker.save() {
+                return Err(
+                    anyhow::Error::new(diagnostic(&persistence, FailurePhase::Checkpoint))
+                        .context(failure),
+                );
             }
-            return Err(error);
+            return Err(anyhow::Error::new(failure));
+        }
+        if first_sample && worker.checkpoint.last_sample == Some(now) {
+            tracing::info!({ phase = FailurePhase::Sample.as_str(), event = "first_sample",
+                origins = worker.checkpoint.status.origins, sequence = worker.checkpoint.sequence,
+                losses = worker.checkpoint.status.losses }, "Forecast log first sample recorded");
         }
         self.next_sample
             .store(now.saturating_add(60), Ordering::Release);
@@ -372,8 +585,12 @@ impl ForecastLog {
         for account in accounts {
             let provider = provider(account.provider);
             ensure!(
-                valid_id(&account.id, provider) && ids.insert(account.id.clone()),
-                "forecast_log_invalid_or_duplicate_identity"
+                valid_id(&account.id, provider),
+                "forecast_log_invalid_identity"
+            );
+            ensure!(
+                ids.insert(account.id.clone()),
+                "forecast_log_duplicate_account"
             );
             inputs.insert(account.id.clone(), input(account, now)?);
         }
@@ -602,6 +819,10 @@ impl ForecastLog {
     /// Owner must freeze store writes and stop/drain samplers before releasing
     /// its lease. No filesystem work occurs after this synchronous call returns.
     pub fn close(&self) -> Result<()> {
+        self.close_inner()
+            .map_err(|error| anyhow::Error::new(diagnostic(&error, FailurePhase::Close)))
+    }
+    fn close_inner(&self) -> Result<()> {
         let already_closed = self.closed.swap(true, Ordering::AcqRel);
         let mut worker = self
             .worker
@@ -627,16 +848,22 @@ impl ForecastLog {
             worker.checkpoint.clean = true;
             worker.save()
         })();
-        if result.is_err() {
+        if let Err(error) = result {
+            let failure = diagnostic(&error, FailurePhase::Close);
+            worker.checkpoint.last_failure.get_or_insert(failure);
             self.stopped.store(true, Ordering::Release);
             worker.checkpoint.clean = false;
             worker.checkpoint.status.stopped = true;
             worker.checkpoint.status.losses = worker.checkpoint.status.losses.saturating_add(1);
-            if worker.save().is_err() {
-                bail!("forecast_log_close_and_loss_persistence_failed");
+            if let Err(persistence) = worker.save() {
+                return Err(
+                    anyhow::Error::new(diagnostic(&persistence, FailurePhase::Checkpoint))
+                        .context(failure),
+                );
             }
+            return Err(anyhow::Error::new(failure));
         }
-        result
+        Ok(())
     }
     pub fn status(&self) -> Result<Status> {
         let worker = self
@@ -645,10 +872,25 @@ impl ForecastLog {
             .map_err(|_| anyhow::anyhow!("forecast_log_worker_poisoned"))?;
         Ok(worker.checkpoint.status)
     }
+    pub fn last_failure(&self) -> Result<Option<FailureDiagnostic>> {
+        self.worker
+            .lock()
+            .map(|worker| worker.checkpoint.last_failure)
+            .map_err(|_| {
+                anyhow::Error::new(FailureDiagnostic {
+                    phase: FailurePhase::Open,
+                    reason: FailureReason::Poisoned,
+                })
+            })
+    }
 }
 
 impl Worker {
     fn save(&self) -> Result<()> {
+        self.save_inner()
+            .map_err(|error| anyhow::Error::new(diagnostic(&error, FailurePhase::Checkpoint)))
+    }
+    fn save_inner(&self) -> Result<()> {
         let bytes = serde_json::to_vec(&self.checkpoint)?;
         ensure!(bytes.len() <= CHECKPOINT_CAP, "forecast_log_checkpoint_cap");
         super::atomic_write(&self.root.join("checkpoint.json"), &bytes)
@@ -693,6 +935,10 @@ impl Worker {
         Ok(())
     }
     fn drain_outbox(&mut self) -> Result<()> {
+        self.drain_outbox_inner()
+            .map_err(|error| anyhow::Error::new(diagnostic(&error, FailurePhase::Archive)))
+    }
+    fn drain_outbox_inner(&mut self) -> Result<()> {
         let mut total = self.journal_bytes;
         let mut highest = self.journal_last;
         // Scan once on open, not once per minute; subsequent appends retain watermarks.
@@ -798,18 +1044,23 @@ fn timestamp(value: &str) -> Result<i64> {
         .timestamp())
 }
 fn window_name(name: &str) -> bool {
-    // Native Claude parser emits these two named account DTO windows as well.
-    if matches!(name, "7d_oi" | "7d_sonnet") {
+    // Native slot names carry no duration; never infer 5h/7d from these aliases.
+    if matches!(name, "primary" | "secondary" | "7d_oi" | "7d_sonnet") {
         return true;
+    }
+    if name.len() > 21 {
+        return false;
     }
     let Some((unit, digits)) = name.as_bytes().split_last() else {
         return false;
     };
     !digits.is_empty()
-        && digits.len() <= 6
         && digits.iter().all(u8::is_ascii_digit)
         && matches!(*unit, b's' | b'm' | b'h' | b'd')
-        && digits.iter().any(|b| *b != b'0')
+        && name[..name.len() - 1]
+            .parse::<u64>()
+            .ok()
+            .is_some_and(|n| n > 0)
 }
 fn usable(a: &AdminAccount) -> bool {
     a.user_state == AdminUserState::Active
@@ -834,10 +1085,8 @@ fn input(a: &AdminAccount, now: i64) -> Result<Input> {
     let mut reason = a.windows.is_empty().then_some(Unavailable::MissingWindow);
     let mut remaining = 1.0f64;
     for w in &a.windows {
-        ensure!(
-            window_name(&w.name) && names.insert(&w.name),
-            "forecast_log_window_invalid"
-        );
+        ensure!(window_name(&w.name), "forecast_log_window_name_invalid");
+        ensure!(names.insert(&w.name), "forecast_log_duplicate_window");
         let observed = w
             .observed_at
             .as_deref()
@@ -957,6 +1206,27 @@ fn validate_forecast(f: &AccountUsageForecast) -> Result<()> {
     Ok(())
 }
 fn validate_checkpoint(c: &Checkpoint) -> Result<()> {
+    if let Some(receipt) = &c.recovery {
+        ensure!(
+            receipt.archive.starts_with("forecast-log.failed-")
+                && receipt.archive.len() <= 96
+                && receipt
+                    .archive
+                    .strip_prefix("forecast-log.failed-")
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty()
+                            && suffix
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    })
+                && DateTime::from_timestamp(receipt.at, 0).is_some()
+                && receipt.prior_losses > 0,
+            FailureDiagnostic {
+                phase: FailurePhase::Open,
+                reason: FailureReason::Bounds,
+            }
+        );
+    }
     ensure!(
         c.schema == 1
             && c.users.accounts.len() <= ACCOUNTS
