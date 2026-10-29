@@ -24,7 +24,7 @@ pub enum IdKind {
 }
 
 /// Refusals contain no offending text or payload and are safe to count/log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireRefusal {
     Schema,
@@ -37,6 +37,19 @@ pub enum WireRefusal {
     Health,
     Quota,
     QuotaReference,
+    QuotaRoot,
+    QuotaWindows,
+    QuotaWindow,
+    QuotaWindowName,
+    QuotaWindowUsed,
+    QuotaWindowStatus,
+    QuotaWindowReset,
+    QuotaWindowObserved,
+    QuotaCredits,
+    QuotaCreditFlag,
+    QuotaCreditBalance,
+    QuotaPaidServing,
+    MissingPermit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,7 +220,13 @@ impl From<Window> for String {
         value.0
     }
 }
-vocabulary!(Status, Quota, { Rejected => "rejected", Allowed => "allowed", Warning => "allowed_warning" });
+// Native Codex header snapshots retain the boolean header as literal text.
+// These are not aliases for allowed/rejected: native health reads distinguish
+// those strings, so the archive must preserve them without interpretation.
+vocabulary!(Status, Quota, {
+    Rejected => "rejected", Allowed => "allowed", Warning => "allowed_warning",
+    True => "true", False => "false"
+});
 vocabulary!(ReloginReason, Health, {
     InvalidGrant => "invalid_grant", TokenRevoked => "token_revoked", Revoked => "revoked",
     AuthAfterRefresh => "auth_after_refresh", RefreshReused => "refresh_token_reused",
@@ -496,38 +515,45 @@ fn date(v: &Value) -> Result<DateTime<Utc>, WireRefusal> {
         .map_err(|_| WireRefusal::Quota)
 }
 fn window(v: &Value) -> Result<WindowFacts, WireRefusal> {
-    let o = object(v)?;
+    let o = object(v).map_err(|_| WireRefusal::QuotaWindow)?;
     Ok(WindowFacts {
         name: field(o.get("name"), |v| {
             Window::parse(v.as_str().ok_or(WireRefusal::Quota)?)
-        })?,
-        used_pct: field(o.get("used_pct"), number)?,
+        })
+        .map_err(|_| WireRefusal::QuotaWindowName)?,
+        used_pct: field(o.get("used_pct"), number).map_err(|_| WireRefusal::QuotaWindowUsed)?,
         status: field(o.get("status"), |v| {
             Status::parse(v.as_str().ok_or(WireRefusal::Quota)?)
-        })?,
-        reset_at: field(o.get("reset_at"), date)?,
-        observed_at: field(o.get("observed_at"), date)?,
+        })
+        .map_err(|_| WireRefusal::QuotaWindowStatus)?,
+        reset_at: field(o.get("reset_at"), date).map_err(|_| WireRefusal::QuotaWindowReset)?,
+        observed_at: field(o.get("observed_at"), date)
+            .map_err(|_| WireRefusal::QuotaWindowObserved)?,
     })
 }
 fn quota(v: &Value) -> Result<QuotaFacts, WireRefusal> {
-    let o = object(v)?;
+    let o = object(v).map_err(|_| WireRefusal::QuotaRoot)?;
     Ok(QuotaFacts {
         windows: field(o.get("windows"), |v| {
-            let rows = v.as_array().ok_or(WireRefusal::Quota)?;
+            let rows = v.as_array().ok_or(WireRefusal::QuotaWindows)?;
             if rows.len() > 32 {
                 return Err(WireRefusal::Bounds);
             }
             rows.iter().map(window).collect()
         })?,
         credits: field(o.get("credits"), |v| {
-            let c = object(v)?;
+            let c = object(v).map_err(|_| WireRefusal::QuotaCredits)?;
             Ok(CreditFacts {
-                has_credits: field(c.get("has_credits"), boolean)?,
-                unlimited: field(c.get("unlimited"), boolean)?,
-                balance: field(c.get("balance"), number)?,
+                has_credits: field(c.get("has_credits"), boolean)
+                    .map_err(|_| WireRefusal::QuotaCreditFlag)?,
+                unlimited: field(c.get("unlimited"), boolean)
+                    .map_err(|_| WireRefusal::QuotaCreditFlag)?,
+                balance: field(c.get("balance"), number)
+                    .map_err(|_| WireRefusal::QuotaCreditBalance)?,
             })
         })?,
-        paid_serving_observed_at: field(o.get("paid_serving_observed_at"), date)?,
+        paid_serving_observed_at: field(o.get("paid_serving_observed_at"), date)
+            .map_err(|_| WireRefusal::QuotaPaidServing)?,
         // effective_account unconditionally replaces signals with Null.
     })
 }

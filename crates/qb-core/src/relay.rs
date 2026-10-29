@@ -784,13 +784,12 @@ impl RelayState {
             observability.forecast_account(account);
         }
         if let Some(producer) = observability.replay()
-            && bindings
-                .attach_tape(producer.clone(), &initial_accounts)
-                .is_err()
+            && let Err(reason) = bindings.attach_tape(producer.clone(), &initial_accounts)
         {
-            producer.producer_failed();
+            producer.startup_witness_failed(reason);
             tracing::warn!(
                 code = "decision_tape_initial_witness_failed",
+                reason = reason.as_str(),
                 "Decision tape startup state is incomplete"
             );
         }
