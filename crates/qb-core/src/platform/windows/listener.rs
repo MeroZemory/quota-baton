@@ -25,29 +25,26 @@ pub(crate) async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
 }
 
 fn register(listener: std::net::TcpListener, port: u16) -> anyhow::Result<TcpListener> {
-    listener.set_nonblocking(true).map_err(|error| {
+    listener.set_nonblocking(true).inspect_err(|error| {
         tracing::warn!(
             phase = "listener_nonblocking",
             code = error.raw_os_error(),
             "Native listener operation failed"
         );
-        error
     })?;
-    let retained = listener.try_clone().map_err(|error| {
+    let retained = listener.try_clone().inspect_err(|error| {
         tracing::warn!(
             phase = "listener_clone",
             code = error.raw_os_error(),
             "Native listener operation failed"
         );
-        error
     })?;
-    let listener = TcpListener::from_std(listener).map_err(|error| {
+    let listener = TcpListener::from_std(listener).inspect_err(|error| {
         tracing::warn!(
             phase = "listener_registration",
             code = error.raw_os_error(),
             "Native listener operation failed"
         );
-        error
     })?;
     super::service::listener_bank::retain(port, retained)?;
     Ok(listener)

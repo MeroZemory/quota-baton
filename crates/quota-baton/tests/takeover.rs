@@ -1,4 +1,7 @@
 //! Two real cores per scenario; only disposable homes and numeric loopback fakes.
+#[cfg(windows)]
+#[path = "takeover/r20_failed_prepare.rs"]
+mod r20_failed_prepare;
 #[path = "takeover/r20_stress.rs"]
 mod r20_stress;
 use futures_util::{SinkExt, StreamExt};

@@ -77,7 +77,7 @@ fn ready_requires_exact_pid_nonce_unexpired_and_one_use() {
 }
 
 #[test]
-fn grant_recovery_requires_proven_dead_recipient_and_active_incumbent() {
+fn grant_recovery_requires_unready_proven_dead_recipient_before_shutdown() {
     assert!(can_recover_grant(false, false, 42, 43, RecipientLife::Dead));
     for life in [RecipientLife::Alive, RecipientLife::Unknown] {
         assert!(!can_recover_grant(false, false, 42, 43, life));

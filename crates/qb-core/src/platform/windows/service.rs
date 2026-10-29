@@ -143,13 +143,13 @@ pub(crate) fn routes(relay: Arc<RelayState>) -> Router {
         .with_state(relay)
 }
 async fn export_listeners(
-    State(relay): State<Arc<RelayState>>,
+    State(_relay): State<Arc<RelayState>>,
     Json(request): Json<listener_bank::ExportRequest>,
 ) -> axum::response::Response {
-    if relay.is_draining() {
-        return (StatusCode::CONFLICT, "listener export unavailable").into_response();
-    }
-    match listener_bank::export(request.recipientpid, &relay) {
+    // Failed drain preparation keeps the incumbent and its listeners alive.
+    // The bank alone fences shutdown and any previous recipient capability;
+    // the relay's draining flag does not mean preparation succeeded.
+    match listener_bank::export(request.recipientpid) {
         Ok(export) => ([(header::CACHE_CONTROL, "no-store")], Json(export)).into_response(),
         Err(_) => (StatusCode::CONFLICT, "listener export unavailable").into_response(),
     }
