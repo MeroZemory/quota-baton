@@ -67,6 +67,58 @@ pub struct AdminAccount {
     pub spread_threshold: u64,
 }
 
+/// Explicit R19 Not Used membership, independent of temporary availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementExclusion {
+    Disabled,
+    Paused,
+    ClaudeFree,
+    NeedsRelogin,
+}
+
+pub fn placement_exclusion(
+    provider: &str,
+    user_state: &str,
+    plan: Option<&str>,
+    health_kind: &str,
+) -> Option<PlacementExclusion> {
+    if user_state == "disabled" {
+        Some(PlacementExclusion::Disabled)
+    } else if user_state == "paused" {
+        Some(PlacementExclusion::Paused)
+    } else if (provider == "claude" && plan == Some("free"))
+        || health_kind == "plan_without_claude_code"
+    {
+        Some(PlacementExclusion::ClaudeFree)
+    } else if health_kind == "needs_relogin" {
+        Some(PlacementExclusion::NeedsRelogin)
+    } else {
+        None
+    }
+}
+
+impl AdminAccount {
+    pub fn placement_exclusion(&self) -> Option<PlacementExclusion> {
+        let provider = match self.provider {
+            AdminProvider::Claude => "claude",
+            AdminProvider::Codex => "codex",
+        };
+        let user_state = match self.user_state {
+            AdminUserState::Active => "active",
+            AdminUserState::Paused => "paused",
+            AdminUserState::Disabled => "disabled",
+        };
+        let health_kind = match &self.health {
+            AdminHealth::Ready {} => "ready",
+            AdminHealth::PlanWithoutClaudeCode {} => "plan_without_claude_code",
+            AdminHealth::Cooling { .. } => "cooling",
+            AdminHealth::NeedsRelogin { .. } => "needs_relogin",
+            AdminHealth::Unknown(health) => health.kind.as_str(),
+        };
+        placement_exclusion(provider, user_state, self.plan.as_deref(), health_kind)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AdminProvider {
@@ -410,6 +462,75 @@ mod tests {
             "last_used_at":null,"bound_sessions":4,"token_expires_at":null,"drain":false,
             "allow_credits":true,"refresh_attention":true,"active_sessions":2,"spread_threshold":3
         })
+    }
+
+    #[test]
+    fn n7_placement_exclusion_matches_r19_and_typed_accounts() {
+        use PlacementExclusion::*;
+        for (provider, state, plan, kind, expected) in [
+            (
+                "claude",
+                "disabled",
+                Some("free"),
+                "needs_relogin",
+                Some(Disabled),
+            ),
+            (
+                "claude",
+                "paused",
+                Some("free"),
+                "needs_relogin",
+                Some(Paused),
+            ),
+            ("claude", "active", Some("free"), "ready", Some(ClaudeFree)),
+            (
+                "claude",
+                "active",
+                None,
+                "plan_without_claude_code",
+                Some(ClaudeFree),
+            ),
+            (
+                "codex",
+                "active",
+                None,
+                "plan_without_claude_code",
+                Some(ClaudeFree),
+            ),
+            (
+                "claude",
+                "active",
+                Some("max_20x"),
+                "needs_relogin",
+                Some(NeedsRelogin),
+            ),
+            ("codex", "active", Some("free"), "ready", None),
+            ("claude", "active", Some("max_20x"), "cooling", None),
+            ("claude", "active", None, "ready", None),
+            ("claude", "active", None, "future_health", None),
+            ("claude", "active", Some("Free"), "ready", None),
+        ] {
+            let mut value = wire();
+            value["provider"] = json!(provider);
+            value["source"] = json!({"kind":"oauth"});
+            value["user_state"] = json!(state);
+            value["plan"] = json!(plan);
+            value["health"] = match kind {
+                "needs_relogin" => {
+                    json!({"kind":kind,"reason":"synthetic","since":"2030-01-01T00:00:00Z"})
+                }
+                "cooling" => {
+                    json!({"kind":kind,"reason":"quota","until":"2030-01-02T00:00:00Z","scope":"account"})
+                }
+                _ => json!({"kind":kind}),
+            };
+            // Temporary pool availability and drain are not Not Used membership.
+            value["pool_eligible"] = json!(false);
+            value["drain"] = json!(true);
+            let account: AdminAccount = serde_json::from_value(value).unwrap();
+            assert_eq!(placement_exclusion(provider, state, plan, kind), expected);
+            assert_eq!(account.placement_exclusion(), expected);
+        }
     }
 
     #[test]

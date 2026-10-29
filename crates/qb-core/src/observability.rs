@@ -242,6 +242,7 @@ struct Credits {
 
 enum Command {
     PollQuota(String, Box<Snapshot>),
+    ReconcileAccounts(BTreeSet<String>, mpsc::Sender<Result<(), String>>),
     Ledger(serde_json::Value),
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     Capture(serde_json::Value),
@@ -1380,6 +1381,31 @@ impl Observability {
         }
     }
 
+    /// The caller supplies a successful authoritative Store list under its
+    /// transaction. Direct Observability users need not have an account store.
+    pub(crate) fn reconcile_accounts(
+        &self,
+        existing: &[crate::accounts::Account],
+    ) -> anyhow::Result<()> {
+        let known: BTreeSet<_> = existing.iter().map(|account| account.id.clone()).collect();
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, _| known.contains(id));
+        self.shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_accounts(&known);
+        self.dashboard.retain_accounts(&known);
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::ReconcileAccounts(known, tx))
+            .map_err(|_| anyhow::anyhow!("observability worker unavailable"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("observability worker unavailable"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     pub fn flush(&self) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -1659,7 +1685,10 @@ impl Writer {
                 Some(path) => self.append(path, &value["shape"]),
                 None => Ok(()),
             },
-            Command::Flush(_) | Command::FreezeQuota(_) | Command::Stop => unreachable!(),
+            Command::ReconcileAccounts(_, _)
+            | Command::Flush(_)
+            | Command::FreezeQuota(_)
+            | Command::Stop => unreachable!(),
         };
         if result.is_err() {
             tracing::warn!("Observability write failed; later events will retry");
@@ -1775,6 +1804,17 @@ fn run(
     };
     loop {
         match rx.recv_timeout(SYNC_INTERVAL.saturating_sub(writer.last_sync.elapsed())) {
+            Ok(Command::ReconcileAccounts(known, reply)) => {
+                let result = if writer.quota_frozen {
+                    Err("observability quota is frozen".into())
+                } else {
+                    let before = writer.state.accounts.len();
+                    writer.state.accounts.retain(|id, _| known.contains(id));
+                    writer.quota_dirty |= before != writer.state.accounts.len();
+                    writer.flush()
+                };
+                let _ = reply.send(result);
+            }
             Ok(Command::Flush(reply)) => {
                 let _ = reply.send(writer.flush());
             }
