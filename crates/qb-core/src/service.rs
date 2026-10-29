@@ -2,6 +2,10 @@
 use crate::{config::Config, relay::RelayState};
 use std::{future::Future, path::Path, sync::Arc};
 
+pub fn trace_handover_phase(phase: &'static str) {
+    tracing::info!(pid = std::process::id(), phase, "Core handover lifecycle");
+}
+
 pub fn prepare_process() -> anyhow::Result<()> {
     crate::platform::service::prepare_process()
 }

@@ -267,6 +267,7 @@ async fn request_takeover(
         .no_proxy()
         .timeout(std::time::Duration::from_secs(35))
         .build()?;
+    qb_core::service::trace_handover_phase("drain_requested");
     let response = client
         .post(format!("http://127.0.0.1:{port}/admin/v1/lifecycle/drain"))
         .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
@@ -283,6 +284,7 @@ async fn request_takeover(
             response.status()
         );
     }
+    qb_core::service::trace_handover_phase("drain_acknowledged");
     Ok(response.json().await?)
 }
 
@@ -501,6 +503,7 @@ async fn run() -> anyhow::Result<()> {
             let startup_failure = qb_core::service::defer_startup_error(
                 box_service.start(relay.clone()).and_then(|_| {
                     qb_core::service::notify_ready().and_then(|_| {
+                        qb_core::service::trace_handover_phase("ready");
                         print_stdout(format_args!("프록시를 시작했습니다.")).map_err(Into::into)
                     })
                 }),
@@ -536,6 +539,7 @@ async fn run() -> anyhow::Result<()> {
                 // Stop accepting new connections before handing the credential
                 // lease to the successor. Existing handlers remain alive under
                 // axum's graceful-shutdown drain.
+                qb_core::service::trace_handover_phase("listener_shutdown_requested");
                 servers.shutdown();
                 servers.wait_for_listener_close().await;
                 if relay.is_draining() && qb_core::service::should_release_lease_early() {

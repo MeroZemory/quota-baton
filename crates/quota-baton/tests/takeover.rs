@@ -1,4 +1,6 @@
 //! Two real cores per scenario; only disposable homes and numeric loopback fakes.
+#[path = "takeover/r20_stress.rs"]
+mod r20_stress;
 use futures_util::{SinkExt, StreamExt};
 use qb_core::accounts::{
     Account, AccountStore, Health, Identity, Provider, Source, StoreError, TokenMeta, Tokens,

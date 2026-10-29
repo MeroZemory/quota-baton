@@ -47,6 +47,9 @@ impl RunningServers {
 struct HandoverListener {
     listener: Option<TcpListener>,
     closed: watch::Sender<bool>,
+    role: &'static str,
+    port: u16,
+    accepted: bool,
 }
 impl axum::serve::Listener for HandoverListener {
     type Io = TcpStream;
@@ -54,6 +57,10 @@ impl axum::serve::Listener for HandoverListener {
     async fn accept(&mut self) -> (TcpStream, SocketAddr) {
         let (stream, addr) =
             axum::serve::Listener::accept(self.listener.as_mut().expect("listener alive")).await;
+        if !self.accepted {
+            self.accepted = true;
+            listener_phase(self.role, self.port, "first_accept");
+        }
         if let Err(error) = stream.set_nodelay(true) {
             tracing::debug!(%error, "failed to set TCP_NODELAY on accepted HTTP socket");
         }
@@ -66,8 +73,18 @@ impl axum::serve::Listener for HandoverListener {
 impl Drop for HandoverListener {
     fn drop(&mut self) {
         drop(self.listener.take());
+        listener_phase(self.role, self.port, "closed");
         self.closed.send_replace(true);
     }
+}
+fn listener_phase(role: &'static str, port: u16, phase: &'static str) {
+    tracing::info!(
+        pid = std::process::id(),
+        role,
+        port,
+        phase,
+        "HTTP listener lifecycle"
+    );
 }
 #[derive(Clone)]
 struct Peer(SocketAddr);
@@ -138,7 +155,9 @@ pub(crate) async fn spawn_with_box_registry(
         "local secrets must be distinct"
     );
     let data = crate::platform::bind_listener(config.server.data_port).await?;
+    listener_phase("data", data.local_addr()?.port(), "bound");
     let admin = crate::platform::bind_listener(config.server.admin_port).await?;
+    listener_phase("admin", admin.local_addr()?.port(), "bound");
     let data_addr = data.local_addr()?;
     let admin_addr = admin.local_addr()?;
     let (shutdown, mut data_shutdown) = watch::channel(false);
@@ -191,6 +210,9 @@ pub(crate) async fn spawn_with_box_registry(
             HandoverListener {
                 listener: Some(data),
                 closed: data_closed,
+                role: "data",
+                port: data_addr.port(),
+                accepted: false,
             },
             data_app.into_make_service_with_connect_info::<Peer>(),
         )
@@ -208,6 +230,9 @@ pub(crate) async fn spawn_with_box_registry(
             HandoverListener {
                 listener: Some(admin),
                 closed: admin_closed,
+                role: "admin",
+                port: admin_addr.port(),
+                accepted: false,
             },
             admin_app.into_make_service_with_connect_info::<Peer>(),
         )
