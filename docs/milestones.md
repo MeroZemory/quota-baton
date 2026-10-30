@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N6r-T schema8 기록기 보완 관문PASS·설치 인계
-목표: 새 실제1h 무손실·10MB/h 미만 확인; 이후24h margin0 수용
+현재 마일스톤: N6r-T schema8 실제1h identity·power PASS, 40MB/h·512MiB 기본값 관문PASS
+목표: 설치 후 다중 epoch 실제24h 무손실 margin0 수용; R20 남은 관문 재개
 핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
-사용자 대기: 없음
-갱신: 2026-10-30 07:55 KST (실제 보존284/284 identity·단일 fault170 검출; 전체 budget손실3270 insufficient. Native24.37→7.22MB·유지구간6.47MB/h; Windows/Linux 관문 완료)
+사용자 대기: 없음 (설계 세션 설치·6h 봉인 운영 인계)
+갱신: 2026-10-30 10:56 KST (실제638/638 identity, model2/640·loss0; fault14 정확 검출, 실제30분guard 미도달)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -145,7 +145,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: N6r-T schema8 producer volume repair has passed its installable gate on impl/n6r-tape; owner installation and a fresh sealed real hour are next. The immutable schema7 epoch from installed50257fa remains insufficient: 284/286 comparable identity matches, model2(0.70%), budget refusals3270 and no other loss. The separately registered post-census raw-tuple source fault changes exactly170 and component power passes; the original pre-capture singleton protocol remains unexercised. The actual new ordinary reader reproduces the installed reference. Native retained-corpus reconstruction restores2915records exactly and reduces encoded24,370,623->7,218,570bytes (70.4%); whole bytes/selection85.2->25.2KB, selection-only76.8->16.6KB, retained-span6.47MB/h. Missing attempts are unknown; full live<10MB/h and loss0 require the next capture. Fixed encoded budget20,000,000B/hour; schema8 writes state/decision-tape-v8,5/6/7 remain read-only. Windows full default sole startup-fixture failure repaired focused; full allfeatures/core, both strict configurations, ordinary build/reader pass. Linux31tape+20raw+6platform/check/three strict profiles and LFpackaging pass; owned volume cleaned to633,020,416bytes. R20 is parked clean at impl/r20 WIP8dd6f03. Real2 permit identity445/445 remains accepted; natural guard power and the24h census remain pending, controlled A->B->A only after no natural reaching decision and joint owner execution. impl/r14-replay remains stopped/unmerged. N7-L clock starts2026-10-29 13:49 KST; no scoring/model work before2026-11-05 13:49. R18window-hold f40bd53 and R19 installed; L1 real P5 stays with user/design; N12 awaits O14. Report: .sandbox/reports/N6r-T.tape7-real1.md.
+**Current S1 order**: schema8 real hour passes selection and permit identity638/638, model2/640(0.3125%), losses0; the shared raw-fact source fault changes exactly14 and fails both identity/paired comparisons as required. Actual no30-minute-guard control remains insufficient_not_exercised (637 same-account,1 missing source). The40,000,000 hourly encoded budget is configurable and the disk default is now512MiB; stop-go/loss and existing schema compatibility remain qualified. Windows/Linux focused gates pass; reports retain original failures and dependency-aware reuse. The owner installs and sets live disk512, then captures24h across independently sealed epochs (recommended6h/12h/18h/final24h due unchanged dictionary/decoded-epoch bounds). v8 disk accounting is independent of legacy roots; archive-and-remove helper is synthetic-qualified, never live-applied. R20 is parked clean at impl/r20 6f8bf37 with actual200 stressPASS and remaining row gate pending; resume it next. impl/r14-replay remains stopped/unmerged. N7-L clock starts2026-10-29 13:49 KST; no scoring/model work before2026-11-05 13:49. R18window-hold f40bd53 and R19 installed; L1 real P5 stays with user/design; N12 awaits O14. Report: .sandbox/reports/N6r-T.tape8-real1.md.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
@@ -570,7 +570,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
 | Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
-| N6r decision tape | 실제schema7 보존284/284 identity·별도 rawfault170 검출, model2/286; budget손실3270 전체insufficient. Native기록2915건24.37->7.22MB(70.4%)·유지구간6.47MB/h | 새schema8 실제1h 손실0·<10MB/h 확인, 이후24h margin0·실제guard census | schema8 producer Windows/Linux 관문PASS·설치인계; state/decision-tape-v8; 이전입력불변·0채움없음 |
+| N6r decision tape | schema8 실제638/638 identity·fault14 검출·loss0, model0.3125%; 실제30분guard insufficient_not_exercised | >=24h 완전 다중epoch margin0·실제guard census/power | 40MB/h·512MiB 기본값 양OS 관문PASS; 설계 설치·6h 봉인 운영 인계, B1/3 유지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
