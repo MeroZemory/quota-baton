@@ -108,6 +108,7 @@ pub enum SelectionInputError {
     PolicyScope,
     MissingPool,
     MissingReturnHistory,
+    MissingCapacityFacts,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

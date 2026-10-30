@@ -6,6 +6,140 @@ use crate::config::RoutingConfig;
 use crate::routing::{Mode, On5hLimit, Settings};
 use std::sync::Arc;
 
+#[test]
+fn capacity_producer_records_measurements_without_changing_percent_placement() {
+    use crate::bindings::kernel::selection_capacity::{
+        CapacityFacts, CapacitySample, WindowSamples,
+    };
+    let (_home, table) = table();
+    let mut free = crate::bindings::tests::candidate("capacity-a", 20.0, 168, 5);
+    free.account.provider = Provider::Codex;
+    free.account.plan = Some("free".into());
+    let mut pro = free.clone();
+    pro.account.id = "capacity-b".into();
+    pro.account.plan = Some("pro".into());
+    let rows = vec![free, pro];
+    let now = Utc::now();
+    let data = table.data.lock().unwrap();
+    let mut inputs = kernel_shell::selection_snapshot(
+        &table,
+        &data,
+        SelectionEntry::Ordered,
+        Provider::Codex,
+        None,
+        None,
+        None,
+        &rows,
+        &rows,
+        None,
+        MoveObservations::untracked(),
+        None,
+        now,
+        true,
+        None,
+        None,
+    )
+    .unwrap();
+    let chosen = |inputs: &DecisionInputs| select(inputs).unwrap().decision;
+    let legacy = chosen(&inputs);
+    assert_eq!(
+        legacy.choice,
+        SelectionChoice::Selected {
+            account: "capacity-a".into()
+        }
+    );
+    let measured = |row: &Candidate, tokens: u64, n: usize| CapacityFacts {
+        plan: row.account.plan.clone().unwrap(),
+        provider: row.account.provider,
+        windows: row.quota.as_ref().unwrap()["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| {
+                let end: DateTime<Utc> = w["observed_at"].as_str().unwrap().parse().unwrap();
+                (
+                    w["name"].as_str().unwrap().to_owned(),
+                    WindowSamples {
+                        samples: (0..n)
+                            .map(|i| CapacitySample {
+                                input_tokens: tokens,
+                                used_pct_delta: 1.0,
+                                start_at: end - chrono::Duration::seconds((n - i) as i64 * 20),
+                                end_at: end - chrono::Duration::seconds((n - i) as i64 * 20 - 10),
+                                reset_at: w["reset_at"].as_str().unwrap().parse().unwrap(),
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    // No capacity is inferred from the Free/Pro names. Only the raw intervals
+    // distinguish their token room, with the same actual percent and resets.
+    let s = inputs.selection.as_mut().unwrap();
+    s.metrics
+        .capacity
+        .as_mut()
+        .unwrap()
+        .insert(rows[0].account.id.clone(), measured(&rows[0], 100, 3));
+    s.metrics
+        .capacity
+        .as_mut()
+        .unwrap()
+        .insert(rows[1].account.id.clone(), measured(&rows[1], 10_000, 3));
+    let weighted = chosen(&inputs);
+    assert_eq!(
+        weighted, legacy,
+        "producer must keep percent policy despite unequal measured token room"
+    );
+    assert_eq!(
+        weighted.choice,
+        SelectionChoice::Selected {
+            account: "capacity-a".into()
+        }
+    );
+    let before = serde_json::to_value(&inputs).unwrap();
+    let record =
+        crate::bindings::permit_tape::selection::capture(&inputs, &weighted, |_, id| id.to_owned())
+            .unwrap();
+    assert_eq!(
+        crate::bindings::permit_tape::selection::replay(&record).unwrap(),
+        record.actual
+    );
+    assert_eq!(serde_json::to_value(&inputs).unwrap(), before);
+    let mut unrecorded = serde_json::to_value(&record).unwrap();
+    unrecorded["inputs"]["selection"]["metrics"]
+        .as_object_mut()
+        .unwrap()
+        .remove("capacity");
+    let unrecorded = serde_json::from_value(unrecorded).unwrap();
+    assert_eq!(
+        crate::bindings::permit_tape::selection::replay(&unrecorded).unwrap(),
+        record.actual,
+        "legacy missing measurements do not change this installed percent policy",
+    );
+
+    // Below N, a legacy unweighted winner remains unchanged; mixed units are
+    // never compared pairwise and no guessed equal token capacity is supplied.
+    inputs
+        .selection
+        .as_mut()
+        .unwrap()
+        .metrics
+        .capacity
+        .as_mut()
+        .unwrap()
+        .insert(rows[0].account.id.clone(), measured(&rows[0], 100, 2));
+    assert_eq!(chosen(&inputs), legacy);
+    inputs.selection.as_mut().unwrap().candidates.truncate(1);
+    assert_eq!(
+        chosen(&inputs).choice,
+        SelectionChoice::Selected {
+            account: "capacity-a".into()
+        }
+    );
+}
+
 fn table() -> (tempfile::TempDir, Arc<BindingTable>) {
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let base = executable

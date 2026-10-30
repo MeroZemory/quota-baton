@@ -73,6 +73,7 @@ fn inputs() -> DecisionInputs {
             "launch_anchors": {KEY: ROOT}, "session_binding_max_secs": 77
         },
         "metrics": {
+            "capacity": {},
             "config": RoutingConfig::default(), "recent": {A: [[now(), ROOT], [now(), KEY]]},
             "idle_placements": [ROOT], "thresholds": {A: 3},
             "overload_marks": {ROOT: {"expires": now(), "from": A, "target": B}},

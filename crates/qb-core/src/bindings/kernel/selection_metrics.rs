@@ -17,6 +17,10 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricInputs {
+    /// Raw measured intervals, never a plan multiplier or a scored answer.
+    /// None is an unrecorded legacy readset, not known-empty measurements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capacity: Option<BTreeMap<String, super::selection_capacity::CapacityFacts>>,
     pub config: RoutingConfig,
     pub recent: BTreeMap<String, Vec<(DateTime<Utc>, String)>>,
     pub idle_placements: BTreeSet<String>,
@@ -62,6 +66,7 @@ pub struct PlacementAsOfInput {
 /// Ephemeral results: never persisted as part of the raw input protocol.
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
+    pub remaining_tokens: Option<f64>,
     pub gate: bool,
     pub unknown: bool,
     pub weekly: Option<DateTime<Utc>>,
@@ -348,6 +353,7 @@ fn calculate(
     stale: impl Fn(&Value) -> bool,
 ) -> Metrics {
     let mut m = Metrics {
+        remaining_tokens: None,
         gate: true,
         unknown: false,
         weekly: None,
@@ -362,6 +368,7 @@ fn calculate(
     let pending = pending.max(c.inflight);
     let state = placement_state(c, raw);
     let mut seen = false;
+    let mut projected_windows = BTreeMap::new();
     let mut slot_usage = [None::<f64>; 2];
     for w in windows {
         let Some(weekly) = account_window(c.account.provider, w) else {
@@ -402,6 +409,7 @@ fn calculate(
             m.usage = f64::INFINITY;
             continue;
         };
+        projected_windows.insert(w["name"].as_str().expect("gating window").to_owned(), usage);
         m.usage = m.usage.max(usage);
         let near = reset.is_some_and(|r| (r - now).num_seconds() as u64 <= cfg.near_reset_secs);
         let gate = if weekly {
@@ -420,6 +428,21 @@ fn calculate(
     if !seen {
         m.unknown = true;
         m.usage = f64::INFINITY;
+    }
+    if !m.unknown {
+        m.remaining_tokens = raw
+            .capacity
+            .as_ref()
+            .and_then(|rows| rows.get(&c.account.id))
+            .and_then(|facts| {
+                super::selection_capacity::remaining_tokens(
+                    facts,
+                    &c.account,
+                    c.quota.as_ref()?,
+                    &projected_windows,
+                    now,
+                )
+            });
     }
     m
 }
