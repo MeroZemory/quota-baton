@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: launch-expired 일반 takeover 관문완료·dev 인계
-목표: 최종봉인 뒤 schema9 producer 설치, 그 다음 managed launch 인계 수정 설치; schema8 원형24h 판정과 schema9 warm>=24h R21 비교는 별도
+현재 마일스톤: launch-expired 수정 수용·661997d 단일설치 대기
+목표: 최종봉인 뒤661997d 한 번 설치·schema9 percent 기준 capture 시작; schema8 원형24h 판정과 schema9 warm>=24h R21 비교는 별도
 핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (인계 수정 관문을 실제 수용으로 세지 않음)
 사용자 대기: 10-31 11:04 최종봉인·기존 설치 순서; N7은11/05 13:49 이후·L1 실제수용·N12 O14
-갱신: 2026-10-30 21:54 KST (패치간 HTTP/WS old URL 유지 확인·메모리 보안 검토·양 플랫폼 관문 통과; 최초 구버전 migration 재실행 경로 유지·설치7b3f9ce 유지)
+갱신: 2026-10-30 22:10 KST (owner 수용: producer+launch handover 단일661997d 설치·routing/tape/percent 정책 불변; 최초 old→patched 재실행 경로 유지·설치7b3f9ce 유지)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -147,7 +147,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: launch-expired ordinary takeover fix is gated for dev handoff after the schema9 producer; it must not install during the current capture. First old-to-patched upgrade retains legacy/relaunch because an unpatched incumbent has no grant exporter; subsequent patched takeovers preserve the existing URL. Managed Linux service exec reload and genuine expiry remain separate limits. Installed7b3f9ce/schema8 e02..e05 seals remain unchanged; after10-31 11:04 export run original>=24h identity/power/census first. Producer f1e2911 contains R20+schema9 raw capacity readset with percent policy unchanged; owner installs it first, then this fix on the following install. R21 stays unmerged on impl/r21 until warm>=24h schema9 percent-vs-weighted paired verdict (margin0). N7 scoring waits until11-05 13:49. Reports: MAIN `.sandbox/reports/R13.Launch.md`, `.sandbox/reports/N6r-T.capacity-producer.md`, `.sandbox/reports/R21.md`.
+**Current S1 order**: launch-expired ordinary takeover fix is accepted for the combined schema9 rollout; it must not install during the current capture. The owner accepted one combined661997d install immediately after10-31 11:04seal, with schema9 reference capture under661997d; no intermediate producer-only takeover. First old-to-patched upgrade retains legacy/relaunch because an unpatched incumbent has no grant exporter; subsequent patched takeovers preserve the existing URL. Managed Linux service exec reload and genuine expiry remain separate limits. Installed7b3f9ce/schema8 e02..e05 seals remain unchanged; after10-31 11:04 export run original>=24h identity/power/census first. Producer f1e2911 contains R20+schema9 raw capacity readset with percent policy unchanged; its code is included in the single owner-approved661997d install together with this fix. R21 stays unmerged on impl/r21 until warm>=24h schema9 percent-vs-weighted paired verdict (margin0). N7 scoring waits until11-05 13:49. Reports: MAIN `.sandbox/reports/R13.Launch.md`, `.sandbox/reports/N6r-T.capacity-producer.md`, `.sandbox/reports/R21.md`.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
