@@ -533,6 +533,22 @@ fn canonical<'a>(d: &'a Data, key: &'a str) -> Option<&'a str> {
         .map(String::as_str)
         .or_else(|| d.launch_anchors.get(key).map(|a| a.canonical_key.as_str()))
 }
+pub(super) fn handover_activity(
+    data: &mut Data,
+    anchor: &str,
+    at: DateTime<Utc>,
+) -> std::result::Result<(), LaunchError> {
+    if !data.launch_anchors.contains_key(anchor) {
+        return Err(LaunchError::UnknownLaunch);
+    }
+    let current = info(data, anchor)?;
+    if !current.managed {
+        return Err(LaunchError::UnknownLaunch);
+    }
+    touch(data, &current.canonical_key, at);
+    Ok(())
+}
+
 fn info(d: &Data, key: &str) -> std::result::Result<LaunchInfo, LaunchError> {
     let key = canonical(d, key).ok_or(LaunchError::UnknownLaunch)?;
     let group = d.groups.get(key).ok_or(LaunchError::UnknownLaunch)?;

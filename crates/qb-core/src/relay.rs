@@ -1,3 +1,5 @@
+mod takeover_handover;
+pub use takeover_handover::MAX_REPLY_BYTES as MAX_TAKEOVER_REPLY_BYTES;
 mod box_scope;
 pub(crate) mod credentials;
 #[cfg(test)]

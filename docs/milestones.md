@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N6r-T schema9 capacity producer 관문PASS·dev 인계
-목표: schema8 봉인후 원형24h identity/power/census; schema9 producer 설치·warm>=24h 뒤 percent 대 R21 weighted paired
-핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (producer 준비를 수용으로 세지 않음)
-사용자 대기: 10-31 11:04 최종봉인·설계세션 producer 설치/실제capture health; N7은11/05 13:49 이후·L1 실제수용·N12 O14
-갱신: 2026-10-30 19:12 KST (percent불변·R21미병합; schema9 focused/static/Windows입력별보완/Linux strict3·일반build/check 통과; 설치7b3f9ce 유지)
+현재 마일스톤: launch-expired 일반 takeover 관문완료·dev 인계
+목표: 최종봉인 뒤 schema9 producer 설치, 그 다음 managed launch 인계 수정 설치; schema8 원형24h 판정과 schema9 warm>=24h R21 비교는 별도
+핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (인계 수정 관문을 실제 수용으로 세지 않음)
+사용자 대기: 10-31 11:04 최종봉인·기존 설치 순서; N7은11/05 13:49 이후·L1 실제수용·N12 O14
+갱신: 2026-10-30 21:54 KST (패치간 HTTP/WS old URL 유지 확인·메모리 보안 검토·양 플랫폼 관문 통과; 최초 구버전 migration 재실행 경로 유지·설치7b3f9ce 유지)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -147,7 +147,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: R20 final gate is complete on impl/r20: fresh final-source200 handovers in413.37s, TCP41213+HTTP14285 allsuccessful, timeout/non2xx/transport0,201/201 timelines and home removed. Originaldefault3983/3 stays intact; exactrecorder1 and defaulttakeover10 repair its3failures after the isolated0/2 diagnostic. Newnativelease2/platform6/bank11, fmt/twostrict, allfeatures4398/0/38ignored, core1703/0/2ignored, ordinarybuild and readonlylaunchcheck pass. Linux actualheldbody2/platform6/check/threestrict pass; the laterWindows-onlyfix reuses unchangedLinuxproductioninputs. Architecture and shortLinuxguide document lifecycle/legacy limits. R20 is ready for dev merge but MUST NOT install during the owner24h capture. Installed7b3f9ce starts e02 at2026-10-30 11:02:48KST, live disk512; owner-retired legacy roots and scheduled6h seals produce e02..e05, finalseal2026-10-31 11:04KST. Next prescribed S1 is the sealed24h paired verdict+census; realhour638/638/fault14PASS and guard insufficient_not_exercised remain separate. N7-L earliestscoring2026-11-05 13:49KST; no modelwork before7days. L1 actualP5 is owner/user acceptance, VM TCP is a later phase, N12 awaitsO14. No independent ready S1 remains; ask the owner at this gate if another approved brief is available. impl/r14-replay stays stopped/unmerged. Reports: .sandbox/reports/R20.md and N6r-T.tape8-real1.md.
+**Current S1 order**: launch-expired ordinary takeover fix is gated for dev handoff after the schema9 producer; it must not install during the current capture. First old-to-patched upgrade retains legacy/relaunch because an unpatched incumbent has no grant exporter; subsequent patched takeovers preserve the existing URL. Managed Linux service exec reload and genuine expiry remain separate limits. Installed7b3f9ce/schema8 e02..e05 seals remain unchanged; after10-31 11:04 export run original>=24h identity/power/census first. Producer f1e2911 contains R20+schema9 raw capacity readset with percent policy unchanged; owner installs it first, then this fix on the following install. R21 stays unmerged on impl/r21 until warm>=24h schema9 percent-vs-weighted paired verdict (margin0). N7 scoring waits until11-05 13:49. Reports: MAIN `.sandbox/reports/R13.Launch.md`, `.sandbox/reports/N6r-T.capacity-producer.md`, `.sandbox/reports/R21.md`.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 

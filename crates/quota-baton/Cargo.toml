@@ -52,3 +52,7 @@ phase0 = ["qb-core/phase0"]
 [[test]]
 name = "m7c_spawned"
 required-features = ["testkit"]
+
+[[test]]
+name = "takeover_launch"
+required-features = ["testkit"]

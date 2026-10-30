@@ -3162,6 +3162,21 @@ impl BindingTable {
         let state = snapshot(&self.data.lock().unwrap_or_else(|e| e.into_inner()));
         Ok(serde_json::to_value(state)?)
     }
+    /// Prepare only from authenticated, independently validated token grants.
+    /// Fold source activity before import pruning, without inventing account or
+    /// owner authority and without extending the grant's remaining lifetime.
+    pub(crate) fn prepare_launch_handover(
+        &self,
+        value: &Value,
+        activity: &[(zeroize::Zeroizing<String>, DateTime<Utc>)],
+    ) -> Result<Value> {
+        let mut data = decode_scoped(value.clone(), self.policies.requires_strict_recovery())?;
+        for (anchor, at) in activity {
+            launch::handover_activity(&mut data, anchor, *at)?;
+        }
+        Ok(serde_json::to_value(snapshot(&data))?)
+    }
+
     /// Takeover only: reject import while any request or socket owns the table.
     pub fn import(&self, value: Value) -> Result<()> {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());

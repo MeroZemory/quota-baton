@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 /// This envelope is not a lease-release receipt or permission to restore state.
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "contract-tests"), serde(deny_unknown_fields))]
-pub struct LifecycleReply<Bindings> {
+#[serde(bound(deserialize = "Bindings: Deserialize<'de>, Managed: Deserialize<'de>"))]
+pub struct LifecycleReply<Bindings, Managed = serde_json::Value> {
     pub bindings: Bindings,
     pub lease_released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<Managed>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,5 +66,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn managed_handover_is_optional_and_typed_without_duplicate_fields() {
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Managed {
+            schema: u16,
+        }
+        let old: LifecycleReply<Value, Managed> =
+            serde_json::from_str(r#"{"bindings":[],"lease_released":true}"#).unwrap();
+        assert!(old.managed.is_none());
+        let raw = r#"{"bindings":[],"lease_released":true,"managed":{"schema":1}}"#;
+        let new: LifecycleReply<Value, Managed> = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_string(&new).unwrap(), raw);
+        for raw in [
+            r#"{"bindings":[],"lease_released":true,"managed":{},"managed":{}}"#,
+            r#"{"bindings":[],"lease_released":true,"managed":{"schema":"1"}}"#,
+            r#"{"bindings":[],"lease_released":true,"managed":{"schema":1,"extra":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<LifecycleReply<Value, Managed>>(raw).is_err());
+        }
     }
 }

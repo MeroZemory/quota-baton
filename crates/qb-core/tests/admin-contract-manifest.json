@@ -197,7 +197,7 @@
       "file": "crates/qb-proto/src/admin_control.rs",
       "json": true,
       "defaults": true,
-      "coverage": "Reviewed full production schema; direct cfg(test) items excluded. Zero JSON/default allowances; later findings must fail."
+      "coverage": "Entire shared lifecycle wire envelope; typed optional negotiated handover defaults to absent for old peers. Exact reviewed managed-field allowance only; no grant payload is persisted."
     },
     {
       "file": "crates/qb-proto/src/admin_error.rs",
@@ -312,6 +312,18 @@
       "json": true,
       "defaults": true,
       "coverage": "Entire production file; direct cfg(test) items and test functions excluded. Registered admin response/helper graph; literal JSON policy only except admin request defaults."
+    },
+    {
+      "file": "crates/qb-core/src/relay/takeover_handover.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire production authenticated loopback handover adapter; typed LifecycleReply response and strict typed ephemeral grant subtree; only native legacy binding-import literals are allowed."
+    },
+    {
+      "file": "crates/qb-core/src/launch_tokens/handover.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "Entire transient authenticated handover grant wire schema and custom bounded wiping deserializers. No JSON literals or serde defaults are approved; malformed fields refuse restoration."
     }
   ],
   "baseline": [
@@ -710,7 +722,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 563,
+        "line": 562,
         "rule": "admin-json",
         "snippet": "json!({\"changed\":[],\"removed\":[],\"resync\":true})",
         "field": "",
@@ -724,7 +736,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 647,
+        "line": 646,
         "rule": "serde-default",
         "snippet": "default",
         "field": "force",
@@ -1228,7 +1240,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 212,
+        "line": 214,
         "rule": "admin-json",
         "snippet": "json!({\"account\":a.id,\"forecast\":self.observability.forecast_view(&a.id,\r\n                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})",
         "field": "",
@@ -1242,7 +1254,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 2023,
+        "line": 2025,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\"type\": kind, \"message\": message}})",
         "field": "",
@@ -1742,6 +1754,48 @@
       },
       "count": 1,
       "reason": "R18 fixed native quota-hold-cleared notification after successful metadata commit: the existing bounded account ID and constant window_gone_after_plan_change reason are broadcast; no upstream payload or arbitrary text is emitted."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_control.rs",
+        "line": 12,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "managed",
+        "field_type": "Option<Managed>",
+        "owner": "struct:LifecycleReply",
+        "attribute": "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+      },
+      "count": 1,
+      "reason": "Negotiated memory-only takeover extension: omission means no managed grant payload and retains legacy recovery for old incumbents/callers. Only the authenticated lifecycle path requests the typed optional payload; no authority is inferred from absence."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/relay/takeover_handover.rs",
+        "line": 55,
+        "rule": "admin-json",
+        "snippet": "json!([])",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Legacy lifecycle binding-list fallback only: the existing typed response still serializes an empty binding array if native export has none; no managed authority is created."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/relay/takeover_handover.rs",
+        "line": 130,
+        "rule": "admin-json",
+        "snippet": "json!({\"schema\":1,\"bindings\":legacy_bindings})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Native legacy BindingTable import envelope only after bounded authenticated lifecycle decode. Real C8 rows survive; provisional launch rows without managed metadata are removed. Not an admin response shape or fabricated launch grant."
     }
   ]
 }
