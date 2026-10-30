@@ -191,7 +191,7 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                 assert_eq!(manifest["sealed"], true);
                 assert_eq!(manifest["accepted"], manifest["persisted"]);
                 assert!(manifest["persisted"].as_u64().unwrap() >= 3);
-                assert_eq!(manifest["hourly_encoded_byte_limit"], 20_000_000);
+                assert_eq!(manifest["hourly_encoded_byte_limit"], 40_000_000);
                 assert!(
                     manifest["losses"]
                         .as_object()
