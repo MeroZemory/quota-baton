@@ -146,3 +146,15 @@ Owner decision (2026-10-30 11:02 KST): resolved. Installed7b3f9ce, live disk512,
 R20 passes its final-source200 and all remaining gates; it is ready to merge without installation. Keep installed7b3f9ce and the planned e02..e05 seals. The next prescribed code/data gate needs the owner's sealed24h export; N7 waits for seven days, L1 P5 requires user/server acceptance, and N12 still needs O14. The L1 brief explicitly puts VM TCP after the current container/Unix phase, so it is not an unstarted P4 blocker.
 
 Is another approved independent brief ready while these external inputs accumulate? If not, Main's next action is the actual24h paired verdict and move census when e02..e05 arrive. No additional install or model work is proposed. This question is batched with the R20 milestone report; no interim report was sent.
+
+
+## R21 gate question: measured-capacity capture before the weighted paired verdict
+
+R21's source candidate learns native own-request input tokens against complete quota reports and records those raw intervals in schema 9. It distinguishes a known empty measurement map (normal percent fallback) from a legacy unrecorded map (CapacityFactsMissing, not zero samples/moves). The ongoing installed 7b3f9ce schema-8 capture has no such readset; its original identity/power/census remains useful, but cannot supply the weighted candidate's missing state. Epoch HMAC keys are deliberately not exported, so historical per-account calibration cannot be joined by account ID. The pinned 10-22..24 export also has zero certifiable intervals under the pre-registered conditions, not zero account capacity. Evidence: MAIN `.sandbox/reports/R21-evidence/data-audit/` and `policy-readset-refinement.json`.
+
+Recommendation after the scheduled final seal: preserve and evaluate that original capture, then install a schema-9 producer with the existing percent selector unchanged. Let actual measurements warm, check their availability and capture health, and use a fresh reference tape for installed-percent versus R21. This needs no guessed plan multiplier, guessed identity, filled owner, manual setting or synthetic real-data claim. The weighted source branch remains separate and unmerged until its data gate; only the owner installs. Please adopt that producer-first follow-up or direct an equivalent source-complete input. This question is queued for the R21 gate report, not sent as an interim update.
+
+
+## Queued after R21: live launch_expired recovery
+
+Owner message2026-10-30: investigate one live codex-tui0.164 client/session-null bursts at04:22Z/05:23Z (12POST409 plus14WS409), including idle retention, takeover launch groups and epoch changes. Live-process recovery should rebind rather than409. Not urgent; no install during capture. Upstream in-band model-capacity stalls are separately identified by the owner and must not be attributed to qb without ledger errors. Evidence receipt MAIN `.sandbox/reports/R21-evidence/owner-queued-followup.json`.

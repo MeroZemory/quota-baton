@@ -265,6 +265,12 @@ fn remap(w: &mut WireSelectionInputs, map: &mut Mapper<'_>) -> Result<(), WireRe
         mark.target = map(A, &mark.target)?;
     }
     keys(&mut m.pacing, A, map)?;
+    if let Some(capacity) = &mut m.capacity {
+        keys(capacity, A, map)?;
+        if capacity.values().any(|facts| !facts.valid()) {
+            return Err(WireRefusal::Shape);
+        }
+    }
     keys(&mut m.placements, A, map)?;
     for placement in m.placements.values_mut() {
         if placement.windows.len() > 32 {
@@ -542,7 +548,12 @@ pub(crate) fn replay(record: &SelectionRecord) -> Result<SelectionDecision, Wire
         .to_inputs()?;
     kernel::selection::select(&inputs)
         .map(|evaluation| evaluation.decision)
-        .map_err(|_| WireRefusal::Shape)
+        .map_err(|error| match error {
+            kernel::selection::SelectionInputError::MissingCapacityFacts => {
+                WireRefusal::CapacityFactsMissing
+            }
+            _ => WireRefusal::Shape,
+        })
 }
 
 #[cfg(test)]

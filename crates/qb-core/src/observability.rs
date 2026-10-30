@@ -257,6 +257,7 @@ enum Command {
 }
 
 pub struct Observability {
+    placement_capacity: std::sync::Mutex<crate::placement_capacity::Measurements>,
     forecast_log: std::sync::Mutex<Option<Arc<forecast_log::ForecastLog>>>,
     replay: std::sync::Mutex<Option<Arc<replay_runtime::Runtime>>>,
     dashboard: Arc<crate::dashboard::runtime::Runtime>,
@@ -346,7 +347,7 @@ impl Observability {
             }
         }
         match replay_runtime::Runtime::start_tape(
-            &home.join("state/decision-tape-v8"),
+            &home.join("state/decision-tape-v9"),
             config.disk_limit_mib,
             config.hourly_encoded_byte_limit,
         ) {
@@ -627,6 +628,10 @@ impl Observability {
         if previous == account.plan.as_deref() {
             return;
         }
+        self.placement_capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate(account, Utc::now());
         let plan = |value: Option<&str>| value.and_then(|s| PlanName::try_from(s.to_owned()).ok());
         self.dashboard.activity(ActivityInput {
             ts: Utc::now(),
@@ -818,6 +823,9 @@ impl Observability {
             .name("qb-observability".into())
             .spawn(move || run(home, state, rx, worker_dropped, worker_dashboard))?;
         Ok(Self {
+            placement_capacity: std::sync::Mutex::new(
+                crate::placement_capacity::Measurements::default(),
+            ),
             forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard,
@@ -1058,6 +1066,10 @@ impl Observability {
     }
 
     pub fn record_request(&self, mut record: RequestRecord) {
+        self.placement_capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_request(&record);
         record.upstream_error_code = record
             .upstream_error_code
             .as_deref()
@@ -1326,6 +1338,49 @@ impl Observability {
 
     pub fn quota_snapshot(&self, id: &str) -> Option<serde_json::Value> {
         self.snapshots.lock().ok()?.get(id).cloned()
+    }
+
+    pub(crate) fn observe_placement_capacity(
+        &self,
+        account: &crate::accounts::Account,
+        snapshot: &serde_json::Value,
+        blocked: bool,
+        now: DateTime<Utc>,
+    ) {
+        self.placement_capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(account, snapshot, blocked, now);
+    }
+
+    pub(crate) fn placement_capacity_facts(
+        &self,
+        id: &str,
+    ) -> Option<crate::placement_capacity::CapacityFacts> {
+        self.placement_capacity.lock().ok()?.facts(id)
+    }
+
+    pub(crate) fn placement_capacity_tokens(
+        &self,
+        account: &crate::accounts::Account,
+        quota: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Option<u64> {
+        let facts = self.placement_capacity_facts(&account.id)?;
+        let projected = quota["windows"]
+            .as_array()?
+            .iter()
+            .filter_map(|window| {
+                crate::bindings::account_window(account.provider, window)?;
+                Some((
+                    window["name"].as_str()?.to_owned(),
+                    window["used_pct"].as_f64()?,
+                ))
+            })
+            .collect();
+        let room =
+            crate::placement_capacity::remaining_tokens(&facts, account, quota, &projected, now)?;
+        (room.is_finite() && room >= 0.0 && room < u64::MAX as f64).then_some(room as u64)
     }
 
     pub(crate) fn paid_serving_proof(
@@ -2875,6 +2930,9 @@ mod tests {
     fn retained_burst_is_bounded_fresh_and_expires_without_persistence() {
         let (tx, rx) = mpsc::sync_channel(16);
         let obs = Observability {
+            placement_capacity: std::sync::Mutex::new(
+                crate::placement_capacity::Measurements::default(),
+            ),
             forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
@@ -2924,6 +2982,9 @@ mod tests {
         // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
+            placement_capacity: std::sync::Mutex::new(
+                crate::placement_capacity::Measurements::default(),
+            ),
             forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
@@ -3066,6 +3127,9 @@ mod tests {
             let _ = done_tx.send(drained);
         });
         let obs = Observability {
+            placement_capacity: std::sync::Mutex::new(
+                crate::placement_capacity::Measurements::default(),
+            ),
             forecast_log: std::sync::Mutex::new(None),
             replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),

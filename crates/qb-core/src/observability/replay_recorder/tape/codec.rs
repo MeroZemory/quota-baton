@@ -1,4 +1,4 @@
-//! Schema 8 storage only. Operates on already privacy-projected tape DTOs.
+//! Schema 8/9 storage. Operates on already privacy-projected tape DTOs.
 //! No native Account is accepted here; dictionaries live for exactly one epoch.
 use super::*;
 use crate::bindings::permit_tape::selection::SelectionRow;
@@ -19,6 +19,14 @@ enum Slice {
     SelectionRow(Box<SelectionRow>),
     RecentTuple(RecentTuple),
     MetricConfig(Box<crate::config::RoutingConfig>),
+    MeasuredCapacity(Box<MeasuredCapacity>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasuredCapacity {
+    account: String,
+    facts: crate::bindings::kernel::selection_capacity::CapacityFacts,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,6 +329,7 @@ enum Location<'a> {
     Row(Option<&'a str>),
     Recent(&'a str),
     Config,
+    Capacity(&'a str),
 }
 
 impl Location<'_> {
@@ -336,6 +345,10 @@ impl Location<'_> {
             Self::Config => Slice::MetricConfig(Box::new(
                 serde_json::from_value(value.clone()).map_err(json_error)?,
             )),
+            Self::Capacity(account) => Slice::MeasuredCapacity(Box::new(MeasuredCapacity {
+                account: (*account).to_owned(),
+                facts: serde_json::from_value(value.clone()).map_err(json_error)?,
+            })),
         };
         if self.restore(&slice)? != *value {
             return Err(invalid());
@@ -355,6 +368,11 @@ impl Location<'_> {
             }
             (Self::Config, Slice::MetricConfig(config)) => {
                 serde_json::to_value(config).map_err(json_error)
+            }
+            (Self::Capacity(account), Slice::MeasuredCapacity(measured))
+                if *account == measured.account && measured.facts.valid() =>
+            {
+                serde_json::to_value(&measured.facts).map_err(json_error)
             }
             _ => Err(invalid()),
         }
@@ -416,6 +434,13 @@ fn visit(
     for (account, recent) in object(field(metrics, "recent")?)? {
         for tuple in recent.as_array_mut().ok_or_else(invalid)? {
             apply(tuple, Location::Recent(account), &mut refs, &mut f)?;
+        }
+    }
+    // Older schema-8 records omit this map. Keep their exact slice hashes and
+    // wire representation; schema 9 adds identity-bound measurement references.
+    if let Some(capacity) = metrics.get_mut("capacity") {
+        for (account, facts) in object(capacity)? {
+            apply(facts, Location::Capacity(account), &mut refs, &mut f)?;
         }
     }
     Ok(())

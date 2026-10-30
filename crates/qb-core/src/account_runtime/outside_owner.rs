@@ -111,7 +111,7 @@ impl OutsideOwner {
         // install. Do not silently erase a previously protected account.
         let initial = !dir.exists();
         let loaded = (|| {
-            fs::create_dir_all(&dir).map_err(|_| ())?;
+            crate::platform::prepare_observation_directory(&dir).map_err(|_| ())?;
             if initial {
                 let disk = Disk::default();
                 Self::write(&path, &disk)?;
@@ -468,6 +468,7 @@ impl super::AccountRuntime {
         reported: &Value,
         wait_origin: Option<super::ReportOrigin>,
         outside_origin: Option<PollOrigin>,
+        capacity: Option<(DateTime<Utc>, bool)>,
     ) -> Result<crate::accounts::Account, ()> {
         self.apply_quota_snapshot_reported_inner(
             id,
@@ -481,7 +482,12 @@ impl super::AccountRuntime {
             None,
         )
         .await
-        .map(|(account, _, _, _)| account)
+        .map(|(account, _, _, applied)| {
+            if applied && let Some((started_at, true)) = capacity {
+                self.observe_polled_placement_capacity(&account, reported, started_at);
+            }
+            account
+        })
     }
 }
 
@@ -668,7 +674,7 @@ mod tests {
             .observe_poll(id, reported.clone(), complete)
             .unwrap();
         runtime
-            .apply_polled_quota_snapshot(id, snapshot, &reported, None, Some(origin))
+            .apply_polled_quota_snapshot(id, snapshot, &reported, None, Some(origin), None)
             .await
             .unwrap();
         complete
@@ -823,7 +829,7 @@ mod tests {
         assert!(origin.is_none());
         let snapshot = raw(0, 2, 0.);
         runtime
-            .apply_polled_quota_snapshot(&id, snapshot.clone(), &snapshot, None, origin)
+            .apply_polled_quota_snapshot(&id, snapshot.clone(), &snapshot, None, origin, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1098,7 +1104,14 @@ mod tests {
                 .capture_at(&id, at(window, offset), false)
                 .unwrap();
             runtime
-                .apply_polled_quota_snapshot(&id, snapshot.clone(), &snapshot, None, Some(origin))
+                .apply_polled_quota_snapshot(
+                    &id,
+                    snapshot.clone(),
+                    &snapshot,
+                    None,
+                    Some(origin),
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -1111,7 +1124,7 @@ mod tests {
         drop(active);
         let snapshot = raw(2, 3, 50.);
         runtime
-            .apply_polled_quota_snapshot(&id, snapshot.clone(), &snapshot, None, Some(origin))
+            .apply_polled_quota_snapshot(&id, snapshot.clone(), &snapshot, None, Some(origin), None)
             .await
             .unwrap();
         assert!(
@@ -1132,7 +1145,14 @@ mod tests {
                 .capture_at(&id, at(window, offset), false)
                 .unwrap();
             runtime
-                .apply_polled_quota_snapshot(&id, snapshot.clone(), &snapshot, None, Some(origin))
+                .apply_polled_quota_snapshot(
+                    &id,
+                    snapshot.clone(),
+                    &snapshot,
+                    None,
+                    Some(origin),
+                    None,
+                )
                 .await
                 .unwrap();
         }

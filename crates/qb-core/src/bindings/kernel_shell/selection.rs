@@ -266,6 +266,19 @@ pub(in crate::bindings) fn snapshot(
             session_binding_max_secs: table.config.session_binding_max_secs,
         },
         metrics: MetricInputs {
+            capacity: Some(
+                table
+                    .move_observability()
+                    .map_or_else(BTreeMap::new, |obs| {
+                        cohort
+                            .iter()
+                            .filter_map(|id| {
+                                obs.placement_capacity_facts(id)
+                                    .map(|facts| (id.clone(), facts))
+                            })
+                            .collect()
+                    }),
+            ),
             config: table.config.clone(),
             recent,
             idle_placements: activity_groups

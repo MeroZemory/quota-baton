@@ -75,7 +75,7 @@ fn epoch() -> Epoch {
             }))
             .unwrap(),
             metrics: serde_json::from_value(serde_json::json!({
-                "config": RoutingConfig::default(), "recent": {}, "idle_placements": [],
+                "capacity": {}, "config": RoutingConfig::default(), "recent": {}, "idle_placements": [],
                 "thresholds": {}, "overload_marks": {}, "pacing": {}, "placements": {}
             }))
             .unwrap(),

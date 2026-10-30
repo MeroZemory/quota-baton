@@ -3523,6 +3523,63 @@ mod tests {
         );
     }
     #[test]
+    fn r21_healthy_tray_forecast_region_exposes_capacity_without_warning_or_layout_change() {
+        for (language, estimate) in [
+            (qb_tray::i18n::UiLanguage::Ko, "약 72만 토큰 남음 (추정)"),
+            (
+                qb_tray::i18n::UiLanguage::En,
+                "about 720000 tokens remaining (estimate)",
+            ),
+        ] {
+            qb_tray::i18n::with_language(language, || {
+                let mut baseline = None;
+                for capacity in [None, Some(720_000_u64)] {
+                    let mut account = serde_json::json!({
+                        "id":"sample-hover", "provider":"codex", "user_state":"active",
+                        "pool_eligible":true, "health":{"kind":"ready"}, "source":"oauth",
+                        "windows":[{"name":"5h","used_pct":20.,"reset_at":"2099-01-01T00:00:00Z"}]
+                    });
+                    if let Some(tokens) = capacity {
+                        account["placement_capacity_tokens"] = serde_json::json!(tokens);
+                    }
+                    let view = v2::project(
+                        &serde_json::json!({"accounts":[account]}).to_string(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                    let row = row_view(&view, "sample-hover").unwrap();
+                    assert_eq!(row.state, v2::DisplayState::Ready);
+                    assert!(!row.forecast_warning);
+                    assert_eq!(row.raw.pool_eligible, Some(true));
+                    let scene =
+                        geometry::Scene::build(&view, geometry::Presentation::default(), 900.);
+                    let bounds = scene
+                        .row("sample-hover")
+                        .unwrap()
+                        .forecast
+                        .expect("existing healthy forecast region");
+                    let pointer = [
+                        (bounds.left + bounds.right) / 2.,
+                        (bounds.top + bounds.bottom) / 2.,
+                    ];
+                    let (text, hovered) =
+                        tooltip_content(&view, &scene, pointer[0], pointer[1]).unwrap();
+                    assert_eq!(hovered, bounds);
+                    assert_eq!(text, row.forecast_tooltip);
+                    if capacity.is_some() {
+                        let (previous_bounds, lines, tooltip) = baseline.as_ref().unwrap();
+                        assert_eq!(&bounds, previous_bounds);
+                        assert_eq!(&row.forecast_lines, lines);
+                        assert_eq!(text, format!("{tooltip} · {estimate}"));
+                    } else {
+                        assert!(!text.contains(estimate));
+                        baseline = Some((bounds, row.forecast_lines.clone(), text));
+                    }
+                }
+            });
+        }
+    }
+    #[test]
     fn disclosure_click_inverts_the_painted_collapsed_default_without_a_manual_entry() {
         let view = v2::project(r#"{"pools":{"codex":{"eligible":0}},"accounts":[{"id":"off","provider":"codex","user_state":"disabled"}]}"#, SystemTime::now()).unwrap();
         let scene = geometry::Scene::build(&view, geometry::Presentation::default(), 900.);

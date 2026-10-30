@@ -35,6 +35,8 @@ pub struct AdminAccount {
     pub quota_notice: Option<AdminQuotaNotice>,
     pub credits_in_use: bool,
     pub usage_forecast: AccountUsageForecast,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_capacity_tokens: Option<u64>,
     pub has_alternative: bool,
     pub id: String,
     pub generation: u64,
@@ -530,6 +532,33 @@ mod tests {
             let account: AdminAccount = serde_json::from_value(value).unwrap();
             assert_eq!(placement_exclusion(provider, state, plan, kind), expected);
             assert_eq!(account.placement_exclusion(), expected);
+        }
+    }
+
+    #[test]
+    fn r21_placement_capacity_is_additive_optional_and_read_only() {
+        let original = wire();
+        let legacy: AdminAccount = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(legacy.placement_capacity_tokens, None);
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), original);
+        for tokens in [0, 123_456, u64::MAX] {
+            let mut input = original.clone();
+            input["placement_capacity_tokens"] = json!(tokens);
+            let decoded: AdminAccount = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(decoded.placement_capacity_tokens, Some(tokens));
+            assert_eq!(decoded.pool_eligible, legacy.pool_eligible);
+            assert_eq!(decoded.placement_exclusion(), legacy.placement_exclusion());
+            assert_eq!(serde_json::to_value(decoded).unwrap(), input);
+        }
+        let mut nullable = original.clone();
+        nullable["placement_capacity_tokens"] = Value::Null;
+        let decoded: AdminAccount = serde_json::from_value(nullable).unwrap();
+        assert_eq!(decoded.placement_capacity_tokens, None);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), original);
+        for invalid in [json!(-1), json!(1.5), json!("123456")] {
+            let mut input = wire();
+            input["placement_capacity_tokens"] = invalid;
+            assert!(serde_json::from_value::<AdminAccount>(input).is_err());
         }
     }
 

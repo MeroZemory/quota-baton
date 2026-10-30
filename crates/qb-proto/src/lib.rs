@@ -60,6 +60,26 @@ pub struct CpaImportRequest {
     pub dry_run: bool,
 }
 
+/// Read-only measured placement capacity label shared by CLI and native UI.
+pub fn placement_capacity_label(tokens: u64, english: bool) -> String {
+    let step = 10_u128.pow(tokens.checked_ilog10().unwrap_or(0).saturating_sub(1));
+    let rounded = (u128::from(tokens) + step / 2) / step * step;
+    if english {
+        format!("about {rounded} tokens remaining (estimate)")
+    } else if rounded >= 10_000 {
+        let whole = rounded / 10_000;
+        let fraction = rounded % 10_000 / 1_000;
+        let amount = if fraction == 0 {
+            whole.to_string()
+        } else {
+            format!("{whole}.{fraction}")
+        };
+        format!("약 {amount}만 토큰 남음 (추정)")
+    } else {
+        format!("약 {rounded} 토큰 남음 (추정)")
+    }
+}
+
 #[cfg(test)]
 mod health_contract_tests {
     use super::HealthResponse;
