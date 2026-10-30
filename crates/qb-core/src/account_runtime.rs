@@ -2830,6 +2830,8 @@ impl AccountRuntime {
         capture_receipt: bool,
     ) -> Result<(Account, Option<ObservedUsagePoll>, Option<Value>), ()> {
         let id = report.account.id.clone();
+        let complete = report.complete;
+        let report_started_at = report.started_at;
         let snapshot = report.snapshot.clone();
         let publication = if capture_receipt && report.complete {
             wait_owner::ReportPublication::ImmediatePollReceipt
@@ -2849,12 +2851,39 @@ impl AccountRuntime {
         )
         .await
         .map(|(account, receipt, snapshot, quota_applied)| {
+            if complete && quota_applied {
+                self.observe_polled_placement_capacity(&account, &snapshot, report_started_at);
+            }
             let receipt = receipt.and_then(|receipt| match receipt {
                 wait_owner::ReportReceipt::Poll(receipt) => Some(receipt),
                 wait_owner::ReportReceipt::Http(_) => None,
             });
             (account, receipt, quota_applied.then_some(snapshot))
         })
+    }
+
+    fn observe_polled_placement_capacity(
+        &self,
+        account: &Account,
+        reported: &Value,
+        started_at: DateTime<Utc>,
+    ) {
+        // Measurement timestamps describe dispatch for both providers. This
+        // private copy does not alter quota reduction or native health proofs.
+        let mut measured = reported.clone();
+        if let Some(windows) = measured["windows"].as_array_mut() {
+            for window in windows {
+                if !window["observed_at"].is_null() {
+                    window["observed_at"] = Value::String(started_at.to_rfc3339());
+                }
+            }
+        }
+        let blocked = self.outside_protected(&account.id)
+            || self.inflight.lock().map_or(true, |counts| {
+                counts.get(&account.id).copied().unwrap_or(0) > 0
+            });
+        self.obs
+            .observe_placement_capacity(account, &measured, blocked, Utc::now());
     }
 
     #[allow(clippy::too_many_arguments)]

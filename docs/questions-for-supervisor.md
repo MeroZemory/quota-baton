@@ -146,3 +146,8 @@ Owner decision (2026-10-30 11:02 KST): resolved. Installed7b3f9ce, live disk512,
 R20 passes its final-source200 and all remaining gates; it is ready to merge without installation. Keep installed7b3f9ce and the planned e02..e05 seals. The next prescribed code/data gate needs the owner's sealed24h export; N7 waits for seven days, L1 P5 requires user/server acceptance, and N12 still needs O14. The L1 brief explicitly puts VM TCP after the current container/Unix phase, so it is not an unstarted P4 blocker.
 
 Is another approved independent brief ready while these external inputs accumulate? If not, Main's next action is the actual24h paired verdict and move census when e02..e05 arrive. No additional install or model work is proposed. This question is batched with the R20 milestone report; no interim report was sent.
+
+
+## R21 producer-first decision resolved (2026-10-30)
+
+Owner approved: R21 stays unmerged, schema8 final seal/export10-31 11:04 then installed7b3f9ce identity/power/census first. Merge R20+schema9 producer only before then if ready; owner installs immediately afterseal, percent policy unchanged. Warm+>=24h schema9 supplies first percent-vs-weighted R21 candidate verdict. Epoch HMAC key export is unnecessary: recordedcapacity and candidate/source/accountlinks share opaqueIDs, writer-close/keydrop reader replay tested. No cross-epoch historical join. Producer report MAIN `.sandbox/reports/N6r-T.capacity-producer.md`. launch_expired followup remains next queued node.

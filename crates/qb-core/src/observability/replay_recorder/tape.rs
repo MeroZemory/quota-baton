@@ -1,4 +1,4 @@
-//! Schema 8 selection tape (with read-only schema 5/6/7 compatibility). Earlier roots are never rewritten.
+//! Schema 9 measured-capacity tape (with read-only schema 5/6/7/8 compatibility). Earlier roots are never rewritten.
 //! Producers only enqueue bounded typed metadata. The sole writer compresses and syncs.
 use super::*;
 use crate::bindings::decision_tape::DecisionRecord;
@@ -10,7 +10,7 @@ use std::{
 
 mod codec;
 
-pub(super) const TAPE_SCHEMA: u16 = 8;
+pub(super) const TAPE_SCHEMA: u16 = 9;
 const RECORD_BYTES: usize = 256 * 1024;
 // Schema 8 definitions can make a cold frame larger than its logical Record.
 // Includes the JSONL newline; logical expansion keeps RECORD_BYTES unchanged.
@@ -185,6 +185,9 @@ struct TapeState {
     manifest: Manifest,
 }
 struct TapeShared {
+    // Replay restores recorded opaque IDs and each decision's capacity map.
+    // It never hashes raw identities again. Keep this random key memory-only;
+    // exporting it would enable identity guessing and is not needed for replay.
     key: [u8; 32],
     state: Mutex<TapeState>,
 }
@@ -1110,7 +1113,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     }
     let epoch_bytes = bounded_file(&path.join("epoch.json"), CONTROL_BYTES)?;
     let epoch: EpochHeader = serde_json::from_slice(&epoch_bytes).map_err(|_| fail())?;
-    if !matches!(epoch.schema, 5 | 6 | 7 | TAPE_SCHEMA) {
+    if !matches!(epoch.schema, 5 | 6 | 7 | 8 | TAPE_SCHEMA) {
         return Err(io::Error::other("decision_tape_unsupported_schema"));
     }
     let header_bytes = bounded_file(&path.join("header.json"), CONTROL_BYTES)?;
@@ -1172,8 +1175,10 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
         b"quota-baton/decision-tape-v6/epoch\0"
     } else if epoch.schema == 7 {
         b"quota-baton/decision-tape-v7/epoch\0"
-    } else {
+    } else if epoch.schema == 8 {
         b"quota-baton/decision-tape-v8/epoch\0"
+    } else {
+        b"quota-baton/decision-tape-v9/epoch\0"
     });
     for bytes in [&epoch_bytes, &header_bytes] {
         hash.update((bytes.len() as u64).to_be_bytes());
@@ -1202,7 +1207,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     let mut read_states_complete = true;
     let mut last_stamp = header.start;
     let mut codec = codec::Decoder::default();
-    let line_limit = if epoch.schema == 8 {
+    let line_limit = if epoch.schema >= 8 {
         WIRE_RECORD_BYTES
     } else {
         RECORD_BYTES
@@ -1248,7 +1253,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
             {
                 return Err(fail());
             }
-            let record: Record = if epoch.schema == 8 {
+            let record: Record = if epoch.schema >= 8 {
                 codec.decode(&line).map_err(|_| fail())?
             } else {
                 serde_json::from_slice(&line).map_err(|_| fail())?
@@ -1524,3 +1529,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tape/key_tests.rs"]
+mod key_tests;

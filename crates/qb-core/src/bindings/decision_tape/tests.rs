@@ -555,7 +555,7 @@ async fn populated_native_reopen_records_startup_witness_before_first_permit() {
     );
     obs.shutdown_replay();
 
-    let epoch = home.join("state/decision-tape-v8/e00");
+    let epoch = home.join("state/decision-tape-v9/e00");
     let manifest: tape::Manifest =
         serde_json::from_slice(&fs::read(epoch.join("manifest.json")).unwrap()).unwrap();
     assert!(manifest.sealed);

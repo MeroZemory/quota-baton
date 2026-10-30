@@ -31,6 +31,7 @@ pub enum IdKind {
 pub enum WireRefusal {
     Schema,
     Shape,
+    CapacityFactsMissing,
     Bounds,
     Identity,
     Collision,

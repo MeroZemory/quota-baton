@@ -444,7 +444,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3224,
+        "line": 3253,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_updated\",\"data\":{\"id\":id,\"snapshot\":snapshot}})",
         "field": "",
@@ -458,7 +458,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3347,
+        "line": 3376,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: bound account is cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -472,7 +472,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3349,
+        "line": 3378,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: bound account is cooling\"}})",
         "field": "",
@@ -486,7 +486,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3415,
+        "line": 3444,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: all accounts are cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -500,7 +500,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3417,
+        "line": 3446,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: all accounts are cooling\"}})",
         "field": "",
@@ -514,7 +514,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3427,
+        "line": 3456,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"invalid_request_error\",\"message\":format!(\"quota-baton: no usable {0} account — run quota-baton accounts login {0} --no-browser\",provider.as_str())}})",
         "field": "",
@@ -528,7 +528,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4285,
+        "line": 4314,
         "rule": "admin-json",
         "snippet": "json!(\"quota_notice\")",
         "field": "",
@@ -542,7 +542,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4286,
+        "line": 4315,
         "rule": "admin-json",
         "snippet": "json!(account.id)",
         "field": "",
@@ -556,7 +556,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4287,
+        "line": 4316,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\",\"data\":data})",
         "field": "",
@@ -570,7 +570,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4324,
+        "line": 4353,
         "rule": "admin-json",
         "snippet": "json!([\r\n        account.health,\r\n        account.user_state,\r\n        account.drain,\r\n        account.allow_credits,\r\n        account.quota_cooling,\r\n        account.payment_until\r\n    ])",
         "field": "",
@@ -822,7 +822,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 433,
+        "line": 434,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":at, \"event\":\"binding_move_cost\",\r\n            \"move_id\":id, \"session\":session, \"provider\":provider, \"reread_tokens\":null,\r\n            \"measurement\":\"pending\"})",
         "field": "",
@@ -836,7 +836,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 480,
+        "line": 481,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":at, \"event\":\"binding_move_cost\",\r\n                \"move_id\":id, \"reread_tokens\":reread_tokens,\r\n                \"measurement\":if reread_tokens.is_some() { \"known\" } else { \"unknown\" }})",
         "field": "",
@@ -850,7 +850,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 509,
+        "line": 510,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now(), \"event\":\"binding_move_refused\",\r\n            \"session\":session, \"from\":event.from, \"to\":event.to, \"reason\":event.reason,\r\n            \"proposed_reason\":event.proposed_reason,\r\n            \"until\":event.until, \"newly_tripped\":event.newly_tripped, \"forced\":event.forced})",
         "field": "",
@@ -864,7 +864,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 551,
+        "line": 552,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now(), \"event\":\"core_warning\", \"data\":value})",
         "field": "",
@@ -878,7 +878,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 553,
+        "line": 554,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\", \"data\":value})",
         "field": "",
@@ -892,7 +892,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 583,
+        "line": 584,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"takeover\",\r\n            \"phase\": phase, \"pid\": std::process::id()\r\n        })",
         "field": "",
@@ -906,7 +906,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 618,
+        "line": 619,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"login\",\"provider\":provider,\"login_id\":login_id,\"outcome\":status,\"account\":account_id})",
         "field": "",
@@ -920,7 +920,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 619,
+        "line": 620,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"login_progress\",\"data\":{\"login_id\":login_id,\"status\":status,\"account_id\":account_id}})",
         "field": "",
@@ -934,7 +934,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 691,
+        "line": 696,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"token_refresh\",\"account\":account,\"trigger\":trigger,\"outcome\":outcome,\"expires_at\":expires_at})",
         "field": "",
@@ -948,7 +948,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 733,
+        "line": 738,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"core_warning\",\r\n            \"kind\": \"burst\", \"burst_new_sessions\": observed_count,\r\n        })",
         "field": "",
@@ -962,7 +962,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 737,
+        "line": 742,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"event\": \"core_warning\",\r\n            \"data\": qb_proto::admin_sse::BurstWarning {\r\n                kind: qb_proto::admin_sse::WarningKind::Burst,\r\n                burst_new_sessions: observed_count,\r\n            },\r\n        })",
         "field": "",
@@ -976,7 +976,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 746,
+        "line": 751,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"core_warning\",\"account\":account,\"code\":code})",
         "field": "",
@@ -990,7 +990,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 748,
+        "line": 753,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\",\"data\":{\"account\":account,\"code\":code}})",
         "field": "",
@@ -1004,7 +1004,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 752,
+        "line": 757,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(),\r\n            \"event\": phase,\r\n        })",
         "field": "",
@@ -1018,7 +1018,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 756,
+        "line": 761,
         "rule": "admin-json",
         "snippet": "json!({\"event\": phase, \"data\": {}})",
         "field": "",
@@ -1032,7 +1032,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 905,
+        "line": 913,
         "rule": "admin-json",
         "snippet": "json!(provider)",
         "field": "",
@@ -1046,7 +1046,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 994,
+        "line": 1002,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\":Utc::now().to_rfc3339(), \"event\":\"placement\", \"session\":session,\r\n            \"account\":event.to, \"evidence\":event.evidence, \"capped\":event.capped,\r\n            \"placed_since_obs\":event.placed_since_obs, \"charge\":event.placement_charge_pct\r\n        })",
         "field": "",
@@ -1060,7 +1060,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1002,
+        "line": 1010,
         "rule": "admin-json",
         "snippet": "json!({\r\n                \"ts\":Utc::now().to_rfc3339(), \"event\":\"victim_skipped_unknown_cost\",\r\n                \"count\":count\r\n            })",
         "field": "",
@@ -1074,7 +1074,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1009,
+        "line": 1017,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\":Utc::now().to_rfc3339(), \"event\":\"poll\", \"account\":account,\r\n            \"reason\":\"placement_evidence\"\r\n        })",
         "field": "",
@@ -1088,7 +1088,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1023,
+        "line": 1031,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":event,\"transport\":\"ws\",\"connection\":connection,\"account\":account,\"close_code\":code,\"reason\":reason})",
         "field": "",
@@ -1102,7 +1102,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1043,
+        "line": 1051,
         "rule": "admin-json",
         "snippet": "json!({\"destination\":destination,\"shape\":{\"response_header_names\":headers.keys().map(|n|n.as_str()).filter(|name|crate::dashboard::labels::capture_header_allowed(name)).collect::<Vec<_>>(),\"response_header_values\":values}})",
         "field": "",
@@ -1116,7 +1116,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1053,
+        "line": 1061,
         "rule": "admin-json",
         "snippet": "json!({\"destination\":destination,\"shape\":{\"message_types\":counts}})",
         "field": "",
@@ -1130,7 +1130,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1116,
+        "line": 1128,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(),\r\n            \"event\": \"overload_detected\",\r\n            \"account\": account,\r\n            \"active\": active,\r\n            \"threshold\": threshold,\r\n            \"groups_hit\": groups_hit,\r\n            \"marked\": marked,\r\n        })",
         "field": "",
@@ -1144,7 +1144,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1143,
+        "line": 1155,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"binding_move\",\r\n            \"session\": session, \"from\": from, \"to\": to, \"reason\": reason,\r\n            \"bytes_in\": bytes, \"keys\": keys, \"debug_pin\": debug_pin\r\n        })",
         "field": "",
@@ -1158,7 +1158,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1342,
+        "line": 1399,
         "rule": "admin-json",
         "snippet": "json!(Utc::now())",
         "field": "",
@@ -1172,7 +1172,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1370,
+        "line": 1427,
         "rule": "admin-json",
         "snippet": "json!({\r\n            \"ts\": Utc::now().to_rfc3339(), \"event\": \"account_changed\",\r\n            \"account\": account.id, \"provider\": account.provider,\r\n            \"generation\": account.generation, \"plan\": plan,\r\n            \"health\": account.health, \"user_state\": account.user_state,\r\n        })",
         "field": "",
@@ -1186,7 +1186,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1405,
+        "line": 1462,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now().to_rfc3339(),\"event\":\"health_changed\",\"account\":id,\"from\":from,\"to\":to,\"reason\":value[\"reason\"],\"until\":value[\"until\"]})",
         "field": "",
@@ -1200,7 +1200,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1422,
+        "line": 1479,
         "rule": "admin-json",
         "snippet": "json!({\"ts\": Utc::now().to_rfc3339(), \"event\": \"linked_reload\", \"account\": account_id, \"trigger\": trigger, \"outcome\": outcome, \"expires_at\": expires_at})",
         "field": "",
@@ -1214,7 +1214,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 1446,
+        "line": 1503,
         "rule": "admin-json",
         "snippet": "json!({\r\n                \"destination\": destination,\r\n                \"shape\": crate::capture::response_shape(headers)\r\n            })",
         "field": "",
@@ -1648,7 +1648,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/observability.rs",
-        "line": 674,
+        "line": 679,
         "rule": "admin-json",
         "snippet": "json!({\"ts\":Utc::now().to_rfc3339(), \"event\":\"permission_denied\", \"account\":account, \"error_type\":error_type, \"message\":diagnostic})",
         "field": "",
@@ -1704,7 +1704,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2975,
+        "line": 3004,
         "rule": "admin-json",
         "snippet": "json!({\"name\":cause.window,\"observed_at\":cause.started_at})",
         "field": "",
@@ -1718,7 +1718,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3000,
+        "line": 3029,
         "rule": "admin-json",
         "snippet": "json!(report.started_at)",
         "field": "",
@@ -1732,7 +1732,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3210,
+        "line": 3239,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_hold_cleared\",\"data\":{\n                        \"id\":account_id,\"reason\":\"window_gone_after_plan_change\"\n                    }})",
         "field": "",

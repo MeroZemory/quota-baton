@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R20 관문PASS·dev 인계, N6r 실제24h 수집 중
-목표: 봉인 e02..e05 실제24h paired margin0·이동 census; N7은7일 후 채점
-핵심 지표: 결정적 수용 1/3 (N6r 실제 재생·N7 통합 예측 수용 전) · Linux 실제 수용 0/1 (L1 P5 실제 수용 전)
-사용자 대기: N6r 봉인export·N7 7일로그·L1 실제수용·N12 O14 (현재 추가 ready S1 없음)
-갱신: 2026-10-30 12:58 KST (R20 최종200/200 실패0·전체4398/0·Core1703/0; 설치7b3f9ce 유지)
+현재 마일스톤: N6r-T schema9 capacity producer 관문PASS·dev 인계
+목표: schema8 봉인후 원형24h identity/power/census; schema9 producer 설치·warm>=24h 뒤 percent 대 R21 weighted paired
+핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (producer 준비를 수용으로 세지 않음)
+사용자 대기: 10-31 11:04 최종봉인·설계세션 producer 설치/실제capture health; N7은11/05 13:49 이후·L1 실제수용·N12 O14
+갱신: 2026-10-30 19:12 KST (percent불변·R21미병합; schema9 focused/static/Windows입력별보완/Linux strict3·일반build/check 통과; 설치7b3f9ce 유지)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -129,6 +129,8 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N6 R14.2 recorder, minimum delivery | S1 | none | `impl/r14.2` (keep db6baac), brief R14 plus D29 amendment 4 | schema, off switch, default off, 7-day bound, tests; then S2 install and enable; the 24 h capture starts at install |
 | N6t R14 typed rebind and static write check | S1 | none | `impl/r14-rebind` | compile-time choke point, static check failing on a planted write, existing tests |
 | N6r decision-tape real gate | S1 | owner sealed e02..e05 export after2026-10-31 11:04KST; installed7b3f9ce identity | `impl/n6r-tape` | >=24h native paired margin0/coverage/loss plus realmove census and reached-guard power; onehour638/638/fault14PASS does not accept24h |
+| N6r-T capacity producer | S1 | owner installation only after10-31 11:04 seal; then warm+>=24h schema9 | `impl/n6r-capacity-producer` | percent/native selector exact dev, schema9 measured facts+opaque links, no key export needed, writer/reader/code gate qualified; R21 stays separate |
+| R21 measured-capacity candidate | S1 | source-complete schema9 warm+>=24h, owner-approved paired gate | `impl/r21` at1ad42fa (unmerged) | historical/schema8 weighted verdict insufficient; first real candidate after fresh capture |
 | N5m R13 C measurement: Codex cache survival by idle gap; client hold tolerance against a fake upstream | W | none | background `codex-qb exec` worker in `.sandbox/r13-measure/`; no cargo in S1 | measurement table in the R13 report |
 | N5a R13 E HTTP wait and reset-resume for non-urgent sessions at 5h limits | S1 | none (bound is a setting; N5m only tunes its default) | `impl/r13-wait` | hold then serve on the same account after reset; bound exceeded falls back; cancellation releases |
 | N5b R13 E WS/SSE cancellation and keepalive during a hold | S1 | none | `impl/r13-ws-hold` | cancelled held WS/SSE releases its slot and binding; no orphaned upstream |
