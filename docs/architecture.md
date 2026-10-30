@@ -549,22 +549,15 @@ Details are in contract C11.
 - **Priority.** The core runs at `ABOVE_NORMAL_PRIORITY_CLASS`, so that a saturated machine does not starve relaying or health checks.
 - **Config** reloads on file change. Account changes apply immediately through the admin API.
 - **Takeover.**
-  1. `quota-baton serve --takeover` asks the running core, over the admin API, to drain.
-  2. The old core does the following:
-     - stops refresh-ahead and 401-triggered refresh; a 401 during drain is relayed without refreshing and without changing health
-     - stops writing account and state files
-     - flushes bindings, exports them, closes its data listener
-     - **releases the credential lease**
-  3. The new core:
-     - acquires the lease
-     - loads the accounts
-     - imports the bindings
-     - binds the port, retrying for up to 2 s
-  4. The old core finishes its in-flight HTTP streams. WebSocket connections are closed with 1001 after their current response.
-  5. The old core exits when idle, or after the drain timeout (default 30 min).
-- **Gapless handover.**
-  - Spiked in M3 (2026-10-13): the new core binds the port in under 1 ms while the old core still holds accepted sockets, with or without `SO_EXCLUSIVEADDRUSE`. Socket duplication is not needed.
-  - If it does not, hand the listening socket over with `WSADuplicateSocketW` instead.
+  1. On Windows, the successor checks the native credential lease before requesting listener export. A free lease uses ordinary startup; the temporary check is not ownership, and common startup still acquires the authoritative store lease. A busy lease keeps the authenticated transfer path.
+  2. The incumbent exports both listening sockets through a one-use, PID-bound capability. It retains the recipient process handle and a fresh nonce. The successor imports the sockets before requesting drain.
+  3. The old core stops refresh-ahead and 401-triggered refresh, stops account/state writers, freezes quota and bindings, and exports the bindings. A 401 already in flight is relayed unchanged without refreshing or changing health.
+  4. After durable drain preparation, the old core releases the credential lease while retaining its acceptors. The successor acquires the lease, loads accounts, imports bindings and starts serving. It acknowledges readiness over the retained authenticated connection to the incumbent.
+  5. The old core then closes its acceptors. An ordinary request not yet dispatched may forward its original body only after successor readiness and old data-listener closure. Box- or launch-scoped authority is not forwarded; those callers receive a retryable refusal. Already dispatched responses finish on the old core.
+  6. WebSockets close with 1001 after their current response. The old core exits when idle or at the drain timeout (default 30 min).
+
+  A failed durable preparation retains the old lease and cannot publish readiness. A later explicit attempt can replace only an unready grant whose original recipient is proven dead, using a different PID and nonce. A ready or live grant cannot be replaced.
+- **Listener continuity.** Windows uses `WSADuplicateSocketW`, retains descriptor owners through registration, and drops them when the corresponding acceptor closes. This avoids the close/rebind interval left by the earlier M3 path. Explicit `404` from an older incumbent uses the legacy drain/bind path; that first upgrade does not claim listener overlap. Cold startup and legacy binding still retry an occupied port for up to 2 s. Linux keeps its socket-preserving managed reload; see [Linux lifecycle internals](linux-internals.md).
   - A WebSocket gap longer than about 6 s moves active Codex sessions to HTTP permanently (§9).
 - **Configuration** stays deliberately small. Behaviour fixes go into code, with tests, never into config knobs.
 
