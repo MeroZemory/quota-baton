@@ -16,7 +16,9 @@ const RECORD_BYTES: usize = 256 * 1024;
 // Includes the JSONL newline; logical expansion keeps RECORD_BYTES unchanged.
 const WIRE_RECORD_BYTES: usize = 1024 * 1024;
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
-const HOUR_BYTES: u64 = 20_000_000;
+const LEGACY_HOUR_BYTES: u64 = 20_000_000;
+#[cfg(test)]
+const HOUR_BYTES: u64 = crate::config::DEFAULT_REPLAY_HOURLY_ENCODED_BYTES;
 const DECODED_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const GROUP_BYTES: usize = 1024 * 1024;
 const MAX_ACCOUNTS: usize = 4096;
@@ -267,7 +269,7 @@ pub(crate) fn open_with_provenance(
         producer_failure_reasons: BTreeMap::new(),
         encoded_bytes: 0,
         compressed_bytes: 0,
-        hourly_encoded_byte_limit: HOUR_BYTES,
+        hourly_encoded_byte_limit: limits.hourly_encoded_byte_limit(),
         budget_window_ns: 0,
         budget_window_used: 0,
         budget_window_stopped: false,
@@ -647,7 +649,7 @@ impl Producer {
             }
         };
         let codec::Prepared { bytes, update } = prepared;
-        if s.used + bytes.len() as u64 > HOUR_BYTES {
+        if s.used + bytes.len() as u64 > s.manifest.hourly_encoded_byte_limit {
             s.budget_stopped = true;
             let l = &mut s.manifest.losses;
             increment(&mut l.budget, &mut l.saturated, 1);
@@ -1116,13 +1118,18 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
     let manifest_path = path.join("manifest.json");
     let manifest_bytes = bounded_file(&manifest_path, MANIFEST_RESERVE / 2)?;
     let m: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|_| fail())?;
+    let valid_hourly_limit = if m.schema <= 7 {
+        m.hourly_encoded_byte_limit == LEGACY_HOUR_BYTES
+    } else {
+        (1..=crate::config::MAX_REPLAY_HOURLY_ENCODED_BYTES).contains(&m.hourly_encoded_byte_limit)
+    };
     if header.schema != epoch.schema
         || m.schema != epoch.schema
         || header.capture != m.capture
         || header.start.utc_ns != epoch.start_utc_ns
         || header.identity_domain_version != ID_DOMAIN_VERSION
-        || m.hourly_encoded_byte_limit != HOUR_BYTES
-        || m.budget_window_used > HOUR_BYTES
+        || !valid_hourly_limit
+        || m.budget_window_used > m.hourly_encoded_byte_limit
         || m.segments.len() > MAX_SEGMENTS
         || m.persisted > MAX_RECORDS as u64
         || m.accepted < m.persisted

@@ -13,13 +13,18 @@ The operator can opt in before starting a core:
 ```toml
 [routing_replay]
 enabled = true
-disk_limit_mib = 256
+disk_limit_mib = 512
+hourly_encoded_byte_limit = 40_000_000
 ```
 
 Set `enabled = false` and restart or take over to stop capture. The default is
 `false`; an off start creates no capture directory, key or writer. The disk budget
-must be between 16 and 512 MiB, including when capture is off. Invalid configuration
+defaults to 512 MiB and must be between 16 and 512 MiB, including when capture is off. Invalid configuration
 is rejected rather than silently clamped.
+
+The `hourly_encoded_byte_limit` option defaults to 40,000,000 encoded bytes per
+hour. Operators can set it between 1 and 512,000,000 bytes, including when capture
+is off; invalid values are rejected rather than clamped.
 
 Files live under the core home's `state/routing-replay/`. There is one writer and
 one root lock. Each start creates a separate epoch with fresh pseudonyms. A takeover
@@ -52,13 +57,13 @@ owner coverage is incomplete. A sanitized 24-hour export and a production-router
 differential gate are separate work; neither an empty archive nor these synthetic
 storage tests satisfy them.
 
-## Decision-local permit tape
+## Decision-local selection and permit tape
 
-Current builds write `state/decision-tape-v6/`. The native offline reader also
-accepts sealed schema-5 exports; older roots are neither rewritten nor removed.
-Each epoch retains the 20,000,000 encoded-byte hourly stop-go budget and explicit
-loss counters. Export the whole sealed epoch with its header, manifest and all
-segments; a live or partial directory is insufficient.
+Current builds write `state/decision-tape-v8/`. The native offline reader also
+accepts sealed schema-5/6/7 exports; older roots are neither rewritten nor removed.
+Each epoch uses the configured encoded-byte hourly stop-go budget (40,000,000 by
+default) and retains explicit loss counters. Export the whole sealed epoch with
+its header, manifest and all segments; a live or partial directory is insufficient.
 
 Permit inputs retain native quota status strings, including literal `true` and
 `false`, without interpreting them as allowed or rejected. The startup witness
@@ -67,7 +72,13 @@ complete owner image. The manifest counts `permit_not_comparable_reasons` and
 `producer_failure_reasons` using closed diagnostic enums. Their checked totals
 must equal the aggregate counters. No raw error or rejected payload is retained.
 
-These inputs cover permit proposals, not selection or completed moves. More than
+The tape covers selection and permit proposals; completed rebinds are completeness
+markers, not replayed commits. More than
 1% not-comparable records makes a replay insufficient. A tape containing only
 same-account associations cannot establish the power of a changed move guard;
 zero observed differences on such a tape is not power acceptance.
+
+The current `state/decision-tape-v8` root has its own disk budget across its epochs.
+Legacy sibling roots are not charged to it. Dictionary, decoded-epoch and epoch-slot
+bounds are separate from disk space; a long capture can consist of several sealed
+epochs, each replayed from its own initial witness.
