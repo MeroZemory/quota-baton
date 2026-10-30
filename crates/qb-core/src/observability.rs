@@ -348,6 +348,7 @@ impl Observability {
         match replay_runtime::Runtime::start_tape(
             &home.join("state/decision-tape-v8"),
             config.disk_limit_mib,
+            config.hourly_encoded_byte_limit,
         ) {
             Ok(runtime) => *slot = Some(Arc::new(runtime)),
             Err(_) => tracing::warn!(

@@ -550,6 +550,82 @@ fn hourly_stop_go_counts_every_refusal_and_resumes_without_resetting_loss() {
 }
 
 #[test]
+fn configured_hourly_budget_stops_on_actual_bytes_and_reader_keeps_legacy_limits() {
+    let directory = directory();
+    let limits = Limits::default()
+        .with_hourly_encoded_byte_limit(1024)
+        .unwrap();
+    assert_eq!(Limits::default().hourly_encoded_byte_limit(), 40_000_000);
+    assert!(Limits::default().with_hourly_encoded_byte_limit(0).is_err());
+    assert!(
+        Limits::default()
+            .with_hourly_encoded_byte_limit(crate::config::MAX_REPLAY_HOURLY_ENCODED_BYTES + 1)
+            .is_err()
+    );
+    let (producer, writer) = open(&directory.path().join("tape"), limits, at(0)).unwrap();
+    let path = writer.root.clone();
+    let event = Event::InitialWitness {
+        component: Owner::Bindings,
+        revision: 1,
+        cursor: 0,
+        rows: 0,
+        digest: Fingerprint([1; 32]),
+    };
+    let mut cursor = 1;
+    while producer
+        .metadata(at(cursor), Owner::Runtime, cursor, None, event)
+        .is_some()
+    {
+        cursor += 1;
+        assert!(cursor <= 1024);
+    }
+    assert!(cursor > 1, "at least one real wire record must fit");
+    assert_eq!(
+        producer.metadata(at(cursor + 1), Owner::Runtime, cursor + 1, None, event),
+        None
+    );
+    let state = producer.shared.state.lock().unwrap();
+    assert!(state.budget_stopped && state.enabled);
+    assert!(state.used > 0 && state.used <= 1024);
+    drop(state);
+    assert!(
+        producer
+            .metadata(at(HOUR_NS), Owner::Runtime, cursor + 2, None, event)
+            .is_some()
+    );
+    writer.close(at(HOUR_NS + 1)).unwrap();
+    let m = manifest(&path);
+    assert_eq!(m.hourly_encoded_byte_limit, 1024);
+    assert_eq!(m.losses.budget, 2);
+    assert!(!m.budget_window_stopped);
+    assert_eq!(read_epoch(&path).unwrap().losses, 2);
+    for (limit, used) in [(0, 0), (512_000_001, 0), (1024, 1025)] {
+        let mut bad = m.clone();
+        bad.hourly_encoded_byte_limit = limit;
+        bad.budget_window_used = used;
+        fs::write(
+            path.join("manifest.json"),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .unwrap();
+        assert!(read_epoch(&path).is_err());
+    }
+
+    // Old schema8 default20 remains readable after the new default40 ships.
+    let (_, legacy_writer) = open(
+        &directory.path().join("old-default"),
+        Limits::default()
+            .with_hourly_encoded_byte_limit(LEGACY_HOUR_BYTES)
+            .unwrap(),
+        at(0),
+    )
+    .unwrap();
+    let legacy_path = legacy_writer.root.clone();
+    legacy_writer.close(at(1)).unwrap();
+    assert!(read_epoch(&legacy_path).is_ok());
+}
+
+#[test]
 fn closed_launch_refusals_and_aborted_capture_are_retained_without_raw_errors() {
     let (_directory, producer, writer) = fixture();
     let path = writer.root.clone();
@@ -977,6 +1053,7 @@ fn schema6_writer_refuses_legacy5_root_without_rewriting_it() {
     legacy.encoded_bytes = raw.len() as u64;
     legacy.compressed_bytes = compressed.len() as u64;
     legacy.budget_window_used = raw.len() as u64;
+    legacy.hourly_encoded_byte_limit = LEGACY_HOUR_BYTES;
     fs::write(
         path.join("manifest.json"),
         serde_json::to_vec(&legacy).unwrap(),

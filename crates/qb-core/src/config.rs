@@ -89,18 +89,23 @@ pub enum LinuxSecretBackend {
     File0600,
 }
 
+pub(crate) const DEFAULT_REPLAY_HOURLY_ENCODED_BYTES: u64 = 40_000_000;
+pub(crate) const MAX_REPLAY_HOURLY_ENCODED_BYTES: u64 = 512_000_000;
+
 /// Body-free owner metadata only; explicit operator opt-in, never enabled by a client.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RoutingReplayConfig {
     pub enabled: bool,
     pub disk_limit_mib: u64,
+    pub hourly_encoded_byte_limit: u64,
 }
 impl Default for RoutingReplayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            disk_limit_mib: 256,
+            disk_limit_mib: 512,
+            hourly_encoded_byte_limit: DEFAULT_REPLAY_HOURLY_ENCODED_BYTES,
         }
     }
 }
@@ -109,6 +114,10 @@ impl RoutingReplayConfig {
         anyhow::ensure!(
             (16..=512).contains(&self.disk_limit_mib),
             "routing replay disk limit must be between 16 and 512 MiB"
+        );
+        anyhow::ensure!(
+            (1..=MAX_REPLAY_HOURLY_ENCODED_BYTES).contains(&self.hourly_encoded_byte_limit),
+            "routing replay hourly encoded byte limit must be between 1 and 512000000 bytes"
         );
         Ok(())
     }
@@ -1154,30 +1163,47 @@ mod r141_trip_validation_tests {
 mod n6_replay_config_tests {
     use super::*;
 
-    fn synthetic_home() -> tempfile::TempDir {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn synthetic_home() -> (tempfile::TempDir, std::path::PathBuf) {
+        let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let root = executable
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .join(".sandbox/r142/minimum-config-test-homes");
         fs::create_dir_all(&root).unwrap();
-        tempfile::tempdir_in(root).unwrap()
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let home = directory.path().join("home");
+        crate::platform::create_private_directory_new(&home).unwrap();
+        (directory, home)
+    }
+
+    fn write_config(path: &Path, text: &str) -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        crate::platform::configure_secret_open(&mut options);
+        std::io::Write::write_all(&mut options.open(path)?, text.as_bytes())
     }
 
     #[test]
     fn n6_replay_config_defaults_off_and_roundtrips_with_current_ui() {
         for config in [Config::default(), toml::from_str::<Config>("").unwrap()] {
             assert!(!config.routing_replay.enabled);
-            assert_eq!(config.routing_replay.disk_limit_mib, 256);
+            assert_eq!(config.routing_replay.disk_limit_mib, 512);
+            assert_eq!(config.routing_replay.hourly_encoded_byte_limit, 40_000_000);
             config.routing_replay.validate().unwrap();
         }
         let partial: Config = toml::from_str("[routing_replay]\nenabled=true\n").unwrap();
         assert!(partial.routing_replay.enabled);
-        assert_eq!(partial.routing_replay.disk_limit_mib, 256);
+        assert_eq!(partial.routing_replay.disk_limit_mib, 512);
+        assert_eq!(partial.routing_replay.hourly_encoded_byte_limit, 40_000_000);
         let budget_only: Config = toml::from_str("[routing_replay]\ndisk_limit_mib=16\n").unwrap();
         assert!(!budget_only.routing_replay.enabled);
         assert_eq!(budget_only.routing_replay.disk_limit_mib, 16);
+        assert_eq!(
+            budget_only.routing_replay.hourly_encoded_byte_limit,
+            40_000_000
+        );
         for enabled in [false, true] {
             let config: Config = toml::from_str(&format!(
                 "[ui]\nlanguage='en'\n[routing_replay]\nenabled={enabled}\ndisk_limit_mib=512\n"
@@ -1187,6 +1213,7 @@ mod n6_replay_config_tests {
             assert_eq!(again.ui.language, UiLanguage::En);
             assert_eq!(again.routing_replay.enabled, enabled);
             assert_eq!(again.routing_replay.disk_limit_mib, 512);
+            assert_eq!(again.routing_replay.hourly_encoded_byte_limit, 40_000_000);
             again.routing_replay.validate().unwrap();
         }
     }
@@ -1198,6 +1225,7 @@ mod n6_replay_config_tests {
                 RoutingReplayConfig {
                     enabled,
                     disk_limit_mib: limit,
+                    ..RoutingReplayConfig::default()
                 }
                 .validate()
                 .unwrap();
@@ -1206,6 +1234,7 @@ mod n6_replay_config_tests {
                 let error = RoutingReplayConfig {
                     enabled,
                     disk_limit_mib: limit,
+                    ..RoutingReplayConfig::default()
                 }
                 .validate()
                 .unwrap_err();
@@ -1219,19 +1248,20 @@ mod n6_replay_config_tests {
 
     #[test]
     fn n6_replay_config_load_validates_without_clamping_or_rewriting() {
-        let home = synthetic_home();
-        let path = home.path().join("config.toml");
-        let missing = Config::load(home.path()).unwrap();
+        let (_directory, home) = synthetic_home();
+        let path = home.join("config.toml");
+        let missing = Config::load(&home).unwrap();
         assert!(!missing.routing_replay.enabled);
-        assert_eq!(missing.routing_replay.disk_limit_mib, 256);
+        assert_eq!(missing.routing_replay.disk_limit_mib, 512);
+        assert_eq!(missing.routing_replay.hourly_encoded_byte_limit, 40_000_000);
         assert!(!path.exists(), "missing config must not be created");
         for enabled in [false, true] {
             for limit in [16i64, 256, 512] {
                 let text = format!(
                     "# synthetic fixture\n[ui]\nlanguage='en'\n[routing_replay]\nenabled={enabled}\ndisk_limit_mib={limit}\n"
                 );
-                fs::write(&path, &text).unwrap();
-                let config = Config::load(home.path()).unwrap();
+                write_config(&path, &text).unwrap();
+                let config = Config::load(&home).unwrap();
                 assert_eq!(config.routing_replay.enabled, enabled);
                 assert_eq!(config.routing_replay.disk_limit_mib, limit as u64);
                 assert_eq!(config.ui.language, UiLanguage::En);
@@ -1239,9 +1269,9 @@ mod n6_replay_config_tests {
             }
             for limit in [0i64, 15, 513, i64::MAX] {
                 let text = format!("[routing_replay]\nenabled={enabled}\ndisk_limit_mib={limit}\n");
-                fs::write(&path, &text).unwrap();
+                write_config(&path, &text).unwrap();
                 assert_eq!(
-                    Config::load(home.path()).unwrap_err().to_string(),
+                    Config::load(&home).unwrap_err().to_string(),
                     "routing replay disk limit must be between 16 and 512 MiB"
                 );
                 assert_eq!(fs::read_to_string(&path).unwrap(), text);
@@ -1250,27 +1280,89 @@ mod n6_replay_config_tests {
     }
 
     #[test]
+    fn n6r_replay_hourly_budget_override_roundtrips_with_other_defaults() {
+        let config: Config =
+            toml::from_str("[routing_replay]\nhourly_encoded_byte_limit=12345678\n").unwrap();
+        assert!(!config.routing_replay.enabled);
+        assert_eq!(config.routing_replay.disk_limit_mib, 512);
+        assert_eq!(config.routing_replay.hourly_encoded_byte_limit, 12_345_678);
+        config.routing_replay.validate().unwrap();
+        let again: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.routing_replay.hourly_encoded_byte_limit, 12_345_678);
+        again.routing_replay.validate().unwrap();
+    }
+
+    #[test]
+    fn n6r_replay_hourly_budget_bounds_apply_off_and_on_without_rewriting() {
+        let (_directory, home) = synthetic_home();
+        let path = home.join("config.toml");
+        for enabled in [false, true] {
+            for limit in [1, 40_000_000, 512_000_000] {
+                let text = format!(
+                    "[routing_replay]\nenabled={enabled}\nhourly_encoded_byte_limit={limit}\n"
+                );
+                write_config(&path, &text).unwrap();
+                let config = Config::load(&home).unwrap();
+                assert_eq!(config.routing_replay.enabled, enabled);
+                assert_eq!(config.routing_replay.disk_limit_mib, 512);
+                assert_eq!(config.routing_replay.hourly_encoded_byte_limit, limit);
+                assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            }
+            for limit in [0, 512_000_001, i64::MAX as u64, u64::MAX] {
+                let error = RoutingReplayConfig {
+                    enabled,
+                    hourly_encoded_byte_limit: limit,
+                    ..RoutingReplayConfig::default()
+                }
+                .validate()
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "routing replay hourly encoded byte limit must be between 1 and 512000000 bytes"
+                );
+                // TOML integers are signed; the full u64 range is checked above.
+                if limit <= i64::MAX as u64 {
+                    let text = format!(
+                        "[routing_replay]\nenabled={enabled}\nhourly_encoded_byte_limit={limit}\n"
+                    );
+                    write_config(&path, &text).unwrap();
+                    assert_eq!(
+                        Config::load(&home).unwrap_err().to_string(),
+                        "routing replay hourly encoded byte limit must be between 1 and 512000000 bytes"
+                    );
+                    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn n6_replay_config_load_rejects_types_without_echoing_values() {
-        let home = synthetic_home();
-        let path = home.path().join("config.toml");
+        let (_directory, home) = synthetic_home();
+        let path = home.join("config.toml");
         for text in [
             "[routing_replay]\nenabled='synthetic-private-value'\n",
             "[routing_replay]\nenabled=1\n",
             "[routing_replay]\ndisk_limit_mib=-1\n",
             "[routing_replay]\ndisk_limit_mib=16.5\n",
             "[routing_replay]\ndisk_limit_mib='synthetic-private-value'\n",
+            "[routing_replay]\nhourly_encoded_byte_limit=-1\n",
+            "[routing_replay]\nhourly_encoded_byte_limit=1.5\n",
+            "[routing_replay]\nhourly_encoded_byte_limit='synthetic-private-value'\n",
+            "[routing_replay]\nhourly_encoded_byte_limit=true\n",
+            "[routing_replay]\nhourly_encoded_byte_limit=[]\n",
             "routing_replay='synthetic-private-value'\n",
         ] {
-            fs::write(&path, text).unwrap();
+            write_config(&path, text).unwrap();
             assert_eq!(
-                Config::load(home.path()).unwrap_err().to_string(),
+                Config::load(&home).unwrap_err().to_string(),
                 "invalid config.toml types"
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), text);
         }
-        fs::write(&path, "[routing_replay]\nenabled=synthetic-private-value\n").unwrap();
+        write_config(&path, "[routing_replay]\nenabled=synthetic-private-value\n").unwrap();
         assert_eq!(
-            Config::load(home.path()).unwrap_err().to_string(),
+            Config::load(&home).unwrap_err().to_string(),
             "invalid config.toml"
         );
     }
