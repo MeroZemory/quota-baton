@@ -57,10 +57,15 @@ impl Runtime {
     }
     /// Main supplies the separate state/decision-tape-v8 root. Legacy roots are
     /// neither inspected nor removed, even when their disk cap was exhausted.
-    pub(crate) fn start_tape(root: &Path, disk_limit_mib: u64) -> io::Result<Self> {
+    pub(crate) fn start_tape(
+        root: &Path,
+        disk_limit_mib: u64,
+        hourly_encoded_byte_limit: u64,
+    ) -> io::Result<Self> {
         Self::start_tape_with_provenance(
             root,
             disk_limit_mib,
+            hourly_encoded_byte_limit,
             super::replay_recorder::Provenance::OperatorOptIn,
         )
     }
@@ -70,6 +75,7 @@ impl Runtime {
         Self::start_tape_with_provenance(
             root,
             disk_limit_mib,
+            crate::config::DEFAULT_REPLAY_HOURLY_ENCODED_BYTES,
             super::replay_recorder::Provenance::Synthetic,
         )
     }
@@ -77,6 +83,7 @@ impl Runtime {
     fn start_tape_with_provenance(
         root: &Path,
         disk_limit_mib: u64,
+        hourly_encoded_byte_limit: u64,
         provenance: super::replay_recorder::Provenance,
     ) -> io::Result<Self> {
         let start = Instant::now();
@@ -87,7 +94,8 @@ impl Runtime {
             disk_limit_mib
                 .checked_mul(1024 * 1024)
                 .ok_or_else(|| io::Error::other("decision_tape_disk_limit"))?,
-        )?;
+        )?
+        .with_hourly_encoded_byte_limit(hourly_encoded_byte_limit)?;
         let (tape, archive) = super::replay_recorder::tape::open_with_provenance(
             root,
             limits,
@@ -399,6 +407,18 @@ mod tests {
     fn manifest(root: &Path, epoch: &str) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(root.join(epoch).join("manifest.json")).unwrap())
             .unwrap()
+    }
+    #[test]
+    fn tape_runtime_installs_the_configured_hourly_budget_before_capture() {
+        let dir = directory();
+        let root = dir.path().join("configured-tape");
+        let runtime = Runtime::start_tape(&root, 16, 12_345).unwrap();
+        runtime.shutdown();
+        assert_eq!(manifest(&root, "e00")["hourly_encoded_byte_limit"], 12_345);
+        assert_eq!(manifest(&root, "e00")["sealed"], true);
+        let invalid = dir.path().join("invalid-tape");
+        assert!(Runtime::start_tape(&invalid, 16, 0).is_err());
+        assert!(!invalid.exists());
     }
     #[test]
     fn r142_replay_runtime_drains_on_close_and_off_rejects_new_metadata() {

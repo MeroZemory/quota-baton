@@ -20,7 +20,7 @@ const MAX_RECORD: usize = 8192;
 const QUEUE_RECORDS: usize = 1024; // <=8 MiB encoded payload, plus bounded container overhead.
 const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 256;
-const DISK_BYTES: u64 = 256 * 1024 * 1024;
+const DISK_BYTES: u64 = 512 * 1024 * 1024;
 const MANIFEST_RESERVE: u64 = 512 * 1024;
 const MAX_EPOCHS: usize = 8;
 const CONTROL_BYTES: u64 = 8192;
@@ -34,11 +34,13 @@ const RETENTION_NS: u64 = 7 * 24 * HOUR_NS;
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     disk_bytes: u64,
+    hourly_encoded_byte_limit: u64,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
             disk_bytes: DISK_BYTES,
+            hourly_encoded_byte_limit: crate::config::DEFAULT_REPLAY_HOURLY_ENCODED_BYTES,
         }
     }
 }
@@ -47,10 +49,23 @@ impl Limits {
         if !(16 * 1024 * 1024..=512 * 1024 * 1024).contains(&disk_bytes) {
             return Err(io::Error::other("capture_disk_limit"));
         }
-        Ok(Self { disk_bytes })
+        Ok(Self {
+            disk_bytes,
+            ..Self::default()
+        })
     }
     pub fn disk_bytes(self) -> u64 {
         self.disk_bytes
+    }
+    pub fn with_hourly_encoded_byte_limit(mut self, bytes: u64) -> io::Result<Self> {
+        if !(1..=crate::config::MAX_REPLAY_HOURLY_ENCODED_BYTES).contains(&bytes) {
+            return Err(io::Error::other("capture_hourly_encoded_byte_limit"));
+        }
+        self.hourly_encoded_byte_limit = bytes;
+        Ok(self)
+    }
+    pub fn hourly_encoded_byte_limit(self) -> u64 {
+        self.hourly_encoded_byte_limit
     }
 }
 
@@ -1657,7 +1672,7 @@ mod tests {
 
     #[test]
     fn limits_validate_default_and_both_bounds() {
-        assert_eq!(Limits::default().disk_bytes(), 256 * 1024 * 1024);
+        assert_eq!(Limits::default().disk_bytes(), 512 * 1024 * 1024);
         for bytes in [16 * 1024 * 1024, 512 * 1024 * 1024] {
             assert_eq!(Limits::new(bytes).unwrap().disk_bytes(), bytes);
         }
