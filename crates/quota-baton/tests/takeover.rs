@@ -308,7 +308,14 @@ async fn ready(client: &Client, home: &Home, token: &str, pid: u32) {
         }
     })
     .await
-    .expect("requested core did not become healthy");
+    .unwrap_or_else(|error| {
+        let logs = ["owner.stderr", "successor.stderr"].map(|name| {
+            let content = fs::read_to_string(home.path.join(name)).unwrap_or_default();
+            let tail: String = content.chars().rev().take(8192).collect();
+            format!("{name}: {}", tail.chars().rev().collect::<String>())
+        });
+        panic!("requested core {pid} did not become healthy: {error}; {logs:?}");
+    });
 }
 async fn start(home: &Home, client: &Client) -> (Core, String) {
     let core = Core::spawn(home, false);
@@ -1086,7 +1093,15 @@ async fn port_case(release_port: bool) {
     let b = Core::spawn(&home, true);
     let began = Instant::now();
     if release_port {
-        until(|| phase(&home, b.pid, "lease_acquired")).await;
+        until(|| {
+            assert!(
+                b.status().is_none(),
+                "successor exited before lease acquisition: {}",
+                b.stderr()
+            );
+            phase(&home, b.pid, "lease_acquired")
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(b.status().is_none());
         drop(holder);
