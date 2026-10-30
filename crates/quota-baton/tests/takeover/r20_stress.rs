@@ -14,7 +14,7 @@ use futures_util::FutureExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    io::Write,
+    io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpStream},
     panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
@@ -600,6 +600,34 @@ fn synthetic_command(home: &Home) -> Command {
     command
 }
 
+// The ordinary ledger also contains every request. Parsing all those JSON
+// objects repeatedly makes the stress observer grow with all previous traffic.
+// Native ledger serialization writes this literal event tag compactly. Parse
+// the much smaller phase subset, and reject older lifetimes of a reused PID.
+fn takeover_rows(home: &Home, since: chrono::DateTime<chrono::Utc>) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for entry in fs::read_dir(home.path.join("ledger")).unwrap() {
+        let entry = entry.unwrap();
+        let mut reader = BufReader::new(fs::File::open(entry.path()).unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 || !line.ends_with('\n') {
+                break; // A concurrent append's partial last line is not a record yet.
+            }
+            if !line.contains(r#""event":"takeover""#) {
+                continue;
+            }
+            let row: Value = serde_json::from_str(&line).unwrap();
+            let at: chrono::DateTime<chrono::Utc> = row["ts"].as_str().unwrap().parse().unwrap();
+            if row["event"] == "takeover" && at >= since {
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
 async fn exercise(run: &mut Run) {
     let (url, upstream) = fake().await;
     run.upstream = Some(upstream);
@@ -617,6 +645,7 @@ async fn exercise(run: &mut Run) {
     let http = client();
     let mut command = synthetic_command(home);
     command.arg("serve");
+    let mut predecessor_started = chrono::Utc::now();
     run.cores.push(Core::from_command(
         command,
         home.path.join("core-000.stderr"),
@@ -651,6 +680,7 @@ async fn exercise(run: &mut Run) {
         let predecessor = run.cores[0].pid;
         let mut command = synthetic_command(home);
         command.args(["serve", "--takeover"]);
+        let successor_started = chrono::Utc::now();
         run.journal
             .lock()
             .unwrap()
@@ -681,15 +711,24 @@ async fn exercise(run: &mut Run) {
             "predecessor exited unsuccessfully"
         );
         let after_exit = run.journal.lock().unwrap().counts.attempts;
-        for (pid, phases) in [
-            (predecessor, ["drain_started", "lease_released", "exited"]),
-            (
-                successor,
-                ["lease_acquired", "bindings_imported", "listening"],
-            ),
-        ] {
-            until(|| phases.iter().all(|name| phase(home, pid, name))).await;
-        }
+        until(|| {
+            let rows = takeover_rows(home, predecessor_started);
+            [
+                (predecessor, ["drain_started", "lease_released", "exited"]),
+                (
+                    successor,
+                    ["lease_acquired", "bindings_imported", "listening"],
+                ),
+            ]
+            .iter()
+            .all(|(pid, names)| {
+                names.iter().all(|name| {
+                    rows.iter()
+                        .any(|row| row["pid"] == *pid && row["phase"] == *name)
+                })
+            })
+        })
+        .await;
         until(|| {
             run.journal
                 .lock()
@@ -701,7 +740,23 @@ async fn exercise(run: &mut Run) {
                 .all(|(now, after_exit)| *now >= after_exit + 2)
         })
         .await;
-        let phases: Vec<_> = ledger(home)
+        let rows = takeover_rows(home, predecessor_started);
+        if number == 1 {
+            let original: Vec<_> = ledger(home)
+                .into_iter()
+                .filter(|row| row["event"] == "takeover")
+                .filter(|row| {
+                    row["ts"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .unwrap()
+                        >= predecessor_started
+                })
+                .collect();
+            assert_eq!(rows, original, "native phase filter must be lossless");
+        }
+        let phases: Vec<_> = rows
             .iter()
             .filter(|r| r["pid"] == predecessor || r["pid"] == successor)
             .filter_map(native_phase)
@@ -724,6 +779,7 @@ async fn exercise(run: &mut Run) {
         // so a successor's first accept later in its lifetime remains available.
         record_census(&run.cores[0], home, true, &run.journal);
         drop(run.cores.remove(0));
+        predecessor_started = successor_started;
     }
 }
 
@@ -749,6 +805,7 @@ async fn r20_spawned_core_200_handovers() {
         "started_utc":chrono::Utc::now().to_rfc3339(),"os":std::env::consts::OS,
         "arch":std::env::consts::ARCH,"probe_period_ms":10,"connect_timeout_ms":1000,
         "probe_close_mode":"abortive_linger_zero_no_application_request",
+        "ledger_observation_mode":"compact_takeover_tag_prefilter_then_json_current_generation",
         "request_timeout_ms":2000,"overall_timeout_secs":OVERALL.as_secs(),
         "harness_sha256":format!("{:x}",Sha256::digest(include_bytes!("r20_stress.rs"))),
         "binary_sha256":format!("{:x}",Sha256::digest(fs::read(binary).unwrap())),
