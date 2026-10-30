@@ -354,6 +354,7 @@ fn default_drain_timeout() -> u64 {
 
 async fn lifecycle_drain(
     State(state): State<RuntimeAdmin>,
+    headers: axum::http::HeaderMap,
     request: Result<Json<DrainRequest>, JsonRejection>,
 ) -> Response {
     let timeout = request.ok().map(|Json(value)| value.drain_timeout_secs);
@@ -368,14 +369,12 @@ async fn lifecycle_drain(
         )
         .await
         {
-            Ok(()) => Json(qb_proto::admin_control::LifecycleReply {
-                bindings: bindings
-                    .get("bindings")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-                lease_released: true,
-            })
-            .into_response(),
+            Ok(()) => {
+                let mut capability = headers.get_all("x-qb-launch-handover").iter();
+                let managed = capability.next().is_some_and(|value| value == "1")
+                    && capability.next().is_none();
+                state.relay.takeover_reply(bindings, managed)
+            }
             Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "Lease handover timed out"),
         },
         Err(()) => error(
@@ -389,7 +388,7 @@ async fn lifecycle_shutdown(
     State(state): State<RuntimeAdmin>,
     request: Result<Json<DrainRequest>, JsonRejection>,
 ) -> Response {
-    lifecycle_drain(State(state), request).await
+    lifecycle_drain(State(state), axum::http::HeaderMap::new(), request).await
 }
 
 async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
