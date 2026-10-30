@@ -78,6 +78,19 @@ pub(crate) async fn handle_takeover(home: &Path, config: &Config, takeover: bool
     // Native bounded TCP has no proxy, redirects or automatic POST retries.
     // Run the export off the async executor; only an explicit 404 is legacy.
     let target = tokio::task::spawn_blocking(move || -> Result<Option<ReadyTarget>> {
+        // A configured port is not evidence of a credential owner. After a
+        // completed drain there may be no incumbent from which to import.
+        // The common startup loop still acquires the authoritative store lease
+        // and handles another process racing this temporary observation.
+        let accounts = crate::platform::prepare_account_directory(&home)?;
+        match crate::platform::Lease::acquire(&accounts) {
+            Ok(lease) => {
+                drop(lease);
+                return Ok(None);
+            }
+            Err(crate::accounts::StoreError::LeaseBusy) => {}
+            Err(error) => return Err(error.into()),
+        }
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, ports[1]));
         let stream = match TcpStream::connect_timeout(&address, REQUEST_LIMIT) {
             Ok(stream) => stream,
@@ -378,3 +391,7 @@ pub(crate) fn defer_startup_error(
     }
     Ok(result.err())
 }
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;
