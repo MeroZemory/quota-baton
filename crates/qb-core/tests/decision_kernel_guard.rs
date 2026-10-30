@@ -383,8 +383,10 @@ fn guard(source: &str) -> Vec<String> {
                     && item.attrs.is_empty()
                     && compact(&tokens(&item.vis)) == "pub(super)" => {}
             Item::Mod(item)
-                if item.ident == "selection"
-                    && item.content.is_none()
+                if matches!(
+                    item.ident.to_string().as_str(),
+                    "selection" | "selection_capacity"
+                ) && item.content.is_none()
                     && item.attrs.is_empty()
                     && compact(&tokens(&item.vis)) == "pub(crate)" => {}
             Item::Mod(item)
@@ -2436,6 +2438,47 @@ const METRICS_IMPORTS: &[&str] = &[
     "use std::{ cmp::Ordering, collections::{BTreeMap, BTreeSet}, };",
 ];
 
+// This entire pure module is inside the boundary, including validation methods.
+const CAPACITY_SOURCE: &str = include_str!("../src/bindings/kernel/selection_capacity.rs");
+const CAPACITY_SIGNATURES: &[&str] = &[
+    "pub(crate) fn valid(&self) -> bool",
+    "pub(crate) fn remaining_tokens(facts: &CapacityFacts, account: &Account, quota: &Value, projected_pct: &BTreeMap<String, f64>, now: DateTime<Utc>,) -> Option<f64>",
+    "pub(crate) fn known_plan(provider: Provider, plan: &str) -> bool",
+    "pub(crate) fn supported(name: &str) -> bool",
+    "fn date(v: &Value) -> Option<DateTime<Utc>>",
+    "pub(crate) fn compatible(account: &Account, snapshot: &Value, now: DateTime<Utc>) -> bool",
+    "pub(crate) fn observation(raw: &Value, now: DateTime<Utc>,) -> Option<(DateTime<Utc>, DateTime<Utc>, f64)>",
+];
+const CAPACITY_IMPORTS: &[&str] = &[
+    "use crate::accounts::{Account, Provider};",
+    "use chrono::{DateTime, Duration, Utc};",
+    "use serde::{Deserialize, Serialize};",
+    "use serde_json::Value;",
+    "use std::collections::BTreeMap;",
+];
+const CAPACITY_TYPES: &str = "Account Provider DateTime Utc String BTreeMap Vec CapacityFacts WindowSamples CapacitySample Value Option f64 u64 i64 usize bool str";
+const CAPACITY_PATHS: &str = "Some None self MIN_SAMPLES MAX_SAMPLES MAX_WINDOWS MAX_AGE_SECS MAX_INTERVAL_SECS Duration::seconds f64::INFINITY f64::total_cmp Provider::Codex Provider::Claude known_plan supported compatible observation date";
+const CAPACITY_METHODS: &str = "valid len iter all is_finite is_multiple_of contains timestamp windows as_deref as_str is_empty as_array filter next is_some get any map collect sort_by max min then_some as_bytes last bytes is_ascii_digit parse is_ok_and ok is_none_or is_null as_f64";
+// Constants and raw fields are finite declarations, never general static admission.
+const CAPACITY_CONSTANTS: &[&str] = &[
+    "const MIN_SAMPLES: usize = 3;",
+    "const MAX_SAMPLES: usize = 16;",
+    "const MAX_WINDOWS: usize = 16;",
+    "const MAX_AGE_SECS: i64 = 300;",
+    "const MAX_INTERVAL_SECS: i64 = 86_400;",
+];
+const CAPACITY_STRUCTS: &[(&str, &str)] = &[
+    (
+        "CapacityFacts",
+        "pub plan: String, pub provider: Provider, pub windows: BTreeMap<String, WindowSamples>,",
+    ),
+    ("WindowSamples", "pub samples: Vec<CapacitySample>,"),
+    (
+        "CapacitySample",
+        "pub input_tokens: u64, pub used_pct_delta: f64, pub start_at: DateTime<Utc>, pub end_at: DateTime<Utc>, pub reset_at: DateTime<Utc>,",
+    ),
+];
+
 const POLICY_SOURCE: &str = include_str!("../src/routing/selection_inputs.rs");
 
 const POLICY_SIGNATURES: &[&str] = &[
@@ -2506,9 +2549,9 @@ pub(super) fn candidate_facts(
 // implementation and std/chrono/serde value semantics remain trusted here;
 // this syntax guard does NOT prove purity of infinitely many possible callees.
 // No native BindingTable/Data/PolicyStore type is allowed inside evaluation.
-const SELECTION_TYPES: &str = "Account AffinityInput BindingInput BTreeMap BTreeSet CandidateInput ChurnLimits DateTime DecisionInputs GroupInput Health HealthReason HoldDiagnostic LaunchInput MetricInputs Metrics Mode MovementInput On5hLimit Option Ordering OverloadInput PlacementAsOfInput PlacementEvidence PlacementInput PlacementState PlacementWindow PlacementWindowInput Plan PolicyInputRefusal PolicyKeyInput PolicyRowsInput PreferenceInput Provider Result RootHintInput RoutingConfig SelectionBinding SelectionChoice SelectionDecision SelectionEntry SelectionEvaluation SelectionEvidence SelectionInputError SelectionInputs SelectionLabel SelectionPolicyInput SelectionReturnInput SessionInput Settings String T UsageObservationAsOf UserState Utc Value Vec bool f64 i64 str u64 usize super::DecisionInputs super::permit::SoleTargetInput m::Metrics crate::routing::Plan std::cmp::Ordering";
-const SELECTION_PATHS: &str = "Some None Ok Err self CAPACITY IDLE_SECS Duration::from_secs Health::Cooling HealthReason::Quota SelectionChoice::Hold SelectionChoice::None SelectionChoice::Selected SelectionEntry::Ordered SelectionEntry::ReturnGuard SelectionInputError::AccountOrder SelectionInputError::MissingPool SelectionInputError::MissingReturnHistory SelectionInputError::MissingSelection SelectionInputError::PolicyScope SelectionLabel::ColdRebalance SelectionLabel::Forced SelectionLabel::Inherited SelectionLabel::MarkWait SelectionLabel::New SelectionLabel::Overload UserState::Active Vec::new affinity::protected_source affinity::retained_binding chrono::Duration::minutes chrono::Duration::seconds crate::accounts::health::UnusableEvidence::observe crate::routing::Mode::Rebalance crate::routing::Mode::Strict f64::total_cmp f64::INFINITY m::active_sessions m::compare_gated m::has_overload_mark m::metrics_for m::placement_capped_for m::placement_evidence_for m::rebalance_target_base_for m::rebalance_target_for m::rebalance_target_waiting_for m::reserved m::spread_threshold super::accepted_in super::candidate_facts super::effective_account super::semantic_evidence super::stale_window super::group String::as_str str::to_owned PlacementEvidence::Fresh PlacementEvidence::Weak PlacementState::default usize::from Mode::Rebalance Mode::Strict PolicyInputRefusal::MissingTargetPool";
-const SELECTION_METHODS: &str = "and_then any append as_array as_deref as_f64 as_ref as_str checked_sub clone cloned cmp collect contains contains_key copied count discretionary_allowed eligible_at expect filter filter_map find first flatten get get_or_insert_with into into_iter is_empty is_err is_finite is_none is_none_or is_ok_and is_some is_some_and iter len map map_or map_or_else max min min_by num_seconds observe charge_count weak ok_or or or_else permits_dispatch placement_plan plan policy_id position push retain rev saturating_add selected_id settings signed_duration_since sort_by strip_prefix then then_with to_owned to_std total_cmp transpose unwrap_or";
+const SELECTION_TYPES: &str = "Account AffinityInput BindingInput BTreeMap BTreeSet CandidateInput ChurnLimits DateTime DecisionInputs GroupInput Health HealthReason HoldDiagnostic LaunchInput MetricInputs Metrics Mode MovementInput On5hLimit Option Ordering OverloadInput PlacementAsOfInput PlacementEvidence PlacementInput PlacementState PlacementWindow PlacementWindowInput Plan PolicyInputRefusal PolicyKeyInput PolicyRowsInput PreferenceInput Provider Result RootHintInput RoutingConfig SelectionBinding SelectionChoice SelectionDecision SelectionEntry SelectionEvaluation SelectionEvidence SelectionInputError SelectionInputs SelectionLabel SelectionPolicyInput SelectionReturnInput SessionInput Settings String T UsageObservationAsOf UserState Utc Value Vec bool f64 i64 str u64 usize super::DecisionInputs super::permit::SoleTargetInput m::Metrics crate::routing::Plan std::cmp::Ordering super::selection_capacity::CapacityFacts";
+const SELECTION_PATHS: &str = "Some None Ok Err self CAPACITY IDLE_SECS Duration::from_secs Health::Cooling HealthReason::Quota SelectionChoice::Hold SelectionChoice::None SelectionChoice::Selected SelectionEntry::Ordered SelectionEntry::ReturnGuard SelectionInputError::AccountOrder SelectionInputError::MissingPool SelectionInputError::MissingReturnHistory SelectionInputError::MissingSelection SelectionInputError::MissingCapacityFacts SelectionInputError::PolicyScope SelectionLabel::ColdRebalance SelectionLabel::Forced SelectionLabel::Inherited SelectionLabel::MarkWait SelectionLabel::New SelectionLabel::Overload UserState::Active Vec::new affinity::protected_source affinity::retained_binding chrono::Duration::minutes chrono::Duration::seconds crate::accounts::health::UnusableEvidence::observe crate::routing::Mode::Rebalance crate::routing::Mode::Strict f64::total_cmp f64::INFINITY m::active_sessions m::compare_gated m::has_overload_mark m::metrics_for m::placement_capped_for m::placement_evidence_for m::rebalance_target_base_for m::rebalance_target_for m::rebalance_target_waiting_for m::reserved m::spread_threshold super::accepted_in super::candidate_facts super::effective_account super::semantic_evidence super::stale_window super::group String::as_str str::to_owned PlacementEvidence::Fresh PlacementEvidence::Weak PlacementState::default usize::from Mode::Rebalance Mode::Strict PolicyInputRefusal::MissingTargetPool super::selection_capacity::remaining_tokens BTreeMap::new";
+const SELECTION_METHODS: &str = "and_then any append as_array as_deref as_f64 as_ref as_str checked_sub clone cloned cmp collect contains contains_key copied count discretionary_allowed eligible_at expect filter filter_map find first flatten get get_or_insert_with into into_iter is_empty is_err is_finite is_none is_none_or is_ok_and is_some is_some_and iter len map map_or map_or_else max min min_by num_seconds observe charge_count weak ok_or or or_else permits_dispatch placement_plan plan policy_id position push retain rev saturating_add selected_id settings signed_duration_since sort_by strip_prefix then then_with to_owned to_std total_cmp transpose unwrap_or zip fold insert";
 
 fn listed(list: &str, name: &str) -> bool {
     list.split_whitespace().any(|allowed| allowed == name)
@@ -2605,7 +2648,15 @@ impl<'ast> Visit<'ast> for SelectionBoundary<'_> {
             _ => None,
         };
         if let Some(path) = path
-            && (path.leading_colon.is_some() || !listed(SELECTION_PATHS, &path_name(path)))
+            && (path.leading_colon.is_some()
+                || !listed(
+                    if self.imports == CAPACITY_IMPORTS {
+                        CAPACITY_PATHS
+                    } else {
+                        SELECTION_PATHS
+                    },
+                    &path_name(path),
+                ))
         {
             self.errors
                 .push("unreviewed selection pattern value".into());
@@ -2639,17 +2690,40 @@ impl<'ast> Visit<'ast> for SelectionBoundary<'_> {
             "struct SelectionBinding { key: String, account: String, last_used: DateTime<Utc>, }",
         )
         .unwrap();
-        if compact(&tokens(item)) != compact(&tokens(&expected)) {
+        if self.imports == CAPACITY_IMPORTS || compact(&tokens(item)) != compact(&tokens(&expected))
+        {
             self.errors
                 .push("nested selection item / state / import".into());
+        }
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        let mut raw = field.clone();
+        raw.attrs.retain(|a| !a.path().is_ident("doc"));
+        if self.imports == METRICS_IMPORTS
+            && compact(&tokens(&raw))
+                == compact(
+                    r#"#[serde(default, skip_serializing_if = "Option::is_none")] pub(crate) capacity: Option<BTreeMap<String, super::selection_capacity::CapacityFacts>>"#,
+                )
+        {
+            // This exact backward-compatible raw field is the only new serde seam.
+            self.visit_type(&field.ty);
+        } else {
+            visit::visit_field(self, field);
         }
     }
 
     fn visit_type_path(&mut self, ty: &'ast syn::TypePath) {
         if ty.qself.is_some()
             || ty.path.leading_colon.is_some()
-            || !(listed(SELECTION_TYPES, &path_name(&ty.path))
-                || (self.pure_policy_receiver && ty.path.is_ident("Self")))
+            || !(listed(
+                if self.imports == CAPACITY_IMPORTS {
+                    CAPACITY_TYPES
+                } else {
+                    SELECTION_TYPES
+                },
+                &path_name(&ty.path),
+            ) || (self.pure_policy_receiver && ty.path.is_ident("Self")))
         {
             self.errors.push(format!(
                 "native / unreviewed selection type: {}",
@@ -2685,30 +2759,52 @@ impl<'ast> Visit<'ast> for SelectionBoundary<'_> {
             Expr::Path(p) => {
                 let name = path_name(&p.path);
                 let helpers = "select return_blocked rebind_budget_source select_ordered prefer prefer_root_hint prefer_pacing_and_evidence effective_for policy_key account_cmp idle protected select_ranked retained_binding protected_source launch_retained retained source metrics metrics_for placement_state evidence placement_evidence_for placement_capped_for activity active_sessions reservations reserved threshold spread_threshold has_overload_mark rebalance_target_waiting_for waiting rebalance_target_base_for rebalance_target_for compare_gated compare_in_order calculate account_window date group";
+                let known_local = self.locals.contains(&name);
+                let known_path = listed(
+                    if self.imports == CAPACITY_IMPORTS {
+                        CAPACITY_PATHS
+                    } else {
+                        SELECTION_PATHS
+                    },
+                    &name,
+                );
+                let known_helper = self.imports != CAPACITY_IMPORTS && listed(helpers, &name);
                 if p.qself.is_some()
                     || p.path.leading_colon.is_some()
-                    || (!self.locals.contains(&name)
-                        && !listed(SELECTION_PATHS, &name)
-                        && !listed(helpers, &name))
+                    || !(known_local || known_path || known_helper)
                 {
                     self.errors
                         .push(format!("external selection value / getter: {}", tokens(p)));
                 }
             }
             Expr::MethodCall(c) => {
-                if !listed(SELECTION_METHODS, &c.method.to_string()) {
+                if !listed(
+                    if self.imports == CAPACITY_IMPORTS {
+                        CAPACITY_METHODS
+                    } else {
+                        SELECTION_METHODS
+                    },
+                    &c.method.to_string(),
+                ) {
                     self.errors
                         .push(format!("unreviewed selection method: {}", c.method));
                 }
                 // Pin the native value seam to the locally reconstructed value.
                 let receiver = compact(&tokens(&c.receiver));
+                if self.imports == CAPACITY_IMPORTS
+                    && c.method == "get"
+                    && receiver != "facts.windows"
+                {
+                    self.errors.push("unrecorded capacity getter".into());
+                }
                 if listed("observe weak charge_count", &c.method.to_string()) && receiver != "state"
                 {
                     self.errors.push("nonlocal PlacementState receiver".into());
                 }
             }
             Expr::Struct(s) => {
-                if s.qself.is_some()
+                if self.imports == CAPACITY_IMPORTS
+                    || s.qself.is_some()
                     || s.path.leading_colon.is_some()
                     || !listed(
                         "SelectionEvaluation SelectionDecision SelectionEvidence SelectionBinding HoldDiagnostic SelectionChoice::Selected SelectionChoice::Hold super::permit::SoleTargetInput PlacementState PlacementWindow UsageObservationAsOf Metrics Plan",
@@ -2716,6 +2812,37 @@ impl<'ast> Visit<'ast> for SelectionBoundary<'_> {
                     )
                 {
                     self.errors.push("unreviewed selection construction".into());
+                }
+            }
+            Expr::Field(f) if self.imports == CAPACITY_IMPORTS => {
+                if let syn::Member::Named(name) = &f.member
+                    && !listed(
+                        "provider plan windows samples input_tokens used_pct_delta start_at end_at reset_at",
+                        &name.to_string(),
+                    )
+                {
+                    self.errors.push("unrecorded capacity field read".into());
+                }
+            }
+            Expr::Index(index) if self.imports == CAPACITY_IMPORTS => {
+                if let Expr::Lit(literal) = &*index.index
+                    && let syn::Lit::Str(key) = &literal.lit
+                    && !listed(
+                        "windows name used_pct observed_at reset_at status paid_serving_observed_at",
+                        &key.value(),
+                    )
+                {
+                    self.errors.push("unrecorded capacity quota key".into());
+                }
+                if !matches!(
+                    &*index.index,
+                    Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(_),
+                        ..
+                    })
+                ) && !listed("ratios s name", &compact(&tokens(&index.expr)))
+                {
+                    self.errors.push("dynamic capacity quota key".into());
                 }
             }
             Expr::Field(f) if matches!(&f.member, syn::Member::Named(n) if n == "data") => {
@@ -2769,8 +2896,38 @@ fn selection_guard(
                 }
             }
             Item::Fn(f) if !policy => boundary.function(&f.vis, &f.sig, &f.block, &f.attrs),
+            Item::Const(c) if imports == CAPACITY_IMPORTS => {
+                if !CAPACITY_CONSTANTS
+                    .iter()
+                    .any(|expected| compact(expected) == compact(&tokens(c)))
+                {
+                    boundary
+                        .errors
+                        .push("unreviewed capacity constant / state".into());
+                }
+            }
             Item::Struct(s) => {
-                if !listed(SELECTION_TYPES, &s.ident.to_string()) || !s.generics.params.is_empty() {
+                if imports == CAPACITY_IMPORTS {
+                    let fields = s.fields.iter().map(tokens).collect::<Vec<_>>().join(",") + ",";
+                    if compact(&tokens(&s.vis)) != "pub(crate)"
+                        || !CAPACITY_STRUCTS.iter().any(|(name, expected)| {
+                            s.ident == *name && compact(expected) == compact(&fields)
+                        })
+                    {
+                        boundary
+                            .errors
+                            .push("unreviewed capacity raw fields".into());
+                    }
+                }
+                if !listed(
+                    if imports == CAPACITY_IMPORTS {
+                        CAPACITY_TYPES
+                    } else {
+                        SELECTION_TYPES
+                    },
+                    &s.ident.to_string(),
+                ) || !s.generics.params.is_empty()
+                {
                     boundary
                         .errors
                         .push("unreviewed selection value declaration".into());
@@ -2778,10 +2935,35 @@ fn selection_guard(
                 boundary.visit_item_struct(s);
             }
             Item::Enum(e) => {
-                if !listed(SELECTION_TYPES, &e.ident.to_string()) || !e.generics.params.is_empty() {
+                if imports == CAPACITY_IMPORTS
+                    || !listed(SELECTION_TYPES, &e.ident.to_string())
+                    || !e.generics.params.is_empty()
+                {
                     boundary.errors.push("unreviewed selection enum".into());
                 }
                 boundary.visit_item_enum(e);
+            }
+            Item::Impl(i)
+                if imports == CAPACITY_IMPORTS
+                    && i.trait_.is_none()
+                    && i.generics.params.is_empty()
+                    && i.generics.where_clause.is_none()
+                    && i.unsafety.is_none()
+                    && compact(&tokens(&i.self_ty)) == "CapacityFacts" =>
+            {
+                for attr in &i.attrs {
+                    boundary.visit_attribute(attr);
+                }
+                for member in &i.items {
+                    match member {
+                        syn::ImplItem::Fn(f) if f.sig.ident == "valid" => {
+                            boundary.pure_policy_receiver = true;
+                            boundary.function(&f.vis, &f.sig, &f.block, &f.attrs);
+                            boundary.pure_policy_receiver = false;
+                        }
+                        _ => boundary.errors.push("unreviewed capacity impl item".into()),
+                    }
+                }
             }
             Item::Impl(i) if policy && i.trait_.is_none() && i.generics.params.is_empty() => {
                 let owner = compact(&tokens(&i.self_ty));
@@ -2845,7 +3027,7 @@ fn selection_sources() -> [(
     &'static [&'static str],
     &'static [&'static str],
     bool,
-); 4] {
+); 5] {
     [
         (
             SELECTION_SOURCE,
@@ -2860,6 +3042,12 @@ fn selection_sources() -> [(
             false,
         ),
         (METRICS_SOURCE, METRICS_SIGNATURES, METRICS_IMPORTS, false),
+        (
+            CAPACITY_SOURCE,
+            CAPACITY_SIGNATURES,
+            CAPACITY_IMPORTS,
+            false,
+        ),
         (POLICY_SOURCE, POLICY_SIGNATURES, POLICY_IMPORTS, true),
     ]
 }
@@ -2883,6 +3071,8 @@ fn planted_selection_native_global_clock_and_io_reads_fail_guard() {
             "pub fn select(inputs: &DecisionInputs) -> Result<SelectionEvaluation, SelectionInputError> {"
         } else if source == AFFINITY_SOURCE {
             "fn idle(now: DateTime<Utc>, last: DateTime<Utc>) -> u64 {"
+        } else if source == CAPACITY_SOURCE {
+            ") -> Option<f64> {"
         } else {
             "pub fn metrics(inputs: &DecisionInputs, id: &str) -> Option<Metrics> {"
         };
@@ -2990,4 +3180,118 @@ fn selection_bridge_and_ownerless_placement_constants_remain_allowed() {
         selection_guard(&fixture, METRICS_SIGNATURES, METRICS_IMPORTS, false),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn capacity_every_function_and_valid_method_reject_hidden_reads() {
+    assert_eq!(
+        selection_guard(
+            CAPACITY_SOURCE,
+            CAPACITY_SIGNATURES,
+            CAPACITY_IMPORTS,
+            false
+        ),
+        Vec::<String>::new()
+    );
+    for signature in CAPACITY_SIGNATURES {
+        let name = signature
+            .split("fn ")
+            .nth(1)
+            .unwrap()
+            .split('(')
+            .next()
+            .unwrap();
+        for planted in [
+            "let _x = Utc::now();",
+            "let _x = GLOBAL;",
+            "static HIDDEN: u64 = 1;",
+            "let _x = self.data.lock();",
+            "fn hidden() { let _x = crate::bindings::native_snapshot(); }",
+            "let _x = crate::placement_capacity::remaining_tokens();",
+            "let _x = std::fs::read(\"live\");",
+            "let _x = account.plan_observed_at;",
+            "let _x = snapshot[\"signals\"][\"serving_from_credits\"].as_bool();",
+            "let _x = snapshot[\"plan\"].as_str();",
+            "let _x = snapshot.get(\"signals\");",
+            "let _x = { let k = \"signals\"; snapshot[k] };",
+        ] {
+            let mut file = syn::parse_file(CAPACITY_SOURCE).unwrap();
+            let mut changed = false;
+            for item in &mut file.items {
+                let block = match item {
+                    Item::Fn(f) if f.sig.ident == name => Some(&mut f.block.stmts),
+                    Item::Impl(i) => i.items.iter_mut().find_map(|member| match member {
+                        syn::ImplItem::Fn(f) if f.sig.ident == name => Some(&mut f.block.stmts),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                if let Some(stmts) = block {
+                    stmts.insert(0, syn::parse_str(planted).unwrap());
+                    changed = true;
+                }
+            }
+            assert!(changed, "stale capacity function: {name}");
+            assert!(
+                !selection_guard(&tokens(&file), CAPACITY_SIGNATURES, CAPACITY_IMPORTS, false)
+                    .is_empty(),
+                "capacity read escaped in {name}: {planted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn capacity_declarations_and_raw_facts_have_no_owner_escape() {
+    for (needle, replacement) in [
+        ("pub plan: String,", "pub plan: String, pub owner: Account,"),
+        (
+            "pub samples: Vec<CapacitySample>,",
+            "pub samples: Vec<CapacitySample>, pub clock: DateTime<Utc>,",
+        ),
+        (
+            "pub input_tokens: u64,",
+            "pub input_tokens: u64, pub state: Value,",
+        ),
+        (
+            "const MIN_SAMPLES: usize = 3;",
+            "const MIN_SAMPLES: usize = GLOBAL;",
+        ),
+        (
+            "pub(crate) fn valid(&self)",
+            "pub(crate) fn valid(&self, owner: &Account)",
+        ),
+        ("impl CapacityFacts {", "#[cfg(test)] impl CapacityFacts {"),
+        (
+            "pub(crate) fn remaining_tokens(",
+            "#[cfg(test)] pub(crate) fn remaining_tokens(",
+        ),
+    ] {
+        let fixture = CAPACITY_SOURCE.replacen(needle, replacement, 1);
+        assert_ne!(
+            fixture, CAPACITY_SOURCE,
+            "stale capacity declaration: {needle}"
+        );
+        assert!(
+            !selection_guard(&fixture, CAPACITY_SIGNATURES, CAPACITY_IMPORTS, false).is_empty(),
+            "capacity declaration escaped: {replacement}"
+        );
+    }
+    for extra in [
+        "fn hidden_owner() { let _x = crate::bindings::native_snapshot(); }",
+        "static HIDDEN: u64 = 1;",
+        "impl CapacityFacts { fn hidden_owner(&self) { let _x = GLOBAL; } }",
+    ] {
+        let fixture = format!("{CAPACITY_SOURCE}\n{extra}");
+        assert!(
+            !selection_guard(&fixture, CAPACITY_SIGNATURES, CAPACITY_IMPORTS, false).is_empty(),
+            "hidden capacity item escaped: {extra}"
+        );
+    }
+    let fixture = METRICS_SOURCE.replace(
+        "super::selection_capacity::remaining_tokens",
+        "crate::placement_capacity::remaining_tokens",
+    );
+    assert_ne!(fixture, METRICS_SOURCE);
+    assert!(!selection_guard(&fixture, METRICS_SIGNATURES, METRICS_IMPORTS, false).is_empty());
 }

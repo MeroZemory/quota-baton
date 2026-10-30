@@ -2,6 +2,63 @@ use super::*;
 use crate::bindings::permit_tape::{AccountFacts, Field, HealthFacts};
 use serde_json::json;
 
+#[test]
+fn r21_schema9_measurement_references_preserve_facts_and_account_identity() {
+    use crate::bindings::kernel::selection_capacity::{
+        CapacityFacts, CapacitySample, WindowSamples,
+    };
+    let mut record = sample();
+    let end: DateTime<Utc> = "2026-10-30T00:00:00Z".parse().unwrap();
+    let facts = CapacityFacts {
+        provider: crate::accounts::Provider::Codex,
+        plan: "pro".into(),
+        windows: ["5h", "7d"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    WindowSamples {
+                        samples: (0..16)
+                            .map(|i| CapacitySample {
+                                input_tokens: 10_000 + i as u64,
+                                used_pct_delta: 1.0,
+                                start_at: end - chrono::Duration::seconds((16 - i) * 20),
+                                end_at: end - chrono::Duration::seconds((16 - i) * 20 - 10),
+                                reset_at: end + chrono::Duration::days(2),
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    let Payload::SelectionTape(envelope) = &mut record.event else {
+        panic!("selection fixture")
+    };
+    let metrics = &mut envelope.record.inputs.as_mut().unwrap().selection.metrics;
+    let id = "a:00000000000000000000000000000001";
+    metrics.capacity = Some(BTreeMap::from([(id.into(), facts.clone())]));
+    let expanded = serde_json::to_vec(&record).unwrap().len();
+    let mut encoder = Encoder::default();
+    let mut decoder = Decoder::default();
+    let first = round_trip(&mut encoder, &mut decoder, &record);
+    record.sequence += 1;
+    let repeated = round_trip(&mut encoder, &mut decoder, &record);
+    assert!(repeated < expanded / 2 && repeated < first / 2);
+    let raw = serde_json::to_value(&facts).unwrap();
+    let slice = Location::Capacity(id).capture(&raw).unwrap();
+    assert!(Location::Capacity("a:other").restore(&slice).is_err());
+    let mut invalid = facts;
+    invalid.windows.get_mut("5h").unwrap().samples[0].input_tokens = 0;
+    assert!(
+        Location::Capacity(id)
+            .capture(&serde_json::to_value(invalid).unwrap())
+            .is_err()
+    );
+    // Records without capacity facts still use the old dictionary representation.
+    round_trip(&mut Encoder::default(), &mut Decoder::default(), &sample());
+}
+
 fn sample() -> Record {
     let row = SelectionRow {
         account: AccountFacts {

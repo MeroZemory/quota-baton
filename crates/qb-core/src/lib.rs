@@ -20,6 +20,7 @@ pub mod oauth;
 pub mod observability;
 #[cfg(all(feature = "phase0", debug_assertions))]
 pub mod phase0;
+pub(crate) mod placement_capacity;
 pub(crate) mod platform;
 pub mod provider_forecast;
 pub mod quota;

@@ -17,6 +17,7 @@ pub(super) mod permit;
 pub use permit::{PermitDecision, PermitDenied, PermitInputs, PreparedMove, decide_move};
 pub(crate) mod selection;
 pub(super) mod selection_affinity;
+pub(crate) mod selection_capacity;
 pub(super) mod selection_metrics;
 pub use selection::{SelectionInputs, SelectionReturnInput};
 

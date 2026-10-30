@@ -31,6 +31,7 @@ fn raw_candidate(c: &Candidate) -> CandidateInput {
 
 fn raw(d: &Data, config: RoutingConfig) -> MetricInputs {
     MetricInputs {
+        capacity: Some(BTreeMap::new()),
         config,
         recent: d
             .accounts

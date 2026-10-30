@@ -634,6 +634,7 @@ impl UsagePoller {
                                 &reported,
                                 wait_origin,
                                 outside_origin,
+                                Some((usage_started_at, replace_windows)),
                             )
                             .await
                             .map_err(|_| PollError::Unavailable)?;
@@ -835,8 +836,17 @@ mod tests {
         assert!(!text.contains("synthetic-secret"));
         assert!(!text.contains("synthetic@example.invalid"));
     }
+    struct FixtureHome {
+        _parent: tempfile::TempDir,
+        home: std::path::PathBuf,
+    }
+    impl FixtureHome {
+        fn path(&self) -> &std::path::Path {
+            &self.home
+        }
+    }
     struct Fixture {
-        _root: tempfile::TempDir,
+        _root: FixtureHome,
         fake: ScriptedUpstream,
         relay: Arc<RelayState>,
         ids: Vec<String>,
@@ -846,6 +856,18 @@ mod tests {
             Self::with_provider(count, Provider::Codex).await
         }
         async fn with_provider(count: usize, provider: Provider) -> Self {
+            Self::with_provider_and_interval(
+                count,
+                provider,
+                Config::default().quota.poll_min_interval_secs,
+            )
+            .await
+        }
+        async fn with_provider_and_interval(
+            count: usize,
+            provider: Provider,
+            min_interval_secs: u64,
+        ) -> Self {
             let base = std::env::var_os("QB_TEST_USAGE_ROOT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| {
@@ -858,15 +880,17 @@ mod tests {
                 });
             std::fs::create_dir_all(&base).unwrap();
             let root = tempfile::tempdir_in(base).unwrap();
+            let home = root.path().join("home");
+            crate::platform::create_private_directory_new(&home).unwrap();
             // Match the existing browserless-login fixture: an explicit private
             // test key backend, without a service credential or source writes.
-            let mut config = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+            let mut config = tempfile::NamedTempFile::new_in(&home).unwrap();
             std::io::Write::write_all(&mut config, b"[secrets]\nlinux_backend = \"file-0600\"\n")
                 .unwrap();
-            config.persist(root.path().join("config.toml")).unwrap();
+            config.persist(home.join("config.toml")).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             let store = loop {
-                match AccountStore::acquire(root.path()) {
+                match AccountStore::acquire(&home) {
                     Ok(store) => break Arc::new(store),
                     Err(StoreError::LeaseBusy) if std::time::Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(10)).await
@@ -901,14 +925,18 @@ mod tests {
             }
             let fake = ScriptedUpstream::start().await.unwrap();
             let mut config = Config::default();
+            config.quota.poll_min_interval_secs = min_interval_secs;
             config.upstream.codex_usage_base = fake.url.clone();
             config.upstream.claude_usage_base = fake.url.clone();
-            let obs = Arc::new(Observability::new(root.path(), None).unwrap());
+            let obs = Arc::new(Observability::new(&home, None).unwrap());
             let relay = Arc::new(
                 RelayState::new(store, &config, obs, Arc::new(DebugPins::default())).unwrap(),
             );
             Self {
-                _root: root,
+                _root: FixtureHome {
+                    _parent: root,
+                    home,
+                },
                 fake,
                 relay,
                 ids,
@@ -1388,4 +1416,5 @@ mod tests {
     include!("quota/profile_tests.rs");
     mod r18_profile_tests;
     mod r18_relay_tests;
+    mod r21_capacity_tests;
 }

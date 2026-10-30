@@ -3365,7 +3365,7 @@ fn effective_account(
     let inputs = kernel_shell::candidate_inputs(d, c, None, model, now);
     kernel::effective_account(&inputs, &c.account.id).expect("provided raw candidate")
 }
-fn account_window(provider: Provider, w: &Value) -> Option<bool> {
+pub(crate) fn account_window(provider: Provider, w: &Value) -> Option<bool> {
     match w["name"].as_str()? {
         "7d" | "secondary" => Some(true),
         "5h" | "primary" => Some(false),
