@@ -8,7 +8,7 @@ use crate::{
 use axum::body::{Body, to_bytes};
 use futures_util::{FutureExt, StreamExt, stream};
 use serde_json::{Value, json};
-use std::{io::Write, panic::AssertUnwindSafe, path::Path};
+use std::{io::Write, panic::AssertUnwindSafe};
 use tokio::sync::oneshot;
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -98,10 +98,17 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(seed_account: bool, retain_mib: u64) -> Self {
-        let base =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests/r20-handover-http");
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let base = executable
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".sandbox/tests/r20-handover-http");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let directory = tempfile::tempdir_in(base).unwrap();
+        let home = directory.path().join("home");
+        crate::platform::create_private_directory_new(&home).unwrap();
         let successor = Successor::new().await;
         let mut config = Config::default();
         config.secrets.linux_backend = LinuxSecretBackend::File0600;
@@ -116,14 +123,12 @@ impl Fixture {
         config.upstream.claude_token_endpoint = Some(format!("{}/oauth/token", successor.url));
         // NamedTempFile creates the private config without an inline Unix mode
         // branch; File0600 also prevents Secret Service/DPAPI fixture coupling.
-        let mut config_file = tempfile::NamedTempFile::new_in(home.path()).unwrap();
+        let mut config_file = tempfile::NamedTempFile::new_in(&home).unwrap();
         config_file
             .write_all(toml::to_string(&config).unwrap().as_bytes())
             .unwrap();
-        config_file
-            .persist(home.path().join("config.toml"))
-            .unwrap();
-        let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+        config_file.persist(home.join("config.toml")).unwrap();
+        let store = Arc::new(AccountStore::acquire(&home).unwrap());
         if seed_account {
             let identity = Identity::Codex {
                 account_id: "r20-synthetic-account".into(),
@@ -149,7 +154,7 @@ impl Fixture {
                 )
                 .unwrap();
         }
-        let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+        let obs = Arc::new(Observability::new(&home, None).unwrap());
         let state = Arc::new(
             RelayState::new(store, &config, obs.clone(), Arc::new(DebugPins::default())).unwrap(),
         );
@@ -157,7 +162,7 @@ impl Fixture {
             state,
             obs,
             successor,
-            _home: home,
+            _home: directory,
         }
     }
     fn request(&self, body: Body) -> Request {
