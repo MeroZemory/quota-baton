@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: launch-expired 수정 수용·661997d 단일설치 대기
-목표: 최종봉인 뒤661997d 한 번 설치·schema9 percent 기준 capture 시작; schema8 원형24h 판정과 schema9 warm>=24h R21 비교는 별도
-핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (인계 수정 관문을 실제 수용으로 세지 않음)
-사용자 대기: 10-31 11:04 최종봉인·기존 설치 순서; N7은11/05 13:49 이후·L1 실제수용·N12 O14
-갱신: 2026-10-30 22:10 KST (owner 수용: producer+launch handover 단일661997d 설치·routing/tape/percent 정책 불변; 최초 old→patched 재실행 경로 유지·설치7b3f9ce 유지)
+현재 마일스톤: N6r schema8 실제24h 판정 insufficient·schema9 기준capture 시작
+목표: 비교불가 원인/관문 검토 후 producer 후속 결정; schema9 warm>=24h 뒤 R21 paired·N7은7일 후
+핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (identity/power와 실제 후보 수용 구분)
+사용자 대기: 다음 N6r producer 작업의 채택 검토·schema9 >=24h export·N7 11/05 13:49 이후·L1 실제수용·N12 O14
+갱신: 2026-10-31 11:31 KST (24h 선택nc17.8763%·permit1.5899%, loss0; 661997d 11:05 설치840/0·schema9 e00 시작, 새 rate/loss 미보고)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -128,8 +128,8 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N2 R16.3 provider charts and pace line | S1 | none | `impl/r16.3` from dev, brief section R16.3 | focused gate, real-path capture, regressions for differing resets and a paused account |
 | N6 R14.2 recorder, minimum delivery | S1 | none | `impl/r14.2` (keep db6baac), brief R14 plus D29 amendment 4 | schema, off switch, default off, 7-day bound, tests; then S2 install and enable; the 24 h capture starts at install |
 | N6t R14 typed rebind and static write check | S1 | none | `impl/r14-rebind` | compile-time choke point, static check failing on a planted write, existing tests |
-| N6r decision-tape real gate | S1 | owner sealed e02..e05 export after2026-10-31 11:04KST; installed7b3f9ce identity | `impl/n6r-tape` | >=24h native paired margin0/coverage/loss plus realmove census and reached-guard power; onehour638/638/fault14PASS does not accept24h |
-| N6r-T capacity producer | S1 | owner installation only after10-31 11:04 seal; then warm+>=24h schema9 | `impl/n6r-capacity-producer` | percent/native selector exact dev, schema9 measured facts+opaque links, no key export needed, writer/reader/code gate qualified; R21 stays separate |
+| N6r decision-tape real gate | S1 | schema8 real24h insufficient; next producer step requires adopted review | `impl/n6r-tape` | >=24h native paired margin0/coverage/loss plus realmove census and reached-guard power; onehour638/638/fault14PASS does not accept24h |
+| N6r-T capacity producer | S1 | installed661997d10-31 11:05; wait warm+>=24h schema9 | `impl/n6r-capacity-producer` | percent/native selector exact dev, schema9 measured facts+opaque links, no key export needed, writer/reader/code gate qualified; R21 stays separate |
 | R21 measured-capacity candidate | S1 | source-complete schema9 warm+>=24h, owner-approved paired gate | `impl/r21` at1ad42fa (unmerged) | historical/schema8 weighted verdict insufficient; first real candidate after fresh capture |
 | N5m R13 C measurement: Codex cache survival by idle gap; client hold tolerance against a fake upstream | W | none | background `codex-qb exec` worker in `.sandbox/r13-measure/`; no cargo in S1 | measurement table in the R13 report |
 | N5a R13 E HTTP wait and reset-resume for non-urgent sessions at 5h limits | S1 | none (bound is a setting; N5m only tunes its default) | `impl/r13-wait` | hold then serve on the same account after reset; bound exceeded falls back; cancellation releases |
@@ -147,7 +147,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: launch-expired ordinary takeover fix is accepted for the combined schema9 rollout; it must not install during the current capture. The owner accepted one combined661997d install immediately after10-31 11:04seal, with schema9 reference capture under661997d; no intermediate producer-only takeover. First old-to-patched upgrade retains legacy/relaunch because an unpatched incumbent has no grant exporter; subsequent patched takeovers preserve the existing URL. Managed Linux service exec reload and genuine expiry remain separate limits. Installed7b3f9ce/schema8 e02..e05 seals remain unchanged; after10-31 11:04 export run original>=24h identity/power/census first. Producer f1e2911 contains R20+schema9 raw capacity readset with percent policy unchanged; its code is included in the single owner-approved661997d install together with this fix. R21 stays unmerged on impl/r21 until warm>=24h schema9 percent-vs-weighted paired verdict (margin0). N7 scoring waits until11-05 13:49. Reports: MAIN `.sandbox/reports/R13.Launch.md`, `.sandbox/reports/N6r-T.capacity-producer.md`, `.sandbox/reports/R21.md`.
+**Current S1 order**: schema8 e02..e05 real24h closes insufficient: installed identity and selection power pass, but selection17.8763% and permit1.5899% refusals exceed1%; per-epoch failures cannot be diluted. Native cooling literal observed is a source-valid tape mismatch, with erased historical literals unproven. Further N6r producer changes await the adopted review required by GOAL. Owner installed661997d once at10-31 11:05 after final seal (840/0, both smokes OK): R20+schema9 producer+launch handover, percent unchanged. decision-tape-v9/e00 capture started per owner; fresh rates/losses not reported. R21 remains unmerged at1ad42fa until warm>=24h schema9 paired margin0. N7 waits until11-05 13:49. Report: MAIN `.sandbox/reports/N6r-T.tape8-24h.md`; prior producer, launch and R21 reports remain cited in their rows.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
@@ -572,7 +572,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
 | Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
-| N6r decision tape | schema8 실제638/638 identity·fault14 검출·loss0, model0.3125%; 실제30분guard insufficient_not_exercised | >=24h 완전 다중epoch margin0·실제guard census/power | 40MB/h·512MiB 기본값 양OS 관문PASS; 설계 설치·6h 봉인 운영 인계, B1/3 유지 |
+| N6r decision tape | schema8 실제24h identity 선택9969/permit11946·단일global fault1건 검출·loss0, 선택nc17.8763%/permit1.5899%로 insufficient | 매epoch nc<=1%와 실제후보 margin0; observed/native 투영 불일치·모델 소실 진단 | 다음 producer 단계 채택 검토·schema9 warm>=24h R21 별도, B1/3 유지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
