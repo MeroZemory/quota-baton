@@ -36,9 +36,20 @@ pub enum WireRefusal {
     Identity,
     Collision,
     Plan,
+    // Legacy broad codes remain readable for sealed historical epochs.
     Model,
+    ModelLength,
+    InputModelLength,
+    HealthModelLength,
+    PermitModelLength,
+    SelectionModelLength,
     Health,
+    HealthScope,
+    ReloginReason,
     Quota,
+    CoolingWindow,
+    PlacementWindow,
+    QuotaEncoding,
     QuotaReference,
     QuotaRoot,
     QuotaWindows,
@@ -110,53 +121,15 @@ vocabulary!(Plan, Plan, {
     Promax => "promax", Max => "max", Max5 => "max_5x", Max20 => "max_20x",
     Team => "team", Business => "business", Enterprise => "enterprise", Edu => "edu"
 });
-/// Exact native model identifiers, with bounded family/version vocabulary.
+/// Exact native model input. Absence/null is represented by the enclosing Option.
+/// Preserve aliases and literal strings without interpreting their model family.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Model(String);
 impl Model {
     fn parse(text: &str) -> Result<Self, WireRefusal> {
-        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        let version = |s: &str| s.split('.').all(numeric);
-        let suffix = |s: &str| {
-            numeric(s)
-                || matches!(
-                    s,
-                    "codex"
-                        | "mini"
-                        | "nano"
-                        | "max"
-                        | "latest"
-                        | "preview"
-                        | "pro"
-                        | "chat"
-                        | "luna"
-                        | "turbo"
-                        | "thinking"
-                        | "fast"
-                        | "spark"
-                        | "lite"
-                )
-        };
-        let rest = text.strip_prefix("claude-").unwrap_or(text);
-        let family = ["opus", "sonnet", "haiku"].iter().find_map(|family| {
-            if rest == *family {
-                Some("")
-            } else {
-                rest.strip_prefix(*family).and_then(|s| s.strip_prefix('-'))
-            }
-        });
-        let valid = if let Some(rest) = family {
-            rest.is_empty() || rest.split('-').all(suffix)
-        } else if let Some(rest) = text.strip_prefix("gpt-").or_else(|| text.strip_prefix('o')) {
-            let mut parts = rest.split('-');
-            parts.next().is_some_and(version) && parts.all(suffix)
-        } else {
-            text.strip_prefix("codex-")
-                .is_some_and(|s| !s.is_empty() && s.split('-').all(suffix))
-        };
-        if text.len() > 96 || text.ends_with('-') || !valid {
-            return Err(WireRefusal::Model);
+        if text.len() > 96 {
+            return Err(WireRefusal::ModelLength);
         }
         Ok(Self(text.into()))
     }
@@ -187,7 +160,7 @@ impl Window {
     fn parse(text: &str) -> Result<Self, WireRefusal> {
         let named = matches!(
             text,
-            "primary" | "secondary" | "five_hour" | "seven_day" | "seven_day_opus"
+            "primary" | "secondary" | "five_hour" | "seven_day" | "seven_day_opus" | "observed"
         );
         let (duration, suffix) = text
             .split_once('_')
@@ -230,7 +203,7 @@ vocabulary!(Status, Quota, {
     Rejected => "rejected", Allowed => "allowed", Warning => "allowed_warning",
     True => "true", False => "false"
 });
-vocabulary!(ReloginReason, Health, {
+vocabulary!(ReloginReason, ReloginReason, {
     InvalidGrant => "invalid_grant", TokenRevoked => "token_revoked", Revoked => "revoked",
     AuthAfterRefresh => "auth_after_refresh", RefreshReused => "refresh_token_reused",
     RefreshExpired => "refresh_token_expired", RefreshInvalidated => "refresh_token_invalidated"
@@ -383,8 +356,12 @@ impl HealthFacts {
                     Scope::Account
                 } else {
                     Scope::Model(
-                        Model::parse(scope.strip_prefix("model:").ok_or(WireRefusal::Health)?)
-                            .map_err(|_| WireRefusal::Health)?,
+                        Model::parse(
+                            scope
+                                .strip_prefix("model:")
+                                .ok_or(WireRefusal::HealthScope)?,
+                        )
+                        .map_err(|_| WireRefusal::HealthModelLength)?,
                     )
                 },
             },
@@ -436,7 +413,7 @@ impl AccountFacts {
                 .as_ref()
                 .map(|q| {
                     Ok::<_, WireRefusal>(CoolingFacts {
-                        window: Window::parse(&q.window)?,
+                        window: Window::parse(&q.window).map_err(|_| WireRefusal::CoolingWindow)?,
                         reset_at: q.reset_at,
                         started_at: q.started_at,
                     })
@@ -701,7 +678,7 @@ fn remap_permit(
         s.from = map(IdKind::Account, &s.from)?;
         s.to = map(IdKind::Account, &s.to)?;
         if let Some(m) = &s.model {
-            Model::parse(m)?;
+            Model::parse(m).map_err(|_| WireRefusal::PermitModelLength)?;
         }
     }
     Ok(())
@@ -802,7 +779,12 @@ pub fn capture(
     remap_actual(&mut actual, &mut map)?;
     let wire = WireInputs {
         now: inputs.now,
-        model: inputs.model.as_deref().map(Model::parse).transpose()?,
+        model: inputs
+            .model
+            .as_deref()
+            .map(Model::parse)
+            .transpose()
+            .map_err(|_| WireRefusal::InputModelLength)?,
         key: inputs
             .key
             .as_deref()
@@ -1075,8 +1057,8 @@ fn quota_digest(
     use sha2::{Digest, Sha256};
     wire_id(IdKind::Account, account)?;
     bounded(quota)?;
-    let bytes =
-        serde_json::to_vec(&(SCHEMA, account, revision, quota)).map_err(|_| WireRefusal::Quota)?;
+    let bytes = serde_json::to_vec(&(SCHEMA, account, revision, quota))
+        .map_err(|_| WireRefusal::QuotaEncoding)?;
     Ok(QuotaDigest(Sha256::digest(bytes).into()))
 }
 
@@ -1112,3 +1094,7 @@ pub fn replay(record: &PermitRecord) -> Result<PermitDecision, WireRefusal> {
 #[cfg(test)]
 #[path = "permit_tape/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "permit_tape/native_vocabulary_tests.rs"]
+mod native_vocabulary_tests;

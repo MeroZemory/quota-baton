@@ -249,7 +249,7 @@ fn refused_input_is_retained_and_counted_without_manufacturing_a_move() {
     let path = writer.root.clone();
     witness(&producer);
     let mut inputs = permit_inputs();
-    inputs.model = Some("private-model-canary".into());
+    inputs.model = Some("m".repeat(97));
     assert_eq!(
         producer.permit(
             at(2),
@@ -266,7 +266,7 @@ fn refused_input_is_retained_and_counted_without_manufacturing_a_move() {
     assert!(epoch.permits[0].inputs.is_none());
     assert_eq!(
         epoch.permits[0].refusal,
-        Some(permit_tape::WireRefusal::Model)
+        Some(permit_tape::WireRefusal::InputModelLength)
     );
     assert_eq!(manifest(&path).permit_not_comparable, 1);
     assert_eq!(
@@ -889,7 +889,7 @@ fn schema6_native_refusals_count_the_record_reason_or_missing_permit() {
     let path = writer.root.clone();
     witness(&producer);
     let mut inputs = permit_inputs();
-    inputs.model = Some("private-model-canary".into());
+    inputs.model = Some("m".repeat(97));
     assert!(
         producer
             .permit(at(2), 1, &inputs, &PermitDecision::NotRequired)
@@ -908,10 +908,16 @@ fn schema6_native_refusals_count_the_record_reason_or_missing_permit() {
     assert_eq!(m.permit_not_comparable, 2);
     assert_eq!(
         m.permit_not_comparable_reasons,
-        BTreeMap::from([(WireRefusal::Model, 1), (WireRefusal::MissingPermit, 1),])
+        BTreeMap::from([
+            (WireRefusal::InputModelLength, 1),
+            (WireRefusal::MissingPermit, 1),
+        ])
     );
     let epoch = read_epoch(&path).unwrap();
-    assert_eq!(epoch.permits[0].refusal, Some(WireRefusal::Model));
+    assert_eq!(
+        epoch.permits[0].refusal,
+        Some(WireRefusal::InputModelLength)
+    );
     assert!(epoch.permits[0].inputs.is_none());
     assert!(epoch.permits[1].refusal.is_none());
     assert!(epoch.permits[1].inputs.as_ref().unwrap().permit.is_none());
@@ -929,7 +935,7 @@ fn schema6_rejects_diagnostic_tampering_omissions_unknown_keys_and_overflow() {
     let path = writer.root.clone();
     witness(&producer);
     let mut inputs = permit_inputs();
-    inputs.model = Some("private-model-canary".into());
+    inputs.model = Some("m".repeat(97));
     assert!(
         producer
             .permit(
@@ -1020,7 +1026,7 @@ fn schema6_writer_refuses_legacy5_root_without_rewriting_it() {
             )
             .is_some()
     );
-    inputs.model = Some("private-model-canary".into());
+    inputs.model = Some("m".repeat(97));
     assert!(
         producer
             .permit(
@@ -1091,7 +1097,10 @@ fn schema6_writer_refuses_legacy5_root_without_rewriting_it() {
         .collect();
     let loaded = crate::observability::decision_reader::load(&path).unwrap();
     assert_eq!(loaded.permits.len(), 2);
-    assert_eq!(loaded.permits[1].refusal, Some(WireRefusal::Model));
+    assert_eq!(
+        loaded.permits[1].refusal,
+        Some(WireRefusal::InputModelLength)
+    );
     let epoch_before = loaded.tape_sha256;
     assert!(open(path.parent().unwrap(), Limits::default(), at(5)).is_err());
     assert_eq!(read_epoch(&path).unwrap().tape_sha256, epoch_before);
@@ -1359,4 +1368,63 @@ fn schema6_native_quota_refusals_have_finite_manifest_counters() {
     }
     let wire = String::from_utf8(fs::read(path.join("manifest.json")).unwrap()).unwrap();
     assert!(!wire.contains("private-"));
+}
+
+#[test]
+fn native_writer_reader_preserves_observed_cooling_and_null_literal_models() {
+    use crate::bindings::kernel::PermitDecision;
+    let (_directory, producer, writer) = fixture();
+    let path = writer.root.clone();
+    witness(&producer);
+    let models = [
+        None,
+        Some(""),
+        Some("null"),
+        Some("auto"),
+        Some("provider/model-alias"),
+    ];
+    for (index, model) in models.into_iter().enumerate() {
+        let mut input = permit_inputs();
+        input.model = model.map(str::to_owned);
+        let source = &mut input.accounts.get_mut("native-source").unwrap().account;
+        source.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "observed".into(),
+            reset_at: input.now + chrono::Duration::hours(1),
+            started_at: input.now,
+        });
+        assert_eq!(
+            producer.permit(
+                at(index as u64 + 2),
+                index as u64 + 1,
+                &input,
+                &PermitDecision::NotRequired
+            ),
+            Some(index as u64 + 2)
+        );
+    }
+    writer.close(at(8)).unwrap();
+    let archive = read_epoch(&path).unwrap();
+    assert!(archive.permit_complete);
+    assert_eq!(archive.losses, 0);
+    assert_eq!(manifest(&path).permit_not_comparable, 0);
+    for (record, model) in archive.permits.iter().zip(models) {
+        assert!(record.refusal.is_none());
+        let restored = record.inputs.as_ref().unwrap().to_inputs().unwrap();
+        assert_eq!(restored.model.as_deref(), model);
+        assert!(restored.accounts.values().any(|row| {
+            row.account
+                .quota_cooling
+                .as_ref()
+                .is_some_and(|q| q.window == "observed")
+        }));
+    }
+    let executed = crate::observability::permit_reader::execute(&archive, "a".repeat(64));
+    assert_eq!(executed.frames.len(), models.len());
+    assert!(executed.refused.is_empty());
+    assert!(
+        executed
+            .frames
+            .iter()
+            .all(|frame| frame.decision == PermitDecision::NotRequired)
+    );
 }

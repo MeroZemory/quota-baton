@@ -152,7 +152,11 @@ impl SelectionRow {
 }
 
 fn model(value: &Option<String>) -> Result<(), WireRefusal> {
-    value.as_deref().map(Model::parse).transpose()?;
+    value
+        .as_deref()
+        .map(Model::parse)
+        .transpose()
+        .map_err(|_| WireRefusal::SelectionModelLength)?;
     Ok(())
 }
 
@@ -277,7 +281,7 @@ fn remap(w: &mut WireSelectionInputs, map: &mut Mapper<'_>) -> Result<(), WireRe
             return Err(WireRefusal::Bounds);
         }
         for (name, row) in &mut placement.windows {
-            Window::parse(name)?;
+            Window::parse(name).map_err(|_| WireRefusal::PlacementWindow)?;
             // Placement values are raw quota windows, never arbitrary JSON.
             let projected = QuotaFacts {
                 windows: Field::Value(vec![window(&row.value)?]),
@@ -354,7 +358,12 @@ pub(crate) fn capture(
     let mut identity = |_: IdKind, id: &str| Ok(id.to_owned());
     let mut w = WireSelectionInputs {
         now: inputs.now,
-        model: inputs.model.as_deref().map(Model::parse).transpose()?,
+        model: inputs
+            .model
+            .as_deref()
+            .map(Model::parse)
+            .transpose()
+            .map_err(|_| WireRefusal::InputModelLength)?,
         key: inputs.key.clone(),
         accounts: inputs
             .accounts

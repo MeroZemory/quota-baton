@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N6r schema8 실제24h 판정 insufficient·schema9 기준capture 시작
-목표: 비교불가 원인/관문 검토 후 producer 후속 결정; schema9 warm>=24h 뒤 R21 paired·N7은7일 후
-핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (identity/power와 실제 후보 수용 구분)
-사용자 대기: 다음 N6r producer 작업의 채택 검토·schema9 >=24h export·N7 11/05 13:49 이후·L1 실제수용·N12 O14
-갱신: 2026-10-31 11:31 KST (24h 선택nc17.8763%·permit1.5899%, loss0; 661997d 11:05 설치840/0·schema9 e00 시작, 새 rate/loss 미보고)
+현재 마일스톤: N6r producer vocabulary 관문 완료·설치 인계
+목표: 새 schema9 기준capture 설치 후1h nc<=1%·loss/rate 확인, 이어 warm>=24h R21 paired
+핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (producer gate는 실제 수용으로 세지 않음)
+사용자 대기: 설계 설치·새 schema9 1h 건강성; N7 11/05 13:49 이후·L1 실제수용·N12 O14
+갱신: 2026-10-31 12:54 KST (native grammar/null/원문 model/subtype 양OS focused 통과·e03 과거 거절 보존; 설치661997d 유지)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -147,7 +147,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: schema8 e02..e05 real24h closes insufficient: installed identity and selection power pass, but selection17.8763% and permit1.5899% refusals exceed1%; per-epoch failures cannot be diluted. Native cooling literal observed is a source-valid tape mismatch, with erased historical literals unproven. Further N6r producer changes await the adopted review required by GOAL. Owner installed661997d once at10-31 11:05 after final seal (840/0, both smokes OK): R20+schema9 producer+launch handover, percent unchanged. decision-tape-v9/e00 capture started per owner; fresh rates/losses not reported. R21 remains unmerged at1ad42fa until warm>=24h schema9 paired margin0. N7 waits until11-05 13:49. Report: MAIN `.sandbox/reports/N6r-T.tape8-24h.md`; prior producer, launch and R21 reports remain cited in their rows.
+**Current S1 order**: vocabulary producer focused gate is ready for owner installation. Native window/cooling origins including observed and null/absent/literal models are recorded; remaining projection refusals have contextual finite codes and old codes stay readable.40MB/hour,512MiB,schema9, percent policy and R21 remain unchanged. Owner installs and restarts schema9, checks selection/permit nc<=1% plus ordinary loss/rate health at1h, then allows warm>=24h for the R21 margin0 gate. Installed661997d remains the live source until that install; its previous e00 carries the old grammar. R21 stays unmerged at1ad42fa. No new stagnation review for this known producer defect, per owner decision. N7 waits until11-05 13:49. Reports: MAIN `.sandbox/reports/N6r-T.vocabulary.md` and accepted-insufficient `.sandbox/reports/N6r-T.tape8-24h.md`.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
