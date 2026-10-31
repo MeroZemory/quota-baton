@@ -147,7 +147,7 @@ struct RollingLog {
 }
 impl RollingLog {
     fn new(directory: PathBuf) -> io::Result<Self> {
-        fs::create_dir_all(&directory)?;
+        crate::platform::ensure_private_dir_all(&directory)?;
         let mut writer = Self {
             directory,
             file: None,

@@ -769,7 +769,7 @@ impl Observability {
         #[cfg(all(feature = "shape-capture", debug_assertions))]
         let capture = capture.map(crate::capture::Capture::new).transpose()?;
         crate::platform::prepare_observation_directory(&home.join("state"))?;
-        fs::create_dir_all(home.join("ledger"))?;
+        crate::platform::ensure_private_dir_all(&home.join("ledger"))?;
         prune(&home.join("ledger"));
         // 손상된 캐시는 격리하고 빈 상태로 시작한다. 원문 오류는 로그에 남기지 않는다.
         let path = home.join("state/quota.json");

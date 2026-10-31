@@ -80,13 +80,13 @@ pub(crate) fn prepare_runtime_home(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 pub(crate) fn prepare_secret_home(home: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(home)
+    super::ensure_private_dir_all(home)
 }
 pub(crate) fn prepare_account_directory(
     home: &Path,
 ) -> Result<std::path::PathBuf, crate::accounts::StoreError> {
     let dir = home.join("accounts");
-    std::fs::create_dir_all(&dir).map_err(|_| crate::accounts::StoreError::Io)?;
+    super::ensure_private_dir_all(&dir).map_err(|_| crate::accounts::StoreError::Io)?;
     Ok(dir)
 }
 pub(crate) fn read_config(home: &Path) -> std::io::Result<Option<String>> {

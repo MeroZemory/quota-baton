@@ -2561,7 +2561,7 @@ fn atomic_bytes_with_counter(
         Storage::FileSystem::{DELETE, FILE_SHARE_NONE},
     };
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        qb_core::ensure_private_dir_all(parent)?;
     }
     for _ in 0..64 {
         let serial = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

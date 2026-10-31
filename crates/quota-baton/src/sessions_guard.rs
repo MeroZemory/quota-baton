@@ -343,7 +343,7 @@ mod platform {
                     if !create || !current.starts_with(&root) {
                         bail!("대상 폴더가 없습니다");
                     }
-                    match std::fs::create_dir(&current) {
+                    match qb_core::ensure_private_dir_all(&current) {
                         Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(inspection_error(error)),
@@ -978,7 +978,7 @@ mod platform {
             let parent = path
                 .parent()
                 .ok_or_else(|| anyhow!("Codex 잠금 폴더가 없습니다"))?;
-            std::fs::create_dir_all(parent)?;
+            qb_core::ensure_private_dir_all(parent)?;
             let (checked, _) = pin_path(home, path)?;
             pins.extend(checked);
         }

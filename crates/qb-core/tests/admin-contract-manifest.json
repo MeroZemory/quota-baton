@@ -1268,7 +1268,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/routing.rs",
-        "line": 1716,
+        "line": 1712,
         "rule": "admin-json",
         "snippet": "json!({\"revision\":state.revision,\"defaults\":self.defaults,\"projects\":state.projects,\"sessions\":state.sessions.keys().map(|id| (id.clone(), self.resolve(&state,id))).collect::<BTreeMap<_,_>>()})",
         "field": "",
