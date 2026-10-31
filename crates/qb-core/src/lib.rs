@@ -51,3 +51,13 @@ pub mod logging;
 pub fn home() -> anyhow::Result<std::path::PathBuf> {
     platform::home()
 }
+
+/// Prepare application-owned data directories without repairing unsafe existing paths.
+pub fn ensure_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    platform::ensure_private_dir_all(path)
+}
+
+/// Exclusively create one new private data directory; never reuse an existing leaf.
+pub fn create_private_directory_new(path: &std::path::Path) -> std::io::Result<()> {
+    platform::create_private_directory_new(path)
+}

@@ -2,7 +2,7 @@
 mod anchor_choice;
 pub mod forecast;
 pub(crate) use anchor_choice::{AnchorChoiceEvidence, AnchorRecoveryEvidence};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1049,7 +1049,8 @@ impl PolicyStore {
     pub fn new(home: &Path, defaults: Settings) -> Result<Self> {
         defaults.validate()?;
         let path = home.join("state/routing-policies.json");
-        let directory_failed = fs::create_dir_all(path.parent().expect("policy parent")).is_err();
+        crate::platform::ensure_private_dir_all(path.parent().expect("policy parent"))
+            .context("routing policy data directory must be private")?;
         let recovered = recover_policy(&path, &defaults, None, None, None);
         let file_seen = recovered.seen;
         let intent = strict_intent(&recovered.state, &defaults);
@@ -1066,11 +1067,6 @@ impl PolicyStore {
         if let Some(code) = recovered.warning {
             warnings.push(PolicyWarning { code });
         }
-        if directory_failed {
-            warnings.push(PolicyWarning {
-                code: "routing_policy_directory_failed",
-            });
-        }
         Ok(Self {
             path,
             defaults,
@@ -1083,7 +1079,7 @@ impl PolicyStore {
             file_seen: AtomicBool::new(file_seen),
             recovery_blocked: AtomicBool::new(recovered.blocked),
             lifecycle_recovery: AtomicBool::new(false),
-            persistence_failed: AtomicBool::new(recovered.degraded || directory_failed),
+            persistence_failed: AtomicBool::new(recovered.degraded),
             recovery_intent: Mutex::new(intent),
             durable_generation: Mutex::new(generation),
             warnings: Mutex::new(WarningState {
