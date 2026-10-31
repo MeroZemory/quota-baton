@@ -1,3 +1,4 @@
+#![cfg(windows)]
 //! Actual admin route bytes consumed by the real tray transport.
 //! Requires the frozen manual-refresh / refresh-usage / action-consumer candidates.
 #![cfg(debug_assertions)]

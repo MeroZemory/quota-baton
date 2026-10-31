@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! Synthetic loopback only; no production management or image endpoints.
 #![cfg(feature = "testkit")]
 

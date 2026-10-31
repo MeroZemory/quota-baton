@@ -1,8 +1,15 @@
 //! Same actual route bytes -> shared response aliases -> exact JSON facts.
 //! Separate fixture from sessions/account candidates; synthetic local state only.
 #![cfg(debug_assertions)]
+#[cfg(windows)]
+#[path = "r15_history_response/windows_client.rs"]
+mod client_checks;
+#[cfg(unix)]
+#[path = "r15_history_response/unix_client.rs"]
+mod client_checks;
 use axum::{Router, http::StatusCode};
 use chrono::{Duration as ChronoDuration, Utc};
+use client_checks::same_client_response;
 use futures_util::FutureExt;
 use qb_core::{
     accounts::{AccountStore, Provider},
@@ -60,7 +67,14 @@ impl Harness {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r15-history-tests");
         fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
-        let home = root.path().join("sample-acct-home");
+        let home = tempfile::tempdir_in(root.path()).unwrap().keep();
+        let mut private_config = tempfile::NamedTempFile::new_in(&home).unwrap();
+        std::io::Write::write_all(
+            &mut private_config,
+            b"[secrets]\nlinux_backend = \"file-0600\"\n",
+        )
+        .unwrap();
+        private_config.persist(home.join("config.toml")).unwrap();
         let store = Arc::new(AccountStore::acquire(&home).unwrap());
         let upstream_trap = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         upstream_trap.set_nonblocking(true).unwrap();
@@ -158,31 +172,6 @@ async fn same_response<T: DeserializeOwned + Serialize>(
         "current response keys/order changed"
     );
     original
-}
-
-async fn same_client_response(h: &Harness) {
-    let client = qb_tray::client::AdminClient::new(h.servers.admin_addr.port(), ADMIN).unwrap();
-    let activity = client.dashboard_activity_raw(7).await.unwrap();
-    let original = h.captured.lock().unwrap().last().unwrap().clone();
-    assert_eq!(serde_json::to_vec(&activity).unwrap(), original);
-    let display = client.dashboard_activity(7).await.unwrap();
-    let body = h.captured.lock().unwrap().last().unwrap().clone();
-    let previous: qb_tray::dashboard_model::ActivityResponse =
-        serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        serde_json::to_value(display).unwrap(),
-        serde_json::to_value(previous).unwrap()
-    );
-    let usage = client.dashboard_usage_history_raw().await.unwrap();
-    let original = h.captured.lock().unwrap().last().unwrap().clone();
-    assert_eq!(serde_json::to_vec(&usage).unwrap(), original);
-    let display = client.dashboard_usage_history().await.unwrap();
-    let body = h.captured.lock().unwrap().last().unwrap().clone();
-    let previous: qb_tray::dashboard_model::UsageHistory = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        serde_json::to_value(display).unwrap(),
-        serde_json::to_value(previous).unwrap()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

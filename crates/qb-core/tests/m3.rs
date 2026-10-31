@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};

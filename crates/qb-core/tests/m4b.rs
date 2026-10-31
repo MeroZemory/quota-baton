@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! C7/C8 regressions through loopback HTTP and the runtime admin router.
 #[path = "support/n5c_launch_http.rs"]
 mod n5c_launch_http;

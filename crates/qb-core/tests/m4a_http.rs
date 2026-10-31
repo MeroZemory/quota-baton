@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};

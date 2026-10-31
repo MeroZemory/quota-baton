@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use qb_core::accounts::{
     Account, AccountStore, Identity, Source, SourceMatch, StoreError, Tokens,

@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use chrono::{Duration, Utc};
 use qb_core::account_runtime::AccountRuntime;
 use qb_core::accounts::{

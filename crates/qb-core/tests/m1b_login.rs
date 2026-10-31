@@ -41,7 +41,14 @@ impl Harness {
             .join(".sandbox/m1b-login-tests");
         fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
-        let home = root.path().join("home");
+        let home = tempfile::tempdir_in(root.path()).unwrap().keep();
+        let mut private_config = tempfile::NamedTempFile::new_in(&home).unwrap();
+        std::io::Write::write_all(
+            &mut private_config,
+            b"[secrets]\nlinux_backend = \"file-0600\"\n",
+        )
+        .unwrap();
+        private_config.persist(home.join("config.toml")).unwrap();
         let store = Arc::new(AccountStore::acquire(&home).unwrap());
         let obs = Arc::new(Observability::new(&home, None).unwrap());
         let fake = ScriptedUpstream::start().await.unwrap();

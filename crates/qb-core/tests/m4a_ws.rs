@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use axum::http::{HeaderMap, StatusCode};
 #[cfg(feature = "testkit")]
 #[path = "support/n10_capacity_spill.rs"]

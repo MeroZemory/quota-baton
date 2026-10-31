@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! Minimum capture acceptance: actual listener and relay, synthetic credentials only.
 #![cfg(feature = "testkit")]
 
@@ -191,7 +193,10 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                 assert_eq!(manifest["sealed"], true);
                 assert_eq!(manifest["accepted"], manifest["persisted"]);
                 assert!(manifest["persisted"].as_u64().unwrap() >= 3);
-                assert_eq!(manifest["hourly_encoded_byte_limit"], 40_000_000);
+                assert_eq!(
+                    manifest["hourly_encoded_byte_limit"],
+                    config.routing_replay.hourly_encoded_byte_limit
+                );
                 assert!(
                     manifest["losses"]
                         .as_object()

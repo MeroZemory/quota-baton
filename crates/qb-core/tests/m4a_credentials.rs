@@ -1,3 +1,4 @@
+#![cfg(windows)]
 #![cfg(all(feature = "testkit", debug_assertions))]
 
 // Compile the bounded internal credential layer against the production modules.

@@ -1,3 +1,4 @@
+#![cfg(windows)]
 #![cfg(all(feature = "testkit", debug_assertions))]
 
 use axum::http::{HeaderMap, StatusCode};

@@ -1,3 +1,4 @@
+#![cfg(windows)]
 #![cfg(all(feature = "testkit", debug_assertions))]
 //! Synthetic loopback only. Test execution is coordinated by the primary worker.
 use axum::http::{HeaderMap, StatusCode};

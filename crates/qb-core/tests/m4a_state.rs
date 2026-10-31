@@ -1,3 +1,7 @@
+#[cfg(windows)]
+#[path = "m4a_state/windows_cases.rs"]
+mod windows_cases;
+
 use chrono::{Duration, TimeZone, Utc};
 use qb_core::accounts::{
     Account, AccountStore, Health, HealthReason, HealthSignal, StoreError, UserState,
@@ -24,6 +28,24 @@ fn account() -> Account {
         "token_meta": {"expires_at": null, "last_refresh_at": null, "refresh_uncertain": false}
     }))
     .unwrap()
+}
+
+fn write_private(path: &std::path::Path, bytes: &[u8]) {
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+    std::io::Write::write_all(&mut file, bytes).unwrap();
+    file.persist(path).unwrap();
+}
+
+fn private_home(base: &std::path::Path) -> tempfile::TempDir {
+    fs::create_dir_all(base).unwrap();
+    let home = tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap();
+    write_private(
+        &home.path().join("config.toml"),
+        b"[secrets]\nlinux_backend = \"file-0600\"\n",
+    );
+    let accounts = tempfile::tempdir_in(home.path()).unwrap().keep();
+    fs::rename(accounts, home.path().join("accounts")).unwrap();
+    home
 }
 
 fn acquire(home: &std::path::Path) -> AccountStore {
@@ -93,13 +115,12 @@ fn c5_persistence_metadata_generation_blob_lease_and_load_expiry() {
     let sandbox =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/state-fixtures");
     fs::create_dir_all(&sandbox).unwrap();
-    let home = tempfile::tempdir_in(&sandbox).unwrap();
-    fs::create_dir(home.path().join("accounts")).unwrap();
+    let home = private_home(&sandbox);
     let a = account();
     let path = home.path().join("accounts").join(format!("{}.json", a.id));
     let mut record = serde_json::to_value(&a).unwrap();
     record["secret_dpapi_b64"] = json!("synthetic-opaque-blob");
-    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    write_private(&path, &serde_json::to_vec(&record).unwrap());
     let store = Arc::new(acquire(home.path()));
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = events.clone();
@@ -233,85 +254,6 @@ fn c5_persistence_metadata_generation_blob_lease_and_load_expiry() {
     assert_eq!(store.list().unwrap()[0].generation, 20);
 }
 
-#[test]
-fn c5_reimport_preserves_metadata_and_only_newer_tokens_clear_needs_relogin() {
-    let sandbox =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/state-fixtures");
-    fs::create_dir_all(&sandbox).unwrap();
-    let home = tempfile::tempdir_in(&sandbox).unwrap();
-    let source = home.path().join("synthetic-cpa");
-    fs::create_dir(&source).unwrap();
-    let file = source.join("fixture.json");
-    let mut fixture = json!({
-        "type": "codex", "account_id": "synthetic-state", "email": "fixture@example.invalid",
-        "access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "id_token": null,
-        "last_refresh": now(), "expired": now() + Duration::hours(1)
-    });
-    fs::write(&file, serde_json::to_vec(&fixture).unwrap()).unwrap();
-    let store = acquire(home.path());
-    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = events.clone();
-    store.set_observer(Arc::new(move |account, previous| {
-        recorded
-            .lock()
-            .unwrap()
-            .push((previous.clone(), account.health.clone()));
-    }));
-    qb_core::accounts::import::run(&store, &source, &[], false).unwrap();
-    let id = account().id;
-    let terminal = store
-        .update_metadata(&id, |a| {
-            // Legacy persisted state from before linked revocations were distinguished.
-            a.health = Health::NeedsRelogin {
-                reason: "token_revoked".into(),
-                since: now(),
-            };
-            a.user_state = UserState::Paused;
-            a.auth_failures = 3;
-            a.drain = true;
-            a.allow_credits = true;
-            a.label = "User label".into();
-        })
-        .unwrap();
-    // Equal timestamps may import tokens, but cannot clear terminal health.
-    qb_core::accounts::import::run(&store, &source, &[], false).unwrap();
-    let equal = store.load(&id).unwrap();
-    assert_eq!(equal.health, terminal.health);
-    assert_eq!(equal.auth_failures, 3);
-    assert_eq!(equal.label, "User label");
-    assert!(equal.drain && equal.allow_credits);
-    assert_eq!(equal.user_state, UserState::Paused);
-    fixture["last_refresh"] = json!(now() - Duration::minutes(1));
-    fs::write(&file, serde_json::to_vec(&fixture).unwrap()).unwrap();
-    qb_core::accounts::import::run(&store, &source, &[], false).unwrap();
-    assert_eq!(store.load(&id).unwrap(), equal);
-    fixture["last_refresh"] = json!(now() + Duration::minutes(1));
-    fs::write(&file, serde_json::to_vec(&fixture).unwrap()).unwrap();
-    qb_core::accounts::import::run(&store, &source, &[], false).unwrap();
-    let newer = store.load(&id).unwrap();
-    assert_eq!(newer.health, Health::Ready);
-    assert_eq!(newer.auth_failures, 0);
-    assert!(newer.drain && newer.allow_credits);
-    assert_eq!(newer.user_state, UserState::Paused);
-    assert_eq!(newer.label, "User label");
-    assert!(matches!(
-        events.lock().unwrap().last(),
-        Some((Health::NeedsRelogin { .. }, Health::Ready))
-    ));
-    store
-        .update_metadata(&id, |a| {
-            a.health = Health::Cooling {
-                reason: HealthReason::Quota,
-                until: now() + Duration::hours(1),
-                scope: "account".into(),
-            };
-            a.quota_credit_releasable = true;
-        })
-        .unwrap();
-    qb_core::accounts::import::run(&store, &source, &[], false).unwrap();
-    assert!(store.load(&id).unwrap().quota_credit_releasable);
-}
-
 mod runtime_regressions {
     //! Synthetic regressions through the runtime that production relay calls.
     use axum::http::{HeaderMap, StatusCode};
@@ -338,8 +280,7 @@ mod runtime_regressions {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../.sandbox/m4a1-runtime");
             fs::create_dir_all(&root).unwrap();
-            let home = tempfile::tempdir_in(&root).unwrap();
-            fs::create_dir(home.path().join("accounts")).unwrap();
+            let home = super::private_home(&root);
             let ids = providers.iter().enumerate().map(|(index, provider)| {
             let identity = match provider {
                 Provider::Codex => Identity::Codex { user_id: None, account_id: format!("synthetic-{index}"), email: "fixture@example.invalid".into() },
@@ -353,7 +294,7 @@ mod runtime_regressions {
                 "generation":1,"token_meta":{"expires_at":null,"last_refresh_at":null,"refresh_uncertain":false},
                 "secret_dpapi_b64":"synthetic-opaque-blob"
             });
-            fs::write(home.path().join("accounts").join(format!("{id}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
+            super::write_private(&home.path().join("accounts").join(format!("{id}.json")), &serde_json::to_vec(&record).unwrap());
             id
         }).collect();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -570,7 +511,9 @@ mod runtime_regressions {
             "type":"codex.rate_limits", "active_limit":"credits",
             "rate_limits":{"primary":{"used_percent":100,"window_minutes":300,"reset_at":(Utc::now()+Duration::hours(1)).timestamp()}}
         })).await;
-        let home = tempfile::tempdir().unwrap();
+        let home = super::private_home(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a1-runtime"),
+        );
         let table = BindingTable::new(home.path(), RoutingConfig::default()).unwrap();
         let selected = || {
             table.preview(
@@ -740,7 +683,9 @@ mod runtime_regressions {
 
     #[tokio::test]
     async fn credits_partial_updates_have_identical_live_persisted_and_restarted_state() {
-        let home = tempfile::tempdir().unwrap();
+        let home = super::private_home(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a1-runtime"),
+        );
         let obs = Observability::new(home.path(), None).unwrap();
         let mut h = codex_headers(40.0, 100.0, Utc::now());
         h.insert("x-codex-credits-has-credits", "true".parse().unwrap());

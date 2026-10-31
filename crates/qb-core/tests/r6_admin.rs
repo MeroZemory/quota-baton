@@ -1,3 +1,4 @@
+#![cfg(windows)]
 #![cfg(all(feature = "testkit", debug_assertions))]
 //! Authenticated native-file takeover through the real admin and D17 refresh path.
 use axum::http::StatusCode;

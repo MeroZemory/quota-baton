@@ -1,3 +1,4 @@
+#![cfg(windows)]
 #![cfg(all(feature = "testkit", debug_assertions))]
 
 //! Relay acceptance, not direct BurstTracker tests. Window arithmetic stays in

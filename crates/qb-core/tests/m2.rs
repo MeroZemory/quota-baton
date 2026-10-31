@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use axum::http::StatusCode;
 use bytes::Bytes;
 use qb_core::{

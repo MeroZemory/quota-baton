@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! Real loopback R14 regressions.
 //! All homes, credentials, quota observations and upstream replies are synthetic.
 #![cfg(feature = "testkit")]

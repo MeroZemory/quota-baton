@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! One real /state response through the real tray decoder. No spawned client.
 //! Source-only candidate: account transport integration may intentionally be red.
 use axum::{
