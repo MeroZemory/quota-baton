@@ -222,7 +222,7 @@ impl Fixture {
             .unwrap()
             .join(".sandbox/n5d-ws-prep/poll-reset-fixtures");
         require(std::fs::create_dir_all(&base));
-        let home = require(tempfile::tempdir_in(base));
+        let home = require(qb_testkit::fixture::home_in(base));
         let store = Arc::new(require(AccountStore::acquire(home.path())));
         let mut synthetic = crate::accounts::health::tests::fixture();
         synthetic.token_meta.expires_at = Some(require(

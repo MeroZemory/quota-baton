@@ -20,7 +20,7 @@ impl Fixture {
             .unwrap()
             .join(".sandbox/tests/oauth-manual");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         // Explicit synthetic file backend: no inherited systemd credential or
         // global environment mutation is needed on the Linux test runner.
         let mut options = std::fs::OpenOptions::new();

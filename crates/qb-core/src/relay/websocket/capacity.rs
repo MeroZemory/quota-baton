@@ -481,7 +481,7 @@ mod tests {
             .join(".sandbox/ws-capacity-tests");
         std::fs::create_dir_all(&root).unwrap();
         for case in ["wrong_target", "wrong_source", "dead_reservation"] {
-            let home = tempfile::tempdir_in(&root).unwrap();
+            let home = qb_testkit::fixture::tempdir_in(&root).unwrap();
             let mut config = crate::config::RoutingConfig::default();
             // One successful ordinary move exhausts this budget. A veto must
             // leave that move available, and capacity proof must still charge it.
@@ -712,7 +712,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/ws-capacity-tests");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root).unwrap();
         let table =
             BindingTable::new(home.path(), crate::config::RoutingConfig::default()).unwrap();
         let identity = crate::accounts::Identity::Codex {

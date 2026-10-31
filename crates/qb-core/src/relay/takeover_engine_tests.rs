@@ -90,7 +90,7 @@ impl EngineFixture {
             .unwrap()
             .join(".sandbox/staging/r6-core/engine-homes");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(root.path()).unwrap());
         let obs = Arc::new(Observability::new(root.path(), None).unwrap());
         let runtime = AccountRuntime::new(store.clone(), obs.clone(), 1.0);

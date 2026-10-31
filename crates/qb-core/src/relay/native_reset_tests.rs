@@ -98,7 +98,7 @@ impl Fixture {
             .unwrap()
             .join(".sandbox/r13-part-c/n5d-native/control-fixtures");
         require(std::fs::create_dir_all(&base));
-        let home = require(tempfile::tempdir_in(base));
+        let home = require(qb_testkit::fixture::home_in(base));
         let store = Arc::new(require(AccountStore::acquire(home.path())));
         let account = require(store.save(
             &crate::accounts::health::tests::fixture(),

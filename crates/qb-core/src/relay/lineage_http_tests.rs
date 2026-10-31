@@ -31,7 +31,7 @@ async fn authenticated_box_http_strips_root_hint_and_prefers_eligible_root_accou
         .unwrap()
         .join(".sandbox/tests/box-lineage-http");
     require(std::fs::create_dir_all(&base));
-    let home = require(tempfile::tempdir_in(base));
+    let home = require(qb_testkit::fixture::tempdir_in(base));
     let upstream = require(bounded(ScriptedUpstream::start()).await);
     let mut config = Config::default();
     config.server.data_port = 0;

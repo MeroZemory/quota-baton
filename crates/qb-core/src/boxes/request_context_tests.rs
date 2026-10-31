@@ -23,7 +23,7 @@ fn fixture() -> (tempfile::TempDir, BoxRegistry, BoxAuthority) {
         .unwrap()
         .join(".sandbox/tests/box-request-context");
     std::fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root).unwrap();
+    let home = qb_testkit::fixture::home_in(root).unwrap();
     let registry = BoxRegistry::open(home.path()).unwrap();
     let (scope, key) = registry
         .add(BoxName::parse("synthetic-context").unwrap())

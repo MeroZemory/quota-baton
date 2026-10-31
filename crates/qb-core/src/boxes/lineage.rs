@@ -90,7 +90,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/tests/box-lineage");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::home_in(root).unwrap();
         let registry = BoxRegistry::open(home.path()).unwrap();
         let (scope, key) = registry
             .add(BoxName::parse("sample-box").unwrap())

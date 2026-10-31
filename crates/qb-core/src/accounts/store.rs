@@ -1489,7 +1489,7 @@ mod tests {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r18-store-tests")
             });
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let mut config = tempfile::NamedTempFile::new_in(root.path()).unwrap();
         std::io::Write::write_all(&mut config, b"[secrets]\nlinux_backend = \"file-0600\"\n")
             .unwrap();
@@ -1750,7 +1750,7 @@ mod tests {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r18-store-tests")
             });
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let mut config = tempfile::NamedTempFile::new_in(root.path()).unwrap();
         std::io::Write::write_all(&mut config, b"[secrets]\nlinux_backend = \"file-0600\"\n")
             .unwrap();
@@ -1869,7 +1869,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/n5a-store-fixtures");
         fs::create_dir_all(&sandbox).unwrap();
-        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let root = qb_testkit::fixture::home_in(sandbox).unwrap();
         let dir = crate::platform::prepare_account_directory(root.path()).unwrap();
         let store = AccountStore {
             dir,
@@ -1882,6 +1882,8 @@ mod tests {
             lease: Mutex::new(None),
             writes_stopped: AtomicBool::new(false),
         };
+        // Keep the no-config settings fixtures after native protector setup.
+        fs::remove_file(root.path().join("config.toml")).unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&events);
         {
@@ -2060,9 +2062,9 @@ mod tests {
             secret_dpapi_b64: "synthetic-unused-secret".into(),
             takeover_receipt: None,
         };
-        fs::write(
+        qb_testkit::fixture::write_private(
             store.path(&account.id).unwrap(),
-            serde_json::to_vec(&record).unwrap(),
+            &serde_json::to_vec(&record).unwrap(),
         )
         .unwrap();
     }
@@ -2268,7 +2270,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/hardening-fixtures");
         fs::create_dir_all(&sandbox).unwrap();
-        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let root = qb_testkit::fixture::home_in(sandbox).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let store = loop {
             match AccountStore::acquire(root.path()) {

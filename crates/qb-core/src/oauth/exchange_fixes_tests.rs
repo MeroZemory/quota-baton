@@ -53,7 +53,7 @@ async fn r10_own_login_leaves_label_unset_for_both_providers() {
             .unwrap()
             .join(".sandbox/r10-exchange-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::home_in(base).unwrap();
         let store = crate::accounts::AccountStore::acquire(root.path()).unwrap();
         crate::accounts::login::save(&store, &account, &tokens, false).unwrap();
         for label in [

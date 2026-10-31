@@ -2500,7 +2500,14 @@ mod tests {
     }
 
     fn home() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap()
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/routing-tests");
+        fs::create_dir_all(&root).unwrap();
+        home_in(root)
+    }
+    pub(super) fn home_in(parent: impl AsRef<Path>) -> tempfile::TempDir {
+        let home = qb_testkit::fixture::tempdir_in(parent).unwrap();
+        crate::platform::create_private_directory_new(&home.path().join("state")).unwrap();
+        home
     }
     fn settings(mode: Mode) -> Settings {
         Settings {
@@ -2576,7 +2583,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let move_settings = Settings {
             on_5h_limit: On5hLimit::Move,
@@ -2647,7 +2654,7 @@ mod tests {
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
         for policy in [On5hLimit::Wait, On5hLimit::Move] {
-            let home = tempfile::tempdir_in(&root).unwrap();
+            let home = home_in(&root);
             let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
             let strict = Settings {
                 on_5h_limit: policy,
@@ -2699,7 +2706,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let project = store
             .put_project(
@@ -2751,7 +2758,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let key = "codex:r13-observed";
         let id = session_id(key);
@@ -2798,7 +2805,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let key = "claude:12345678-1234-4321-abcd-123456789abc";
         let id = session_id(key);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -2855,7 +2862,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
         let key = "claude:12345678-1234-4321-abcd-123456789abc";
         let id = session_id(key);
@@ -2924,7 +2931,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let key = "claude:12345678-1234-4321-abcd-123456789abc";
         let id = session_id(key);
@@ -2971,7 +2978,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let parent = session_id("codex:r13-legacy");
         let key = "codex:r13-legacy:agent:child";
@@ -3007,7 +3014,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
         let key = "claude:r13-atomic-urgent";
         let id = session_id(key);
@@ -3069,7 +3076,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let path = home.path().join("routing-policies.json");
         let id = session_id("claude:r13-prior-pair");
         let project = "a".repeat(32);
@@ -3170,7 +3177,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let key = "claude:12345678-1234-4321-abcd-123456789abc";
         let id = session_id(key);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -3279,7 +3286,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let project = store
             .put_project(
@@ -3354,7 +3361,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let key = "claude:r13-legacy-after-toggle";
         let id = session_id(key);
@@ -3413,7 +3420,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-policy-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = home_in(root);
         let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
         let key = "claude:r13-omitted-atomic";
         let id = session_id(key);
@@ -4346,7 +4353,7 @@ mod tests {
             }
             assert_eq!(store.plan(Some("codex:fenced")).settings.mode, Mode::Strict);
             assert_eq!(fs::read(fence_path(&store.path)).unwrap(), latest_fence);
-            fs::write(&store.path, &latest).unwrap();
+            qb_testkit::fixture::write_private(&store.path, &latest).unwrap();
         }
         // While alive, even a coordinated rollback of both files is rejected.
         fs::write(&store.path, &old).unwrap();
@@ -4448,7 +4455,7 @@ mod tests {
         let home = home();
         fs::create_dir_all(home.path().join("state")).unwrap();
         let path = home.path().join("state/routing-policies.json");
-        fs::write(&path, b"not-json").unwrap();
+        qb_testkit::fixture::write_private(&path, b"not-json").unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         assert!(store.permits_dispatch(Some("codex:unrelated"), "cx-a"));
         assert!(!path.exists());
@@ -4506,9 +4513,9 @@ mod tests {
         let original = serde_json::json!({"schema":1,"revision":7,"projects":{},"sessions":{
             id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},
             "explicit":{"mode":"strict","reset_wait_secs":7},"anchor":"cx-a","movements":[]}}});
-        fs::write(
+        qb_testkit::fixture::write_private(
             home.path().join("state/routing-policies.json"),
-            serde_json::to_vec(&original).unwrap(),
+            &serde_json::to_vec(&original).unwrap(),
         )
         .unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -6286,7 +6293,7 @@ mod issue_operation_writer_tests {
             .unwrap()
             .join(".sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
-        let dir = tempfile::tempdir_in(root).unwrap();
+        let dir = super::tests::home_in(root);
         let store = Arc::new(
             PolicyStore::new(
                 dir.path(),
@@ -6349,7 +6356,7 @@ mod issue_operation_writer_tests {
             .unwrap()
             .join(".sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
-        let dir = tempfile::tempdir_in(root).unwrap();
+        let dir = super::tests::home_in(root);
         let store = PolicyStore::new(
             dir.path(),
             Settings {

@@ -56,10 +56,7 @@ impl Fixture {
             .unwrap()
             .join(".sandbox/r13-part-c/wait-runtime-tests/fixtures");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::Builder::new()
-            .prefix("synthetic-runtime-")
-            .tempdir_in(base)
-            .unwrap();
+        let home = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
         let mut account = crate::accounts::health::tests::fixture();
         account.token_meta.expires_at = expires_at;

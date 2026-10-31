@@ -1115,7 +1115,7 @@ mod tests {
                 .unwrap()
                 .join(".sandbox/n10-image-admission");
             std::fs::create_dir_all(&base).unwrap();
-            let root = tempfile::tempdir_in(base).unwrap();
+            let root = qb_testkit::fixture::tempdir_in(base).unwrap();
             let imports = root.path().join("imports");
             std::fs::create_dir_all(&imports).unwrap();
             let mut selectors = Vec::new();
@@ -1137,7 +1137,8 @@ mod tests {
                 .unwrap();
                 selectors.push(format!("codex:{email}"));
             }
-            let store = AccountStore::acquire(&root.path().join("home")).unwrap();
+            let home = qb_testkit::fixture::home_in(root.path()).unwrap().keep();
+            let store = AccountStore::acquire(&home).unwrap();
             crate::platform::seed_account_fixtures(&store, &imports, &selectors, false).unwrap();
             let ids: Vec<_> = store.list().unwrap().into_iter().map(|a| a.id).collect();
             for id in &ids {

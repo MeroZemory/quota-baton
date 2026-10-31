@@ -34,7 +34,7 @@ async fn shared_tcp_box_revoke_closes_only_a_provider_ws_and_drains_its_grant() 
         .unwrap()
         .join(".sandbox/tests/box-provider-ws");
     require(std::fs::create_dir_all(&base));
-    let home = require(tempfile::tempdir_in(base));
+    let home = require(qb_testkit::fixture::tempdir_in(base));
     let upstream = require(bounded(WebSocketUpstream::start()).await);
     // The fake otherwise replaces/closes A when B connects: that would mask
     // whether the real exact-grant watcher closed A.

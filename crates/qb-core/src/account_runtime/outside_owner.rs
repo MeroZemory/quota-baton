@@ -589,7 +589,7 @@ mod tests {
                 .unwrap()
                 .join(".sandbox/n10/outside-owner-fixtures");
             fs::create_dir_all(&base).unwrap();
-            let home = tempfile::tempdir_in(base).unwrap();
+            let home = qb_testkit::fixture::tempdir_in(base).unwrap();
             let owner = OutsideOwner::new_at(home.path(), at(0, 1));
             Self { home, owner }
         }
@@ -618,6 +618,7 @@ mod tests {
     }
 
     fn runtime(f: &Fixture) -> (Arc<super::super::AccountRuntime>, String) {
+        qb_testkit::fixture::configure_home(f.home.path()).unwrap();
         let store = Arc::new(crate::accounts::AccountStore::acquire(f.home.path()).unwrap());
         let account = crate::accounts::health::tests::fixture();
         let id = account.id.clone();

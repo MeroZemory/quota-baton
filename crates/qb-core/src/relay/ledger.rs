@@ -561,7 +561,7 @@ mod accounting_tests {
                 .unwrap()
                 .join(".sandbox/r14-ledger-tests");
             std::fs::create_dir_all(&root).unwrap();
-            let home = tempfile::tempdir_in(root).unwrap();
+            let home = qb_testkit::fixture::tempdir_in(root).unwrap();
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let table =
                 BindingTable::new(home.path(), crate::config::RoutingConfig::default()).unwrap();
@@ -933,7 +933,7 @@ mod admission_tests {
             .unwrap()
             .join(".sandbox/ledger-admission");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         let table = crate::bindings::BindingTable::new(
             home.path(),
             crate::config::RoutingConfig::default(),
@@ -991,7 +991,7 @@ mod timeout_phase_tests {
             .unwrap()
             .join(".sandbox/r13-g-ledger");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root).unwrap();
         let obs = Arc::new(Observability::new(home.path(), None).unwrap());
         for expired in [false, true] {
             let mut completion = Completion::new(

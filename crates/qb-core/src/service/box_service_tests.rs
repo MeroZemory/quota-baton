@@ -9,7 +9,7 @@ fn fixture(declared: &[&str]) -> (tempfile::TempDir, BoxRegistry, BoxService) {
         .unwrap()
         .join(".sandbox/tests/box-service-selection");
     std::fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(base).unwrap();
+    let home = qb_testkit::fixture::home_in(base).unwrap();
     let registry = BoxRegistry::open(home.path()).unwrap();
     let service = BoxService {
         sockets: SocketSet::new(),

@@ -1598,7 +1598,7 @@ mod tests {
                 .unwrap()
                 .join(".sandbox/r13-part-c/owner-fixtures");
             std::fs::create_dir_all(&base).unwrap();
-            let home = tempfile::tempdir_in(base).unwrap();
+            let home = qb_testkit::fixture::home_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             {
                 let _gate = store.transaction().unwrap();
@@ -1618,9 +1618,9 @@ mod tests {
         fn write(home: &std::path::Path, account: &Account) {
             let mut record = serde_json::to_value(account).unwrap();
             record["secret_dpapi_b64"] = json!("synthetic-unused-ciphertext");
-            std::fs::write(
+            qb_testkit::fixture::write_private(
                 home.join("accounts").join(format!("{}.json", account.id)),
-                serde_json::to_vec(&record).unwrap(),
+                &serde_json::to_vec(&record).unwrap(),
             )
             .unwrap();
         }

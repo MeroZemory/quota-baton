@@ -134,13 +134,14 @@ async fn pair_with_pump_timer_probe(
         .unwrap()
         .join(".sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(root).unwrap();
     let obs = Arc::new(Observability::new(home.path(), None).unwrap());
     let budget = InflightBudget::new(limit);
     let memory_guard = Arc::new(crate::guard::MemoryGuard::new(100));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = listener.local_addr().unwrap();
     let relay = if tracking {
+        qb_testkit::fixture::configure_home(home.path()).unwrap();
         let store = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 match crate::accounts::AccountStore::acquire(home.path()) {
@@ -1047,7 +1048,7 @@ async fn c6_row_13a_only_response_events_commit_the_current_request() {
         .unwrap()
         .join(".sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(root).unwrap();
     let context = Context {
         launch_pin: None,
         runtime: None,
@@ -1362,7 +1363,7 @@ async fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders()
                 .unwrap()
                 .join(".sandbox/pump-tests");
             std::fs::create_dir_all(&root).unwrap();
-            let home = tempfile::tempdir_in(root).unwrap();
+            let home = qb_testkit::fixture::tempdir_in(root).unwrap();
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let context = Context {
                 launch_pin: None,

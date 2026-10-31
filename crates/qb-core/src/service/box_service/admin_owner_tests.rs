@@ -15,7 +15,7 @@ fn fixture() -> (
         .unwrap()
         .join(".sandbox/tests/box-owner-publication");
     std::fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(base).unwrap();
+    let home = qb_testkit::fixture::home_in(base).unwrap();
     let registry = BoxRegistry::open(home.path()).unwrap();
     let (scope, key) = registry
         .add(BoxName::parse("synthetic-box").unwrap())

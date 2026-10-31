@@ -1229,7 +1229,7 @@ mod tests {
                 .unwrap()
                 .join(".sandbox/r13-part-c/n5d-native/fixtures");
             std::fs::create_dir_all(&base).unwrap();
-            let home = tempfile::tempdir_in(base).unwrap();
+            let home = qb_testkit::fixture::home_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let account = store
                 .save(
@@ -2255,7 +2255,7 @@ mod tests {
         original_due(&f, &scope).await;
         // The original record/fences remain live; this other table has no
         // native placement. An early Pending return would bypass its gate.
-        let home = tempfile::tempdir_in(f._home.path()).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(f._home.path()).unwrap();
         let empty = BindingTable::new(home.path(), RoutingConfig::default()).unwrap();
         assert!(f.runtime.wait_owner.deferred.record(&scope, id).is_some());
         assert_eq!(

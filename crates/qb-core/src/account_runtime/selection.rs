@@ -99,7 +99,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/runtime-selection-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
         let obs = Arc::new(Observability::new(home.path(), None).unwrap());
         let runtime = AccountRuntime::new(store, obs, 0.0);

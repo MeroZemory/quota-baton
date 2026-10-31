@@ -917,7 +917,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-part-c/native-cache-unit-runs");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::home_in(root).unwrap();
         let store = Arc::new(crate::accounts::AccountStore::acquire(home.path()).unwrap());
         let obs = Arc::new(crate::observability::Observability::new(home.path(), None).unwrap());
         let mut config = crate::config::Config::default();
@@ -1252,7 +1252,7 @@ mod publication_tests {
             .unwrap()
             .join(".sandbox/r13-part-c/publication-unit-runs");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::home_in(root).unwrap();
         let store = Arc::new(crate::accounts::AccountStore::acquire(home.path()).unwrap());
         let identity = crate::accounts::Identity::Codex {
             account_id: "synthetic-publication-account".into(),

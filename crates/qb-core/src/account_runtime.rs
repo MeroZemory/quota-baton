@@ -260,7 +260,7 @@ mod release_probe_tests {
                 .unwrap()
                 .join(".sandbox/r12.9/runtime-fixtures");
             std::fs::create_dir_all(&base).unwrap();
-            let home = tempfile::tempdir_in(base).unwrap();
+            let home = qb_testkit::fixture::home_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let runtime = AccountRuntime::new(store.clone(), obs, 0.0);
@@ -566,7 +566,7 @@ mod release_probe_tests {
             .unwrap()
             .join(".sandbox/r12.9/runtime-fixtures");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
         let obs = Arc::new(Observability::new(home.path(), None).unwrap());
         let runtime = AccountRuntime::new(store, obs, 0.0);
@@ -599,7 +599,7 @@ mod release_probe_tests {
             .unwrap()
             .join(".sandbox/r12.9/runtime-fixtures");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
         let obs = Arc::new(Observability::new(home.path(), None).unwrap());
         let runtime = AccountRuntime::new(store.clone(), obs, 0.0);
@@ -698,7 +698,7 @@ mod selection_admission_tests {
                 .unwrap()
                 .join(".sandbox/r11-prep/selection-admission-fixtures");
             std::fs::create_dir_all(&base).unwrap();
-            let home = tempfile::tempdir_in(base).unwrap();
+            let home = qb_testkit::fixture::home_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let runtime = AccountRuntime::new(store.clone(), obs, 0.0);
@@ -3566,7 +3566,7 @@ mod r1_rate_tests {
                 .unwrap()
                 .join(".sandbox/r1-rate-test-fixtures");
             std::fs::create_dir_all(&base).unwrap();
-            let home = tempfile::tempdir_in(base).unwrap();
+            let home = qb_testkit::fixture::home_in(base).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             Self {
@@ -4378,7 +4378,7 @@ mod r5_view_tests {
     #[tokio::test]
     async fn credits_original_http_and_stream_revision_cannot_attach_to_a_later_reset() {
         for stream in [false, true] {
-            let home = tempfile::tempdir().unwrap();
+            let home = qb_testkit::fixture::home_in(std::env::temp_dir()).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
@@ -4441,7 +4441,7 @@ mod r5_view_tests {
     #[tokio::test]
     async fn credits_delayed_success_cannot_reopen_a_newer_off_or_empty_span() {
         for off in [false, true] {
-            let home = tempfile::tempdir().unwrap();
+            let home = qb_testkit::fixture::home_in(std::env::temp_dir()).unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
@@ -4552,7 +4552,7 @@ mod r5_view_tests {
             .unwrap()
             .join(".sandbox/r5-view-fixtures");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
         let obs = Arc::new(Observability::new(home.path(), None).unwrap());
         let runtime = AccountRuntime::new(store.clone(), obs.clone(), 1.0);

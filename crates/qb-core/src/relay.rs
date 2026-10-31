@@ -3692,7 +3692,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/l1-relay-lineage");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let cpa = root.path().join("synthetic-input");
         std::fs::create_dir_all(&cpa).unwrap();
         let mut activate = Vec::new();
@@ -3705,7 +3705,8 @@ mod tests {
             })).unwrap()).unwrap();
             activate.push(format!("codex:{email}"));
         }
-        let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
+        let home = qb_testkit::fixture::home_in(root.path()).unwrap().keep();
+        let store = Arc::new(AccountStore::acquire(&home).unwrap());
         crate::platform::seed_account_fixtures(&store, &cpa, &activate, false).unwrap();
         let obs = Arc::new(Observability::new(store.home(), None).unwrap());
         let mut config = Config::default();
@@ -3792,7 +3793,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/n6t-successor");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let cpa = root.path().join("cpa");
         std::fs::create_dir_all(&cpa).unwrap();
         let mut activate = Vec::new();
@@ -3805,7 +3806,8 @@ mod tests {
             })).unwrap()).unwrap();
             activate.push(format!("codex:{email}"));
         }
-        let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
+        let home = qb_testkit::fixture::home_in(root.path()).unwrap().keep();
+        let store = Arc::new(AccountStore::acquire(&home).unwrap());
         crate::platform::seed_account_fixtures(&store, &cpa, &activate, false).unwrap();
         let obs = Arc::new(Observability::new(store.home(), None).unwrap());
         let mut config = Config::default();
@@ -3969,7 +3971,7 @@ mod tests {
                 .unwrap()
                 .join(".sandbox/r1-tray2-fixtures");
             std::fs::create_dir_all(&base).unwrap();
-            let root = tempfile::tempdir_in(base).unwrap();
+            let root = qb_testkit::fixture::tempdir_in(base).unwrap();
             let cpa = root.path().join("cpa");
             std::fs::create_dir_all(&cpa).unwrap();
             let mut activate = Vec::new();
@@ -3982,7 +3984,8 @@ mod tests {
                 })).unwrap()).unwrap();
                 activate.push(format!("codex:{email}"));
             }
-            let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
+            let home = qb_testkit::fixture::home_in(root.path()).unwrap().keep();
+            let store = Arc::new(AccountStore::acquire(&home).unwrap());
             crate::platform::seed_account_fixtures(&store, &cpa, &activate, false).unwrap();
             let fake = ScriptedUpstream::start().await.unwrap();
             let mut config = Config::default();
@@ -4114,7 +4117,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/hardening-fixtures");
         std::fs::create_dir_all(&sandbox).unwrap();
-        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(sandbox).unwrap();
         let cpa = root.path().join("cpa");
         std::fs::create_dir_all(&cpa).unwrap();
         std::fs::write(cpa.join("synthetic.json"), serde_json::to_vec(&serde_json::json!({
@@ -4122,9 +4125,10 @@ mod tests {
             "access_token":"synthetic-placement-access", "refresh_token":"synthetic-placement-refresh",
             "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-10-13T00:00:01Z"
         })).unwrap()).unwrap();
+        let home = qb_testkit::fixture::home_in(root.path()).unwrap().keep();
         let deadline = Instant::now() + Duration::from_secs(15);
         let store = loop {
-            match AccountStore::acquire(&root.path().join("home")) {
+            match AccountStore::acquire(&home) {
                 Ok(store) => break Arc::new(store),
                 Err(crate::accounts::StoreError::LeaseBusy) if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(10)).await

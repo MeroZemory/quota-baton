@@ -64,11 +64,10 @@ mod r7_snapshot_tests {
     use super::*;
     #[test]
     fn r7_legacy_binding_snapshot_preserves_metadata_without_counting_idle_pin_as_activity() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("state")).unwrap();
+        let root = tests::fixture_dir();
         let now = Utc::now();
         let key = "codex:r7-synthetic-root";
-        fs::write(root.path().join("state/bindings.json"),serde_json::to_vec(&serde_json::json!({"schema":1,"bindings":[{"key":key,"account":"cx-123abc","last_used":now-chrono::Duration::seconds(1000)}]})).unwrap()).unwrap();
+        qb_testkit::fixture::write_private(root.path().join("state/bindings.json"),&serde_json::to_vec(&serde_json::json!({"schema":1,"bindings":[{"key":key,"account":"cx-123abc","last_used":now-chrono::Duration::seconds(1000)}]})).unwrap()).unwrap();
         let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
         let before = table.dashboard_snapshot(now);
         assert_eq!(before.len(), 1);
@@ -4563,10 +4562,12 @@ mod tests {
             .unwrap()
             .join(".sandbox/bindings-tests");
         fs::create_dir_all(&root).unwrap();
-        tempfile::Builder::new()
+        let home = tempfile::Builder::new()
             .prefix("bindings-")
-            .tempdir_in(root)
-            .unwrap()
+            .tempdir_in(root.canonicalize().unwrap())
+            .unwrap();
+        crate::platform::create_private_directory_new(&home.path().join("state")).unwrap();
+        home
     }
     fn strict_root_policy(home: &Path, key: &str) -> crate::routing::PolicyStore {
         let store = crate::routing::PolicyStore::new(
@@ -4827,7 +4828,7 @@ mod tests {
             let policy_path = dir.path().join("state/routing-policies.json");
             let policy_bytes = fs::read(&policy_path).unwrap();
             let path = dir.path().join("state/bindings.json");
-            fs::write(&path, raw).unwrap();
+            qb_testkit::fixture::write_private(&path, raw).unwrap();
             crate::local_secrets::restrict(&path).unwrap();
             let cfg = RoutingConfig::default();
             cfg.validate().unwrap();
@@ -4969,7 +4970,7 @@ mod tests {
             fs::create_dir_all(dir.path().join("state")).unwrap();
             let path = dir.path().join("state/bindings.json");
             let raw=br#"{"schema":1,"bindings":[{"key":"codex:old","account":"cx-a","account":"cx-b","last_used":"2026-10-20T00:00:00Z"}]}"#;
-            fs::write(&path, raw).unwrap();
+            qb_testkit::fixture::write_private(&path, raw).unwrap();
             crate::local_secrets::restrict(&path).unwrap();
             crate::platform::test_assert_snapshot_owner_only(&path);
             let cfg = RoutingConfig::default();
@@ -5020,7 +5021,7 @@ mod tests {
         let bytes = serde_json::to_vec(&json!({"schema":1,"bindings":bindings})).unwrap();
         assert!((bytes.len() as u64) < SNAPSHOT_MAX_BYTES);
         let path = dir.path().join("state/bindings.json");
-        fs::write(&path, bytes).unwrap();
+        qb_testkit::fixture::write_private(&path, &bytes).unwrap();
         crate::local_secrets::restrict(&path).unwrap();
         let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();
         assert_eq!(t.count(), CAPACITY);
@@ -5057,11 +5058,11 @@ mod tests {
             }
             let policy_path = dir.path().join("state/routing-policies.json");
             let policy_bytes = serde_json::to_vec(&policy).unwrap();
-            fs::write(&policy_path, &policy_bytes).unwrap();
+            qb_testkit::fixture::write_private(&policy_path, &policy_bytes).unwrap();
             crate::local_secrets::restrict(&policy_path).unwrap();
             let value = json!({"schema":1,"bindings":[{"key":"codex:alias","account":"a","last_used":"2020-01-01T00:00:00Z"},{"key":"codex:alias:agent:x","account":"b","last_used":"2020-01-01T00:00:00Z"}]});
             let bytes = serde_json::to_vec(&value).unwrap();
-            fs::write(&t.path, &bytes).unwrap();
+            qb_testkit::fixture::write_private(&t.path, &bytes).unwrap();
             crate::local_secrets::restrict(&t.path).unwrap();
             if schema == 1 {
                 let before = t.export().unwrap();
@@ -5461,9 +5462,9 @@ mod tests {
         };
         assert!(BindingTable::new(dir.path(), config).is_err());
         fs::create_dir_all(dir.path().join("state")).unwrap();
-        fs::write(
+        qb_testkit::fixture::write_private(
             dir.path().join("state/bindings.json"),
-            r#"{"schema":2,"bindings":[]}"#,
+            br#"{"schema":2,"bindings":[]}"#,
         )
         .unwrap();
         let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();

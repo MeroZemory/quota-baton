@@ -111,7 +111,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/n6t-store");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let cpa = root.path().join("cpa");
         std::fs::create_dir_all(&cpa).unwrap();
         std::fs::write(
@@ -124,7 +124,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let store = AccountStore::acquire(&root.path().join("home")).unwrap();
+        let home = qb_testkit::fixture::home_in(root.path()).unwrap().keep();
+        let store = AccountStore::acquire(&home).unwrap();
         crate::platform::seed_account_fixtures(
             &store,
             &cpa,

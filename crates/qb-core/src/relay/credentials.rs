@@ -1649,7 +1649,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r2a-ownership-race");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::home_in(base).unwrap();
         let store = AccountStore::acquire(root.path()).unwrap();
         let identity = Identity::Codex {
             account_id: "synthetic-ownership-race".into(),
@@ -1757,7 +1757,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/hardening-fixtures");
         std::fs::create_dir_all(&sandbox).unwrap();
-        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let root = qb_testkit::fixture::home_in(sandbox).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         let store = loop {
             match AccountStore::acquire(root.path()) {

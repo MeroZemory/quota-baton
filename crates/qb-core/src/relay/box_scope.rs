@@ -37,7 +37,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/tests/box-relay-scope");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::home_in(root).unwrap();
         let boxes = BoxRegistry::open(home.path()).unwrap();
         let (a, a_key) = boxes
             .add(BoxName::parse("sample-a").unwrap())

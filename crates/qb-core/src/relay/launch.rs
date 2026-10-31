@@ -574,8 +574,8 @@ mod tests {
                 .unwrap()
                 .join(".sandbox/r11-catalog-tests");
             fs::create_dir_all(&base).unwrap();
-            let root = tempfile::tempdir_in(base).unwrap();
-            let home = root.path().join("home");
+            let root = qb_testkit::fixture::tempdir_in(base).unwrap();
+            let home = qb_testkit::fixture::home_in(root.path()).unwrap().keep();
             let cpa = root.path().join("synthetic-cpa");
             fs::create_dir_all(&cpa).unwrap();
             fs::write(
@@ -1492,7 +1492,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/tests/box-pending-issue");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::home_in(root).unwrap();
         let boxes = crate::boxes::BoxRegistry::open(home.path()).unwrap();
         let (scope, _key) = boxes
             .add(crate::boxes::BoxName::parse("sample-box").unwrap())
