@@ -538,6 +538,16 @@ Details are in contract C11.
   - Output goes under `.sandbox\` and is included in the A5 secret grep.
   - It is a declared exception to "Codex bodies are never decoded".
 
+### Decision-tape replay operations
+
+Run each sealed epoch through native `debug selection-run --epoch <epoch> --out <run.json>` and `debug permit-run` independently. Match the executing reference binary hash to the header; source association additionally needs the installation receipt. Keep each epoch's InitialWitness and identity domain. Aggregate counters only after those checks; never join opaque account/session names across epochs or fill refused inputs from the current profile.
+
+Selection and permit have different readsets and not-comparable counters. Selection includes supplied candidate/source rows and placements; permit includes source/target facts. Check each kind's unchanged 1% cap in every epoch before an aggregate verdict. Comparable-record identity does not waive refusals, loss, missing witnesses or missing candidate facts. State observation spans and inter-epoch gaps separately.
+
+Register a power target before building, execute the independently changed source on all intended epochs and require exactly the registered difference. Retain source restoration and input hashes. Multiple per-epoch controls do not alone prove one aggregate fault. Reference-versus-itself is a baseline/comparator control, not a real candidate verdict; the weighted candidate needs schema9 measured-capacity inputs.
+
+Census distinguishes allowed outcomes, readable raw proposals, commit markers and completed rebind markers. History snapshots repeat observations. A raw return match does not prove guard reach; erased move history stays unknown. Broad quota/model refusal codes narrow source paths but cannot recover an omitted historical literal or establish an external cause. The real24h gate report in the milestone records demonstrates these limits.
+
 ## 14. Lifecycle and upgrades
 
 - **Startup order.**
