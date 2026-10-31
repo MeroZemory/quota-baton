@@ -468,6 +468,7 @@ struct Scratch {
 
 impl Scratch {
     fn create(root: &Path, base: &Path) -> Result<Self> {
+        qb_core::ensure_private_dir_all(base)?;
         // create_dir is exclusive. Never adopt or clean an older probe directory.
         for _ in 0..32 {
             let path = base.join(format!(
@@ -476,7 +477,7 @@ impl Scratch {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             crate::sessions_guard::safe_path(root, &path)?;
-            match fs::create_dir(&path) {
+            match qb_core::create_private_directory_new(&path) {
                 Ok(()) => {
                     return Ok(Self {
                         root: root.to_owned(),
@@ -629,13 +630,14 @@ fn environment(path: &Path, port: u16) -> Vec<(&'static str, OsString)> {
 
 fn probe(program: &Path, path: &Path) -> Result<()> {
     let _pin = crate::sessions_guard::header_directory(path, path)?;
+    qb_core::ensure_private_dir_all(path)?;
     fs::write(path.join(".qb-canary-root"), [])?;
     fs::write(path.join("empty-git-config"), [])?;
     let server = Server::start()?;
     let env = environment(path, server.port);
     for (key, value) in &env {
         if PATH_ENV.contains(key) {
-            fs::create_dir(Path::new(value))?;
+            qb_core::create_private_directory_new(Path::new(value))?;
         }
     }
     let config = settings(server.port);

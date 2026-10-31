@@ -1424,7 +1424,7 @@ impl BindingTable {
     pub fn new(home: &Path, config: RoutingConfig) -> Result<Arc<Self>> {
         config.validate()?;
         let path = home.join("state/bindings.json");
-        fs::create_dir_all(path.parent().context("binding state directory")?)?;
+        crate::platform::ensure_private_dir_all(path.parent().context("binding state directory")?)?;
         let policies = crate::routing::PolicyStore::new(
             home,
             crate::routing::Settings {
