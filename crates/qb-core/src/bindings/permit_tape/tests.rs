@@ -344,7 +344,7 @@ fn absent_null_and_numeric_quota_facts_are_not_filled() {
 }
 
 #[test]
-fn unsafe_health_unknown_models_and_mapper_errors_refuse_without_raw_text() {
+fn unsafe_health_overlong_models_and_mapper_errors_have_finite_subtypes() {
     let mut input = inputs();
     input
         .accounts
@@ -357,7 +357,7 @@ fn unsafe_health_unknown_models_and_mapper_errors_refuse_without_raw_text() {
     };
     assert_eq!(
         capture(&input, &PermitDecision::NotRequired, |_, _| "x".into()).unwrap_err(),
-        WireRefusal::Health
+        WireRefusal::ReloginReason
     );
     input
         .accounts
@@ -367,14 +367,14 @@ fn unsafe_health_unknown_models_and_mapper_errors_refuse_without_raw_text() {
         .health = Health::Cooling {
         reason: HealthReason::Quota,
         until: now(),
-        scope: "model:private-model-canary".into(),
+        scope: format!("model:{}", "m".repeat(97)),
     };
     assert_eq!(
         capture(&input, &PermitDecision::NotRequired, |_, _| "x".into()).unwrap_err(),
-        WireRefusal::Health
+        WireRefusal::HealthModelLength
     );
     input = inputs();
-    input.model = Some("private-model-canary".into());
+    input.model = Some("m".repeat(97));
     let mut n = 0;
     assert_eq!(
         capture(&input, &PermitDecision::NotRequired, |_, _| {
@@ -382,7 +382,7 @@ fn unsafe_health_unknown_models_and_mapper_errors_refuse_without_raw_text() {
             format!("x{n}")
         })
         .unwrap_err(),
-        WireRefusal::Model
+        WireRefusal::InputModelLength
     );
     input = inputs();
     assert_eq!(
@@ -590,13 +590,15 @@ fn literal_native_duration_and_pinned_model_names_preserve_semantic_evidence() {
         }
     }
     for text in [
-        "gpt-5.4-private-person",
-        "gpt-5.4-user@example.test",
+        "gpt-5.4-custom",
+        "provider/model-alias",
         "claude-opus-",
-        "private model",
+        "test alias",
     ] {
-        assert!(Model::parse(text).is_err());
+        assert_eq!(Model::parse(text).unwrap().as_str(), text);
     }
+    assert!(Model::parse(&"m".repeat(96)).is_ok());
+    assert_eq!(Model::parse(&"m".repeat(97)), Err(WireRefusal::ModelLength));
     for text in ["18446744073709551616m", "private-window", "5h_private"] {
         assert!(Window::parse(text).is_err());
     }
@@ -792,5 +794,125 @@ fn native_codex_boolean_header_status_survives_wire_without_becoming_rejection()
         );
         assert_eq!(replay(&record).unwrap(), record.actual);
         assert!(record.refusal.is_none());
+    }
+}
+
+#[test]
+fn null_absent_and_literal_models_round_trip_without_aliasing() {
+    for model in [
+        None,
+        Some(""),
+        Some("null"),
+        Some("auto"),
+        Some("provider/model:alias"),
+        Some("모델"),
+        Some("  alias\t"),
+    ] {
+        let mut input = inputs();
+        input.from = None;
+        input.model = model.map(str::to_owned);
+        let record = capture_input(&input);
+        assert!(record.refusal.is_none());
+        assert_eq!(record.actual, PermitDecision::NotRequired);
+        let wire = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            wire["inputs"]["model"],
+            serde_json::to_value(model).unwrap()
+        );
+        let decoded: PermitRecord = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            decoded
+                .inputs
+                .as_ref()
+                .unwrap()
+                .to_inputs()
+                .unwrap()
+                .model
+                .as_deref(),
+            model
+        );
+        assert_eq!(replay(&decoded).unwrap(), PermitDecision::NotRequired);
+        if model.is_none() {
+            let mut absent = wire;
+            absent["inputs"].as_object_mut().unwrap().remove("model");
+            let decoded: PermitRecord = serde_json::from_value(absent).unwrap();
+            assert!(decoded.inputs.as_ref().unwrap().model.is_none());
+            assert_eq!(replay(&decoded).unwrap(), PermitDecision::NotRequired);
+        }
+    }
+}
+
+#[test]
+fn observed_cooling_is_raw_evidence_with_no_request_model() {
+    let mut input = inputs();
+    input.model = None;
+    let until = now() + Duration::hours(1);
+    let source = &mut input.accounts.get_mut("private-source-id").unwrap().account;
+    source.health = Health::Cooling {
+        reason: HealthReason::Quota,
+        until,
+        scope: "account".into(),
+    };
+    source.quota_cooling = Some(QuotaCooling {
+        window: "observed".into(),
+        reset_at: until,
+        started_at: now(),
+    });
+    let record = capture_input(&input);
+    assert!(record.refusal.is_none());
+    let wire = record.inputs.as_ref().unwrap();
+    assert!(wire.model.is_none());
+    let restored = wire.to_inputs().unwrap();
+    let source = &restored.accounts[restored.from.as_deref().unwrap()].account;
+    assert_eq!(source.quota_cooling.as_ref().unwrap().window, "observed");
+    assert_eq!(
+        source.health,
+        input.accounts["private-source-id"].account.health
+    );
+    assert_eq!(replay(&record).unwrap(), record.actual);
+}
+
+#[test]
+fn remaining_health_and_cooling_refusals_identify_the_field() {
+    let mut input = inputs();
+    input
+        .accounts
+        .get_mut("private-source-id")
+        .unwrap()
+        .account
+        .health = Health::Cooling {
+        reason: HealthReason::Quota,
+        until: now(),
+        scope: "synthetic_invalid_scope".into(),
+    };
+    assert_eq!(
+        capture(&input, &PermitDecision::NotRequired, |_, _| "x".into()).unwrap_err(),
+        WireRefusal::HealthScope
+    );
+    input = inputs();
+    input
+        .accounts
+        .get_mut("private-source-id")
+        .unwrap()
+        .account
+        .quota_cooling = Some(QuotaCooling {
+        window: "synthetic_invalid_window".into(),
+        reset_at: now(),
+        started_at: now(),
+    });
+    assert_eq!(
+        capture(&input, &PermitDecision::NotRequired, |_, _| "x".into()).unwrap_err(),
+        WireRefusal::CoolingWindow
+    );
+    for reason in [
+        WireRefusal::Model,
+        WireRefusal::Quota,
+        WireRefusal::Health,
+        WireRefusal::InputModelLength,
+        WireRefusal::CoolingWindow,
+        WireRefusal::PlacementWindow,
+    ] {
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(serde_json::from_str::<WireRefusal>(&json).unwrap(), reason);
     }
 }

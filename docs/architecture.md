@@ -540,6 +540,8 @@ Details are in contract C11.
 
 ### Decision-tape replay operations
 
+The recording boundary preserves the model value received by the native chooser: `None` for null/absent input, otherwise the literal string within the existing96-byte bound. Empty strings and the string `"null"` are distinct from `None`; model families/versions are not inferred by the codec. Native window origins, including the transient cooling label `observed`, are source-enumerated and checked against the tape grammar. Field-specific finite refusals diagnose the remaining projection limits without storing offending values. Old broad refusal codes remain readable, and erased historical inputs are never reconstructed.
+
 Run each sealed epoch through native `debug selection-run --epoch <epoch> --out <run.json>` and `debug permit-run` independently. Match the executing reference binary hash to the header; source association additionally needs the installation receipt. Keep each epoch's InitialWitness and identity domain. Aggregate counters only after those checks; never join opaque account/session names across epochs or fill refused inputs from the current profile.
 
 Selection and permit have different readsets and not-comparable counters. Selection includes supplied candidate/source rows and placements; permit includes source/target facts. Check each kind's unchanged 1% cap in every epoch before an aggregate verdict. Comparable-record identity does not waive refusals, loss, missing witnesses or missing candidate facts. State observation spans and inter-epoch gaps separately.
