@@ -106,7 +106,7 @@ impl Fixture {
             .unwrap()
             .join(".sandbox/tests/r20-handover-http");
         std::fs::create_dir_all(&base).unwrap();
-        let directory = tempfile::tempdir_in(base).unwrap();
+        let directory = qb_testkit::fixture::tempdir_in(base).unwrap();
         let home = directory.path().join("home");
         crate::platform::create_private_directory_new(&home).unwrap();
         let successor = Successor::new().await;

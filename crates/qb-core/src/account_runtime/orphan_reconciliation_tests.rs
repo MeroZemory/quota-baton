@@ -24,6 +24,7 @@ fn home() -> PrivateHome {
         .prefix("qb-orphan-observations-")
         .tempdir_in(executable.parent().unwrap())
         .unwrap();
+    let root = qb_testkit::fixture::prepare_tempdir(root).unwrap();
     let path = root.path().join("home");
     crate::platform::prepare_observation_directory(&path).unwrap();
     let home = PrivateHome { _root: root, path };

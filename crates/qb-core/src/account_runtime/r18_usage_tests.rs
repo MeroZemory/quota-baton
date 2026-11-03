@@ -23,7 +23,7 @@ impl Fixture {
                     .join("../../.sandbox/r18-usage-tests")
             });
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let home = root.path().join("home");
         crate::platform::create_private_directory_new(&home).unwrap();
         let mut config = tempfile::NamedTempFile::new_in(&home).unwrap();

@@ -333,7 +333,7 @@ mod tests {
     fn scratch() -> tempfile::TempDir {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-alias-tests");
         fs::create_dir_all(&root).unwrap();
-        tempfile::tempdir_in(root.canonicalize().unwrap()).unwrap()
+        qb_testkit::fixture::tempdir_in(root.canonicalize().unwrap()).unwrap()
     }
 
     #[test]

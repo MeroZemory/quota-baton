@@ -145,7 +145,7 @@ fn table() -> (tempfile::TempDir, Arc<BindingTable>) {
         .unwrap()
         .join(".sandbox/selection-kernel-tests");
     std::fs::create_dir_all(&base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(base).unwrap();
     let home = root.path().join("home");
     crate::platform::create_private_directory_new(&home).unwrap();
     crate::platform::create_private_directory_new(&home.join("state")).unwrap();

@@ -753,7 +753,7 @@ mod tests {
                 .unwrap()
                 .join(".sandbox/a1");
             std::fs::create_dir_all(&root).unwrap();
-            let dir = tempfile::tempdir_in(root).unwrap();
+            let dir = qb_testkit::fixture::tempdir_in(root).unwrap();
             let obs = Arc::new(Observability::new(dir.path(), None).unwrap());
             Self { dir, obs }
         }

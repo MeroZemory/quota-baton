@@ -116,7 +116,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-catalog-snapshot-tests");
         std::fs::create_dir_all(&base).unwrap();
         let base = base.canonicalize().unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         let raw = br#"{ "models":[], "capabilities": {"opaque": [1,2]} }"#;
         let first = CatalogSnapshot::create(home.path(), raw).unwrap();
         let second = CatalogSnapshot::create(home.path(), b"{}").unwrap();
@@ -136,7 +136,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-catalog-snapshot-tests");
         std::fs::create_dir_all(&base).unwrap();
         let base = base.canonicalize().unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         let snapshot = CatalogSnapshot::create(home.path(), b"{}").unwrap();
         assert!(
             OpenOptions::new()
@@ -165,7 +165,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-catalog-snapshot-tests");
         std::fs::create_dir_all(&base).unwrap();
         let base = base.canonicalize().unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         for bytes in [Vec::new(), vec![b' '; MAX_BYTES + 1]] {
             assert!(CatalogSnapshot::create(home.path(), &bytes).is_err());
         }
@@ -178,7 +178,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-catalog-snapshot-tests");
         std::fs::create_dir_all(&base).unwrap();
         let base = base.canonicalize().unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         // Joining onto a Windows verbatim path normalizes `..` in PathBuf,
         // before the API can inspect it. Supply the actual lexical traversal.
         let plain = home.path().to_str().unwrap().strip_prefix(r"\\?\").unwrap();

@@ -391,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_permit_epoch_writes_insufficient_without_creating_a_home() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = qb_testkit::fixture::tempdir_in(std::env::temp_dir()).unwrap();
         let home = directory.path().join("unused-home");
         let out = directory.path().join("verdict.json");
         assert!(
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn r16_debug_snapshot_never_overwrites_an_existing_output() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = qb_testkit::fixture::tempdir_in(std::env::temp_dir()).unwrap();
         let path = directory.path().join("snapshot.json");
         write_new(&path, b"first").unwrap();
         assert!(write_new(&path, b"second").is_err());
@@ -470,7 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_tape_writes_insufficient_without_starting_a_home() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = qb_testkit::fixture::tempdir_in(std::env::temp_dir()).unwrap();
         let home = directory.path().join("unused-home");
         let out = directory.path().join("verdict.json");
         let result = run(

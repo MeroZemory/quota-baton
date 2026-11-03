@@ -19,10 +19,17 @@ fn home() -> TempDir {
         .unwrap()
         .join(".sandbox/tests");
     fs::create_dir_all(&root).unwrap();
-    tempfile::Builder::new()
-        .prefix("m0-")
-        .tempdir_in(root)
-        .unwrap()
+    qb_testkit::fixture::prepare_tempdir(
+        tempfile::Builder::new()
+            .prefix("m0-")
+            .tempdir_in(root.canonicalize().unwrap())
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn write_config(home: &std::path::Path, text: &str) {
+    qb_testkit::fixture::write_private(home.join("config.toml"), text.as_bytes()).unwrap();
 }
 
 fn client() -> Client {
@@ -61,14 +68,17 @@ fn config_defaults_partial_unknown_and_invalid() {
     assert_eq!(defaults.websocket.max_message_size_mib, 192);
     assert!(!defaults.websocket.upstream_deflate);
     assert_eq!(defaults.quota.poll_min_interval_secs, 300);
-    fs::write(home.path().join("config.toml"), "unknown = true\n[server]\ndata_port = 0\nunknown = 1\n[accounts.cx_fake]\ndrain = true\nunknown = false\n").unwrap();
+    write_config(
+        home.path(),
+        "unknown = true\n[server]\ndata_port = 0\nunknown = 1\n[accounts.cx_fake]\ndrain = true\nunknown = false\n",
+    );
     let config = Config::load(home.path()).unwrap();
     assert_eq!(config.server.data_port, 0);
     assert_eq!(config.server.admin_port, 10201);
     assert!(config.accounts["cx_fake"].drain);
     assert!(!config.accounts["cx_fake"].allow_credits);
     for invalid in ["[server]\ndata_port = 'fake-secret-value'", "broken = ["] {
-        fs::write(home.path().join("config.toml"), invalid).unwrap();
+        write_config(home.path(), invalid);
         let error = Config::load(home.path()).unwrap_err().to_string();
         assert!(!error.contains("fake-secret-value"));
     }
@@ -78,7 +88,7 @@ fn config_defaults_partial_unknown_and_invalid() {
         ("[server]\ndata_port = 65536", 65535, 1800),
         ("[websocket]\nidle_close_secs = 3600", 10200, 3599),
     ] {
-        fs::write(home.path().join("config.toml"), text).unwrap();
+        write_config(home.path(), text);
         let config = Config::load(home.path()).unwrap();
         assert_eq!(config.server.data_port, port);
         assert_eq!(config.websocket.idle_close_secs, idle);
@@ -130,11 +140,7 @@ fn local_secrets_round_trip_and_reject_corruption() {
 #[tokio::test]
 async fn listeners_enforce_c2_and_protect_extra_admin_routes() {
     let home = home();
-    fs::write(
-        home.path().join("config.toml"),
-        "[server]\ndata_port = 0\nadmin_port = 0",
-    )
-    .unwrap();
+    write_config(home.path(), "[server]\ndata_port = 0\nadmin_port = 0");
     let config = Config::load(home.path()).unwrap();
     let servers = http::spawn_with_admin(
         &config,
@@ -335,11 +341,7 @@ fn logging_child() {
         access_token = "fake-access-secret", refresh_token = "fake-refresh-secret", id_token = "fake-id-secret",
         code = "fake-code-secret", client_key = "fake-client-secret", "Authorization" = "fake-case-secret",
         headers = ?[("authorization", "fake-header-secret")], safe_value = "visible-safe", "Synthetic redaction check");
-    fs::write(
-        std::path::Path::new(&home).join("config.toml"),
-        "unknown = true",
-    )
-    .unwrap();
+    write_config(std::path::Path::new(&home), "unknown = true");
     Config::load(std::path::Path::new(&home)).unwrap();
     drop(guard);
 }

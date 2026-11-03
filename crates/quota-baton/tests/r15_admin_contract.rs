@@ -2,6 +2,8 @@
 
 //! One real /state response through the real tray decoder. No spawned client.
 //! Source-only candidate: account transport integration may intentionally be red.
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -49,8 +51,10 @@ impl Harness {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.sandbox/r15-admin-contract-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         let home = root.path().join("home");
+        fixture_support::private_directory(&home).unwrap();
+        qb_testkit::fixture::configure_home(&home).unwrap();
         let external = root.path().join("synthetic-cpa");
         fs::create_dir(&external).unwrap();
         for suffix in ["a", "b"] {

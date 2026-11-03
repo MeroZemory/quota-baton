@@ -30,7 +30,7 @@ fn known_users_with_same_email_keep_separate_owned_ids_and_policy() {
     let _serial = SERIAL.lock().unwrap();
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r2a-adoption-fixtures");
     fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(base).unwrap();
+    let home = qb_testkit::fixture::home_in(base).unwrap();
     let store = AccountStore::acquire(home.path()).unwrap();
     let account = |user: &str| -> Account {
         let identity = Identity::Codex {
@@ -99,7 +99,7 @@ fn adopted_legacy_relogin_uses_stored_user_and_preserves_distinct_workspace_user
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r2a-adoption-fixtures");
     fs::create_dir_all(&base).unwrap();
     for source_kind in ["adopted", "oauth", "linked", "wrong-workspace", "no-proof"] {
-        let home = tempfile::tempdir_in(&base).unwrap();
+        let home = qb_testkit::fixture::home_in(&base).unwrap();
         let store = AccountStore::acquire(home.path()).unwrap();
         let missing_cpa = home.path().join("synthetic-cpa-gone");
         assert!(!missing_cpa.exists());

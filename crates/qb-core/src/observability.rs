@@ -1993,7 +1993,15 @@ mod r7_archive_tests {
     #[test]
     fn r7_credential_activity_maps_checked_successes_without_hiding_real_failures() {
         use crate::dashboard::RequestOutcome;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = qb_testkit::fixture::tempdir_in(
+            std::env::current_exe()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         let obs = Observability::new(temp.path(), None).unwrap();
         let account = "cx-123abc";
         for outcome in ["updated", "unchanged", "success"] {
@@ -2039,9 +2047,17 @@ mod r7_archive_tests {
     }
     #[test]
     fn r7_archive_failed_atomic_write_retries_latest_revision_and_freeze_blocks_late_changes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = qb_testkit::fixture::tempdir_in(
+            std::env::current_exe()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         let home = temp.path();
-        fs::create_dir(home.join("state")).unwrap();
+        crate::platform::create_private_directory_new(&home.join("state")).unwrap();
         let runtime = crate::dashboard::runtime::Runtime::new();
         runtime.account_event(
             ActivityKind::TokenRefresh,
@@ -2400,7 +2416,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/observability-tests");
         fs::create_dir_all(&base).unwrap();
-        tempfile::tempdir_in(base).unwrap()
+        qb_testkit::fixture::tempdir_in(base).unwrap()
     }
 
     fn record() -> RequestRecord {
@@ -2915,8 +2931,8 @@ mod tests {
         )
     }
     fn writer(dir: &Path) -> Writer {
-        fs::create_dir_all(dir.join("state")).unwrap();
-        fs::create_dir_all(dir.join("ledger")).unwrap();
+        crate::platform::ensure_private_dir_all(&dir.join("state")).unwrap();
+        crate::platform::ensure_private_dir_all(&dir.join("ledger")).unwrap();
         Writer::new(
             dir.to_owned(),
             QuotaState {
@@ -3206,8 +3222,12 @@ mod tests {
     fn corrupt_and_unsupported_quota_are_renamed_warned_and_start_empty() {
         for contents in ["fake-access-marker", r#"{"schema":2,"accounts":{}}"#] {
             let dir = directory();
-            fs::create_dir(dir.path().join("state")).unwrap();
-            fs::write(dir.path().join("state/quota.json"), contents).unwrap();
+            crate::platform::create_private_directory_new(&dir.path().join("state")).unwrap();
+            qb_testkit::fixture::write_private(
+                dir.path().join("state/quota.json"),
+                contents.as_bytes(),
+            )
+            .unwrap();
             let log = warnings(|| {
                 let obs = Observability::new(dir.path(), None).unwrap();
                 assert!(!dir.path().join("state/quota.json").exists());

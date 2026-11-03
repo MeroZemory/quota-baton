@@ -664,7 +664,7 @@ fn schema8_actual_retained_corpus_native_roundtrip_and_volume() {
     let header: Header =
         serde_json::from_slice(&bounded_file(&input.join("header.json"), CONTROL_BYTES).unwrap())
             .unwrap();
-    let dir = tempfile::tempdir_in(&parent).unwrap();
+    let dir = qb_testkit::fixture::tempdir_in(&parent).unwrap();
     let (producer, mut writer) = open(
         &dir.path().join("reencoded"),
         Limits::default(),

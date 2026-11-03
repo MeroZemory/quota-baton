@@ -3,6 +3,8 @@
 //! Requires the frozen manual-refresh / refresh-usage / action-consumer candidates.
 #![cfg(debug_assertions)]
 
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -59,7 +61,7 @@ impl Harness {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.sandbox/r15-account-actions-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         let cpa = root.path().join("synthetic-cpa");
         fs::create_dir(&cpa).unwrap();
         fs::write(cpa.join("fixture.json"), serde_json::to_vec(&json!({
@@ -67,7 +69,10 @@ impl Harness {
             "access_token":"synthetic-actions-access", "refresh_token":"synthetic-actions-refresh",
             "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-01-01T00:00:00Z"
         })).unwrap()).unwrap();
-        let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
+        let home = root.path().join("home");
+        fixture_support::private_directory(&home).unwrap();
+        qb_testkit::fixture::configure_home(&home).unwrap();
+        let store = Arc::new(AccountStore::acquire(&home).unwrap());
         import::run(
             &store,
             &cpa,

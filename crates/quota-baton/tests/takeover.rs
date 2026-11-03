@@ -1,4 +1,6 @@
 //! Two real cores per scenario; only disposable homes and numeric loopback fakes.
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 #[cfg(windows)]
 #[path = "takeover/r20_failed_prepare.rs"]
 mod r20_failed_prepare;
@@ -111,7 +113,7 @@ impl Home {
         safe_url(data_base);
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/takeover-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base.canonicalize().unwrap()).unwrap();
         // Hold both allocations until both distinct ports have been obtained.
         let data = TcpListener::bind("127.0.0.1:0").unwrap();
         let admin = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -139,7 +141,7 @@ impl Home {
         home
     }
     fn write_config(&self) {
-        fs::write(self.path.join("config.toml"), format!(
+        fixture_support::write_private(self.path.join("config.toml"), format!(
             "[server]\ndata_port={}\nadmin_port={}\ndrain_timeout_secs={}\n[upstream]\nanthropic_base='{}'\ncodex_base='{}'\nclaude_usage_base='{}'\ncodex_usage_base='{}'\nclaude_token_endpoint='{}/oauth/token'\ncodex_token_endpoint='{}/oauth/token'\n[secrets]\nlinux_backend='file-0600'\n",
             self.data, self.admin, self.drain_secs, self.data_base, self.data_base,
             self.usage.url, self.usage.url, self.token.url, self.token.url)).unwrap();

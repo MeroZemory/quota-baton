@@ -35,7 +35,7 @@ impl Fixture {
         let sandbox =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m1b-refresh-fixtures");
         fs::create_dir_all(&sandbox).unwrap();
-        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(sandbox).unwrap();
         let cpa = root.path().join("synthetic-cpa");
         fs::create_dir(&cpa).unwrap();
         let file = json!({"type":provider.as_str(),"account_id":"synthetic-credential","account_uuid":"synthetic-credential","organization_uuid":"synthetic-org","email":"credential@example.invalid","access_token":"synthetic-access-old","refresh_token":"synthetic-refresh-old","last_refresh":Utc::now()-ChronoDuration::hours(1),"expired":Utc::now()+ChronoDuration::minutes(expiry_minutes)});

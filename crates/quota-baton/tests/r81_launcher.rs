@@ -1,5 +1,7 @@
 #![cfg(windows)]
 
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -70,9 +72,9 @@ impl LaunchCore {
         let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
         let client = URL_SAFE_NO_PAD.encode([2u8; 32]);
         let handle = URL_SAFE_NO_PAD.encode([3u8; 32]);
-        fs::write(home.join("admin.token"), &admin).unwrap();
-        fs::write(home.join("client.key"), &client).unwrap();
-        fs::write(
+        fixture_support::write_private(home.join("admin.token"), &admin).unwrap();
+        fixture_support::write_private(home.join("client.key"), &client).unwrap();
+        fixture_support::write_private(
             home.join("config.toml"),
             format!("[server]\ndata_port={port}\nadmin_port={port}\n"),
         )
@@ -315,15 +317,15 @@ fn r81_title_after_child_start_in_hidden_console() {
             println!("actual-node unavailable: no node.exe on test PATH");
             continue;
         }
-        let root = tempfile::tempdir_in(&sandbox).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(&sandbox).unwrap();
         let root = root.path().canonicalize().unwrap();
         let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
         fs::create_dir(root.join("한글 project")).unwrap();
         fs::create_dir_all(root.join("AppData/Roaming/npm")).unwrap();
-        fs::create_dir_all(root.join("profile/.codex-acct/qb")).unwrap();
+        fixture_support::private_directory(root.join("profile/.codex-acct/qb")).unwrap();
         fs::create_dir_all(root.join("profile/AppData/Local")).unwrap();
         fs::create_dir_all(root.join("temp")).unwrap();
-        fs::create_dir_all(root.join("qb/journal")).unwrap();
+        fixture_support::private_directory(root.join("qb/journal")).unwrap();
         fs::write(root.join("qb/journal/wiring.json"), serde_json::to_vec(
             &serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":root.join("profile/.codex-acct/qb")})
         ).unwrap()).unwrap();

@@ -38,8 +38,8 @@ mod tests {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.sandbox/r9-legacy-return");
         fs::create_dir_all(&base).unwrap();
-        let temp = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
-        fs::create_dir_all(temp.path().join("journal")).unwrap();
+        let temp = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        crate::fixture_support::private_directory(temp.path().join("journal")).unwrap();
         let store = Store {
             home: temp.path().to_owned(),
             target: temp.path().to_owned(),

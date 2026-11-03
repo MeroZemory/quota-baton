@@ -1,5 +1,7 @@
 //! Product CLI acceptance; only project-local synthetic homes and client stub.
 #![cfg(windows)]
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use rusqlite::{Connection, OptionalExtension};
 use std::{
     fs,
@@ -171,7 +173,7 @@ impl Fixture {
     fn new() -> Self {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-cli-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         let user = root.path().join("user");
         let source = user.join(".codex");
         let target = user.join(".codex-acct/qb");
@@ -184,7 +186,7 @@ impl Fixture {
             &user.join("AppData/Local"),
             &root.path().join("temp"),
         ] {
-            fs::create_dir_all(dir).unwrap();
+            fixture_support::private_directory(dir).unwrap();
         }
         fs::write(qb.join("journal/wiring.json"),serde_json::to_vec(&serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":target})).unwrap()).unwrap();
         let sentinel = root.path().join("launched.txt");

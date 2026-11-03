@@ -31,20 +31,15 @@ fn account() -> Account {
 }
 
 fn write_private(path: &std::path::Path, bytes: &[u8]) {
-    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
-    std::io::Write::write_all(&mut file, bytes).unwrap();
-    file.persist(path).unwrap();
+    qb_testkit::fixture::write_private(path, bytes).unwrap();
 }
 
 fn private_home(base: &std::path::Path) -> tempfile::TempDir {
     fs::create_dir_all(base).unwrap();
-    let home = tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap();
-    write_private(
-        &home.path().join("config.toml"),
-        b"[secrets]\nlinux_backend = \"file-0600\"\n",
-    );
-    let accounts = tempfile::tempdir_in(home.path()).unwrap().keep();
-    fs::rename(accounts, home.path().join("accounts")).unwrap();
+    let home = qb_testkit::fixture::home_in(base).unwrap();
+    // This test loads a pre-existing account record. Provision the real empty
+    // store first so File0600 has its key before any stored account is seeded.
+    drop(acquire(home.path()));
     home
 }
 

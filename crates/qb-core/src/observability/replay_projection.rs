@@ -169,7 +169,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r142-projection-fixtures");
         std::fs::create_dir_all(&base).unwrap();
-        let dir = tempfile::tempdir_in(base).unwrap();
+        let dir = qb_testkit::fixture::tempdir_in(base).unwrap();
         let runtime = Runtime::start(&dir.path().join("capture"), 16).unwrap();
         let stored:Account=serde_json::from_value(serde_json::json!({
             "schema":1,"id":"private-id-canary","provider":"codex","label":"private-label-canary","email":"private-email-canary","plan":"private-plan-canary",

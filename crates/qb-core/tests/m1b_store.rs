@@ -59,7 +59,7 @@ fn write_cpa(dir: &Path, user: Option<&str>) {
 fn fixture() -> (tempfile::TempDir, AccountStore) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m1b-store");
     fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root).unwrap();
+    let home = qb_testkit::fixture::home_in(root).unwrap();
     let until = Instant::now() + Duration::from_secs(15);
     let store = loop {
         match AccountStore::acquire(home.path()) {

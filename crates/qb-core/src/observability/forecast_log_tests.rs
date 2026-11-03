@@ -2,10 +2,11 @@ use super::*;
 
 fn private_fixture() -> tempfile::TempDir {
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
-    tempfile::Builder::new()
+    let home = tempfile::Builder::new()
         .prefix("qb-forecast-log-")
         .tempdir_in(executable.parent().unwrap())
-        .unwrap()
+        .unwrap();
+    qb_testkit::fixture::prepare_tempdir(home).unwrap()
 }
 use serde_json::json;
 

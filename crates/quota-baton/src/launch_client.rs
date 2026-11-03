@@ -863,7 +863,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-catalog-snapshot-tests");
         std::fs::create_dir_all(&base).unwrap();
         let base = base.canonicalize().unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         for model in [None, Some("configured".to_owned())] {
             let expected = if model.is_none() { REPLY } else { NATIVE };
             let mut response = reply();
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[test]
     fn parse_reads_only_a_bounded_synthetic_home_config_without_writing() {
-        let home = tempfile::tempdir().unwrap();
+        let home = qb_testkit::fixture::tempdir_in(std::env::temp_dir()).unwrap();
         let path = home.path().join("config.toml");
         let original = b"\xef\xbb\xbfmodel='fixture-model'\n";
         std::fs::write(&path, original).unwrap();
@@ -1210,11 +1210,12 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         };
 
-        let home = tempfile::tempdir().unwrap();
+        let home = qb_testkit::fixture::tempdir_in(std::env::temp_dir()).unwrap();
         let admin_token = URL_SAFE_NO_PAD.encode([1u8; 32]);
         let client_key = URL_SAFE_NO_PAD.encode([2u8; 32]);
-        std::fs::write(home.path().join("admin.token"), &admin_token).unwrap();
-        std::fs::write(home.path().join("client.key"), &client_key).unwrap();
+        crate::fixture_support::write_private(home.path().join("admin.token"), &admin_token)
+            .unwrap();
+        crate::fixture_support::write_private(home.path().join("client.key"), &client_key).unwrap();
         let good_body = serde_json::json!({
             "base_url": format!("http://127.0.0.1:10200/l/{TOKEN}/v1"),
             "catalog_url": format!("http://127.0.0.1:10200/l/{TOKEN}/v1/models"),
@@ -1666,10 +1667,10 @@ mod tests {
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root).unwrap();
         let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
-        std::fs::write(home.path().join("admin.token"), &admin).unwrap();
-        std::fs::write(
+        crate::fixture_support::write_private(home.path().join("admin.token"), &admin).unwrap();
+        crate::fixture_support::write_private(
             home.path().join("client.key"),
             URL_SAFE_NO_PAD.encode([2u8; 32]),
         )
@@ -2144,10 +2145,10 @@ mod claude_urgent {
             };
             let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
             std::fs::create_dir_all(&dir).unwrap();
-            let home = tempfile::tempdir_in(dir).unwrap();
+            let home = qb_testkit::fixture::tempdir_in(dir).unwrap();
             let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
-            std::fs::write(home.path().join("admin.token"), &admin).unwrap();
-            std::fs::write(
+            crate::fixture_support::write_private(home.path().join("admin.token"), &admin).unwrap();
+            crate::fixture_support::write_private(
                 home.path().join("client.key"),
                 URL_SAFE_NO_PAD.encode([2u8; 32]),
             )

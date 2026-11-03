@@ -237,7 +237,7 @@ async fn a2_harness() -> (CombinedUpstream, A2Harness) {
     let upstream = CombinedUpstream::start().await;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
     fs::create_dir_all(&root).unwrap();
-    let temp = tempfile::tempdir_in(root).unwrap();
+    let temp = qb_testkit::fixture::tempdir_in(root).unwrap();
     let home = temp.path().join("home");
     let cpa = temp.path().join("cpa");
     fs::create_dir_all(&cpa).unwrap();

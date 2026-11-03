@@ -1386,18 +1386,18 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/session-guard-tests");
         fs::create_dir_all(&scratch).unwrap();
         let scratch = fs::canonicalize(scratch).unwrap();
-        tempfile::tempdir_in(scratch).unwrap()
+        qb_testkit::fixture::tempdir_in(scratch).unwrap()
     }
 
     fn home(root: &Path, name: &str) -> PathBuf {
         let home = root.join(name);
-        fs::create_dir_all(home.join("sessions")).unwrap();
+        crate::fixture_support::private_directory(home.join("sessions")).unwrap();
         home
     }
 
     fn lock_path(home: &Path, name: &str) -> PathBuf {
         let dir = home.join("thread-writer-locks");
-        fs::create_dir_all(&dir).unwrap();
+        crate::fixture_support::private_directory(&dir).unwrap();
         let path = dir.join(name);
         fs::write(&path, []).unwrap();
         path

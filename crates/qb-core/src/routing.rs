@@ -4447,7 +4447,7 @@ mod tests {
     #[test]
     fn corrupt_legacy_without_known_strict_evidence_quarantines_and_serves_defaults() {
         let home = home();
-        fs::create_dir_all(home.path().join("state")).unwrap();
+        crate::platform::ensure_private_dir_all(&home.path().join("state")).unwrap();
         let path = home.path().join("state/routing-policies.json");
         qb_testkit::fixture::write_private(&path, b"not-json").unwrap();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
@@ -4502,7 +4502,7 @@ mod tests {
     #[test]
     fn legacy_codex_agent_hash_keeps_strict_intent_through_schema_upgrade() {
         let home = home();
-        fs::create_dir_all(home.path().join("state")).unwrap();
+        crate::platform::ensure_private_dir_all(&home.path().join("state")).unwrap();
         let id = session_id("codex:legacy");
         let original = serde_json::json!({"schema":1,"revision":7,"projects":{},"sessions":{
             id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},
@@ -4652,11 +4652,14 @@ mod tests {
         for directory in [true, false] {
             let home = home();
             let path = home.path().join("state/routing-policies.json");
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
             if directory {
                 fs::create_dir(&path).unwrap();
             } else {
-                fs::File::create(&path)
+                qb_testkit::fixture::write_private(&path, b"").unwrap();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
                     .unwrap()
                     .set_len(MAX_FILE + 1)
                     .unwrap();

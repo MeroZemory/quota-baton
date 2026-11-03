@@ -89,8 +89,9 @@ async fn fixture(
 ) -> Fixture {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r6-cli-tests");
     std::fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(base).unwrap();
-    std::fs::write(home.path().join("admin.token"), "synthetic-admin").unwrap();
+    let home = qb_testkit::fixture::tempdir_in(base).unwrap();
+    crate::fixture_support::write_private(home.path().join("admin.token"), "synthetic-admin")
+        .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::default();
     config.server.admin_port = listener.local_addr().unwrap().port();

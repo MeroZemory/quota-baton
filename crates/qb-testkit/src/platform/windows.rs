@@ -6,11 +6,11 @@ use windows::{
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                SDDL_REVISION_1,
+                GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
             },
-            DACL_SECURITY_INFORMATION, GetTokenInformation, IsValidSid, OWNER_SECURITY_INFORMATION,
-            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW,
-            TOKEN_QUERY, TOKEN_USER, TokenUser,
+            DACL_SECURITY_INFORMATION, EqualSid, GetTokenInformation, IsValidSid,
+            OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            PSID, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
@@ -32,6 +32,30 @@ impl Drop for Allocation {
         unsafe {
             let _ = LocalFree(Some(self.0));
         }
+    }
+}
+
+fn owner_matches(path: &[u16], user: PSID) -> io::Result<bool> {
+    unsafe {
+        let mut owner = PSID::default();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+        .ok()
+        .map_err(io::Error::other)?;
+        let _descriptor = Allocation(HLOCAL(descriptor.0));
+        if owner.0.is_null() || !IsValidSid(owner).as_bool() {
+            return Err(io::Error::other("invalid fixture directory owner"));
+        }
+        Ok(EqualSid(owner, user).is_ok())
     }
 }
 
@@ -84,15 +108,32 @@ pub(crate) fn prepare_new_fixture_directory(home: &TempDir) -> io::Result<()> {
             .encode_wide()
             .chain(Some(0))
             .collect();
+        let already_owned = owner_matches(&path, user.User.Sid)?;
+        // An owner has WRITE_DAC even when its inherited Modify grant lacks
+        // WRITE_OWNER. Do not request an unnecessary owner rewrite. If the
+        // default owner differs, grant full access before changing that owner.
         SetFileSecurityW(
             PCWSTR(path.as_ptr()),
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             descriptor,
         )
         .ok()
         .map_err(io::Error::other)?;
+        if !already_owned {
+            SetFileSecurityW(
+                PCWSTR(path.as_ptr()),
+                OWNER_SECURITY_INFORMATION,
+                descriptor,
+            )
+            .ok()
+            .map_err(io::Error::other)?;
+        }
+        if !owner_matches(&path, user.User.Sid)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture owner must be the current user",
+            ));
+        }
     }
     Ok(())
 }
@@ -106,6 +147,10 @@ mod tests {
         Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
         EqualSid, GetAce, GetSecurityDescriptorControl, IsValidAcl, IsValidSid, PSID,
         SE_DACL_PROTECTED,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WRITE_OWNER,
     };
 
     fn dacl(path: &Path) -> Vec<u8> {
@@ -205,6 +250,85 @@ mod tests {
         assert_owner_only(ordinary.path());
         assert_owner_only(builder.path());
         assert_eq!(dacl(parent.path()), before);
+    }
+
+    #[test]
+    fn fresh_modify_inherited_child_does_not_require_write_owner() {
+        let parent = crate::fixture::tempdir_in(std::env::temp_dir()).unwrap();
+        let parent_path: Vec<u16> = parent
+            .path()
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            let mut owner = PSID::default();
+            let mut original = PSECURITY_DESCRIPTOR::default();
+            GetNamedSecurityInfoW(
+                PCWSTR(parent_path.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                &mut original,
+            )
+            .ok()
+            .unwrap();
+            let _original = Allocation(HLOCAL(original.0));
+            let mut sid = PWSTR::null();
+            ConvertSidToStringSidW(owner, &mut sid).unwrap();
+            let _sid = Allocation(HLOCAL(sid.0.cast()));
+            // Current-user Modify, inherited by children, excludes WRITE_OWNER.
+            let sddl = format!("D:P(A;OICI;0x1301bf;;;{})", sid.to_string().unwrap());
+            let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+            .unwrap();
+            let _descriptor = Allocation(HLOCAL(descriptor.0));
+            SetFileSecurityW(
+                PCWSTR(parent_path.as_ptr()),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor,
+            )
+            .ok()
+            .unwrap();
+            let parent_before = dacl(parent.path());
+            let child = tempfile::tempdir_in(parent.path()).unwrap();
+            let child_path: Vec<u16> = child
+                .path()
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            assert!(owner_matches(&child_path, owner).unwrap());
+            let error = match CreateFileW(
+                PCWSTR(child_path.as_ptr()),
+                WRITE_OWNER.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            ) {
+                Err(error) => error,
+                Ok(handle) => {
+                    CloseHandle(handle).unwrap();
+                    panic!("Modify-inherited fixture unexpectedly allows WRITE_OWNER");
+                }
+            };
+            assert_eq!(error.code().0 as u32, 0x80070005);
+            let child = crate::fixture::prepare_tempdir(child).unwrap();
+            assert_owner_only(child.path());
+            assert_eq!(std::fs::read_dir(child.path()).unwrap().count(), 0);
+            assert_eq!(dacl(parent.path()), parent_before);
+        }
     }
 
     #[test]

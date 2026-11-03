@@ -37,7 +37,7 @@ fn jwt(user: &str) -> String {
 fn fixture(provider: &'static str, user: Option<&str>) -> Fixture {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r2a-adoption-fixtures");
     fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(root).unwrap();
     let cpa = home.path().join("synthetic-cpa");
     fs::create_dir_all(&cpa).unwrap();
     let identity = if provider == "claude" {

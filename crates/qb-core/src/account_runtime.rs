@@ -4379,7 +4379,15 @@ mod r5_view_tests {
     #[tokio::test]
     async fn credits_original_http_and_stream_revision_cannot_attach_to_a_later_reset() {
         for stream in [false, true] {
-            let home = qb_testkit::fixture::home_in(std::env::temp_dir()).unwrap();
+            let home = qb_testkit::fixture::home_in(
+                std::env::current_exe()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap()
+                    .parent()
+                    .unwrap(),
+            )
+            .unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
@@ -4442,7 +4450,15 @@ mod r5_view_tests {
     #[tokio::test]
     async fn credits_delayed_success_cannot_reopen_a_newer_off_or_empty_span() {
         for off in [false, true] {
-            let home = qb_testkit::fixture::home_in(std::env::temp_dir()).unwrap();
+            let home = qb_testkit::fixture::home_in(
+                std::env::current_exe()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap()
+                    .parent()
+                    .unwrap(),
+            )
+            .unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);

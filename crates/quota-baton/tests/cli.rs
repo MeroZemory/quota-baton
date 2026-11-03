@@ -1,3 +1,5 @@
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 #[cfg(windows)]
 #[path = "cli/windows_cases.rs"]
 mod windows_cases;
@@ -319,10 +321,10 @@ fn command(home: &Path) -> Command {
 fn fixture() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
     std::fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root.canonicalize().unwrap()).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(root.canonicalize().unwrap()).unwrap();
     let data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    std::fs::write(
+    fixture_support::write_private(
         home.path().join("config.toml"),
         format!(
             "[server]\ndata_port={}\nadmin_port={}\n[secrets]\nlinux_backend='file-0600'\n",
@@ -619,7 +621,8 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
         ),
     )
     .unwrap();
-    std::fs::write(home.path().join("admin.token"), "synthetic-admin-secret").unwrap();
+    fixture_support::write_private(home.path().join("admin.token"), "synthetic-admin-secret")
+        .unwrap();
     let state = current_status_fixture(serde_json::json!({"accounts":[{
         "id":"cx-synthetic", "provider":"codex", "label":"합성 🧪\t계정\n\u{1b}",
         "user_state":"active", "health":{"kind":"future_health", "reason":{"access_token":"synthetic-reason-secret","nested_token":"synthetic-access-secret","secret_dpapi_b64":"synthetic-dpapi-secret"}},
@@ -672,7 +675,8 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
         ),
     )
     .unwrap();
-    std::fs::write(home.path().join("admin.token"), "synthetic-admin-token").unwrap();
+    fixture_support::write_private(home.path().join("admin.token"), "synthetic-admin-token")
+        .unwrap();
     let state = current_status_fixture(serde_json::json!({"accounts":[
         {"id":"cx-expired-five", "provider":"codex", "label":"합성 🧪", "user_state":"active",
          "health":{"kind":"ready"}, "probe_pending":true, "windows":[
@@ -769,7 +773,8 @@ fn c6_4_status_renders_per_provider_pool_counts() {
         ),
     )
     .unwrap();
-    std::fs::write(home.path().join("admin.token"), "synthetic-admin-secret").unwrap();
+    fixture_support::write_private(home.path().join("admin.token"), "synthetic-admin-secret")
+        .unwrap();
     let state = current_status_fixture(serde_json::json!({"accounts":[
         {"id":"a","provider":"claude","user_state":"active","health":{"kind":"ready"}},
         {"id":"b","provider":"claude","user_state":"active","health":{"kind":"cooling","reason":"payment","until":"2099-01-01T00:00:00Z"}},

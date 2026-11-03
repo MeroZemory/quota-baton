@@ -45,7 +45,7 @@ impl Harness {
     async fn with_token_endpoint(token_endpoint: Option<String>) -> Self {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r6-admin-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         let source = root.path().join("external");
         fs::create_dir(&source).unwrap();
         let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());

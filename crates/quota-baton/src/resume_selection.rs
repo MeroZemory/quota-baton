@@ -403,7 +403,7 @@ mod tests {
         let base =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-resume-selection-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base.canonicalize().unwrap()).unwrap();
         let db = Connection::open(home.path().join("state_5.sqlite")).unwrap();
         db.execute_batch(
             "CREATE TABLE threads (

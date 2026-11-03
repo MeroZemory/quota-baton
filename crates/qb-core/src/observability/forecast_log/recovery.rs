@@ -113,10 +113,11 @@ mod tests {
 
     fn fixture() -> tempfile::TempDir {
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
-        tempfile::Builder::new()
+        let home = tempfile::Builder::new()
             .prefix("qb-forecast-recovery-")
             .tempdir_in(executable.parent().unwrap())
-            .unwrap()
+            .unwrap();
+        qb_testkit::fixture::prepare_tempdir(home).unwrap()
     }
 
     fn empty_capture(home: &Path) -> std::path::PathBuf {

@@ -660,7 +660,7 @@ mod r8_bounds_tests {
             .unwrap()
             .join(".sandbox/config-clamp-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root).unwrap();
         let text = r#"
 future_root = "synthetic"
 [routing]
@@ -696,7 +696,8 @@ idle_close_secs = 99999
 max_message_size_mib = 0
 future = true
 "#;
-        fs::write(home.path().join("config.toml"), text).unwrap();
+        qb_testkit::fixture::write_private(home.path().join("config.toml"), text.as_bytes())
+            .unwrap();
         let config = Config::load(home.path()).unwrap();
         assert_eq!(config.routing.rate_hold_secs, 1);
         assert_eq!(config.routing.ws_upgrade_hold_secs, 14);
@@ -750,9 +751,10 @@ future = true
             .unwrap()
             .join(".sandbox/config-clamp-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root).unwrap();
         let text = "[routing]\nactive_window_secs = 9223372036854775807\noverload_window_secs = 9223372036854775807\n[accounts.\"cl-a\"]\nspread_threshold = -1\n[accounts.\"cl-b\"]\nspread_threshold = 0\n[accounts.\"cl-c\"]\nspread_threshold = 7\n";
-        fs::write(home.path().join("config.toml"), text).unwrap();
+        qb_testkit::fixture::write_private(home.path().join("config.toml"), text.as_bytes())
+            .unwrap();
         let config = Config::load(home.path()).unwrap();
         assert_eq!(config.accounts["cl-a"].spread_threshold, Some(1));
         assert_eq!(config.accounts["cl-b"].spread_threshold, Some(1));
@@ -791,9 +793,10 @@ future = true
             .unwrap()
             .join(".sandbox/config-clamp-tests");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root).unwrap();
         let text = "[server]\ndata_port=-1\nadmin_port=99999\ndrain_timeout_secs=-1\n[guard]\nretain_max_per_request_mib=-1\ninflight_budget_mib=-1\nmemory_hard_limit_mib=-1\n[tray]\nburst_new_sessions=-1\n";
-        fs::write(home.path().join("config.toml"), text).unwrap();
+        qb_testkit::fixture::write_private(home.path().join("config.toml"), text.as_bytes())
+            .unwrap();
         let config = Config::load(home.path()).unwrap();
         assert_eq!(config.server.data_port, 0);
         assert_eq!(config.server.admin_port, u16::MAX);
@@ -1172,7 +1175,7 @@ mod n6_replay_config_tests {
             .unwrap()
             .join(".sandbox/r142/minimum-config-test-homes");
         fs::create_dir_all(&root).unwrap();
-        let directory = tempfile::tempdir_in(root).unwrap();
+        let directory = qb_testkit::fixture::tempdir_in(root).unwrap();
         let home = directory.path().join("home");
         crate::platform::create_private_directory_new(&home).unwrap();
         (directory, home)

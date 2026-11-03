@@ -809,7 +809,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/usage-capture-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let obs = Observability::new(
             root.path(),
             Some(crate::observability::CaptureOptions {
@@ -879,7 +879,7 @@ mod tests {
                         .join(".sandbox/usage-unit-tests")
                 });
             std::fs::create_dir_all(&base).unwrap();
-            let root = tempfile::tempdir_in(base).unwrap();
+            let root = qb_testkit::fixture::tempdir_in(base).unwrap();
             let home = root.path().join("home");
             crate::platform::create_private_directory_new(&home).unwrap();
             // Match the existing browserless-login fixture: an explicit private

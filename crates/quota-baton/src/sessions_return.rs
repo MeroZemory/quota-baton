@@ -470,7 +470,9 @@ fn execute(
     if record.phase < Phase::Linked {
         for name in &record.names {
             if !name.target.try_exists()? {
-                qb_core::ensure_private_dir_all(name.target.parent().context("대상 폴더가 없습니다")?)?;
+                qb_core::ensure_private_dir_all(
+                    name.target.parent().context("대상 폴더가 없습니다")?,
+                )?;
                 guard::safe_path(&record.target, &name.target)?;
                 check_name(name, &name.source)?;
                 fs::hard_link(&name.source, &name.target)
@@ -668,12 +670,12 @@ mod tests {
         fn new(dependent: bool, paginated: bool) -> Result<Self> {
             let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-return-tests");
             fs::create_dir_all(&base)?;
-            let root = tempfile::tempdir_in(base.canonicalize()?)?;
+            let root = qb_testkit::fixture::tempdir_in(base.canonicalize()?)?;
             let control = root.path().join("control");
             let qb = root.path().join("Q");
             let account = root.path().join("account");
             for path in [control.join("journal"), qb.clone(), account.clone()] {
-                fs::create_dir_all(path)?;
+                crate::fixture_support::private_directory(path)?;
             }
             let qb = qb.canonicalize()?;
             let account = account.canonicalize()?;

@@ -120,7 +120,7 @@ fn native_plan_change_notification_cannot_revive_pre_transition_measurements() {
         .unwrap()
         .join(".sandbox/r21-plan-change");
     std::fs::create_dir_all(&base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(base).unwrap();
     let home = root.path().join("home");
     crate::platform::create_private_directory_new(&home).unwrap();
     let obs = crate::observability::Observability::new(&home, None).unwrap();

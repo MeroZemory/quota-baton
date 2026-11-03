@@ -21,7 +21,7 @@ fn fixture() -> tempfile::TempDir {
     let root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/session-plain-header-tests");
     fs::create_dir_all(&root).unwrap();
-    tempfile::tempdir_in(fs::canonicalize(root).unwrap()).unwrap()
+    qb_testkit::fixture::tempdir_in(fs::canonicalize(root).unwrap()).unwrap()
 }
 
 fn owner(root: &Path, path: &Path) -> HeaderOpen {

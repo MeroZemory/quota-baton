@@ -9,7 +9,7 @@ const D: &str = "44444444-4444-4444-4444-444444444444";
 fn home() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-compressed-tests");
     fs::create_dir_all(&root).unwrap();
-    tempfile::tempdir_in(fs::canonicalize(root).unwrap()).unwrap()
+    qb_testkit::fixture::tempdir_in(fs::canonicalize(root).unwrap()).unwrap()
 }
 
 fn name(home: &Path, physical: &str, compressed: bool) -> PathBuf {

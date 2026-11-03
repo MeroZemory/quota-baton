@@ -45,7 +45,7 @@ impl Harness {
     async fn new(cap: u64, budget: u64) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
         fs::create_dir_all(&root).unwrap();
-        let root = tempfile::tempdir_in(root).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(root).unwrap();
         let home = root.path().join("home");
         let cpa = root.path().join("cpa");
         fs::create_dir_all(&cpa).unwrap();

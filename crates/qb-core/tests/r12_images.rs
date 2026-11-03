@@ -52,7 +52,7 @@ impl Harness {
         let base =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r12-images");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let home = root.path().join("home");
         let imports = root.path().join("imports");
         fs::create_dir_all(&imports).unwrap();

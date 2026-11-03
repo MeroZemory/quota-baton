@@ -337,7 +337,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r7-filename-tests");
         fs::create_dir_all(&base).unwrap();
-        tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap()
+        qb_testkit::fixture::tempdir_in(base).unwrap()
     }
     fn synthetic_decode(slug: &str, root: &Path) -> Decode {
         decode_with(

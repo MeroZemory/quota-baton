@@ -994,7 +994,7 @@ mod tests {
     fn version_fixture() -> Result<(tempfile::TempDir, PathBuf)> {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1211-fixtures");
         fs::create_dir_all(&base)?;
-        let home = tempfile::tempdir_in(fs::canonicalize(base)?)?;
+        let home = qb_testkit::fixture::tempdir_in(fs::canonicalize(base)?)?;
         let program = home.path().join("synthetic-codex.exe");
         fs::write(&program, b"synthetic fixture, never executed")?;
         Ok((home, program))
@@ -1422,9 +1422,11 @@ mod tests {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r12.1/canary");
         fs::create_dir_all(&base)?;
         let base = fs::canonicalize(base)?;
-        let home = tempfile::Builder::new()
-            .prefix("native-check-")
-            .tempdir_in(base)?;
+        let home = qb_testkit::fixture::prepare_tempdir(
+            tempfile::Builder::new()
+                .prefix("native-check-")
+                .tempdir_in(base)?,
+        )?;
         assert_eq!(
             version(&crate::launcher_label::version_output(program)?)?,
             "0.163.0"
@@ -1458,9 +1460,11 @@ mod tests {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r12.1/canary");
         fs::create_dir_all(&base)?;
         let base = fs::canonicalize(base)?;
-        let home = tempfile::Builder::new()
-            .prefix("operator-cache-")
-            .tempdir_in(base)?;
+        let home = qb_testkit::fixture::prepare_tempdir(
+            tempfile::Builder::new()
+                .prefix("operator-cache-")
+                .tempdir_in(base)?,
+        )?;
         let cache = home.path().join(cache_name("0.163.0"));
         let record = b"{\"version\":\"0.163.0\",\"pass\":true}\n";
         fs::write(&cache, record)?;

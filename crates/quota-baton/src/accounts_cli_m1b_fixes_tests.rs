@@ -109,7 +109,7 @@ async fn offline_cleanup_flushes_completed_and_failed_login_ledger_before_return
     use std::sync::Arc;
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m1b-cli-fixes-tests");
     std::fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(base).unwrap();
+    let home = qb_testkit::fixture::home_in(base).unwrap();
     let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
     let obs = Arc::new(qb_core::observability::Observability::new(home.path(), None).unwrap());
     let service = qb_core::oauth::LoginService::new(store, reqwest::Client::new(), obs.clone());

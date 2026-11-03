@@ -72,14 +72,14 @@ async fn takeover_listener_close_is_observed_while_handler_is_still_active() {
 fn takeover_can_release_the_home_lease_before_store_drop() {
     let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
     std::fs::create_dir_all(&parent).unwrap();
-    let root = tempfile::tempdir_in(parent).unwrap();
-    let home = root.path().join("home");
-    let first = AccountStore::acquire(&home).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(parent).unwrap();
+    let home = qb_testkit::fixture::home_in(root.path()).unwrap();
+    let first = AccountStore::acquire(home.path()).unwrap();
     first.release_lease();
 
     // The runtime objects may still hold the first store while the successor
     // acquires the same home during takeover.
-    let second = AccountStore::acquire(&home).unwrap();
+    let second = AccountStore::acquire(home.path()).unwrap();
     second.release_lease();
 }
 
@@ -87,12 +87,12 @@ fn takeover_can_release_the_home_lease_before_store_drop() {
 fn takeover_freezes_the_old_store_before_successor_acquires() {
     let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
     std::fs::create_dir_all(&parent).unwrap();
-    let root = tempfile::tempdir_in(parent).unwrap();
-    let home = root.path().join("home");
-    let first = AccountStore::acquire(&home).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(parent).unwrap();
+    let home = qb_testkit::fixture::home_in(root.path()).unwrap();
+    let first = AccountStore::acquire(home.path()).unwrap();
     first.stop_writes();
     assert!(first.writes_stopped());
     first.release_lease();
-    let second = AccountStore::acquire(&home).unwrap();
+    let second = AccountStore::acquire(home.path()).unwrap();
     second.release_lease();
 }

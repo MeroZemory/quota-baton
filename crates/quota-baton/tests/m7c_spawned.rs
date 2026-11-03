@@ -1,6 +1,8 @@
 //! M7c.1: load the real release `serve` process from a separate test process.
 //! All homes, tokens, and upstreams in this file are synthetic.
 
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use axum::serve::ListenerExt;
 use axum::{
     Router,
@@ -228,7 +230,7 @@ impl Home {
     async fn new() -> Self {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m7c-spawned");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let data = TcpListener::bind("127.0.0.1:0").unwrap();
         let admin = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream = FakeUpstream::start().await;
@@ -239,10 +241,11 @@ impl Home {
             admin: admin.local_addr().unwrap().port(),
             upstream,
         };
-        fs::create_dir_all(&home.path).unwrap();
+        fixture_support::private_directory(&home.path).unwrap();
+        qb_testkit::fixture::configure_home(&home.path).unwrap();
         home.write_accounts();
-        fs::write(home.path.join("config.toml"), format!(
-            "[server]\ndata_port={}\nadmin_port={}\ndrain_timeout_secs=20\n[upstream]\ncodex_base='{}'\nanthropic_base='{}'\nclaude_usage_base='{}'\ncodex_usage_base='{}'\nclaude_token_endpoint='{}/oauth/token'\ncodex_token_endpoint='{}/oauth/token'\n",
+        fixture_support::write_private(home.path.join("config.toml"), format!(
+            "[server]\ndata_port={}\nadmin_port={}\ndrain_timeout_secs=20\n[upstream]\ncodex_base='{}'\nanthropic_base='{}'\nclaude_usage_base='{}'\ncodex_usage_base='{}'\nclaude_token_endpoint='{}/oauth/token'\ncodex_token_endpoint='{}/oauth/token'\n[secrets]\nlinux_backend='file-0600'\n",
             home.data, home.admin, home.upstream.url, home.upstream.url, home.upstream.url, home.upstream.url, home.upstream.url, home.upstream.url)).unwrap();
         home
     }

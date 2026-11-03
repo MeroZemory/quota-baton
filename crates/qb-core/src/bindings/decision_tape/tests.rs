@@ -5,10 +5,11 @@ fn fixture_dir() -> tempfile::TempDir {
     if let Some(parent) = std::env::var_os("QB_TEST_USAGE_ROOT") {
         // The gate supplies an existing private writable parent. TempDir creates
         // a private child; no fixture writes into a read-only source checkout.
-        tempfile::Builder::new()
+        let home = tempfile::Builder::new()
             .prefix("n6r-bindings-")
-            .tempdir_in(parent)
-            .unwrap()
+            .tempdir_in(std::fs::canonicalize(parent).unwrap())
+            .unwrap();
+        qb_testkit::fixture::prepare_tempdir(home).unwrap()
     } else {
         crate::bindings::tests::fixture_dir()
     }

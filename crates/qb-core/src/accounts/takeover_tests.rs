@@ -128,7 +128,7 @@ impl Fixture {
             .unwrap()
             .join(".sandbox/staging/r6-core/test-homes");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(root.path()).unwrap());
         let now = Utc::now();
         let bytes = serde_json::to_vec(&serde_json::json!({"claudeAiOauth":{

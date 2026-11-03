@@ -1,5 +1,7 @@
 //! Spawn the actual Cargo-selected CLI against a synthetic authenticated admin.
 //! No real core, upstream, credential source, or copied executable is used.
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use axum::{
     Json, Router,
     extract::State,
@@ -148,9 +150,9 @@ impl Fixture {
     async fn with_invalid_reply(refresh_ok: bool, invalid_reply: Option<InvalidReply>) -> Self {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r6-cli-spawned");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        std::fs::write(
+        fixture_support::write_private(
             home.path().join("config.toml"),
             format!(
                 "[server]\nadmin_port={}\n",
@@ -158,7 +160,7 @@ impl Fixture {
             ),
         )
         .unwrap();
-        std::fs::write(home.path().join("admin.token"), ADMIN_TOKEN).unwrap();
+        fixture_support::write_private(home.path().join("admin.token"), ADMIN_TOKEN).unwrap();
         let mock = Mock {
             observed: Default::default(),
             refresh_ok,

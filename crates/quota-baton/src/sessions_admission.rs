@@ -628,11 +628,11 @@ mod tests {
         let scratch =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/session-admission-tests");
         fs::create_dir_all(&scratch).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(scratch).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(scratch).unwrap();
         let a = root.path().join("a");
         let b = root.path().join("b");
-        fs::create_dir_all(&a).unwrap();
-        fs::create_dir_all(&b).unwrap();
+        crate::fixture_support::private_directory(&a).unwrap();
+        crate::fixture_support::private_directory(&b).unwrap();
         let first = shared_for(&a, Some(SESSION)).unwrap();
         let second = shared_for(&a, Some(SESSION)).unwrap();
         assert!(exclusive(&[b.clone(), a.clone()], SESSION).is_err());
@@ -693,7 +693,7 @@ mod tests {
         let scratch =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/session-admission-tests");
         fs::create_dir_all(&scratch).unwrap();
-        tempfile::tempdir_in(fs::canonicalize(scratch).unwrap()).unwrap()
+        qb_testkit::fixture::tempdir_in(scratch).unwrap()
     }
 
     #[cfg(windows)]
@@ -703,7 +703,7 @@ mod tests {
             let root = pin_fixture();
             let parent = root.path().join("parent");
             let home = parent.join("home");
-            fs::create_dir_all(&home).unwrap();
+            crate::fixture_support::private_directory(&home).unwrap();
             let source = home.join("staged");
             let target = home.join("published");
             fs::write(&source, b"synthetic rollout").unwrap();

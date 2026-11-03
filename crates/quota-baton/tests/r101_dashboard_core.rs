@@ -1,5 +1,7 @@
 #![cfg(all(feature = "testkit", debug_assertions))]
 //! Synthetic numeric-loopback upstream and isolated spawned core.
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use futures_util::{SinkExt, StreamExt};
 use qb_core::{
     accounts::{AccountStore, import},
@@ -33,12 +35,12 @@ async fn detail(client: &reqwest::Client, port: u16) -> Value {
 async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_next_turn() {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r101-core-tests");
     fs::create_dir_all(&base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(base).unwrap();
     let home = root.path().join("home");
     let profile = root.path().join("profile");
     let external = root.path().join("synthetic-cpa");
     for path in [&home, &profile, &external, &root.path().join("temp")] {
-        fs::create_dir_all(path).unwrap();
+        fixture_support::private_directory(path).unwrap();
     }
     fs::write(
         external.join("fixture.json"),
@@ -50,6 +52,7 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
         .unwrap(),
     )
     .unwrap();
+    qb_testkit::fixture::configure_home(&home).unwrap();
     {
         let store = AccountStore::acquire(&home).unwrap();
         import::run(
@@ -60,8 +63,8 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
         )
         .unwrap();
     } // Release the lease before starting the real CLI process.
-    fs::write(home.join("client.key"), CLIENT).unwrap();
-    fs::write(home.join("admin.token"), ADMIN).unwrap();
+    fixture_support::write_private(home.join("client.key"), CLIENT).unwrap();
+    fixture_support::write_private(home.join("admin.token"), ADMIN).unwrap();
     let fake = WebSocketUpstream::start().await.unwrap();
     fake.state.set_echo(false);
     // Numeric loopback only, including polling and refresh endpoints.
@@ -70,8 +73,8 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
     let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let data_port = data.local_addr().unwrap().port();
     let admin_port = admin.local_addr().unwrap().port();
-    fs::write(home.join("config.toml"), format!(
-        "[server]\ndata_port={data_port}\nadmin_port={admin_port}\n[dashboard]\nresolve_claude_project=false\n[upstream]\ncodex_base='{0}'\nanthropic_base='{0}'\ncodex_usage_base='{0}'\nclaude_usage_base='{0}'\ncodex_token_endpoint='{0}/oauth/token'\nclaude_token_endpoint='{0}/oauth/token'\n", fake.url
+    fixture_support::write_private(home.join("config.toml"), format!(
+        "[server]\ndata_port={data_port}\nadmin_port={admin_port}\n[dashboard]\nresolve_claude_project=false\n[upstream]\ncodex_base='{0}'\nanthropic_base='{0}'\ncodex_usage_base='{0}'\nclaude_usage_base='{0}'\ncodex_token_endpoint='{0}/oauth/token'\nclaude_token_endpoint='{0}/oauth/token'\n[secrets]\nlinux_backend='file-0600'\n", fake.url
     )).unwrap();
     drop((data, admin));
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_quota-baton"));

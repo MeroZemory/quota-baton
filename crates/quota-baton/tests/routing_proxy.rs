@@ -1,4 +1,6 @@
 //! Authenticated local routing CLI must ignore inherited HTTP proxy settings.
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use std::{
     sync::{
         Arc,
@@ -11,10 +13,10 @@ async fn routing_cli_never_sends_admin_credentials_to_an_environment_proxy() {
     let base =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/routing-proxy");
     std::fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(base).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(base).unwrap();
     let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    std::fs::write(
+    fixture_support::write_private(
         home.path().join("config.toml"),
         format!(
             "[server]\nadmin_port={}\n",
@@ -22,12 +24,12 @@ async fn routing_cli_never_sends_admin_credentials_to_an_environment_proxy() {
         ),
     )
     .unwrap();
-    std::fs::write(
+    fixture_support::write_private(
         home.path().join("admin.token"),
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     )
     .unwrap();
-    std::fs::write(
+    fixture_support::write_private(
         home.path().join("client.key"),
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA",
     )

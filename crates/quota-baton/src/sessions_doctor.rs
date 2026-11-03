@@ -508,7 +508,7 @@ mod tests {
     fn fixture() -> tempfile::TempDir {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-doctor-tests");
         fs::create_dir_all(&base).unwrap();
-        tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap()
+        qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap()
     }
 
     #[test]

@@ -65,6 +65,9 @@ mod r7_snapshot_tests {
     #[test]
     fn r7_legacy_binding_snapshot_preserves_metadata_without_counting_idle_pin_as_activity() {
         let root = tests::fixture_dir();
+        // This fixture supplies a pre-existing legacy snapshot. Fresh-state
+        // constructor behavior is covered separately without a seeded file.
+        crate::platform::create_private_directory_new(&root.path().join("state")).unwrap();
         let now = Utc::now();
         let key = "codex:r7-synthetic-root";
         qb_testkit::fixture::write_private(root.path().join("state/bindings.json"),&serde_json::to_vec(&serde_json::json!({"schema":1,"bindings":[{"key":key,"account":"cx-123abc","last_used":now-chrono::Duration::seconds(1000)}]})).unwrap()).unwrap();
@@ -4812,8 +4815,12 @@ mod tests {
     #[test]
     fn oversized_binding_file_is_refused_before_legacy_anchor_capture() {
         let dir = fixture_dir();
-        fs::create_dir_all(dir.path().join("state")).unwrap();
-        let file = fs::File::create(dir.path().join("state/bindings.json")).unwrap();
+        crate::platform::ensure_private_dir_all(&dir.path().join("state")).unwrap();
+        qb_testkit::fixture::write_private(dir.path().join("state/bindings.json"), b"").unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("state/bindings.json"))
+            .unwrap();
         file.set_len(SNAPSHOT_MAX_BYTES + 1).unwrap();
         drop(file);
         assert!(BindingTable::new(dir.path(), RoutingConfig::default()).is_err());
@@ -4966,7 +4973,7 @@ mod tests {
     {
         for strict in [false, true] {
             let dir = fixture_dir();
-            fs::create_dir_all(dir.path().join("state")).unwrap();
+            crate::platform::ensure_private_dir_all(&dir.path().join("state")).unwrap();
             let path = dir.path().join("state/bindings.json");
             let raw=br#"{"schema":1,"bindings":[{"key":"codex:old","account":"cx-a","account":"cx-b","last_used":"2026-10-20T00:00:00Z"}]}"#;
             qb_testkit::fixture::write_private(&path, raw).unwrap();
@@ -5012,7 +5019,7 @@ mod tests {
     #[test]
     fn legacy_twenty_thousand_normal_eighty_byte_keys_remain_readable() {
         let dir = fixture_dir();
-        fs::create_dir_all(dir.path().join("state")).unwrap();
+        crate::platform::ensure_private_dir_all(&dir.path().join("state")).unwrap();
         let now = Utc::now();
         let bindings: Vec<_> = (0..CAPACITY)
             .map(|n| json!({"key":format!("codex:{n:074}"),"account":"cx-account","last_used":now}))
@@ -5460,7 +5467,7 @@ mod tests {
             ..RoutingConfig::default()
         };
         assert!(BindingTable::new(dir.path(), config).is_err());
-        fs::create_dir_all(dir.path().join("state")).unwrap();
+        crate::platform::ensure_private_dir_all(&dir.path().join("state")).unwrap();
         qb_testkit::fixture::write_private(
             dir.path().join("state/bindings.json"),
             br#"{"schema":2,"bindings":[]}"#,

@@ -162,7 +162,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/n6t-pin");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let table =
             BindingTable::new(root.path(), crate::config::RoutingConfig::default()).unwrap();
         let candidates: Vec<_> = ["sample-source", "sample-target", "sample-next"]

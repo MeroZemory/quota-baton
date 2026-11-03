@@ -91,7 +91,7 @@ fn isolated(test: impl FnOnce(&AccountStore, &Path, &Path)) {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m1b2-import-tests");
     fs::create_dir_all(&root).unwrap();
-    let root = tempfile::tempdir_in(root).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(root).unwrap();
     let home = root.path().join("home");
     let cpa = root.path().join("synthetic-cpa");
     fs::create_dir(&cpa).unwrap();

@@ -96,7 +96,7 @@ impl Harness {
     async fn new() -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
         fs::create_dir_all(&root).unwrap();
-        let temp = tempfile::tempdir_in(root).unwrap();
+        let temp = qb_testkit::fixture::tempdir_in(root).unwrap();
         let home = temp.path().join("home");
         let cpa = temp.path().join("cpa");
         fs::create_dir_all(&cpa).unwrap();
@@ -387,7 +387,7 @@ async fn a2_harness() -> (A2Upstream, A2Harness) {
     let upstream = A2Upstream::start().await;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
     fs::create_dir_all(&root).unwrap();
-    let temp = tempfile::tempdir_in(root).unwrap();
+    let temp = qb_testkit::fixture::tempdir_in(root).unwrap();
     let home = temp.path().join("home");
     let cpa = temp.path().join("cpa");
     fs::create_dir_all(&cpa).unwrap();

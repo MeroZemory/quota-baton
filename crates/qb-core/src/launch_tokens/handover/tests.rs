@@ -345,7 +345,7 @@ fn scoped_grant_clones_exact_registry_scope_without_tcp_or_epoch_weakening() {
         });
     std::fs::create_dir_all(&base).unwrap();
     let base = std::fs::canonicalize(base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(base).unwrap();
     let home = root.path().join("home");
     crate::platform::create_private_directory_new(&home).unwrap();
     let boxes = BoxRegistry::open(&home).unwrap();

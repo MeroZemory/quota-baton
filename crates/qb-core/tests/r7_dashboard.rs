@@ -39,7 +39,7 @@ impl Harness {
         let base =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r7-dashboard-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         let home = root.path().join("home");
         let external = root.path().join("synthetic-cpa");
         fs::create_dir(&external).unwrap();

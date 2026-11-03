@@ -1874,7 +1874,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r142-recorder-fixtures");
         fs::create_dir_all(&root).unwrap();
-        tempfile::tempdir_in(root).unwrap()
+        qb_testkit::fixture::tempdir_in(root).unwrap()
     }
     fn event(recorder: &Recorder) -> Event {
         Event::Account {

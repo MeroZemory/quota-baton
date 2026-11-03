@@ -4670,11 +4670,11 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r3-cutover-tests");
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
-        let dir = tempfile::tempdir_in(root).unwrap();
+        let dir = qb_testkit::fixture::tempdir_in(root).unwrap();
         let source = dir.path().join(".codex");
         let npm = dir.path().join("App Data/npm");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&npm).unwrap();
+        crate::fixture_support::private_directory(&source).unwrap();
+        crate::fixture_support::private_directory(&npm).unwrap();
         fs::write(npm.join("codex.cmd"), "synthetic").unwrap();
         fs::write(npm.join("claude.cmd"), "synthetic-never-executed").unwrap();
         fs::write(
@@ -4712,10 +4712,10 @@ trusted_hash = "synthetic-hook-hash"
         fs::write(source.join("AGENTS.md"), "synthetic instructions").unwrap();
         fs::write(source.join("hooks.json"), "{}").unwrap();
         let claude_settings = dir.path().join("claude/settings.json");
-        fs::create_dir(claude_settings.parent().unwrap()).unwrap();
+        crate::fixture_support::private_directory(claude_settings.parent().unwrap()).unwrap();
         fs::write(&claude_settings, format!(r#"{{"env":{{"ANTHROPIC_AUTH_TOKEN":"{SECRET}"}},"nested":{{"innocent":"{SECRET}"}}}}"#)).unwrap();
         let qb_home = dir.path().join("quota-baton");
-        fs::create_dir(&qb_home).unwrap();
+        crate::fixture_support::private_directory(&qb_home).unwrap();
         let client_key = qb_home.join("client.key");
         fs::write(&client_key, KEY).unwrap();
         let p = CutoverPaths {

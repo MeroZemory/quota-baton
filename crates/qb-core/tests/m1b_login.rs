@@ -40,8 +40,8 @@ impl Harness {
             .unwrap()
             .join(".sandbox/m1b-login-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
-        let home = tempfile::tempdir_in(root.path()).unwrap().keep();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root.path()).unwrap().keep();
         let mut private_config = tempfile::NamedTempFile::new_in(&home).unwrap();
         std::io::Write::write_all(
             &mut private_config,

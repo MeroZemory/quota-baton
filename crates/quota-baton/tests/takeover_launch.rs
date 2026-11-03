@@ -1,6 +1,8 @@
 //! Real CLI takeover retains a logical client's launch URL, without C8 identity.
 #![cfg(all(windows, feature = "testkit", debug_assertions))]
 
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use futures_util::{SinkExt, StreamExt};
 use qb_core::accounts::{AccountStore, import};
 use qb_testkit::{ScriptedResponse, ScriptedState, ScriptedUpstream, websocket::WebSocketUpstream};
@@ -335,17 +337,18 @@ async fn actual_takeover_retains_launch_without_c8_for_http_and_ws() {
     checked(tokio::time::timeout(HARD, async {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/takeover-launch-tests");
         checked(fs::create_dir_all(&base), "sandbox_create");
-        let root = checked(tempfile::tempdir_in(base), "sandbox_private");
+        let root = checked(qb_testkit::fixture::tempdir_in(base), "sandbox_private");
         let home = root.path().join("home");
         let cpa = root.path().join("synthetic-cpa");
         for path in [&home, &cpa, &root.path().join("profile"), &root.path().join("temp")] {
-            checked(fs::create_dir_all(path), "fixture_directory");
+            checked(fixture_support::private_directory(path), "fixture_directory");
         }
         checked(fs::write(cpa.join("fixture.json"), checked(serde_json::to_vec(&json!({
             "type":"codex", "email":"takeover@example.invalid", "account_id":"takeover-fixture",
             "access_token":"takeover-synthetic-access", "refresh_token":"takeover-synthetic-refresh",
             "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-10-30T00:00:00Z"
         })), "account_json")), "account_write");
+        checked(qb_testkit::fixture::configure_home(&home), "fixture_private_backend");
         let account = {
             let store = checked(AccountStore::acquire(&home), "fixture_lease");
             checked(import::run(&store, &cpa, &["codex:takeover@example.invalid".into()], false), "fixture_import");
@@ -353,8 +356,8 @@ async fn actual_takeover_retains_launch_without_c8_for_http_and_ws() {
             assert_eq!(accounts.len(), 1, "fixture_account_count");
             accounts[0].id.clone()
         };
-        checked(fs::write(home.join("client.key"), CLIENT), "client_write");
-        checked(fs::write(home.join("admin.token"), ADMIN), "admin_write");
+        checked(fixture_support::write_private(home.join("client.key"), CLIENT), "client_write");
+        checked(fixture_support::write_private(home.join("admin.token"), ADMIN), "admin_write");
         let upstream = Upstream::start().await;
         let usage = checked(ScriptedUpstream::start().await, "usage_bind");
         let token = checked(ScriptedUpstream::start().await, "token_bind");
@@ -371,8 +374,8 @@ async fn actual_takeover_retains_launch_without_c8_for_http_and_ws() {
         let admin_url = format!("http://127.0.0.1:{admin_port}");
         local_port(&admin_url);
         local_port(&format!("http://127.0.0.1:{data_port}"));
-        checked(fs::write(home.join("config.toml"), format!(
-            "[server]\ndata_port={data_port}\nadmin_port={admin_port}\ndrain_timeout_secs=2\n[dashboard]\nresolve_claude_project=false\n[upstream]\ncodex_base='{0}'\nanthropic_base='{0}'\ncodex_usage_base='{1}'\nclaude_usage_base='{1}'\ncodex_token_endpoint='{2}/oauth/token'\nclaude_token_endpoint='{2}/oauth/token'\n",
+        checked(fixture_support::write_private(home.join("config.toml"), format!(
+            "[server]\ndata_port={data_port}\nadmin_port={admin_port}\ndrain_timeout_secs=2\n[dashboard]\nresolve_claude_project=false\n[upstream]\ncodex_base='{0}'\nanthropic_base='{0}'\ncodex_usage_base='{1}'\nclaude_usage_base='{1}'\ncodex_token_endpoint='{2}/oauth/token'\nclaude_token_endpoint='{2}/oauth/token'\n[secrets]\nlinux_backend='file-0600'\n",
             upstream.url, usage.url, token.url)), "config_write");
         let client = checked(Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5)).build(), "client_build");

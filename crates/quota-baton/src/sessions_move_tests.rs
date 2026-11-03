@@ -512,14 +512,14 @@ impl Fixture {
     fn new() -> Result<Self> {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/sessions-move-tests");
         fs::create_dir_all(&base)?;
-        let root = tempfile::tempdir_in(fs::canonicalize(base)?)?;
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base)?)?;
         let source = root.path().join("source");
         let target = root.path().join("target");
         let home = root.path().join("qb");
         for dir in [&source, &target, &home] {
-            fs::create_dir_all(dir)?;
+            crate::fixture_support::private_directory(dir)?;
         }
-        fs::create_dir_all(home.join("journal"))?;
+        crate::fixture_support::private_directory(home.join("journal"))?;
         let source = fs::canonicalize(source)?;
         let target = fs::canonicalize(target)?;
         let home = fs::canonicalize(home)?;
@@ -1334,7 +1334,7 @@ fn compressed_test_home(f: &mut Fixture, location: &str) -> Result<PathBuf> {
         "target" => Ok(f.store.target.clone()),
         "inventory" => {
             let peer = f.root.path().join("peer");
-            fs::create_dir_all(&peer)?;
+            crate::fixture_support::private_directory(&peer)?;
             let peer = fs::canonicalize(peer)?;
             f.store.search_homes.push(peer.clone());
             Ok(peer)
@@ -1542,7 +1542,7 @@ fn partial_or_divergent_paginated_inventory_in_another_home_is_refused_without_w
         let mut f = Fixture::new()?;
         let second = rollout(&f.source, ROOT, SECOND, None, Some(PHYSICAL))?;
         let peer = f.root.path().join("peer");
-        fs::create_dir_all(peer.join("sessions"))?;
+        crate::fixture_support::private_directory(peer.join("sessions"))?;
         let peer = fs::canonicalize(peer)?;
         for physical in physicals {
             let source = match physical {
@@ -1585,7 +1585,7 @@ fn exact_paginated_hardlink_inventory_in_another_home_moves_every_public_name() 
     let mut f = Fixture::new()?;
     let second = rollout(&f.source, ROOT, SECOND, None, Some(PHYSICAL))?;
     let peer = f.root.path().join("peer");
-    fs::create_dir_all(peer.join("sessions"))?;
+    crate::fixture_support::private_directory(peer.join("sessions"))?;
     let peer = fs::canonicalize(peer)?;
     let mut peer_names = Vec::new();
     for source in [&f.original, &second] {
@@ -1629,7 +1629,7 @@ fn an_uninventoried_hardlink_refuses_and_preserves_every_name() -> Result<()> {
 fn all_catalogued_aliases_of_one_file_are_removed_not_just_one_uuid_entry() -> Result<()> {
     let mut f = Fixture::new()?;
     let peer = f.root.path().join("peer");
-    fs::create_dir_all(&peer)?;
+    crate::fixture_support::private_directory(&peer)?;
     let peer = fs::canonicalize(peer)?;
     let aliases = [
         f.source
@@ -2658,7 +2658,7 @@ fn return_and_redo_keep_prior_encrypted_journals_and_private_duplicate_evidence_
 -> Result<()> {
     let mut f = Fixture::new()?;
     let peer = f.root.path().join("peer");
-    fs::create_dir_all(&peer)?;
+    crate::fixture_support::private_directory(&peer)?;
     let peer = fs::canonicalize(peer)?;
     let copy = peer.join("sessions").join(f.original.file_name().unwrap());
     fs::create_dir_all(copy.parent().unwrap())?;

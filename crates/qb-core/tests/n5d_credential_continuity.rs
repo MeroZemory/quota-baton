@@ -14,7 +14,7 @@ fn fixture() -> (tempfile::TempDir, AccountStore, Account) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.sandbox/n5d-credential-continuity-tests");
     fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root).unwrap();
+    let home = qb_testkit::fixture::home_in(root).unwrap();
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let store = loop {
         match AccountStore::acquire(home.path()) {

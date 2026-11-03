@@ -88,12 +88,12 @@ impl Fixture {
     fn new() -> Self {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         let source = root.path().join("source");
         let target = root.path().join("target");
         let home = root.path().join("qb");
         for path in [&source, &target, &home.join("journal")] {
-            fs::create_dir_all(path).unwrap();
+            crate::fixture_support::private_directory(path).unwrap();
         }
         let source = fs::canonicalize(source).unwrap();
         let target = fs::canonicalize(target).unwrap();
@@ -880,7 +880,7 @@ fn r12_9_q_owned_resume_refuses_writer_through_hardlink() {
 fn r12_9_q_owned_resume_refuses_native_ancestor_thread_lock() {
     let (f, _) = r12_9_q_owned_cpa_history();
     let locks = f.store.target.join("thread-writer-locks");
-    fs::create_dir_all(&locks).unwrap();
+    crate::fixture_support::private_directory(&locks).unwrap();
     for id in [A, B, C] {
         let lock = File::options()
             .read(true)
@@ -1285,7 +1285,7 @@ fn share_related_unreadable_compressed_inventory_refuses_before_target_mutation(
             "target" => f.store.target.clone(),
             _ => {
                 let peer = f._root.path().join("peer");
-                fs::create_dir_all(&peer).unwrap();
+                crate::fixture_support::private_directory(&peer).unwrap();
                 f.store.search_homes.push(peer.clone());
                 peer
             }

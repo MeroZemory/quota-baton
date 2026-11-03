@@ -1147,7 +1147,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r13-part-c/n5c-ui-fixtures");
         std::fs::create_dir_all(&root).unwrap();
-        let home = tempfile::tempdir_in(root).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(root).unwrap();
         let config = crate::config::Config::default();
         let table = BindingTable::new(home.path(), config.routing.clone()).unwrap();
         table
@@ -1555,7 +1555,15 @@ mod tests {
 
     #[test]
     fn r7_stale_empty_snapshot_cannot_remove_ensured_row_before_request_start() {
-        let home = tempfile::tempdir().unwrap();
+        let home = qb_testkit::fixture::tempdir_in(
+            std::env::current_exe()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         let config = crate::config::Config::default();
         let table = BindingTable::new(home.path(), config.routing.clone()).unwrap();
         let runtime = Runtime::new();
@@ -1653,7 +1661,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r7-filename-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let temp = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
+        let temp = qb_testkit::fixture::tempdir_in(base).unwrap();
         let projects = temp.path().join("projects");
         std::fs::create_dir_all(projects.join("fixture-private-folder")).unwrap();
         std::fs::write(

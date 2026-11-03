@@ -557,7 +557,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r6-native-fixtures");
         fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         let path = home.path().join("auth.json");
         fs::write(&path, b"synthetic source bytes").unwrap();
         let before = NativeSource.snapshot(Provider::Codex, home.path()).unwrap();

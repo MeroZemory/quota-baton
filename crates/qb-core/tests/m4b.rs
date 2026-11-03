@@ -101,7 +101,7 @@ impl Harness {
             .unwrap();
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4b");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let home = root.path().join("home");
         let cpa = root.path().join("cpa");
         fs::create_dir_all(&cpa).unwrap();

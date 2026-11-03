@@ -5,7 +5,7 @@ fn c5_reimport_preserves_metadata_and_only_newer_tokens_clear_needs_relogin() {
     let sandbox =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/state-fixtures");
     fs::create_dir_all(&sandbox).unwrap();
-    let home = tempfile::tempdir_in(&sandbox).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(&sandbox).unwrap();
     let source = home.path().join("synthetic-cpa");
     fs::create_dir(&source).unwrap();
     let file = source.join("fixture.json");

@@ -1051,7 +1051,7 @@ mod r15_sse_boundary_tests {
             .unwrap()
             .join(".sandbox/r15-sse-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::tempdir_in(base).unwrap();
         let obs = crate::observability::Observability::new(home.path(), None).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1126,7 +1126,7 @@ mod r15_protected_sse_tests {
             .unwrap()
             .join(".sandbox/r15-sse-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let home = tempfile::tempdir_in(base).unwrap();
+        let home = qb_testkit::fixture::home_in(base).unwrap();
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
         let obs = Arc::new(crate::observability::Observability::new(home.path(), None).unwrap());
         let runtime = tokio::runtime::Builder::new_current_thread()

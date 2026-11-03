@@ -275,7 +275,7 @@ mod enabled {
                 .unwrap()
                 .join(".sandbox/capture-tests");
             fs::create_dir_all(&root).unwrap();
-            tempfile::tempdir_in(root).unwrap()
+            qb_testkit::fixture::tempdir_in(root).unwrap()
         }
 
         #[test]

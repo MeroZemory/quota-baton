@@ -1175,11 +1175,11 @@ mod tests {
             let base =
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/session-map-tests");
             fs::create_dir_all(&base).unwrap();
-            let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+            let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
             let path = root.path().join("appdata/herdr/session-homes.json");
             let backup = root.path().join("journal/map-backups");
             let destination = root.path().join("qb-home");
-            fs::create_dir(&destination).unwrap();
+            crate::fixture_support::private_directory(&destination).unwrap();
             let original_home = root.path().join("source-home").to_str().unwrap().to_owned();
             Self {
                 _root: root,
@@ -1191,7 +1191,7 @@ mod tests {
         }
 
         fn write(&self, value: &Value) {
-            fs::create_dir_all(self.path.parent().unwrap()).unwrap();
+            crate::fixture_support::private_directory(self.path.parent().unwrap()).unwrap();
             fs::write(&self.path, serde_json::to_vec(value).unwrap()).unwrap();
         }
 
@@ -1216,7 +1216,7 @@ mod tests {
     ) -> Result<()> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::DELETE;
-        let scratch = tempfile::tempdir_in(path.parent().unwrap())?;
+        let scratch = qb_testkit::fixture::tempdir_in(path.parent().unwrap())?;
         let staged = scratch.path().join("foreign.json");
         publish(&staged, bytes, || Ok(()))?;
         let file = OpenOptions::new()

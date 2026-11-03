@@ -1,3 +1,5 @@
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -293,13 +295,14 @@ fn fixture(port: u16) -> tempfile::TempDir {
         .unwrap()
         .join(".sandbox/tests");
     std::fs::create_dir_all(&root).unwrap();
-    let home = tempfile::tempdir_in(root).unwrap();
-    std::fs::write(
+    let home = qb_testkit::fixture::tempdir_in(root).unwrap();
+    fixture_support::write_private(
         home.path().join("config.toml"),
         format!("[server]\nadmin_port={port}\n"),
     )
     .unwrap();
-    std::fs::write(home.path().join("admin.token"), "synthetic-admin-token").unwrap();
+    fixture_support::write_private(home.path().join("admin.token"), "synthetic-admin-token")
+        .unwrap();
     home
 }
 

@@ -21,14 +21,14 @@ impl Fixture {
         let base =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/session-map-resolve-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         let fixture = Self {
             path: root.path().join("appdata/herdr/session-homes.json"),
             backup: root.path().join("journal/map-backups"),
             target: root.path().join("synthetic-qb-home"),
             _root: root,
         };
-        fs::create_dir(&fixture.target).unwrap();
+        crate::fixture_support::private_directory(&fixture.target).unwrap();
         fixture.write(&json!({
             "sessions": {A: "synthetic-source", B: "synthetic-other-home"},
             "future": {"keep": [1, true], "padding": "synthetic".repeat(1600)}
@@ -37,7 +37,7 @@ impl Fixture {
     }
 
     fn write(&self, value: &Value) {
-        fs::create_dir_all(self.path.parent().unwrap()).unwrap();
+        crate::fixture_support::private_directory(self.path.parent().unwrap()).unwrap();
         fs::write(&self.path, serde_json::to_vec(value).unwrap()).unwrap();
     }
 
@@ -63,7 +63,7 @@ impl Fixture {
 fn foreign_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::DELETE;
-    let scratch = tempfile::tempdir_in(path.parent().unwrap())?;
+    let scratch = qb_testkit::fixture::tempdir_in(path.parent().unwrap())?;
     let staged = scratch.path().join("foreign.json");
     publish(&staged, bytes, || Ok(()))?;
     let file = OpenOptions::new()

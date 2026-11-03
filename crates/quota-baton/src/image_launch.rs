@@ -494,13 +494,13 @@ mod tests {
     fn r12_image_launch_refuses_unpublished_or_remote_or_missing_provider_without_leaking_key() {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r12-launch-tests");
         std::fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let root = std::fs::canonicalize(root.path()).unwrap();
         let qb = root.join("core");
         let ordinary = root.join("qb");
         let image = root.join("qb-images");
         for path in [qb.join("journal"), ordinary.clone(), image.join("log")] {
-            std::fs::create_dir_all(path).unwrap();
+            crate::fixture_support::private_directory(path).unwrap();
         }
         let key = "synthetic-r12-local-key-never-in-error";
         std::fs::write(qb.join("client.key"), key).unwrap();

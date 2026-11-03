@@ -48,9 +48,9 @@ impl Harness {
             .unwrap()
             .join(".sandbox/l1-browserless-login-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         // Keep the private child under root, whose Drop removes the whole fixture.
-        let home = tempfile::tempdir_in(root.path()).unwrap().keep();
+        let home = qb_testkit::fixture::tempdir_in(root.path()).unwrap().keep();
         let mut config_file = tempfile::NamedTempFile::new_in(&home).unwrap();
         std::io::Write::write_all(
             &mut config_file,

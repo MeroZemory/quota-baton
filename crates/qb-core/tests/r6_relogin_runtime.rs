@@ -64,7 +64,7 @@ async fn complete(service: &LoginService, client: &reqwest::Client) -> LoginStat
 async fn adopted_legacy_oauth_completion_clears_original_runtime_id_only_after_success() {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r6-relogin-fixtures");
     fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(base).unwrap();
+    let home = qb_testkit::fixture::home_in(base).unwrap();
     let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
     let identity = Identity::Codex {
         account_id: "r6-workspace".into(),
@@ -289,7 +289,7 @@ async fn r6_started_legacy_takeover_reopens_then_actual_oauth_supersedes_and_old
     use sha2::Digest;
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r6-relogin-fixtures");
     fs::create_dir_all(&base).unwrap();
-    let home = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+    let home = qb_testkit::fixture::home_in(fs::canonicalize(base).unwrap()).unwrap();
     let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
     let now = chrono::Utc::now();
     let identity = Identity::Codex {

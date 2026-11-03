@@ -291,7 +291,7 @@ pub(super) fn directory() -> tempfile::TempDir {
         .unwrap()
         .join(".sandbox/n6r-tape-tests");
     fs::create_dir_all(&root).unwrap();
-    tempfile::tempdir_in(root).unwrap()
+    qb_testkit::fixture::tempdir_in(root).unwrap()
 }
 fn at(n: u64) -> Stamp {
     Stamp {

@@ -37,7 +37,7 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
         let base =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r142-minimum-fixtures");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let cpa = root.path().join("synthetic-cpa");
         fs::create_dir_all(&cpa).unwrap();
         fs::write(

@@ -388,7 +388,7 @@ mod tests {
             .unwrap()
             .join(".sandbox/r142-runtime-fixtures");
         std::fs::create_dir_all(&root).unwrap();
-        tempfile::tempdir_in(root).unwrap()
+        qb_testkit::fixture::tempdir_in(root).unwrap()
     }
     fn event(runtime: &Runtime) -> Event {
         Event::Account {

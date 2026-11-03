@@ -93,7 +93,7 @@ mod tests {
         let root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9.6-preview-title-tests");
         fs::create_dir_all(&root).unwrap();
-        let directory = tempfile::tempdir_in(root).unwrap();
+        let directory = qb_testkit::fixture::tempdir_in(root).unwrap();
         let path = directory.path().join(if compressed {
             "rollout.jsonl.zst"
         } else {

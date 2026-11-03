@@ -3,6 +3,8 @@
 //! durable managed admission, directional recovery, and conflict preservation.
 #![cfg(all(windows, feature = "testkit", debug_assertions))]
 
+#[path = "../src/fixture_support.rs"]
+mod fixture_support;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
@@ -476,7 +478,7 @@ impl Fixture {
     fn new() -> Self {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-crash-tests");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
         assert!(
             root.path()
                 .components()
@@ -498,7 +500,7 @@ impl Fixture {
             &user.join("AppData/Local"),
             &root.path().join("temp"),
         ] {
-            fs::create_dir_all(dir).unwrap();
+            fixture_support::private_directory(dir).unwrap();
         }
         fs::write(
             appdata.join("npm/codex.cmd"),

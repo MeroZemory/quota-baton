@@ -2647,7 +2647,7 @@ mod tests {
     fn tempdir() -> std::io::Result<tempfile::TempDir> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r3-cutover-tests");
         fs::create_dir_all(&root)?;
-        tempfile::tempdir_in(root)
+        qb_testkit::fixture::tempdir_in(root)
     }
     fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
         super::wire_with_options(
@@ -2680,6 +2680,7 @@ mod tests {
         )
         .unwrap();
         let qb_home = dir.path().join("qb");
+        crate::fixture_support::private_directory(&qb_home).unwrap();
         let client_key = dir.path().join("key");
         (
             dir,
@@ -2819,7 +2820,7 @@ mod tests {
     #[test]
     fn r3_dedicated_journal_wins_over_changed_source_and_full_validation_still_runs() {
         let (_dir, p) = r3_retry_paths();
-        fs::create_dir_all(p.journal().parent().unwrap()).unwrap();
+        crate::fixture_support::private_directory(p.journal().parent().unwrap()).unwrap();
         let header = br#"{"schema":3,"mode":"dedicated"}"#;
         fs::write(p.journal(), header).unwrap();
         for source in [
@@ -2850,7 +2851,7 @@ mod tests {
     #[test]
     fn r3_journal_mode_errors_are_generic_and_explicit_overrides_still_win() {
         let (_dir, p) = r3_retry_paths();
-        fs::create_dir_all(p.journal().parent().unwrap()).unwrap();
+        crate::fixture_support::private_directory(p.journal().parent().unwrap()).unwrap();
         for header in [
             "{\"schema\":3,\"mode\":\"synthetic-mode-secret\"}",
             "{\"schema\":3,\"secret\":\"synthetic-mode-secret\"}",
@@ -3108,7 +3109,7 @@ mod tests {
         let apikey = dir.path().join("apikey-home");
         let chatgpt = dir.path().join("chatgpt-home");
         for home in [&exempt, &apikey, &chatgpt] {
-            fs::create_dir_all(home).unwrap();
+            crate::fixture_support::private_directory(home).unwrap();
         }
         fs::write(exempt.join("auth.json"), r#"{"auth_mode":"chatgpt"}"#).unwrap();
         fs::write(
@@ -3158,7 +3159,7 @@ mod tests {
     fn exempt_apikey_home_is_reported_but_never_wired() {
         let (dir, mut p) = paths();
         let home = dir.path().join(".codex-acct").join("apikey");
-        fs::create_dir_all(&home).unwrap();
+        crate::fixture_support::private_directory(&home).unwrap();
         let auth = home.join("auth.json");
         fs::write(&auth, r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old"}"#).unwrap();
         p.codex_session_homes.push(SessionHome {
@@ -3189,7 +3190,7 @@ mod tests {
     fn unwire_succeeds_when_journaled_session_auth_disappears() {
         let (dir, mut p) = paths();
         let home = dir.path().join("session-home");
-        fs::create_dir_all(&home).unwrap();
+        crate::fixture_support::private_directory(&home).unwrap();
         let auth = home.join("auth.json");
         fs::write(&auth, r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old"}"#).unwrap();
         p.codex_session_auth.push(auth.clone());
@@ -3516,7 +3517,7 @@ mod tests {
     fn chatgpt_session_home_detach_is_explicit_and_reversible() {
         let (dir, mut p) = paths();
         let home = dir.path().join("chatgpt-home");
-        fs::create_dir_all(&home).unwrap();
+        crate::fixture_support::private_directory(&home).unwrap();
         let auth = home.join("auth.json");
         fs::write(&auth, r#"{"auth_mode":"chatgpt"}"#).unwrap();
         let session_map = dir.path().join("session-homes.json");
@@ -3616,7 +3617,7 @@ mod tests {
         )
         .unwrap();
         let session_home = dir.path().join("chatgpt-session-home");
-        fs::create_dir_all(&session_home).unwrap();
+        crate::fixture_support::private_directory(&session_home).unwrap();
         let session_auth = session_home.join("auth.json");
         fs::write(
             &session_auth,
@@ -3678,7 +3679,7 @@ pub(crate) mod cpa_dependency_tests {
     pub(crate) fn scratch() -> tempfile::TempDir {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1-cpa-tests");
         fs::create_dir_all(&root).unwrap();
-        tempfile::tempdir_in(root).unwrap()
+        qb_testkit::fixture::tempdir_in(root).unwrap()
     }
 
     // Deliberately invalid DPAPI payload: these paths must only read metadata.
@@ -3701,11 +3702,11 @@ pub(crate) mod cpa_dependency_tests {
             json!({"kind":"cpa", "mode":mode, "dir":home.join("nonexistent-cpa"),
                 "match":{"account_id":format!("synthetic-{label}"), "email":format!("{label}@example.invalid")}})
         };
-        fs::create_dir_all(home.join("accounts")).unwrap();
+        crate::fixture_support::private_directory(home.join("accounts")).unwrap();
         let path = home
             .join("accounts")
             .join(format!("{}.json", identity.id()));
-        fs::write(
+        crate::fixture_support::write_private(
             &path,
             serde_json::to_vec(&json!({
                 "schema":1, "id":identity.id(), "provider":"codex", "label":label,
@@ -3900,6 +3901,7 @@ pub(crate) mod cpa_dependency_tests {
         )
         .unwrap();
         let qb_home = dir.path().join("qb");
+        crate::fixture_support::private_directory(&qb_home).unwrap();
         let client_key = dir.path().join("key");
         (
             dir,

@@ -13,6 +13,8 @@ mod admin_transport;
 
 mod debug_snapshot;
 
+#[cfg(test)]
+mod fixture_support;
 mod platform;
 #[cfg(test)]
 mod preflight_tests;

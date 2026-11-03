@@ -1760,12 +1760,14 @@ mod tests {
         let sandbox = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
         std::fs::create_dir_all(&sandbox)?;
         let sandbox = sandbox.canonicalize()?;
-        let temp = tempfile::Builder::new()
-            .prefix("sessions-db-")
-            .tempdir_in(sandbox)?;
+        let temp = qb_testkit::fixture::prepare_tempdir(
+            tempfile::Builder::new()
+                .prefix("sessions-db-")
+                .tempdir_in(sandbox)?,
+        )?;
         let source = temp.path().join("source");
         let target = temp.path().join("target");
-        std::fs::create_dir(&source)?;
+        crate::fixture_support::private_directory(&source)?;
         Ok((temp, source, target))
     }
 
@@ -2048,7 +2050,7 @@ mod tests {
         )?;
         assert!(plan(&source, &target, &ids).is_err());
         drop(db);
-        std::fs::create_dir(&target)?;
+        crate::fixture_support::private_directory(&target)?;
         std::fs::hard_link(source.join(STATE), target.join(STATE))?;
         assert!(plan(&source, &target, &ids).is_err());
         Ok(())
@@ -2225,7 +2227,7 @@ mod tests {
         let (_temp, source, target) = homes()?;
         let ids = versioned_fixture(&source)?;
         let planned = plan(&source, &target, &ids[..1])?;
-        std::fs::create_dir(&target)?;
+        crate::fixture_support::private_directory(&target)?;
         let db = Connection::open(target.join(STATE))?;
         db.execute_batch("PRAGMA foreign_keys=OFF")?;
         let threads_schema = planned.threads_schema.as_ref().context("threads schema")?;
@@ -2293,7 +2295,7 @@ mod tests {
         let (_temp, source, target) = homes()?;
         let ids = versioned_fixture(&source)?;
         let planned = plan(&source, &target, &ids[..1])?;
-        std::fs::create_dir(&target)?;
+        crate::fixture_support::private_directory(&target)?;
         let db = Connection::open(target.join(STATE))?;
         db.execute("CREATE TABLE unknown_user_data(value TEXT)", [])?;
         assert!(apply(&planned).is_err());
