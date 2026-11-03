@@ -9,18 +9,37 @@ pub fn tempdir_in(parent: impl AsRef<Path>) -> io::Result<TempDir> {
     prepare_tempdir(tempfile::tempdir_in(parent.as_ref().canonicalize()?)?)
 }
 
-/// Prepare only a newly created, empty owned fixture directory. This preserves
-/// Builder prefixes; never pass a populated home or an unsafe-path fixture.
+/// Prepare only a newly created, empty owned fixture directory at a canonical
+/// path. Canonicalize a Builder's parent before creating it. Validation failures
+/// retain the input directory unchanged; the caller remains responsible for its
+/// cleanup. Never pass a populated home or an unsafe-path fixture.
 pub fn prepare_tempdir(home: TempDir) -> io::Result<TempDir> {
-    if !std::fs::symlink_metadata(home.path())?.file_type().is_dir()
-        || std::fs::read_dir(home.path())?
-            .next()
-            .transpose()?
-            .is_some()
-    {
+    let validation = (|| -> io::Result<()> {
+        if !std::fs::symlink_metadata(home.path())?.file_type().is_dir()
+            || home.path() != home.path().canonicalize()?
+            || std::fs::read_dir(home.path())?
+                .next()
+                .transpose()?
+                .is_some()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        let path: String = home
+            .path()
+            .to_string_lossy()
+            .chars()
+            .take(256)
+            .flat_map(char::escape_default)
+            .collect();
+        let _retained_path = home.keep();
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "fixture directory must be newly created and empty",
+            error.kind(),
+            format!(
+                "fixture directory must be a canonical, empty real directory; input retained at '{path}'"
+            ),
         ));
     }
     crate::platform::prepare_new_fixture_directory(&home)?;
@@ -97,5 +116,61 @@ mod tests {
                 .components()
                 .any(|part| matches!(part, std::path::Component::ParentDir))
         );
+    }
+
+    #[test]
+    fn builder_prefix_and_canonical_path_are_preserved() {
+        let parent = tempfile::tempdir().unwrap();
+        let builder = tempfile::Builder::new()
+            .prefix("positive-builder-")
+            .tempdir_in(parent.path().canonicalize().unwrap())
+            .unwrap();
+        let original = builder.path().to_owned();
+        let prepared = prepare_tempdir(builder).unwrap();
+        assert_eq!(prepared.path(), original);
+        assert_eq!(prepared.path(), prepared.path().canonicalize().unwrap());
+        assert!(
+            prepared
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("positive-builder-")
+        );
+        assert_eq!(std::fs::read_dir(prepared.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn populated_inputs_are_retained_without_preparation() {
+        let parent = tempfile::tempdir().unwrap();
+        let real_parent = parent.path().canonicalize().unwrap().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let populated = tempfile::tempdir_in(&real_parent).unwrap();
+        let path = populated.path().to_owned();
+        std::fs::write(path.join("keep"), b"synthetic-owned-data").unwrap();
+        let error = prepare_tempdir(populated).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("input retained at"));
+        assert_eq!(
+            std::fs::read(path.join("keep")).unwrap(),
+            b"synthetic-owned-data"
+        );
+    }
+
+    #[test]
+    fn configured_home_contains_only_config_and_private_writes_replace_records() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = home_in(parent.path()).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from("config.toml")]);
+        let record = home.path().join("record");
+        write_private(&record, b"first").unwrap();
+        write_private(&record, b"second").unwrap();
+        assert_eq!(std::fs::read(record).unwrap(), b"second");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 2);
     }
 }

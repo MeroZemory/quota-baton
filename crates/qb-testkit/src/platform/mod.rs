@@ -1,10 +1,9 @@
 //! Native preparation of newly owned, empty filesystem fixtures only.
 #[cfg(unix)]
-mod unix;
+#[path = "unix.rs"]
+mod native;
 #[cfg(windows)]
-mod windows;
+#[path = "windows.rs"]
+mod native;
 
-#[cfg(unix)]
-pub(crate) use unix::prepare_new_fixture_directory;
-#[cfg(windows)]
-pub(crate) use windows::prepare_new_fixture_directory;
+pub(crate) use native::prepare_new_fixture_directory;

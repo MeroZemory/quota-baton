@@ -8,8 +8,9 @@ use windows::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION_1,
             },
-            DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+            DACL_SECURITY_INFORMATION, GetTokenInformation, IsValidSid, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW,
+            TOKEN_QUERY, TOKEN_USER, TokenUser,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
@@ -57,12 +58,15 @@ pub(crate) fn prepare_new_fixture_directory(home: &TempDir) -> io::Result<()> {
         )
         .map_err(io::Error::other)?;
         let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        if !IsValidSid(user.User.Sid).as_bool() {
+            return Err(io::Error::other("invalid fixture user SID"));
+        }
         let mut sid = PWSTR::null();
         ConvertSidToStringSidW(user.User.Sid, &mut sid).map_err(io::Error::other)?;
         let _sid = Allocation(HLOCAL(sid.0.cast()));
         let sddl = format!(
-            "D:P(A;;FA;;;{})",
-            sid.to_string().map_err(io::Error::other)?
+            "O:{sid}D:P(A;OICI;FA;;;{sid})",
+            sid = sid.to_string().map_err(io::Error::other)?
         );
         let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -82,7 +86,9 @@ pub(crate) fn prepare_new_fixture_directory(home: &TempDir) -> io::Result<()> {
             .collect();
         SetFileSecurityW(
             PCWSTR(path.as_ptr()),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
             descriptor,
         )
         .ok()
@@ -129,12 +135,13 @@ mod tests {
         let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         unsafe {
             let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            let mut owner = PSID::default();
             let mut dacl: *mut ACL = std::ptr::null_mut();
             GetNamedSecurityInfoW(
                 PCWSTR(path.as_ptr()),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                Some(&mut owner),
                 None,
                 Some(&mut dacl),
                 None,
@@ -153,7 +160,7 @@ mod tests {
             GetAce(dacl, 0, &mut ace).unwrap();
             let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
             assert_eq!(ace.Header.AceType, 0);
-            assert_eq!(ace.Header.AceFlags, 0);
+            assert_eq!(ace.Header.AceFlags, 0x03); // object/container inheritance
             assert_eq!(ace.Mask, 0x001f01ff); // FILE_ALL_ACCESS
             let sid = PSID((&raw const ace.SidStart).cast_mut().cast());
             assert!(IsValidSid(sid).as_bool());
@@ -173,6 +180,10 @@ mod tests {
             .unwrap();
             let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
             assert!(
+                EqualSid(owner, user.User.Sid).is_ok(),
+                "fixture owner must be the current user"
+            );
+            assert!(
                 EqualSid(sid, user.User.Sid).is_ok(),
                 "fixture ACL must name only the current user"
             );
@@ -186,7 +197,7 @@ mod tests {
         let ordinary = crate::fixture::tempdir_in(parent.path()).unwrap();
         let builder = tempfile::Builder::new()
             .prefix("case-")
-            .tempdir_in(parent.path())
+            .tempdir_in(parent.path().canonicalize().unwrap())
             .unwrap();
         let original_path = builder.path().to_owned();
         let builder = crate::fixture::prepare_tempdir(builder).unwrap();
@@ -194,5 +205,21 @@ mod tests {
         assert_owner_only(ordinary.path());
         assert_owner_only(builder.path());
         assert_eq!(dacl(parent.path()), before);
+    }
+
+    #[test]
+    fn populated_fixture_retains_its_existing_acl_and_contents() {
+        let parent = tempfile::tempdir().unwrap();
+        let populated = tempfile::tempdir_in(parent.path().canonicalize().unwrap()).unwrap();
+        let path = populated.path().to_owned();
+        std::fs::write(path.join("keep"), b"synthetic-owned-data").unwrap();
+        let before = dacl(&path);
+        let error = crate::fixture::prepare_tempdir(populated).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(dacl(&path), before);
+        assert_eq!(
+            std::fs::read(path.join("keep")).unwrap(),
+            b"synthetic-owned-data"
+        );
     }
 }
