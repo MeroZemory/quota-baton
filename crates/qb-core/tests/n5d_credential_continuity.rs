@@ -3,7 +3,6 @@
 #[path = "n5d_credential_continuity/windows_cases.rs"]
 mod windows_cases;
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
 use qb_core::accounts::{
     Account, AccountStore, Health, HealthReason, Identity, Source, StoreError, Tokens, UserState,

@@ -1,4 +1,5 @@
 use super::*;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use qb_core::accounts::{ImportMode, SourceMatch, linked};
 
 #[test]
