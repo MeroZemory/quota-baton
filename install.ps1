@@ -72,12 +72,147 @@ function Korean([string]$key) {
         m56 = '67aA67aEIOyEpOy5mCDtjIzsnbzsnYQg7KCc6rGw7ZWY7KeAIOuqu+2WiOyKteuLiOuLpA=='
         m57 = '66Gk67CxIO2MjOydvOydhCDrs7TsobTtlojsirXri4jri6Q='
         m58 = '7Yq466CI7J20IOuzteq1rOyXkCDsi6TtjKjtlojsirXri4jri6QuIOyEpOy5mOqwgCDrr7jsmYTro4zsnbwg7IiYIOyeiOyKteuLiOuLpC4g7Yq466CI7J2066W8IOyImOuPmeycvOuhnCDsi5zsnpHtlbQg7KO87IS47JqULg=='
+        m59 = '6riw7KG0IOuNsOydtO2EsCDtj7TrjZTsnZgg7KCR6re8IOq2jO2VnOydhCDrs7TtmLjrkJwg7IKs7Jqp7J6QIOyghOyaqSDqtoztlZzsnLzroZwg67OA6rK97ZaI7Iq164uI64ukLiDsnbTsoIQg6raM7ZWcIOuwseyXhQ=='
+        m60 = '642w7J207YSwIO2PtOuNlOydmCDsoJHqt7wg6raM7ZWc7J2EIOykgOu5hO2VmOyngCDrqrvtlojsirXri4jri6QuIOq4sOyhtCDsi6Ttlokg7YyM7J287J2AIOuzgOqyve2VmOyngCDslYrslZjsirXri4jri6Qu'
+        m61 = '7IOIIOyLpO2WiSDtjIzsnbzsnZgg7Iuc7J6RIOyghCDsoJDqsoDsl5Ag7Iuk7Yyo7ZaI7Iq164uI64ukLiDquLDsobQg7Iuk7ZaJIO2MjOydvOqzvCDsvZTslrTripQg67OA6rK97ZWY7KeAIOyViuyVmOyKteuLiOuLpC4gc2VydmUgLS1jaGVja+ulvCDsp4Dsm5DtlZjripQg7Zi47ZmYIOyLpO2WiSDtjIzsnbzsnYQg7IKs7Jqp7ZW0IOyjvOyEuOyalC4g7J20IOygkOqygOydgCDqsbTrhIjrm7gg7IiYIOyXhuyKteuLiOuLpC4='
+        m62 = '7IOIIOyLpO2WiSDtjIzsnbzsnZgg7Iuc7J6RIOyghCDsoJDqsoDsnYQg7JmE66OM7ZaI7Iq164uI64ukLg=='
+        m63 = '642w7J207YSwIO2PtOuNlOuCmCDshKTsuZgg66Gc6re4IOqyveuhnOyXkCDsnqzrtoTshJ0g7KeA7KCQIOuYkOuKlCDsnpjrqrvrkJwg6rK966Gc6rCAIOyeiOyKteuLiOuLpC4='
+        m64 = '7IOIIOuNsOydtO2EsCDtj7TrjZTsl5Ag67O07Zi465CcIOygkeq3vCDqtoztlZzsnYQg7ISk7KCV7ZaI7Iq164uI64ukLg=='
     }
     return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($text[$key]))
 }
 function Message([string]$ko, [string]$en) { if ($Lang -eq 'en') { return $en } else { return $ko } }
 function Fail([string]$ko, [string]$en) { throw (Message $ko $en) }
 function Say([string]$ko, [string]$en) { if ($Lang -eq 'en') { Write-Host $en } else { Write-Host $ko } }
+function CheckedDirectoryPath([string]$path, [switch]$AllowMissingLeaf) {
+    if ([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathRooted($path) -or
+        $path -match '(^|[\\/])\.\.([\\/]|$)') { Fail (Korean 'm63') 'Unsafe data or install directory path.' }
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\', '/')
+    $root = [IO.Path]::GetPathRoot($full)
+    if ($root -notmatch '^[A-Za-z]:\\$' -or $full.Length -le $root.Length) { Fail (Korean 'm63') 'Data and install directories must be local directories below a drive root.' }
+    $parts = @($full.Substring($root.Length) -split '[\\/]')
+    $current = $root
+    for ($index = -1; $index -lt $parts.Count; $index++) {
+        if ($index -ge 0) { $current = Join-Path $current $parts[$index] }
+        try { $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop }
+        catch {
+            if ($AllowMissingLeaf -and $index -eq ($parts.Count - 1) -and $_.CategoryInfo.Category -eq 'ObjectNotFound') { return $full }
+            throw
+        }
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Fail "$(Korean 'm63'): $current" "Directory must not traverse a file or reparse point: $current" }
+    }
+    return $full
+}
+function CheckedDataHomePath([string]$path) {
+    $dataHome = CheckedDirectoryPath $path -AllowMissingLeaf
+    foreach ($name in @('USERPROFILE', 'LOCALAPPDATA', 'APPDATA')) {
+        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $protected = [IO.Path]::GetFullPath($value).TrimEnd('\', '/')
+        if ([string]::Equals($dataHome, $protected, [StringComparison]::OrdinalIgnoreCase) -or
+            $protected.StartsWith($dataHome + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            Fail "$(Korean 'm63'): $dataHome" "Use a dedicated data home, not $name or its ancestor: $dataHome"
+        }
+    }
+    return $dataHome
+}
+function PrivateDataHomeAcl($acl) {
+    $sddl = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor $sddl
+    if ($null -eq $raw.DiscretionaryAcl) { return $false }
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($owner -ne $currentUser) { return $false }
+    $trusted = @($currentUser, 'S-1-5-18', 'S-1-5-32-544')
+    foreach ($ace in $raw.DiscretionaryAcl) {
+        if ($ace.AceType -eq [Security.AccessControl.AceType]::AccessDenied) { continue }
+        if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed -or $ace.SecurityIdentifier.Value -notin $trusted) { return $false }
+    }
+    return $true
+}
+function WriteInstallLog([string]$message) {
+    [void](CheckedDirectoryPath $InstallDir)
+    if (Test-Path -LiteralPath $installLog) {
+        $item = Get-Item -LiteralPath $installLog -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Fail (Korean 'm63') 'Install log must be a regular file.' }
+    }
+    [IO.File]::AppendAllText($installLog, ([DateTime]::UtcNow.ToString('o') + ' ' + $message + [Environment]::NewLine))
+}
+function SetPrivateDataHomeAcl([string]$dataHome, [Security.AccessControl.DirectorySecurity]$acl) {
+    [void](CheckedDirectoryPath $dataHome)
+    $directory = New-Object IO.DirectoryInfo $dataHome
+    # Persist only descriptor sections actually changed. Set-Acl can also try
+    # to write unchanged loaded owner/group sections without the needed rights.
+    if ($directory.GetType().GetMethod('SetAccessControl')) {
+        $directory.SetAccessControl($acl)
+    } else {
+        [IO.FileSystemAclExtensions]::SetAccessControl($directory, $acl)
+    }
+}
+function PrepareInstallerDataHome([string]$dataHome) {
+    try {
+        $dataHome = CheckedDataHomePath $dataHome
+        $fresh = -not [IO.Directory]::Exists($dataHome)
+        if ($fresh) { [void][IO.Directory]::CreateDirectory($dataHome) }
+        [void](CheckedDirectoryPath $dataHome)
+        $acl = Get-Acl -LiteralPath $dataHome
+        if (-not $fresh -and (PrivateDataHomeAcl $acl)) { return $dataHome }
+        # OI/CI inheritance can propagate below the data root. Refuse every
+        # reparse entry before changing its ACL, never visiting link targets.
+        $pending = New-Object 'System.Collections.Generic.Stack[string]'
+        $pending.Push($dataHome)
+        while ($pending.Count) {
+            $directory = $pending.Pop()
+            [void](CheckedDirectoryPath $directory)
+            foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+                if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$(Korean 'm63'): $($child.FullName)" "Data home ACL migration refuses a reparse entry: $($child.FullName)" }
+                if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+            }
+        }
+        $original = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+        $backup = $null
+        if (-not $fresh) {
+            $backup = $installLog + '.data-dir-acl-before-' + [guid]::NewGuid().ToString('N') + '.sddl'
+            $file = [IO.File]::Open($backup, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $bytes = [Text.Encoding]::UTF8.GetBytes($original); $file.Write($bytes, 0, $bytes.Length) } finally { $file.Dispose() }
+            WriteInstallLog "Data home ACL backup: $dataHome -> $backup"
+        }
+        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $owner = $currentUser.Value
+        $protected = 'D:P(A;OICI;FA;;;' + $owner + ')(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+        $acl.SetSecurityDescriptorSddlForm($protected, [Security.AccessControl.AccessControlSections]::Access)
+        # Even reassigning the same owner can require WRITE_OWNER. Only request
+        # an ownership change when needed; verification still requires our user.
+        if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $owner) { $acl.SetOwner($currentUser) }
+        [void](CheckedDirectoryPath $dataHome)
+        SetPrivateDataHomeAcl $dataHome $acl
+        [void](CheckedDirectoryPath $dataHome)
+        $verified = Get-Acl -LiteralPath $dataHome
+        if ($verified.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $owner -or
+            -not $verified.AreAccessRulesProtected -or -not (PrivateDataHomeAcl $verified)) { throw 'Private data home ACL verification failed.' }
+        if ($fresh) { Say "$(Korean 'm64'): $dataHome" "Protected new empty data home: $dataHome" }
+        else { Say "$(Korean 'm59'): $backup" "Migrated data home ACL; original SDDL: $backup" }
+        WriteInstallLog "Protected data home ACL: $dataHome"
+        return $dataHome
+    } catch { Fail "$(Korean 'm60') $($_.Exception.Message)" "Cannot prepare data home ACL; existing binaries were not changed. $($_.Exception.Message)" }
+}
+function CheckStagedBinary([string]$stagedExe, [string]$dataHome) {
+    $hadHome = Test-Path Env:QB_HOME
+    $savedHome = [Environment]::GetEnvironmentVariable('QB_HOME', 'Process')
+    # Local binding: RunCli uses the staged executable, not the installed core.
+    $exe = $stagedExe
+    try {
+        [Environment]::SetEnvironmentVariable('QB_HOME', $dataHome, 'Process')
+        WriteInstallLog "Staged preflight: $stagedExe serve --check; data home: $dataHome"
+        RunCli @('serve', '--check')
+        WriteInstallLog 'Staged preflight passed.'
+        Say (Korean 'm62') 'Staged startup check passed.'
+    } catch { Fail "$(Korean 'm61') $($_.Exception.Message)" "Staged startup check failed before binary replacement; old core was not changed. Use a compatible release binary supporting serve --check; this preflight cannot be skipped. $($_.Exception.Message)" }
+    finally {
+        if ($hadHome) { [Environment]::SetEnvironmentVariable('QB_HOME', $savedHome, 'Process') }
+        else { Remove-Item Env:QB_HOME -ErrorAction SilentlyContinue }
+    }
+}
 function SafeClientFile([string]$path) {
     if ([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetPathRoot($path).Length -lt 3 -or
         $path -match '[\r\n";%!^&|<>]' -or $path -match '(^|[\\/])\.\.([\\/]|$)') { return $null }
@@ -308,6 +443,7 @@ function CompleteSetup {
 }
 
 $dataDir = if ($env:QB_HOME) { $env:QB_HOME } else { Join-Path $env:LOCALAPPDATA 'quota-baton' }
+$dataDir = CheckedDataHomePath $dataDir
 if ($Lang -eq 'auto') { $Lang = ConfigLanguage (Join-Path $dataDir 'config.toml') }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\', '/')
 if ($InstallDir -eq [IO.Path]::GetPathRoot($InstallDir).TrimEnd('\') -or $InstallDir.Contains('"')) { Fail (Korean 'm21') 'Unsafe InstallDir.' }
@@ -377,8 +513,6 @@ try {
             $scratch = Join-Path ([IO.Path]::GetTempPath()) ('quota-baton-install-' + [guid]::NewGuid().ToString('N'))
             [void][IO.Directory]::CreateDirectory($scratch)
         }
-        $oldHealth = if ($oldCore.Count) { ReadHealth } else { $null }
-        if ($oldCore.Count -and (-not $oldHealth -or -not $oldHealth.ok -or $oldHealth.pid -notin $oldCore.ProcessId)) { Fail (Korean 'm40') 'Cannot validate the installed core before takeover.' }
         [void][IO.Directory]::CreateDirectory($InstallDir)
         # Refuse reparse destinations rather than writing through another location.
         $ancestor = Get-Item -LiteralPath $InstallDir
@@ -387,13 +521,23 @@ try {
             $ancestor = $ancestor.Parent
         }
         $stamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmssfffffff')
+        $installLog = Join-Path $InstallDir 'install.log'
+        if ($installLog.StartsWith(([IO.Path]::GetFullPath($scratch).TrimEnd('\', '/') + '\'), [StringComparison]::OrdinalIgnoreCase)) { Fail (Korean 'm63') 'Installer log and ACL backups must be outside temporary staging.' }
+        foreach ($name in @('quota-baton.exe', 'quota-baton-tray.exe')) {
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($payload[$name], (Join-Path $scratch $name), $false)
+        }
+        $dataDir = PrepareInstallerDataHome $dataDir
+        CheckStagedBinary (Join-Path $scratch 'quota-baton.exe') $dataDir
+        # Even the installed health CLI can enforce data-home permissions, so
+        # migrate before invoking it. Validate the old core before any swap.
+        $oldHealth = if ($oldCore.Count) { ReadHealth } else { $null }
+        if ($oldCore.Count -and (-not $oldHealth -or -not $oldHealth.ok -or $oldHealth.pid -notin $oldCore.ProcessId)) { Fail (Korean 'm40') 'Cannot validate the installed core before takeover.' }
         $renamed = @{}
         $installed = @()
         try {
             foreach ($name in @('quota-baton.exe', 'quota-baton-tray.exe')) {
                 $destination = Join-Path $InstallDir $name
                 $staged = Join-Path $scratch $name
-                [IO.Compression.ZipFileExtensions]::ExtractToFile($payload[$name], $staged, $false)
                 if (Test-Path -LiteralPath $destination) {
                     if ((Get-Item -LiteralPath $destination).Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail (Korean 'm42') 'Executable is a reparse point.' }
                     $backup = $destination + '.old-' + $stamp

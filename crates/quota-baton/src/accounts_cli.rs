@@ -256,14 +256,8 @@ pub(crate) async fn running_admin(
     home: &Path,
     config: &Config,
 ) -> anyhow::Result<Option<(reqwest::Client, String, String)>> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let base = format!("http://127.0.0.1:{}/admin/v1", config.server.admin_port);
-    let token = std::fs::read_to_string(home.join("admin.token")).unwrap_or_default();
+    let (client, base, token, native_socket) =
+        crate::admin_transport::connection(home, config, Duration::from_secs(5), false).await?;
     match client
         .get(format!("{base}/health"))
         .bearer_auth(token.trim())
@@ -280,7 +274,7 @@ pub(crate) async fn running_admin(
             anyhow::ensure!(health.ok, "코어 상태를 확인해 주세요.");
             Ok(Some((client, base, token)))
         }
-        Err(error) if error.is_connect() => Ok(None),
+        Err(error) if error.is_connect() && !native_socket => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -1167,27 +1161,119 @@ pub(crate) fn list_forecast_lines(
     detail: bool,
     english: bool,
 ) -> Vec<String> {
-    if detail {
-        return forecast_lines(account, running);
+    let mut lines = if detail {
+        forecast_lines(account, running)
+    } else {
+        let forecast = running.then_some(account).flatten().and_then(|account| {
+            serde_json::from_value::<qb_core::usage_forecast::AccountUsageForecast>(
+                account["usage_forecast"].clone(),
+            )
+            .ok()
+        });
+        vec![
+            forecast
+                .as_ref()
+                .map(|forecast| qb_core::usage_forecast_display::summary(forecast, english).text)
+                .unwrap_or_else(|| {
+                    if english {
+                        "Measuring".into()
+                    } else {
+                        "측정 중".into()
+                    }
+                }),
+        ]
+    };
+    if let Some(tokens) = running
+        .then_some(account)
+        .flatten()
+        .and_then(|account| account["placement_capacity_tokens"].as_u64())
+        && let Some(line) = lines.first_mut()
+    {
+        line.push_str(" · ");
+        line.push_str(&qb_proto::placement_capacity_label(tokens, english));
     }
-    let forecast = running.then_some(account).flatten().and_then(|account| {
-        serde_json::from_value::<qb_core::usage_forecast::AccountUsageForecast>(
-            account["usage_forecast"].clone(),
-        )
-        .ok()
-    });
-    vec![
-        forecast
-            .as_ref()
-            .map(|forecast| qb_core::usage_forecast_display::summary(forecast, english).text)
-            .unwrap_or_else(|| {
-                if english {
-                    "Measuring".into()
-                } else {
-                    "측정 중".into()
-                }
-            }),
-    ]
+    lines
+}
+
+#[cfg(test)]
+mod r21_placement_display_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn r21_list_capacity_is_online_only_localized_and_preserves_existing_lines() {
+        let legacy = json!({"usage_forecast":{
+            "as_of":"2026-10-23T14:05:00Z","observed_at":null,"windows":[],
+            "earliest_window":null,"credit":null,"truncated":false
+        }});
+        for detail in [false, true] {
+            for (english, expected) in [
+                (false, "약 12만 토큰 남음 (추정)"),
+                (true, "about 120000 tokens remaining (estimate)"),
+            ] {
+                let baseline = list_forecast_lines(Some(&legacy), true, detail, english);
+                let mut weighted = legacy.clone();
+                weighted["placement_capacity_tokens"] = json!(123_456);
+                let lines = list_forecast_lines(Some(&weighted), true, detail, english);
+                assert_eq!(lines.len(), baseline.len());
+                assert_eq!(lines[0], format!("{} · {expected}", baseline[0]));
+                assert_eq!(lines[1..], baseline[1..]);
+                assert_eq!(
+                    list_forecast_lines(Some(&weighted), false, detail, english),
+                    list_forecast_lines(Some(&legacy), false, detail, english)
+                );
+                weighted["placement_capacity_tokens"] = serde_json::Value::Null;
+                assert_eq!(
+                    list_forecast_lines(Some(&weighted), true, detail, english),
+                    baseline
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r21_capacity_rounding_keeps_small_and_large_measured_values_honest() {
+        for (tokens, ko, en) in [
+            (
+                0,
+                "약 0 토큰 남음 (추정)",
+                "about 0 tokens remaining (estimate)",
+            ),
+            (
+                1,
+                "약 1 토큰 남음 (추정)",
+                "about 1 tokens remaining (estimate)",
+            ),
+            (
+                1234,
+                "약 1200 토큰 남음 (추정)",
+                "about 1200 tokens remaining (estimate)",
+            ),
+            (
+                12345,
+                "약 1.2만 토큰 남음 (추정)",
+                "about 12000 tokens remaining (estimate)",
+            ),
+            (
+                99999,
+                "약 10만 토큰 남음 (추정)",
+                "about 100000 tokens remaining (estimate)",
+            ),
+            (
+                u64::MAX,
+                "약 1800000000000000만 토큰 남음 (추정)",
+                "about 18000000000000000000 tokens remaining (estimate)",
+            ),
+        ] {
+            let account = json!({"placement_capacity_tokens":tokens});
+            for (english, expected) in [(false, ko), (true, en)] {
+                assert!(
+                    list_forecast_lines(Some(&account), true, false, english)[0]
+                        .ends_with(expected)
+                );
+            }
+        }
+    }
 }
 
 pub(crate) fn forecast_lines(account: Option<&serde_json::Value>, running: bool) -> Vec<String> {

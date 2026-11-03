@@ -2,6 +2,12 @@
 [CmdletBinding()]
 param([string]$EvidenceDir = 'C:/_projects/SampleUser/quota-baton/.sandbox/reports/R17.1-evidence/upgrade/pwsh')
 $ErrorActionPreference = 'Stop'
+# Resolve built-ins while the real process module lookup environment is intact.
+foreach ($fixtureModuleName in @('Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security', 'Microsoft.PowerShell.Management')) {
+    $fixtureModuleManifest = [IO.Path]::Combine($PSHOME, 'Modules', $fixtureModuleName, ($fixtureModuleName + '.psd1'))
+    Import-Module -Name $fixtureModuleManifest -ErrorAction Stop
+}
+Get-Command -Name @('Get-FileHash', 'Get-Acl', 'Set-Acl', 'Get-Item', 'Get-ChildItem') -ErrorAction Stop | Out-Null
 $project = Split-Path $PSScriptRoot -Parent
 $installer = Join-Path $project 'install.ps1'
 $uninstaller = Join-Path $project 'uninstall.ps1'
@@ -46,9 +52,36 @@ function MockHealth {
     $core = @($scenario.Processes | Where-Object { $_.ExecutablePath -eq $scenario.Exe } | Select-Object -Last 1)
     if ($core.Count) { return [pscustomobject]@{ ok=$true; pid=$core[0].ProcessId; started_at=$core[0].CreationDate } }
 }
-function MockCli([string[]]$Arguments) {
+function MockCli([string[]]$Arguments, [string]$Executable) {
     $global:LASTEXITCODE = 0
     $scenario.Events.Add('cli:' + ($Arguments -join ' '))
+    if (($Arguments -join ' ') -eq 'serve --check') {
+        [void](Contained $Executable)
+        Assert ($Executable -ne $scenario.Exe) 'Preflight used the installed binary'
+        Assert ([IO.File]::ReadAllText($Executable) -eq 'new:quota-baton.exe') 'Preflight did not use the staged new payload'
+        Assert ($env:QB_HOME -ceq $scenario.CheckHome) 'Preflight did not receive the actual data home'
+        Assert ([IO.Directory]::Exists($env:QB_HOME)) 'Fresh data home was not created before preflight'
+        $acl = Get-Acl -LiteralPath $env:QB_HOME
+        Assert ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) 'Migrated home owner is not the current process user'
+        $trusted = @($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value, 'S-1-5-18', 'S-1-5-32-544')
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            Assert ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted) 'Unsafe ACL reached staged preflight'
+        }
+        # Model the read-only startup check's existing known directories too.
+        # The installer may migrate the root; it must not bypass a child refusal.
+        foreach ($name in @('accounts','state','logs')) {
+            $child=Join-Path $env:QB_HOME $name
+            if (-not (Test-Path -LiteralPath $child)) { continue }
+            $item=Get-Item -LiteralPath $child -Force
+            if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $global:LASTEXITCODE=1; return 'unsafe existing startup directory' }
+            $childAcl=Get-Acl -LiteralPath $child
+            foreach ($rule in $childAcl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+                if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) { $global:LASTEXITCODE=1; return 'untrusted existing startup directory ACL' }
+            }
+        }
+        if ($scenario.Failure -eq 'preflight') { throw 'synthetic staged preflight refusal' }
+        if ($scenario.Failure -eq 'unsupported-check') { $global:LASTEXITCODE=2; return "error: unexpected argument '--check' found" }
+    }
     if ($Arguments[0] -eq 'wire') {
         Assert ([IO.File]::Exists((Join-Path $env:APPDATA 'npm/codex.cmd'))) 'Fixed Codex wire target is missing'
         $claude=FindWireClaude
@@ -74,6 +107,7 @@ function Start-Process {
     [void](Contained $FilePath)
     Assert ($WindowStyle -eq 'Hidden') 'Process start was not hidden'
     Assert ((Split-Path $FilePath -Leaf) -match '^quota-baton(?:-tray)?\.exe(?:\.old-\d{21})?$') 'Unexpected synthetic process executable'
+    if ($ArgumentList -contains '--takeover') { Assert ($scenario.Events.Contains('cli:serve --check')) 'Takeover preceded staged preflight' }
     $scenario.NextPid++
     $id = $scenario.NextPid
     $record = [pscustomobject]@{ ProcessId=$id; ExecutablePath=$FilePath; CreationDate=('2030-01-01T00:00:' + $id); Id=$id; HasExited=$false }
@@ -96,6 +130,13 @@ function Start-Sleep { throw 'Unexpected readiness wait in synthetic workflow' }
 function Read-Host { throw 'Unexpected prompt' }
 function Invoke-RestMethod { throw 'Unexpected network request' }
 function Invoke-WebRequest { throw 'Unexpected download' }
+function Set-Acl {
+    [CmdletBinding()]
+    param($LiteralPath, $AclObject)
+    [void](Contained $LiteralPath)
+    if ($scenario -and $scenario.Failure -eq 'acl') { throw 'synthetic ACL apply failure' }
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $LiteralPath -AclObject $AclObject -ErrorAction Stop
+}
 
 function Invoke-FixtureScript([string]$path, [hashtable]$parameters, [switch]$PlainIex, [bool]$IexWhatIf=$false) {
     $text = [IO.File]::ReadAllText($path)
@@ -119,9 +160,17 @@ function Invoke-FixtureScript([string]$path, [hashtable]$parameters, [switch]$Pl
         $assertNull="`nif (`$null -ne `$PSCmdlet) { throw 'IEX unexpectedly inherited PSCmdlet' }; `$scenario.Events.Add('plain-iex-null')`n"
         $edits.Add([pscustomobject]@{Start=$ast.ParamBlock.Extent.EndOffset;End=$ast.ParamBlock.Extent.EndOffset;Text=$assertNull})
     }
-    foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ReadHealth' }, $true)) {
-        $replacement = 'function ReadHealth { MockHealth }'
-        $edits.Add([pscustomobject]@{ Start=$definition.Extent.StartOffset; End=$definition.Extent.EndOffset; Text=$replacement })
+    foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('ReadHealth','SetPrivateDataHomeAcl') }, $true)) {
+        if ($definition.Name -eq 'ReadHealth') {
+            $replacement = 'function ReadHealth { MockHealth }'
+            $edits.Add([pscustomobject]@{ Start=$definition.Extent.StartOffset; End=$definition.Extent.EndOffset; Text=$replacement })
+        } else {
+            # Keep the real native setter body; inject only fixture containment
+            # and the existing deterministic ACL failure at its checked boundary.
+            $entry = $definition.Body.Extent.StartOffset + 1
+            $guard = "`n[void](Contained `$dataHome); if (`$scenario.Failure -eq 'acl') { throw 'synthetic ACL apply failure' }`n"
+            $edits.Add([pscustomobject]@{ Start=$entry; End=$entry; Text=$guard })
+        }
     }
     foreach ($node in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -or $n -is [Management.Automation.Language.CommandAst] }, $true)) {
         if (@($edits | Where-Object { $node.Extent.StartOffset -ge $_.Start -and $node.Extent.EndOffset -le $_.End }).Count) { continue }
@@ -136,7 +185,7 @@ function Invoke-FixtureScript([string]$path, [hashtable]$parameters, [switch]$Pl
             if ($expression -eq '[IO.File]' -and $member -eq 'Copy' -and $node.Arguments[0].Extent.Text -eq '$staged') { $replacement='(CopyFixturePayload $staged $destination)' }
         } elseif ($node.InvocationOperator -eq 'Ampersand' -and $node.CommandElements[0].Extent.Text -eq '$exe') {
             if ($node.Extent.Text -match 'unwire --apply') { $replacement="MockCli @('unwire','--apply')" }
-            elseif ($node.Extent.Text -match '@Arguments') { $replacement='MockCli $Arguments' }
+            elseif ($node.Extent.Text -match '@Arguments') { $replacement='MockCli $Arguments $exe' }
             else { throw ('Unexpected direct native invocation: ' + $node.Extent.Text) }
         }
         if ($null -ne $replacement) { $edits.Add([pscustomobject]@{ Start=$node.Extent.StartOffset; End=$node.Extent.EndOffset; Text=$replacement }) }
@@ -158,11 +207,30 @@ function New-Scenario([string]$name, [string]$failure='') {
     $directory=Join-Path $fixture $name
     [void][IO.Directory]::CreateDirectory($directory)
     foreach ($name in @('quota-baton.exe','quota-baton-tray.exe')) { [IO.File]::WriteAllText((Join-Path $directory $name), 'old:' + $name) }
-    $state=[pscustomobject]@{ Install=$directory; Exe=(Join-Path $directory 'quota-baton.exe'); Tray=(Join-Path $directory 'quota-baton-tray.exe'); Failure=$failure; UserPath='C:\synthetic-unrelated'; Targets=$realTargets; InputPath=$env:PATH; InputPathExt=$env:PATHEXT; InputPathExtPresent=(Test-Path Env:PATHEXT); LockedPath=$null; LockHandle=$null; LockReleased=$false; NextPid=100; Events=(New-Object 'System.Collections.Generic.List[string]'); Processes=(New-Object 'System.Collections.Generic.List[object]') }
+    $checkHome = if ($env:QB_HOME) { $env:QB_HOME } else { Join-Path $env:LOCALAPPDATA 'quota-baton' }
+    $state=[pscustomobject]@{ Install=$directory; Exe=(Join-Path $directory 'quota-baton.exe'); Tray=(Join-Path $directory 'quota-baton-tray.exe'); CheckHome=([IO.Path]::GetFullPath($checkHome)); Failure=$failure; UserPath='C:\synthetic-unrelated'; Targets=$realTargets; InputPath=$env:PATH; InputPathExt=$env:PATHEXT; InputPathExtPresent=(Test-Path Env:PATHEXT); LockedPath=$null; LockHandle=$null; LockReleased=$false; NextPid=100; Events=(New-Object 'System.Collections.Generic.List[string]'); Processes=(New-Object 'System.Collections.Generic.List[object]') }
     $state.Processes.Add([pscustomobject]@{ ProcessId=10; ExecutablePath=$state.Exe; CreationDate='old-core' })
     $state.Processes.Add([pscustomobject]@{ ProcessId=11; ExecutablePath=$state.Tray; CreationDate='old-tray' })
     $state.Processes.Add([pscustomobject]@{ ProcessId=999; ExecutablePath='C:\unrelated\quota-baton.exe'; CreationDate='unrelated' })
     return $state
+}
+function InheritedAclFixture([string]$name) {
+    $parent = Join-Path $fixture $name
+    [void](Contained $parent)
+    [void][IO.Directory]::CreateDirectory($parent)
+    $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $extra = 'S-1-5-21-111111111-222222222-333333333-1107'
+    # Fixture setup changes Access only. Passing a loaded owner/group descriptor
+    # to Set-Acl can request unauthorized writes to otherwise unchanged sections.
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetSecurityDescriptorSddlForm(('D:P(A;OICI;FA;;;' + $owner + ')(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;' + $extra + ')'), [Security.AccessControl.AccessControlSections]::Access)
+    Set-Acl -LiteralPath $parent -AclObject $acl
+    $dataHome = Join-Path $parent 'home'
+    [void][IO.Directory]::CreateDirectory($dataHome)
+    [IO.File]::WriteAllText((Join-Path $dataHome 'keep.txt'), 'synthetic-account-data')
+    $inherited = Get-Acl -LiteralPath $dataHome
+    Assert (@($inherited.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IsInherited -and $_.IdentityReference.Value -eq $extra }).Count -eq 1) 'Extra fixture principal was not inherited'
+    return $dataHome
 }
 try {
     $env:USERPROFILE=Join-Path $fixture 'profile'
@@ -239,6 +307,140 @@ try {
         $source=[IO.File]::ReadAllText((Join-Path $project 'crates/quota-baton/src/launcher_script.rs'))
         Assert ($source.Contains('launch-client --client codex --command') -and $source.Contains('%APPDATA%\\npm\\codex.cmd')) 'Codex explicit npm target source policy changed'
         Write-Host 'Source-policy check only: launcher generation and Rust wire were not executed.'
+    }
+    Case 'inherited-extra-sid-migrates-with-backup-before-preflight-refusal-and-no-swap' {
+        $scenario=New-Scenario 'acl-preflight-refusal' 'preflight'
+        $previousHome=$env:QB_HOME
+        try {
+            $env:QB_HOME=InheritedAclFixture 'inherited-sandbox-parent'
+            $scenario.CheckHome=[IO.Path]::GetFullPath($env:QB_HOME)
+            $original=(Get-Acl -LiteralPath $env:QB_HOME).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+            $messages=New-Object 'System.Collections.Generic.List[string]'
+            $failed=$false
+            try { Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en'} 6>&1 | ForEach-Object { $messages.Add($_.ToString()) } }
+            catch { $failed=$_.Exception.Message -match 'synthetic staged preflight refusal' }
+            Assert $failed 'Staged refusal was not propagated'
+            $backup=@(Get-ChildItem -LiteralPath $scenario.Install -Filter 'install.log.data-dir-acl-before-*.sddl')
+            Assert ($backup.Count -eq 1) 'Original SDDL backup missing or duplicated'
+            Assert ([IO.File]::ReadAllText($backup[0].FullName) -ceq $original) 'Original SDDL was not preserved exactly'
+            Assert (($messages -join "`n") -match 'Migrated data home ACL') 'ACL migration was silent'
+            $acl=Get-Acl -LiteralPath $env:QB_HOME
+            Assert $acl.AreAccessRulesProtected 'Migrated ACL still inherits'
+            $trusted=@($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value,'S-1-5-18','S-1-5-32-544')
+            $rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+            Assert ($rules.Count -eq 3) 'Protected ACL does not have the three trusted grants'
+            foreach ($rule in $rules) {
+                Assert (-not $rule.IsInherited -and $rule.IdentityReference.Value -in $trusted) 'Inherited sandbox grant survived migration'
+                Assert ($rule.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl -and [int]$rule.InheritanceFlags -eq 3) 'Trusted grant lacks inheritable FullControl'
+            }
+            Assert ([IO.File]::ReadAllText($scenario.Exe) -eq 'old:quota-baton.exe') 'Preflight refusal changed old core'
+            Assert ([IO.File]::ReadAllText($scenario.Tray) -eq 'old:quota-baton-tray.exe') 'Preflight refusal changed old tray'
+            Assert (@(Get-ChildItem -LiteralPath $scenario.Install -Filter '*.old-*').Count -eq 0) 'Preflight ran after binary rename'
+            Assert (@($scenario.Processes | Where-Object { $_.ProcessId -in @(10,11,999) }).Count -eq 3) 'Preflight refusal changed running processes'
+            Assert (@($scenario.Events | Where-Object { $_ -match '^(start:|stop:|user-path)' }).Count -eq 0) 'Preflight refusal performed setup side effects'
+            Assert ($env:QB_HOME -ceq $scenario.CheckHome) 'Failed preflight leaked QB_HOME'
+        } finally { $env:QB_HOME=$previousHome }
+    }
+    Case 'old-public-release-without-check-flag-refuses-before-any-swap-or-stop' {
+        $scenario=New-Scenario 'unsupported-public-check' 'unsupported-check'
+        $failed=$false
+        try { Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en'} }
+        catch { $failed=$_.Exception.Message -match 'compatible release binary supporting serve --check' }
+        Assert $failed 'Unsupported public release did not give a compatibility failure'
+        Assert ($scenario.Events.Contains('cli:serve --check')) 'Unsupported check was silently skipped'
+        Assert ([IO.File]::ReadAllText($scenario.Exe) -eq 'old:quota-baton.exe') 'Unsupported check replaced old core'
+        Assert ([IO.File]::ReadAllText($scenario.Tray) -eq 'old:quota-baton-tray.exe') 'Unsupported check replaced old tray'
+        Assert (@(Get-ChildItem -LiteralPath $scenario.Install -Filter '*.old-*').Count -eq 0) 'Unsupported check ran after binary rename'
+        Assert (@($scenario.Events | Where-Object { $_ -match '^(start:|stop:|user-path)' }).Count -eq 0) 'Unsupported check changed processes or user PATH'
+        Assert (@($scenario.Processes | Where-Object { $_.ProcessId -eq 10 }).Count -eq 1) 'Old core did not continue after compatibility refusal'
+    }
+    Case 'private-home-with-untrusted-existing-state-fails-check-before-swap' {
+        $scenario=New-Scenario 'unsafe-existing-state'
+        $previousHome=$env:QB_HOME
+        try {
+            $env:QB_HOME=Join-Path $fixture 'private-root-loose-state'
+            [void][IO.Directory]::CreateDirectory($env:QB_HOME)
+            $scenario.CheckHome=[IO.Path]::GetFullPath($env:QB_HOME)
+            $owner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $acl=New-Object Security.AccessControl.DirectorySecurity
+            $acl.SetSecurityDescriptorSddlForm(('D:P(A;OICI;FA;;;' + $owner + ')(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'),[Security.AccessControl.AccessControlSections]::Access)
+            Set-Acl -LiteralPath $env:QB_HOME -AclObject $acl
+            $state=Join-Path $env:QB_HOME 'state'
+            [void][IO.Directory]::CreateDirectory($state)
+            $acl=New-Object Security.AccessControl.DirectorySecurity
+            $acl.SetSecurityDescriptorSddlForm(('D:P(A;OICI;FA;;;' + $owner + ')(A;OICI;FR;;;S-1-5-21-111111111-222222222-333333333-1107)'),[Security.AccessControl.AccessControlSections]::Access)
+            Set-Acl -LiteralPath $state -AclObject $acl
+            $original=(Get-Acl -LiteralPath $state).Sddl
+            $failed=$false
+            try { Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en'} }
+            catch { $failed=$_.Exception.Message -match 'Staged startup check failed before binary replacement' }
+            Assert $failed 'Existing untrusted child bypassed staged preflight'
+            Assert ((Get-Acl -LiteralPath $state).Sddl -ceq $original) 'Installer repaired an existing startup child directly'
+            Assert ([IO.File]::ReadAllText($scenario.Exe) -eq 'old:quota-baton.exe') 'Child check refusal changed old core'
+            Assert (@(Get-ChildItem -LiteralPath $scenario.Install -Filter '*.old-*').Count -eq 0) 'Child check refusal followed rename'
+            Assert (@($scenario.Events | Where-Object { $_ -match '^(start:|stop:|user-path)' }).Count -eq 0) 'Child check refusal changed live setup'
+        } finally { $env:QB_HOME=$previousHome }
+    }
+    Case 'acl-apply-failure-keeps-backup-and-old-core-before-any-preflight' {
+        $scenario=New-Scenario 'acl-apply-refusal'
+        $previousHome=$env:QB_HOME
+        try {
+            $env:QB_HOME=InheritedAclFixture 'acl-failure-parent'
+            $scenario.CheckHome=[IO.Path]::GetFullPath($env:QB_HOME)
+            $original=(Get-Acl -LiteralPath $env:QB_HOME).Sddl
+            $scenario.Failure='acl'
+            $failed=$false
+            try { Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en'} }
+            catch { $failed=$_.Exception.Message -match 'synthetic ACL apply failure' }
+            Assert $failed 'ACL application failure was ignored'
+            Assert ((Get-Acl -LiteralPath $env:QB_HOME).Sddl -ceq $original) 'Failed ACL application modified the home'
+            Assert (@(Get-ChildItem -LiteralPath $scenario.Install -Filter 'install.log.data-dir-acl-before-*.sddl').Count -eq 1) 'Failed migration lost its SDDL backup'
+            Assert (-not $scenario.Events.Contains('cli:serve --check')) 'Preflight ran after failed ACL preparation'
+            Assert ([IO.File]::ReadAllText($scenario.Exe) -eq 'old:quota-baton.exe') 'ACL failure changed old core'
+            Assert (@(Get-ChildItem -LiteralPath $scenario.Install -Filter '*.old-*').Count -eq 0) 'ACL failure followed a binary rename'
+            Assert (@($scenario.Processes | Where-Object { $_.ProcessId -eq 10 }).Count -eq 1) 'ACL failure changed old core process'
+        } finally { $env:QB_HOME=$previousHome; $scenario.Failure='' }
+    }
+    Case 'fresh-install-protects-empty-home-before-check-without-starting-core' {
+        $scenario=New-Scenario 'fresh-protected-home'
+        $scenario.Processes.Clear()
+        $previousHome=$env:QB_HOME
+        try {
+            $env:QB_HOME=Join-Path $fixture 'fresh-empty-data-home'
+            $scenario.CheckHome=[IO.Path]::GetFullPath($env:QB_HOME)
+            Assert (-not (Test-Path -LiteralPath $env:QB_HOME)) 'Fresh-home precondition failed'
+            Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en';NoStart=$true}
+            Assert ($scenario.Events.Contains('cli:serve --check')) 'Fresh install omitted staged preflight'
+            Assert ((Get-Acl -LiteralPath $env:QB_HOME).AreAccessRulesProtected) 'Fresh home ACL is not protected'
+            Assert (@(Get-ChildItem -LiteralPath $env:QB_HOME -Force).Count -eq 0) 'Check or fixture created startup state'
+            Assert (@($scenario.Events | Where-Object { $_ -match '^(start:|stop:)' }).Count -eq 0) 'NoStart fresh preflight started a process'
+            Assert (@(Get-ChildItem -LiteralPath $scenario.Install -Filter 'install.log.data-dir-acl-before-*.sddl').Count -eq 0) 'Fresh install backed up a nonexistent original home'
+        } finally { $env:QB_HOME=$previousHome }
+    }
+    Case 'acl-migration-refuses-junctions-without-changing-target' {
+        $scenario=New-Scenario 'acl-junction-refusal'
+        $previousHome=$env:QB_HOME
+        try {
+            $env:QB_HOME=InheritedAclFixture 'junction-parent'
+            $scenario.CheckHome=[IO.Path]::GetFullPath($env:QB_HOME)
+            $target=Join-Path $fixture 'outside-data-home'
+            [void][IO.Directory]::CreateDirectory($target)
+            $original=(Get-Acl -LiteralPath $env:QB_HOME).Sddl
+            $targetAcl=(Get-Acl -LiteralPath $target).Sddl
+            $alias=Join-Path $env:QB_HOME 'alias'
+            New-Item -ItemType Junction -Path $alias -Target $target | Out-Null
+            $junctions.Add($alias)
+            $failed=$false
+            try { Invoke-FixtureScript $installer @{ZipPath=$zip;InstallDir=$scenario.Install;Yes=$true;Lang='en'} }
+            catch { $failed=$_.Exception.Message -match 'reparse entry' }
+            Assert $failed 'Data-home junction was followed during migration'
+            Assert ((Get-Acl -LiteralPath $target).Sddl -ceq $targetAcl) 'ACL migration repaired outside the data home'
+            Assert ((Get-Acl -LiteralPath $env:QB_HOME).Sddl -ceq $original) 'Reparse refusal modified the root ACL'
+            Assert (-not $scenario.Events.Contains('cli:serve --check')) 'Unsafe tree reached preflight'
+            Assert ([IO.File]::ReadAllText($scenario.Exe) -eq 'old:quota-baton.exe') 'Reparse refusal changed the core'
+            [IO.Directory]::Delete($alias)
+            [void]$junctions.Remove($alias)
+        } finally { $env:QB_HOME=$previousHome }
     }
     Case 'upgrade-mixed-legacy-retention-keeps-equal-key-newest-pair-and-skips-locked-legacy' {
         $scenario=New-Scenario 'successful'

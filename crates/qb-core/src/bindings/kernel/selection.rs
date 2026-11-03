@@ -149,6 +149,9 @@ pub fn select(inputs: &DecisionInputs) -> Result<SelectionEvaluation, SelectionI
         .as_deref()
         .ok_or(SelectionInputError::MissingSelection)?;
     let unique: BTreeSet<_> = s.account_order.iter().collect();
+    if s.metrics.capacity.is_none() {
+        return Err(SelectionInputError::MissingCapacityFacts);
+    }
     if unique.len() != s.account_order.len()
         || s.candidates
             .iter()
@@ -916,7 +919,30 @@ fn select_ranked(
             m::compare_gated(inputs, &a.account.id, x, &b.account.id, y, anchor)
                 .expect("validated native account order")
         });
-        gated.first().map(|(candidate, _)| *candidate)
+        // Resolve the legacy order first. An unmeasured winner keeps exactly
+        // that result; otherwise compare measured absolute room. Mixing a
+        // token comparator with percent pairwise would be non-transitive.
+        let legacy = gated.first().copied();
+        if legacy.is_some_and(|(_, metric)| metric.remaining_tokens.is_some()) {
+            gated
+                .iter()
+                .copied()
+                .fold(legacy, |best, row| {
+                    if row
+                        .1
+                        .remaining_tokens
+                        .zip(best?.1.remaining_tokens)
+                        .is_some_and(|(room, prior)| room > prior)
+                    {
+                        Some(row)
+                    } else {
+                        best
+                    }
+                })
+                .map(|(candidate, _)| candidate)
+        } else {
+            legacy.map(|(candidate, _)| candidate)
+        }
     } else {
         // Step 5: only when this set has no passing gate, apply its own
         // pacing/cap ordering and then choose the most headroom.

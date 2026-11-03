@@ -250,6 +250,136 @@ pub struct Interaction {
     pub pointer: Option<[f32; 2]>,
     pub tooltip_ready: bool,
 }
+impl Interaction {
+    pub fn move_pointer(&mut self, scene: &Scene, pointer: [f32; 2]) {
+        self.pointer = Some(pointer);
+        self.tooltip_ready = scene.tooltip_at(pointer[0], pointer[1]).is_some();
+    }
+
+    pub fn clear_pointer(&mut self) {
+        self.pointer = None;
+        self.tooltip_ready = false;
+    }
+
+    fn tooltip<'a>(&self, scene: &'a Scene) -> Option<(&'a str, [f32; 2])> {
+        if !self.tooltip_ready {
+            return None;
+        }
+        let pointer = self.pointer?;
+        scene
+            .tooltip_at(pointer[0], pointer[1])
+            .map(|text| (text, pointer))
+    }
+}
+#[cfg(test)]
+mod r21_hover_tests {
+    use super::*;
+    use crate::{client, dashboard_model, i18n, v2};
+    use serde_json::json;
+
+    #[test]
+    fn r21_healthy_dashboard_pointer_exposes_weighted_tooltip_without_warning() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00+09:00").unwrap();
+        let clock = dashboard_model::Clock {
+            now,
+            day_start: now.to_utc() - chrono::Duration::hours(12),
+            day_end: now.to_utc() + chrono::Duration::hours(12),
+        };
+        for (language, estimate) in [
+            (i18n::UiLanguage::Ko, "약 72만 토큰 남음 (추정)"),
+            (
+                i18n::UiLanguage::En,
+                "about 720000 tokens remaining (estimate)",
+            ),
+        ] {
+            i18n::with_language(language, || {
+                let mut baseline = None;
+                for capacity in [None, Some(720_000_u64)] {
+                    let mut account = client::r18_account_fixture::account(
+                        "sample-hover",
+                        "codex",
+                        client::r18_account_fixture::measuring_forecast(),
+                    );
+                    if let Some(tokens) = capacity {
+                        account["placement_capacity_tokens"] = json!(tokens);
+                    }
+                    let raw: client::TraySnapshot =
+                        serde_json::from_value(json!({"accounts":[account]})).unwrap();
+                    let cards = v2::project(
+                        &serde_json::to_string(&raw.presentation().unwrap()).unwrap(),
+                        now.into(),
+                    )
+                    .unwrap();
+                    let row = cards.sections.iter().flat_map(|s| &s.rows).next().unwrap();
+                    assert_eq!(row.state, v2::DisplayState::Ready);
+                    assert!(!row.forecast_warning);
+                    assert_eq!(row.raw.pool_eligible, Some(true));
+                    let mut state = DashboardState {
+                        grouped: true,
+                        ..Default::default()
+                    };
+                    let mut snapshot = dashboard_model::DashboardSnapshot::new(cards);
+                    // NoSessions renders the empty state instead of account headers.
+                    snapshot.sessions.sessions.push(dashboard_model::Session {
+                        id: "012345abcdef".into(),
+                        provider: "codex".into(),
+                        account: "sample-hover".into(),
+                        first_seen_at: Some(clock.utc()),
+                        last_used_at: Some(clock.utc()),
+                        active: true,
+                        ..Default::default()
+                    });
+                    let view = dashboard_model::project(&snapshot, &mut state, &clock);
+                    assert_eq!(view.groups[0].id, "sample-hover");
+                    assert_eq!(view.groups[0].rows.len(), 1);
+                    assert!(!view.groups[0].forecast_warning);
+                    let scene = Scene::build(&view, &state, [1320., 900.], &Metrics::default());
+                    let forecast_key = format!("dashboard:forecast:{}:0", view.groups[0].id);
+                    let node = scene
+                        .accessibility
+                        .iter()
+                        .find(|node| node.key == forecast_key)
+                        .expect("bound session renders the account's forecast node");
+                    assert_eq!(node.parent.as_deref(), Some("group:sample-hover"));
+                    let pointer = [
+                        (node.rect.left + node.rect.right) / 2.,
+                        (node.rect.top + node.rect.bottom) / 2.,
+                    ];
+                    let mut input = Interaction::default();
+                    assert!(input.tooltip(&scene).is_none());
+                    // Same pointer transition used by the real WM_MOUSEMOVE handler.
+                    input.move_pointer(&scene, pointer);
+                    let (text, at) = input
+                        .tooltip(&scene)
+                        .expect("healthy forecast hover reaches renderer");
+                    assert_eq!(at, pointer);
+                    assert_eq!(text, view.groups[0].forecast_tooltip);
+                    if capacity.is_some() {
+                        assert!(text.ends_with(estimate));
+                        let (bounds, lines, tooltip) = baseline.as_ref().unwrap();
+                        assert_eq!(&node.rect, bounds);
+                        assert_eq!(&view.groups[0].forecast_lines, lines);
+                        assert_eq!(text, format!("{tooltip} · {estimate}"));
+                    } else {
+                        assert!(!text.contains(estimate));
+                        baseline = Some((
+                            node.rect,
+                            view.groups[0].forecast_lines.clone(),
+                            text.to_owned(),
+                        ));
+                    }
+                    input.move_pointer(&scene, [-1., -1.]);
+                    assert!(input.tooltip(&scene).is_none());
+                    input.move_pointer(&scene, pointer);
+                    input.clear_pointer();
+                    assert!(input.tooltip(&scene).is_none());
+                    assert!(!input.tooltip_ready);
+                }
+            });
+        }
+    }
+}
+
 fn bounds(r: crate::Rect) -> D2D_RECT_F {
     D2D_RECT_F {
         left: r.left,
@@ -1059,10 +1189,7 @@ impl Renderer {
                     1.,
                 )?;
             }
-            if interaction.tooltip_ready
-                && let Some(pointer) = interaction.pointer
-                && let Some(text) = scene.tooltip_at(pointer[0], pointer[1])
-            {
+            if let Some((text, pointer)) = interaction.tooltip(scene) {
                 self.tooltip(target, scene, text, pointer)?;
             }
             Ok(())

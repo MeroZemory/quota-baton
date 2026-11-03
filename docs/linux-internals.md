@@ -6,11 +6,13 @@ lifecycle rules and historical qualification evidence for maintainers. The
 
 ## Managed lifecycle
 
-With QB_SYSTEMD_MANAGED=1, validate LISTEN_PID=self, exactly two listening stream
-FDs 3/4, distinct names data/admin and exact configured loopback endpoints. Map
+With QB_SYSTEMD_MANAGED=1, validate LISTEN_PID=self and named listening stream
+FDs starting at 3. Current packaging supplies data/admin/admin-unix; older
+two-descriptor data/admin activation remains supported. Validate exact loopback
+endpoints and the Unix socket's path, node identity, mode and group. Map
 by name, never ordering across separate socket units. Reject malformed activation;
 do not fall back to bind. Defaults here are 127.0.0.1:10200 and :10201. Emit real
-READY=1 only after both listeners and application initialization are ready.
+READY=1 only after all supplied listeners and application initialization are ready.
 
 Managed `serve --takeover` must dispatch early to a bounded authenticated HTTP
 helper, not acquire the store lease or become a foreground server. Read only the
@@ -22,12 +24,12 @@ reload timeout. A timeout reports failure; it does not imply cancellation.
 
 The main process completes ordinary admission stop, accepted-work drain, scheduler
 and login cancellation, durable shutdown refreshes and binding/replay/observability
-flushes before exec. Retain the original validated TCP bank FDs 3/4 with CLOEXEC
+flushes before exec. Retain the original validated activation FDs with CLOEXEC
 during normal execution. Declared Unix box listeners have a separate retained
 bank: freeze it after box work and durable cleanup finish, and pass its validated
-FD manifest in `QB_BOX_LISTENERS`. Clear CLOEXEC only on the retained TCP and box
+FD manifest in `QB_BOX_LISTENERS`. Clear CLOEXEC only on the retained activation and box
 bank descriptors immediately before exec. Server duplicates close; never call
-`shutdown()` on a shared listening socket. Restore LISTEN_PID, LISTEN_FDS=2 and
+`shutdown()` on a shared listening socket. Restore LISTEN_PID, the original activation count and
 matching LISTEN_FDNAMES, retaining systemd credential/runtime environment.
 Exec the absolute original argv[0], `/usr/local/bin/quota-baton`, with `serve`.
 Never use current_exe()/proc/self/exe after atomic replacement: it can refer to
@@ -49,9 +51,9 @@ and [managed reload helper](../crates/qb-core/src/platform/unix/service.rs).
 
 ## Socket lifetime and stop policy
 
-Enable only the service. Its Requires/After and Sockets explicitly bring up both
-listeners. Each socket has one-way PartOf=service, propagating stop/restart but
-not reload. Neither socket requires or orders itself after the service: sockets
+Enable only the service. Its Requires/After and Sockets explicitly bring up all
+three listeners. Each socket has one-way PartOf=service, propagating stop/restart but
+not reload. No socket requires or orders itself after the service: sockets
 already order before it, so such reverse ordering would create a cycle.
 NonBlocking belongs on the service. No independent sockets.target enablement.
 
@@ -62,13 +64,22 @@ and kernel-capped. This is not a guarantee for every connection or active stream
 
 The systemd 255 gate verified service-only stop under continuous connections:
 both sockets became inactive and later connects did not reactivate the service.
-Maintenance commands below explicitly stop all three units in one transaction.
+Maintenance commands below explicitly stop all four units in one transaction.
+
+The admin Unix socket is 0660, owned by the service user and `qb-admin`. Runtime
+directory 0710 permits only that group to traverse it; state remains 0700.
+The runtime-only descriptor walk accepts exactly owner-private 0700 or owner/
+`qb-admin` 0710. Private storage policy is unchanged. Native `SO_PEERCRED` is
+checked before a connection reaches axum: the service uid is allowed, otherwise
+bounded reentrant NSS calls must find that uid in `qb-admin`. Host and Origin
+checks are shared with TCP; the Unix path needs no bearer. Its graceful parent
+is joined alongside the TCP admin parent before durable shutdown completes.
 
 ## Intentional stop and recovery
 
 ```bash
-sudo systemctl stop quota-baton.service quota-baton-data.socket quota-baton-admin.socket
-for unit in quota-baton.service quota-baton-data.socket quota-baton-admin.socket; do
+sudo systemctl stop quota-baton.service quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket
+for unit in quota-baton.service quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket; do
   state=$(sudo systemctl show "$unit" -p ActiveState --value)
   test "$state" = inactive || exit 1
 done
@@ -77,7 +88,7 @@ done
 Both ports must refuse connections without reactivation; prove it in the actual
 gate, including service-only stop. Also `sudo systemctl disable quota-baton.service`
 to keep it off after boot. Resume with `sudo systemctl start quota-baton.service`;
-its requirements start both sockets.
+its requirements start all three sockets.
 
 After failed-upgrade inspection, perform the full stop above before rollback:
 

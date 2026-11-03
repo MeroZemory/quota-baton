@@ -1,9 +1,7 @@
 //! Process-local measurements. Cold starts are unweighted; no historical identity join.
 use crate::accounts::Account;
-#[cfg(test)]
-use crate::bindings::kernel::selection_capacity::remaining_tokens;
 pub(crate) use crate::bindings::kernel::selection_capacity::{
-    CapacityFacts, CapacitySample, WindowSamples,
+    CapacityFacts, CapacitySample, WindowSamples, remaining_tokens,
 };
 use crate::bindings::kernel::selection_capacity::{compatible, known_plan, observation, supported};
 use crate::observability::RequestRecord;

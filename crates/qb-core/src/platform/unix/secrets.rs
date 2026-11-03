@@ -24,7 +24,8 @@ pub(crate) fn configure_secret_open(options: &mut fs::OpenOptions) {
 pub(crate) fn prepare_runtime_home(home: &Path) -> io::Result<()> {
     let directory = private_fs::prepare_private_directory(home)?;
     // Logging initializes before AccountStore and must not mkdir these at 0755.
-    private_fs::prepare_private_child(&directory, "logs")?;
+    private_fs::prepare_private_child(&directory, "logs")
+        .map_err(|error| private_fs::permission_path(error, &home.join("logs")))?;
     Ok(())
 }
 
@@ -33,14 +34,21 @@ pub(crate) fn prepare_secret_home(home: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn prepare_account_directory(home: &Path) -> Result<PathBuf, StoreError> {
-    let directory = private_fs::prepare_private_directory(home).map_err(|_| StoreError::Io)?;
-    private_fs::prepare_private_child(&directory, "accounts").map_err(|_| StoreError::Io)?;
+    let directory = private_fs::prepare_private_directory(home)
+        .map_err(|error| private_fs::map_storage_error(error, StoreError::Io))?;
+    private_fs::prepare_private_child(&directory, "accounts").map_err(|error| {
+        private_fs::map_storage_error(
+            private_fs::permission_path(error, &home.join("accounts")),
+            StoreError::Io,
+        )
+    })?;
     Ok(home.join("accounts"))
 }
 
 pub(crate) fn read_private_bytes(path: &Path, max: usize) -> io::Result<Vec<u8>> {
     let (directory, name) = private_fs::parent_and_name(path)?;
-    let mut bytes = private_fs::read_private_leaf(&directory, &name, max)?;
+    let mut bytes = private_fs::read_private_leaf(&directory, &name, max)
+        .map_err(|error| private_fs::permission_path(error, path))?;
     Ok(std::mem::take(&mut *bytes))
 }
 
@@ -65,6 +73,7 @@ pub(crate) fn read_config(home: &Path) -> io::Result<Option<String>> {
 pub(crate) fn create_private_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let (directory, name) = private_fs::parent_and_name(path)?;
     private_fs::create_private_leaf(&directory, &name, bytes)
+        .map_err(|error| private_fs::permission_path(error, path))
 }
 
 pub(crate) fn load_existing_secret_file(path: &Path) -> anyhow::Result<String> {

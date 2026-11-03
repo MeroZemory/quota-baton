@@ -25,6 +25,8 @@ pub enum StoreError {
     LeaseUnavailable,
     #[error("account storage I/O failed")]
     Io,
+    #[error("account storage permissions are unsafe")]
+    StoragePermission(#[source] std::io::Error),
     #[error("invalid account data")]
     InvalidData,
     #[error("account secret protection failed")]

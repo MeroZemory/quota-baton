@@ -126,6 +126,11 @@ fn only_managed_server_invocation_qualifies_for_signal_preparation() {
         "status"
     ])));
     assert!(!server_invocation(&args(&[])));
+    assert!(!server_invocation(&args(&[
+        "/usr/local/bin/quota-baton",
+        "serve",
+        "--check"
+    ])));
 }
 
 #[test]
