@@ -7,7 +7,7 @@ use crate::routing::{Mode, On5hLimit, Settings};
 use std::sync::Arc;
 
 #[test]
-fn capacity_producer_records_measurements_without_changing_percent_placement() {
+fn r21_measured_room_changes_only_measured_placement_and_replays_raw_facts() {
     use crate::bindings::kernel::selection_capacity::{
         CapacityFacts, CapacitySample, WindowSamples,
     };
@@ -89,13 +89,9 @@ fn capacity_producer_records_measurements_without_changing_percent_placement() {
         .insert(rows[1].account.id.clone(), measured(&rows[1], 10_000, 3));
     let weighted = chosen(&inputs);
     assert_eq!(
-        weighted, legacy,
-        "producer must keep percent policy despite unequal measured token room"
-    );
-    assert_eq!(
         weighted.choice,
         SelectionChoice::Selected {
-            account: "capacity-a".into()
+            account: "capacity-b".into()
         }
     );
     let before = serde_json::to_value(&inputs).unwrap();
@@ -114,9 +110,9 @@ fn capacity_producer_records_measurements_without_changing_percent_placement() {
         .remove("capacity");
     let unrecorded = serde_json::from_value(unrecorded).unwrap();
     assert_eq!(
-        crate::bindings::permit_tape::selection::replay(&unrecorded).unwrap(),
-        record.actual,
-        "legacy missing measurements do not change this installed percent policy",
+        crate::bindings::permit_tape::selection::replay(&unrecorded),
+        Err(crate::bindings::permit_tape::WireRefusal::CapacityFactsMissing),
+        "an unrecorded readset must not become zero samples or zero moves",
     );
 
     // Below N, a legacy unweighted winner remains unchanged; mixed units are

@@ -182,6 +182,7 @@ mod tests {
             observed_at: None,
             quota_notice: None,
             credits_in_use: false,
+            placement_capacity_tokens: None,
             usage_forecast: AccountUsageForecast {
                 as_of: time(now),
                 observed_at: None,

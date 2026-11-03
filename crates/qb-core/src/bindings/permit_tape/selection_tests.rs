@@ -551,6 +551,26 @@ fn selection_preserves_null_and_literal_models_with_observed_cooling() {
         );
         let restored = record.inputs.as_ref().unwrap().to_inputs().unwrap();
         assert_eq!(restored.model.as_deref(), model);
+        assert!(
+            restored
+                .selection
+                .as_ref()
+                .unwrap()
+                .metrics
+                .capacity
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "schema9 known-empty measurements must retain the percent fallback"
+        );
+        let mut unknown = input.clone();
+        unknown.selection.as_mut().unwrap().metrics.capacity = None;
+        let unknown_record = capture(&unknown, &expected, mapper()).unwrap();
+        assert_eq!(
+            replay(&unknown_record),
+            Err(WireRefusal::CapacityFactsMissing),
+            "the current model/window grammar must not fill an unrecorded readset"
+        );
         assert_eq!(
             restored.selection.as_ref().unwrap().source_accounts[0]
                 .account
