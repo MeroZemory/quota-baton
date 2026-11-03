@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! Spawn the actual Cargo-selected CLI against a synthetic authenticated admin.
 //! No real core, upstream, credential source, or copied executable is used.
 #[path = "../src/fixture_support.rs"]

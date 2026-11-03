@@ -5049,7 +5049,7 @@ mod tests {
     fn r8_legacy_positive_strict_evidence_survives_invalid_unrelated_fields() {
         let home = home();
         let path = home.path().join("state/routing-policies.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
         let value = serde_json::json!({"schema":1,"revision":3,"projects":{},"sessions":{
             session_id("codex:known"): {"explicit":{"mode":"strict"},"anchor":"cx-a"},
             session_id("codex:broken"): {"unrelated":"invalid"}
@@ -5226,7 +5226,7 @@ mod tests {
     fn sol3_reload_keeps_newer_volatile_history_over_legacy_disk_row() {
         let home = home();
         let path = home.path().join("state/routing-policies.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
         let mut legacy = State {
             revision: 7,
             ..State::default()
@@ -5503,7 +5503,7 @@ mod tests {
     fn close2_salvage_keeps_valid_legacy_child_exception_with_unrelated_invalid_row() {
         let home = home();
         let path = home.path().join("state/routing-policies.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
         let value = serde_json::json!({"schema":1,"revision":4,"projects":{},"sessions":{
             session_id("codex:salvage-parent"): {"project":null,"baseline":Settings::default(),"explicit":settings(Mode::Strict),"anchor":"cx-a","movements":[]},
             session_id("codex:salvage-parent:agent:exception"): {"project":null,"baseline":Settings::default(),"explicit":settings(Mode::Recover),"anchor":"cx-b","movements":[]},
@@ -5646,7 +5646,7 @@ mod tests {
     fn close5_oversized_two_file_recovery_keeps_both_strict_sets_and_allows_forced() {
         let home = home();
         let path = home.path().join("state/routing-policies.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
         let mut old = capacity_state(true, false);
         for session in old.sessions.values_mut() {
             session.explicit = Some(settings(Mode::Strict));
@@ -5875,7 +5875,7 @@ mod tests {
     fn integrated2_duplicate_or_invalid_alias_prefix_cannot_hide_later_strict_root() {
         let home = home();
         let path = home.path().join("state/routing-policies.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
         let a = session_id("codex:alias-a");
         let b = session_id("codex:alias-b");
         let row = serde_json::json!({"project":null,"baseline":Settings::default(),"explicit":settings(Mode::Strict),"anchor":"cx-right","movements":[]});
@@ -5907,7 +5907,7 @@ mod tests {
     fn integrated2_invalid_map_prefix_cannot_hide_positive_strict_evidence() {
         let home = home();
         let path = home.path().join("state/routing-policies.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
         let mut projects = serde_json::Map::new();
         for n in 0..MAX_PROJECTS {
             projects.insert(format!("!invalid-{n:05}"), serde_json::Value::Null);
@@ -6150,7 +6150,7 @@ mod tests {
             for revisit in [true, false] {
                 let home = home();
                 let path = home.path().join("state/routing-policies.json");
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                crate::platform::ensure_private_dir_all(path.parent().unwrap()).unwrap();
                 let legacy = session_id("codex:legacy-promotion");
                 let key = "codex:legacy-promotion:agent:new";
                 let exact = session_id(key);

@@ -29,6 +29,11 @@ fn record(home: &std::path::Path, account: &Account) -> std::path::PathBuf {
 #[test]
 fn actual_store_encrypts_reopens_and_metadata_preserves_ciphertext() {
     let home = private_fs::tests::fixture();
+    create_private_secret(
+        &home.path().join("config.toml"),
+        b"[secrets]\nlinux_backend = \"file-0600\"\n",
+    )
+    .unwrap();
     let store = AccountStore::acquire(home.path()).unwrap();
     let saved = store
         .save(&account("sample-acct"), &tokens(), None)
@@ -63,6 +68,11 @@ fn actual_store_encrypts_reopens_and_metadata_preserves_ciphertext() {
 #[test]
 fn actual_store_rejects_account_cipher_swap_and_unsafe_record_without_repair() {
     let home = private_fs::tests::fixture();
+    create_private_secret(
+        &home.path().join("config.toml"),
+        b"[secrets]\nlinux_backend = \"file-0600\"\n",
+    )
+    .unwrap();
     let store = AccountStore::acquire(home.path()).unwrap();
     let first = store.save(&account("sample-one"), &tokens(), None).unwrap();
     let second = store.save(&account("sample-two"), &tokens(), None).unwrap();

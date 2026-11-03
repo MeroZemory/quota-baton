@@ -80,14 +80,21 @@ fn candidates(ids: &[&str]) -> Vec<Candidate> {
         .collect()
 }
 
+fn fixture_dir() -> tempfile::TempDir {
+    let parent =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4d-fixtures");
+    std::fs::create_dir_all(&parent).unwrap();
+    qb_testkit::fixture::tempdir_in(parent).unwrap()
+}
+
 fn table() -> (tempfile::TempDir, std::sync::Arc<BindingTable>) {
-    let root = tempfile::tempdir().unwrap();
+    let root = fixture_dir();
     let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
     (root, table)
 }
 
 fn table_with(config: RoutingConfig) -> (tempfile::TempDir, std::sync::Arc<BindingTable>) {
-    let root = tempfile::tempdir().unwrap();
+    let root = fixture_dir();
     let table = BindingTable::new(root.path(), config).unwrap();
     (root, table)
 }

@@ -12,7 +12,7 @@ fn fixture() -> (tempfile::TempDir, BoxScope) {
         .unwrap()
         .join(".sandbox/bt");
     std::fs::create_dir_all(&base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(base).unwrap();
     let registry = BoxRegistry::open(root.path()).unwrap();
     let (scope, _key) = registry
         .add(BoxName::parse("a").unwrap())

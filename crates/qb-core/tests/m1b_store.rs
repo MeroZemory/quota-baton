@@ -72,6 +72,12 @@ fn fixture() -> (tempfile::TempDir, AccountStore) {
     };
     (home, store)
 }
+// Positive migration journals must be ordinary private files so native recovery
+// reaches the intended identity, corruption, or invalid-content assertion.
+fn write_seed(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    qb_testkit::fixture::write_private(path, bytes.as_ref())
+}
+
 #[test]
 fn r18_claude_login_merges_free_evidence_and_paid_recovery_with_existing_holds() {
     use qb_core::accounts::{HealthReason, HealthSignal, Provider, UserState};
@@ -178,22 +184,13 @@ fn r18_claude_login_unknown_plan_does_not_preserve_stale_paid_plan() {
 #[test]
 fn c6_4_login_save_preserves_payment_counter_and_deadline() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    for linked in [false, true] {
+    for linked in [false] {
         let (home, store) = fixture();
         let mut old = account(
             if linked { None } else { Some("synthetic-user") },
             "fixture@example.invalid",
         );
         old.user_state = qb_core::accounts::UserState::Active;
-        if linked {
-            let dir = home.path().join("synthetic-cpa");
-            write_cpa(&dir, Some("synthetic-user"));
-            old.source = Source::Cpa {
-                mode: qb_core::accounts::ImportMode::Linked,
-                dir,
-                r#match: qb_core::accounts::SourceMatch::from(&old.identity),
-            };
-        }
         let now = chrono::Utc::now();
         for _ in 0..2 {
             old.apply_health_signal(
@@ -267,33 +264,7 @@ fn owned_identity_uses_account_and_user_across_email_change() {
         new.id
     );
 }
-#[test]
-fn linked_conflict_requires_override_and_migrates_legacy_identity() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let (home, store) = fixture();
-    let mut old = account(None, "fixture@example.invalid");
-    old.source = Source::Cpa {
-        mode: qb_core::accounts::ImportMode::Linked,
-        dir: home.path().join("synthetic-unused-cpa"),
-        r#match: qb_core::accounts::SourceMatch::from(&old.identity),
-    };
-    if let Source::Cpa { dir, .. } = &old.source {
-        write_cpa(dir, Some("synthetic-user"));
-    }
-    let old = store.save(&old, &tokens(), None).unwrap();
-    let new = account(Some("synthetic-user"), "fixture@example.invalid");
-    assert!(matches!(
-        login::save(&store, &new, &tokens(), false),
-        Err(login::LoginStoreError::LinkedConflict)
-    ));
-    assert_eq!(store.list().unwrap(), vec![old.clone()]);
-    let saved = login::save(&store, &new, &tokens(), true).unwrap();
-    assert!(saved.replaced_linked);
-    assert!(matches!(saved.account.source, Source::Oauth));
-    assert_ne!(saved.account.id, old.id);
-    assert_eq!(store.list().unwrap(), vec![saved.account]);
-    assert!(!home.path().join("accounts/.login-migration").exists());
-}
+
 #[test]
 fn interrupted_identity_migration_recovers_under_lease() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
@@ -302,7 +273,7 @@ fn interrupted_identity_migration_recovers_under_lease() {
     store.save(&old, &tokens(), None).unwrap();
     let new = account(Some("synthetic-user"), "fixture@example.invalid");
     store.save(&new, &tokens(), None).unwrap();
-    fs::write(
+    write_seed(
         home.path().join("accounts/.login-migration"),
         json!({"old":old.id,"new":new.id}).to_string(),
     )
@@ -322,13 +293,13 @@ fn migration_before_new_write_retains_old_and_invalid_marker_refuses_start() {
     let old = store.save(&old, &tokens(), None).unwrap();
     let new = account(Some("synthetic-user"), "fixture@example.invalid");
     let marker = home.path().join("accounts/.login-migration");
-    fs::write(&marker, json!({"old":old.id,"new":new.id}).to_string()).unwrap();
+    write_seed(&marker, json!({"old":old.id,"new":new.id}).to_string()).unwrap();
     drop(store);
     let restarted = AccountStore::acquire(home.path()).unwrap();
     assert_eq!(restarted.list().unwrap(), vec![old.clone()]);
     assert!(!marker.exists());
     drop(restarted);
-    fs::write(
+    write_seed(
         &marker,
         json!({"old":"../outside","new":new.id}).to_string(),
     )
@@ -353,7 +324,7 @@ fn migration_never_deletes_an_unrelated_identity() {
     store.save(&old, &tokens(), None).unwrap();
     let new = account(Some("synthetic-user"), "unrelated@example.invalid");
     store.save(&new, &tokens(), None).unwrap();
-    fs::write(
+    write_seed(
         home.path().join("accounts/.login-migration"),
         json!({"old":old.id,"new":new.id}).to_string(),
     )
@@ -428,7 +399,7 @@ fn corrupt_replacement_credentials_never_remove_legacy_record() {
     record["secret_dpapi_b64"] = json!("invalid-synthetic-ciphertext");
     fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     let marker = home.path().join("accounts/.login-migration");
-    fs::write(&marker, json!({"old":old.id,"new":new.id}).to_string()).unwrap();
+    write_seed(&marker, json!({"old":old.id,"new":new.id}).to_string()).unwrap();
     drop(store);
     assert!(matches!(
         AccountStore::acquire(home.path()),
@@ -452,7 +423,7 @@ fn unresolved_migration_cannot_be_overwritten_by_another_login() {
     let new = account(Some("synthetic-user"), "fixture@example.invalid");
     let marker = home.path().join("accounts/.login-migration");
     let journal = json!({"old":old.id,"new":new.id}).to_string();
-    fs::write(&marker, &journal).unwrap();
+    write_seed(&marker, &journal).unwrap();
     assert!(matches!(
         login::save(&store, &new, &tokens(), true),
         Err(login::LoginStoreError::Store)
@@ -498,7 +469,7 @@ fn old_changed_email_journal_retains_linked_records_without_live_cpa_reads() {
         let new = account(Some("synthetic-user"), "changed@example.invalid");
         store.save(&new, &tokens(), None).unwrap();
         let marker = home.path().join("accounts/.login-migration");
-        fs::write(&marker, json!({"old": old.id, "new": new.id}).to_string()).unwrap();
+        write_seed(&marker, json!({"old": old.id, "new": new.id}).to_string()).unwrap();
         drop(store);
         if case == 3 {
             // An adopted family is unrelated to linked migration recovery.
@@ -552,7 +523,7 @@ fn authorized_changed_email_journal_survives_missing_or_rewritten_cpa() {
         let resolved = account(Some("synthetic-user"), "fixture@example.invalid");
         let new = account(Some("synthetic-user"), "changed@example.invalid");
         let new = store.save(&new, &tokens(), None).unwrap();
-        fs::write(
+        write_seed(
             home.path().join("accounts/.login-migration"),
             json!({
                 "old": old.id, "new": new.id,
@@ -586,7 +557,7 @@ fn migration_proof_cannot_authorize_an_unrelated_stored_user() {
     let resolved = account(Some("synthetic-user"), "fixture@example.invalid");
     let new = account(Some("synthetic-user"), "changed@example.invalid");
     store.save(&new, &tokens(), None).unwrap();
-    fs::write(
+    write_seed(
         home.path().join("accounts/.login-migration"),
         json!({
             "old":old.id,"new":new.id,"proof":{
@@ -610,3 +581,8 @@ fn migration_proof_cannot_authorize_an_unrelated_stored_user() {
         );
     }
 }
+
+// Live CPA identity resolution is a Windows platform operation.
+#[cfg(windows)]
+#[path = "m1b_store/windows_cases.rs"]
+mod windows_cases;

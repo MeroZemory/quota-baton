@@ -45,7 +45,7 @@ fn fixture() -> Fixture {
         .unwrap()
         .join(".sandbox/bt");
     std::fs::create_dir_all(&base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = qb_testkit::fixture::tempdir_in(base).unwrap();
     let registry = BoxRegistry::open(root.path()).unwrap();
     let a = enroll(&registry, "a");
     let b = enroll(&registry, "b");

@@ -59,7 +59,7 @@ struct Harness {
     store: Arc<AccountStore>,
     root: tempfile::TempDir,
     upstream_trap: TcpListener,
-    captured: Captured,
+    _captured: Captured,
 }
 impl Harness {
     async fn new() -> Self {
@@ -120,7 +120,7 @@ impl Harness {
             store,
             root,
             upstream_trap,
-            captured,
+            _captured: captured,
         }
     }
     async fn close(mut self) {
