@@ -413,8 +413,10 @@ fn default_cli_has_no_phase0_or_body_capture() {
 async fn startup_recovers_corrupt_quota_and_listens() {
     let _serial = SERVE_SERIAL.lock().await;
     let home = fixture();
-    std::fs::create_dir_all(home.path().join("state")).unwrap();
-    std::fs::write(
+    // Supply a real pre-existing corrupt record, not an unsafe-mode directory
+    // that would be refused before the recovery parser runs.
+    fixture_support::private_directory(home.path().join("state")).unwrap();
+    fixture_support::write_private(
         home.path().join("state/quota.json"),
         "invalid synthetic state",
     )

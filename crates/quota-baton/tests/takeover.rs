@@ -812,12 +812,12 @@ e2e!(
         let upstream = ScriptedUpstream::start().await.unwrap();
         let home = Home::new(&upstream.url).await;
         let ids = accounts(&home, 2);
-        fs::create_dir_all(home.path.join("state")).unwrap();
+        fixture_support::private_directory(home.path.join("state")).unwrap();
         let id = qb_core::routing::session_id("codex:held");
         let policy = serde_json::json!({"schema":1,"revision":9,"projects":{},"sessions":{
         id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},
         "explicit":{"mode":"strict","reset_wait_secs":0},"anchor":ids[0],"movements":[]}}});
-        fs::write(
+        fixture_support::write_private(
             home.path.join("state/routing-policies.json"),
             serde_json::to_vec(&policy).unwrap(),
         )
