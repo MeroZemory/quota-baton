@@ -36,8 +36,9 @@ fn isolated(name: &str, test: impl FnOnce(&Path, &Path)) {
     fs::create_dir_all(&root).unwrap();
     let fixture = tempfile::Builder::new()
         .prefix(name)
-        .tempdir_in(root)
+        .tempdir_in(root.canonicalize().unwrap())
         .unwrap();
+    let fixture = qb_testkit::fixture::prepare_tempdir(fixture).unwrap();
     // 환경 변수는 자식 프로세스에만 설정하여 병렬 테스트와 충돌하지 않는다.
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
