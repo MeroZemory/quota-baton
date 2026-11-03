@@ -393,6 +393,24 @@
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
+      "function": "BindingTable::prepare_launch_handover",
+      "expression": "call: decode_scoped Parenthesis( value .Alone clone Parenthesis( ) ,Alone self .Alone policies .Alone requires_strict_recovery Parenthesis( ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings.rs",
+      "function": "BindingTable::prepare_launch_handover",
+      "expression": "call: serde_json :Joint :Alone to_value Parenthesis( snapshot Parenthesis( &Alone data ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings.rs",
+      "function": "BindingTable::prepare_launch_handover",
+      "expression": "mutable-escape: &Alone mut data",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::prune",
       "expression": "assignment: d .Alone count_change_clock =Alone Some Parenthesis( now )",
       "count": 1
@@ -1091,6 +1109,12 @@
       "path": "crates/qb-core/src/bindings/kernel/selection_affinity.rs",
       "function": "<module>",
       "expression": "sensitive-import: use crate :Joint :Alone bindings :Joint :Alone Brace( CAPACITY ,Alone launch :Joint :Alone IDLE_SECS ) ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/kernel/selection_capacity.rs",
+      "function": "<module>",
+      "expression": "sensitive-import: use serde_json :Joint :Alone Value ;Alone",
       "count": 1
     },
     {

@@ -1057,7 +1057,8 @@ fn prepare_scratch(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<(
                 .open(&tmp)
                 .map(|_| ())
         } else {
-            fs::create_dir(&tmp)
+            qb_core::ensure_private_dir_all(tmp.parent().context("scratch parent")?)?;
+            qb_core::create_private_directory_new(&tmp)
         };
         match result {
             Ok(()) => {}

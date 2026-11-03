@@ -5,6 +5,7 @@ mod fs_identity;
 mod lease;
 mod memory;
 mod private_fs;
+pub(crate) use private_fs::ensure_private_dir_all;
 mod process;
 mod secrets;
 pub(crate) use atomic::*;

@@ -508,6 +508,7 @@ mod tests {
     use serde_json::json;
     use std::{fs, path::Path};
 
+    mod handover_tests;
     mod scoped_issue_tests;
 
     #[test]

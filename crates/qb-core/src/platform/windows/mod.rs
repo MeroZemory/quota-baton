@@ -4,6 +4,7 @@ mod crypto;
 mod fs_identity;
 mod lease;
 mod memory;
+mod private_directory;
 mod process;
 mod secrets;
 pub(crate) use atomic::*;
@@ -12,6 +13,7 @@ pub(crate) use crypto::*;
 pub(crate) use fs_identity::*;
 pub(crate) use lease::Lease;
 pub(crate) use memory::*;
+pub(crate) use private_directory::ensure_private_dir_all;
 pub(crate) use process::*;
 pub(crate) use secrets::*;
 

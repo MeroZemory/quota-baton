@@ -272,7 +272,7 @@ fn save_backup(plan: &MapPlan) -> Result<()> {
         let protected = crate::cutover::protect(&bytes).map_err(|_| anyhow!(BACKUP))?;
         let backup = backup_path(plan)?;
         let parent = backup.parent().ok_or_else(|| anyhow!(BACKUP))?;
-        fs::create_dir_all(parent).map_err(|_| anyhow!(BACKUP))?;
+        qb_core::ensure_private_dir_all(parent).map_err(|_| anyhow!(BACKUP))?;
         // The handle-based publisher uses a native Windows rename API. Give
         // it the extended canonical namespace even when APPDATA/QB_HOME came
         // from ordinary DOS paths; UUID+hash backup names can exceed MAX_PATH.
@@ -360,7 +360,8 @@ fn publish(path: &Path, bytes: &[u8], before_publish: impl FnOnce() -> Result<()
     static NEXT: AtomicU64 = AtomicU64::new(0);
     explicit(path)?;
     let parent = path.parent().ok_or_else(|| anyhow!(FORMAT))?;
-    fs::create_dir_all(parent).map_err(|_| anyhow!("herdr 세션 홈 폴더를 만들 수 없습니다"))?;
+    qb_core::ensure_private_dir_all(parent)
+        .map_err(|_| anyhow!("herdr 세션 홈 폴더를 만들 수 없습니다"))?;
     explicit(path)?;
     let mut file = None;
     for _ in 0..64 {

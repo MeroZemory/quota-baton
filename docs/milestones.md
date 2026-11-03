@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R21 코드/합성 관문PASS·실데이터insufficient·impl/r21 미병합
-목표: schema9 측정입력 producer 결정 뒤 실제 weighted paired margin0; 기존 N6r24h 원형identity/census 유지
-핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (수용 전 지표 추가 없음)
-사용자 대기: 현재24h 봉인export와 schema9 producer-first 수집 결정; N7은11/05 13:49 이후; L1 실제수용·N12 O14
-갱신: 2026-10-30 17:40 KST (R21 기본4015/Core1723·최종Core1587·strict/Linux/실제4PNG·일반build/check통과; 설치7b3f9ce 유지)
+현재 마일스톤: R22 재개 (R23 별도 제품 수정 관문 완료·dev 인계)
+목표: 제품 변경 없이 Windows 기본/전체기능·Linux all-targets 각각 clean3연속0
+핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (producer gate는 실제 수용으로 세지 않음)
+사용자 대기: R22 없음; schema9 >=24h export11/01 13:04 이후·N7 11/05 13:49 이후·L1 실제수용·N12 O14
+갱신: 2026-10-31 15:36 KST (R23 양OS 저장/보안/strict 통과·설치 보류; d96 schema9 1h 선택/permit409·nc/loss0·9.25MBh/40)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -128,8 +128,9 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N2 R16.3 provider charts and pace line | S1 | none | `impl/r16.3` from dev, brief section R16.3 | focused gate, real-path capture, regressions for differing resets and a paused account |
 | N6 R14.2 recorder, minimum delivery | S1 | none | `impl/r14.2` (keep db6baac), brief R14 plus D29 amendment 4 | schema, off switch, default off, 7-day bound, tests; then S2 install and enable; the 24 h capture starts at install |
 | N6t R14 typed rebind and static write check | S1 | none | `impl/r14-rebind` | compile-time choke point, static check failing on a planted write, existing tests |
-| N6r decision-tape real gate | S1 | owner sealed e02..e05 export after2026-10-31 11:04KST; installed7b3f9ce identity | `impl/n6r-tape` | >=24h native paired margin0/coverage/loss plus realmove census and reached-guard power; onehour638/638/fault14PASS does not accept24h |
-| R21 measured-capacity candidate | S1; historical audit W | schema8 lacks measured readset; owner schema9 producer-first decision, no merge before10-31 11:04 seal | `impl/r21` | code/native synthetic gate qualified; historical and real weighted input insufficient; original installed identity/census separate |
+| N6r decision-tape real gate | S1 | schema8 real24h insufficient; next producer step requires adopted review | `impl/n6r-tape` | >=24h native paired margin0/coverage/loss plus realmove census and reached-guard power; onehour638/638/fault14PASS does not accept24h |
+| N6r-T capacity producer | S1 | installed661997d10-31 11:05; wait warm+>=24h schema9 | `impl/n6r-capacity-producer` | percent/native selector exact dev, schema9 measured facts+opaque links, no key export needed, writer/reader/code gate qualified; R21 stays separate |
+| R21 measured-capacity candidate | S1 | source-complete schema9 warm+>=24h, owner-approved paired gate | `impl/r21` at1ad42fa (unmerged) | historical/schema8 weighted verdict insufficient; first real candidate after fresh capture |
 | N5m R13 C measurement: Codex cache survival by idle gap; client hold tolerance against a fake upstream | W | none | background `codex-qb exec` worker in `.sandbox/r13-measure/`; no cargo in S1 | measurement table in the R13 report |
 | N5a R13 E HTTP wait and reset-resume for non-urgent sessions at 5h limits | S1 | none (bound is a setting; N5m only tunes its default) | `impl/r13-wait` | hold then serve on the same account after reset; bound exceeded falls back; cancellation releases |
 | N5b R13 E WS/SSE cancellation and keepalive during a hold | S1 | none | `impl/r13-ws-hold` | cancelled held WS/SSE releases its slot and binding; no orphaned upstream |
@@ -146,7 +147,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: R20 final gate is complete on impl/r20: fresh final-source200 handovers in413.37s, TCP41213+HTTP14285 allsuccessful, timeout/non2xx/transport0,201/201 timelines and home removed. Originaldefault3983/3 stays intact; exactrecorder1 and defaulttakeover10 repair its3failures after the isolated0/2 diagnostic. Newnativelease2/platform6/bank11, fmt/twostrict, allfeatures4398/0/38ignored, core1703/0/2ignored, ordinarybuild and readonlylaunchcheck pass. Linux actualheldbody2/platform6/check/threestrict pass; the laterWindows-onlyfix reuses unchangedLinuxproductioninputs. Architecture and shortLinuxguide document lifecycle/legacy limits. R20 is ready for dev merge but MUST NOT install during the owner24h capture. Installed7b3f9ce starts e02 at2026-10-30 11:02:48KST, live disk512; owner-retired legacy roots and scheduled6h seals produce e02..e05, finalseal2026-10-31 11:04KST. Next prescribed S1 is the sealed24h paired verdict+census; realhour638/638/fault14PASS and guard insufficient_not_exercised remain separate. N7-L earliestscoring2026-11-05 13:49KST; no modelwork before7days. L1 actualP5 is owner/user acceptance, VM TCP is a later phase, N12 awaitsO14. No independent ready S1 remains; ask the owner at this gate if another approved brief is available. impl/r14-replay stays stopped/unmerged. Reports: .sandbox/reports/R20.md and N6r-T.tape8-real1.md.
+**Current S1 order**: R23 fixed the real private-state initialization defect that stopped R22; its Windows and Linux022/077 focused gates passed. Merge R23 to dev without installing before11-01 13:04, then resume impl/r22 WIP11974aa with the product fix and preserve the original failures. R22 still needs three clean consecutive passes per Windows default/all-features and Linux all-targets. No retry-until-pass. Owner installed d96a01f10-31 13:01 (886/0, both smokes); schema9/e01 health14:05 is selection/permit409, nc0/loss0, encoded9.25MB/hour within40 and compressed1.90MB. Scheduled seals10-31 19:03,11-01 01:03/07:03/13:04; no installs until final seal. Owner then exports for the R21 percent-vs-weighted margin0 gate; R21 stays unmerged1ad42fa. N7 scoring remains after11-05 13:49. Reports: MAIN `.sandbox/reports/R23.md`, `.sandbox/reports/R22.md`, `.sandbox/reports/N6r-T.vocabulary.md`.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
@@ -571,7 +572,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
 | Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
-| N6r decision tape | schema8 실제638/638 identity·fault14 검출·loss0, model0.3125%; 실제30분guard insufficient_not_exercised | >=24h 완전 다중epoch margin0·실제guard census/power | 40MB/h·512MiB 기본값 양OS 관문PASS; 설계 설치·6h 봉인 운영 인계, B1/3 유지 |
+| N6r decision tape | schema8 실제24h identity 선택9969/permit11946·단일global fault1건 검출·loss0, 선택nc17.8763%/permit1.5899%로 insufficient | 매epoch nc<=1%와 실제후보 margin0; observed/native 투영 불일치·모델 소실 진단 | 다음 producer 단계 채택 검토·schema9 warm>=24h R21 별도, B1/3 유지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

@@ -18,6 +18,11 @@ The documentation map is in `docs/README.md`. The normative behaviour is in `doc
 - **Run a review build in the implementer's worktree only while the implementer is idle.** Use the default target, run `cargo test` / `cargo clippy` sequentially, and do not keep a second copy.
 - **The implementation worktree's `target/` lives on D:** (NVMe SSD; changed 2026-10-28 when D: had ~290 GiB free and the pagefile moved there). `C:/_projects/SampleUser/quota-baton-impl/target` is a directory junction to `D:/_build/quota-baton-impl/target`, so cargo commands and paths stay unchanged. It is still one target with the same 8 GiB cap. Never put build output on E: (HDD). Temporary release worktrees build in their own `target/` and are removed after use, as before.
 - **Clean the physical target.** On this junction, plain `cargo clean` removes the C: junction but leaves the D: files. Use `cargo clean --target-dir D:/_build/quota-baton-impl/target` for the cleanup rules above, after verifying that exact physical target and compiler quiescence. Recreate the empty D: target directory afterward; retain or restore the C: junction to it. This is the same single target, not an additional build target or environment override. Never clean its parent `D:/_build`.
+- **Linux builds and tests run on the headless server** (`ssh home-server`; Ubuntu 24.04, systemd 255, Docker, sudo; user direction 2026-11-03). They no longer run in Docker Desktop on this PC.
+  - Copy the source with `git archive` over ssh, without adding a git remote to the private repo.
+  - Build under `~/quota-baton-ci/` with one target directory there.
+  - Real-path Linux tests (systemd service, takeover, browserless login with the user) also run on the home server.
+  - Keep the PC-side Docker volume `qb-linux-target` only until the switch is verified, then remove it.
 - If a cleanup is blocked, report the exact path and size instead of working around it.
 - **Retention of run artifacts.** Verification copies, test binaries, temporary homes, and capture or serve logs under `.sandbox/` are deleted once their milestone is merged. Before deleting, record the result in the milestone report.
   - Keep only what a report or review cites: `.sandbox/reports/<M>.md` with its cited evidence files, `.sandbox/reviews`, `.sandbox/briefs` and `.sandbox/research`.

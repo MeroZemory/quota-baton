@@ -69,6 +69,62 @@ pub(super) fn prepare_private_directory(path: &Path) -> io::Result<File> {
     walk_directory(path, true, false)
 }
 
+/// Create a private directory tree without following aliases or repairing modes.
+/// Existing system ancestors may be readable, but must remain trusted. Once a
+/// missing component is reached, every component in the new suffix is private.
+pub(crate) fn ensure_private_dir_all(path: &Path) -> io::Result<()> {
+    ensure_private_tree(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "data directory is not private (expected owner-only permissions); no existing permissions were changed",
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn ensure_private_tree(path: &Path) -> io::Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    trusted_directory(&directory)?;
+    let mut new_suffix = false;
+    for component in absolute.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name = CString::new(name.as_bytes()).map_err(|_| refused())?;
+                directory = match open_at(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+                {
+                    Ok(child) => child,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        // An existing data directory above a missing descendant
+                        // must already be private; never normalize it implicitly.
+                        private(&directory, false)?;
+                        new_suffix = true;
+                        mkdir_private(&directory, &name)?
+                    }
+                    Err(error) => return Err(error),
+                };
+                trusted_directory(&directory)?;
+                if new_suffix {
+                    private(&directory, false)?;
+                }
+            }
+            _ => return Err(refused()),
+        }
+    }
+    private(&directory, false)
+}
+
 fn walk_directory(path: &Path, create: bool, allow_root: bool) -> io::Result<File> {
     let absolute = if path.is_absolute() {
         path.to_owned()

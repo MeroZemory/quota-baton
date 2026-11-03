@@ -16,24 +16,10 @@ use windows::{
 };
 
 pub(crate) fn prepare_observation_directory(path: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(path)
+    super::ensure_private_dir_all(path)
 }
-#[cfg(any(test, feature = "testkit"))]
 pub(crate) fn create_private_directory_new(path: &Path) -> std::io::Result<()> {
-    if let Err(error) = fs::create_dir(path) {
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "directory leaf already exists",
-            ));
-        }
-        return Err(error);
-    }
-    if let Err(error) = super::secrets::restrict(path) {
-        let _ = fs::remove_dir(path);
-        return Err(std::io::Error::other(error));
-    }
-    Ok(())
+    super::private_directory::create_new_private_directory(path)
 }
 
 #[cfg(test)]

@@ -445,16 +445,16 @@ fn malformed_ids_collisions_models_quota_and_bounds_refuse_closed() {
         Err(WireRefusal::Identity)
     ));
     let mut i = inputs();
-    i.model = Some("secret-unsupported-model".into());
+    i.model = Some("m".repeat(97));
     assert!(matches!(
         capture(&i, &actual(), |_, _| "x".into()),
-        Err(WireRefusal::Model)
+        Err(WireRefusal::InputModelLength)
     ));
     let mut output = actual();
-    output.sole_target.as_mut().unwrap().model = Some("secret-unsupported-model".into());
+    output.sole_target.as_mut().unwrap().model = Some("m".repeat(97));
     assert!(matches!(
         refused_record(&output, WireRefusal::Shape, mapper()),
-        Err(WireRefusal::Model)
+        Err(WireRefusal::SelectionModelLength)
     ));
     let mut i = inputs();
     i.selection.as_mut().unwrap().candidates[0].quota = Some(json!({"windows": "secret"}));
@@ -521,4 +521,62 @@ fn no_key_sentinel_and_unknown_wire_fields_are_not_filled() {
     let mut value = serde_json::to_value(&r).unwrap();
     value["inputs"]["selection"]["candidates"][0]["account"]["email"] = json!("secret");
     assert!(serde_json::from_value::<SelectionRecord>(value).is_err());
+}
+
+#[test]
+fn selection_preserves_null_and_literal_models_with_observed_cooling() {
+    for model in [
+        None,
+        Some(""),
+        Some("null"),
+        Some("auto"),
+        Some("provider/model-alias"),
+    ] {
+        let mut input = inputs();
+        input.model = model.map(str::to_owned);
+        let source = &mut input.selection.as_mut().unwrap().source_accounts[0].account;
+        source.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "observed".into(),
+            reset_at: now(),
+            started_at: now(),
+        });
+        let expected = kernel::selection::select(&input).unwrap().decision;
+        let record = capture(&input, &expected, mapper()).unwrap();
+        assert_eq!(replay(&record).unwrap(), record.actual);
+        assert!(record.refusal.is_none());
+        let wire = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            wire["inputs"]["model"],
+            serde_json::to_value(model).unwrap()
+        );
+        let restored = record.inputs.as_ref().unwrap().to_inputs().unwrap();
+        assert_eq!(restored.model.as_deref(), model);
+        assert_eq!(
+            restored.selection.as_ref().unwrap().source_accounts[0]
+                .account
+                .quota_cooling
+                .as_ref()
+                .unwrap()
+                .window,
+            "observed"
+        );
+    }
+}
+
+#[test]
+fn selection_placement_window_refusal_is_not_a_generic_quota_error() {
+    let mut input = inputs();
+    let placements = &mut input.selection.as_mut().unwrap().metrics.placements;
+    let placement = placements.values_mut().next().unwrap();
+    let (_, row) = std::mem::take(&mut placement.windows)
+        .into_iter()
+        .next()
+        .unwrap();
+    placement
+        .windows
+        .insert("synthetic_invalid_window".into(), row);
+    assert!(matches!(
+        capture(&input, &actual(), mapper()),
+        Err(WireRefusal::PlacementWindow)
+    ));
 }

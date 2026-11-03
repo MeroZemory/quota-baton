@@ -14,6 +14,7 @@ mod debug_snapshot;
 
 mod platform;
 mod routing_cli;
+mod takeover_client;
 #[allow(unused_imports)] // Windows feature roots retain their existing crate:: paths.
 use platform::*;
 
@@ -260,32 +261,17 @@ fn friendly_error(error: &anyhow::Error) -> String {
 async fn request_takeover(
     home: &std::path::Path,
     config: &qb_core::config::Config,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     let secrets = qb_core::local_secrets::load_or_create(home)?;
-    let port = config.server.admin_port;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(35))
-        .build()?;
     qb_core::service::trace_handover_phase("drain_requested");
-    let response = client
-        .post(format!("http://127.0.0.1:{port}/admin/v1/lifecycle/drain"))
-        .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", secrets.admin_token),
-        )
-        .json(&serde_json::json!({"drain_timeout_secs": config.server.drain_timeout_secs}))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "실행 중인 코어가 takeover를 거부했습니다 ({})",
-            response.status()
-        );
-    }
+    let bytes = takeover_client::request(
+        config.server.admin_port,
+        &secrets.admin_token,
+        config.server.drain_timeout_secs,
+    )
+    .await?;
     qb_core::service::trace_handover_phase("drain_acknowledged");
-    Ok(response.json().await?)
+    Ok(bytes)
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -437,23 +423,24 @@ async fn run() -> anyhow::Result<()> {
             };
             #[cfg(feature = "phase0")]
             let relay = relay.with_close_after_response(phase0_close_after_response);
+            let relay = if let Some(bytes) = imported_bindings {
+                let restored = tokio::task::spawn_blocking(move || {
+                    let mut relay = relay;
+                    let result = relay.restore_takeover(&bytes);
+                    // Zeroizing bytes and typed grants are dropped on this task
+                    // before its initialized graph is published to listeners.
+                    result.map(|()| relay)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩 복구 작업이 종료되었습니다."))?
+                .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩을 읽지 못했습니다."))?;
+                observability.record_takeover("bindings_imported");
+                restored
+            } else {
+                relay
+            };
             let relay = std::sync::Arc::new(relay);
             relay.set_drain_timeout(config.server.drain_timeout_secs);
-            if let Some(bindings) = imported_bindings {
-                let value = serde_json::json!({
-                    "schema": 1,
-                    "bindings": bindings
-                        .get("bindings")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!([])),
-                });
-                let bindings = relay.bindings.clone();
-                tokio::task::spawn_blocking(move || bindings.import(value))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩 복구 작업이 종료되었습니다."))?
-                    .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩을 읽지 못했습니다."))?;
-                observability.record_takeover("bindings_imported");
-            }
             relay
                 .accounts
                 .initialize_settings(config.accounts.clone())

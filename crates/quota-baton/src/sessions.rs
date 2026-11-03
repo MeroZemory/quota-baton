@@ -756,7 +756,7 @@ fn clean_stale_copies(copies: &[StaleCopy], journal_home: &Path) -> Result<()> {
                 continue;
             }
             if let Some(parent) = name.backup.parent() {
-                fs::create_dir_all(parent)?;
+                qb_core::ensure_private_dir_all(parent)?;
             }
             guard::rename_verified(
                 &copy.home,
@@ -789,7 +789,7 @@ fn restore_stale_copies(copies: &[StaleCopy], journal_home: &Path) -> Result<()>
                     "보존된 오래된 기록이 변경되었습니다"
                 );
                 if let Some(parent) = name.original.parent() {
-                    fs::create_dir_all(parent)?;
+                    qb_core::ensure_private_dir_all(parent)?;
                 }
                 guard::rename_verified(
                     journal_home,
@@ -1566,7 +1566,7 @@ fn import_one_using(
     for link in &record.files {
         if link.owned {
             if let Some(parent) = link.target.parent() {
-                fs::create_dir_all(parent)?;
+                qb_core::ensure_private_dir_all(parent)?;
             }
             guard::safe_path(&store.target, &link.target)?;
             linker(&link.source,&link.target).map_err(|_|anyhow::anyhow!("하드링크를 만들 수 없습니다. 같은 드라이브의 홈을 사용하세요. 기록은 복사하지 않았습니다"))?;
@@ -1749,7 +1749,7 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
                     "이동한 기록을 복구할 수 없습니다"
                 );
                 if let Some(parent) = link.source.parent() {
-                    fs::create_dir_all(parent)?;
+                    qb_core::ensure_private_dir_all(parent)?;
                 }
                 guard::safe_path(&entry.source_home, &link.source)?;
                 fs::hard_link(&link.target, &link.source)?;

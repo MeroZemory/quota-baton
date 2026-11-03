@@ -632,6 +632,8 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `POST /lifecycle/shutdown` `{drain_timeout_secs}` | Graceful exit; flushes bindings |
 | `POST /debug/pin` `{session_key?, account_id}` / `DELETE /debug/pin` | **Phase 0 only.** Forces selection for that session key, or for all sessions if the key is omitted, to the given account, overriding C7. Logged at warn level and shown in the tray. Cleared on restart. |
 
+A successor may negotiate a memory-only managed-launch handover by sending exactly one `x-qb-launch-handover: 1` header to the authenticated loopback drain endpoint. The reply then optionally includes `managed` with the full native binding snapshot and existing launch digest grants. Old peers retain the two-field reply. The whole reply is limited to 16 MiB before parsing, is never logged or persisted, and its transient owned buffers and typed grant fields are zeroized. Grants preserve their Box scope and remaining lifetime; no pin, pending receipt, or account authority is invented. The successor validates and prepares all grants before importing bindings, then commits the registry before serving. Managed restore refusal falls back to legacy real C8 bindings without any partial launch registry; genuinely missing/expired authority retains the existing relaunch path. Malformed outer replies, a false lease receipt, or an oversized reply still refuse startup. Continuity requires both incumbent and successor to support managed-grant export: an old-to-patched upgrade retains the existing relaunch path because the old process cannot supply its registry.
+
 `AccountView` fields:
 - `id`, `provider`, `label`, `email`, `plan`
 - `user_state`, `health` (including `reason`, `until` and `scope`)

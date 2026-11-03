@@ -470,7 +470,7 @@ fn execute(
     if record.phase < Phase::Linked {
         for name in &record.names {
             if !name.target.try_exists()? {
-                fs::create_dir_all(name.target.parent().context("대상 폴더가 없습니다")?)?;
+                qb_core::ensure_private_dir_all(name.target.parent().context("대상 폴더가 없습니다")?)?;
                 guard::safe_path(&record.target, &name.target)?;
                 check_name(name, &name.source)?;
                 fs::hard_link(&name.source, &name.target)

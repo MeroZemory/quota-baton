@@ -1483,7 +1483,7 @@ fn prepare_with_operational_rebase<'a>(
         }
         destination_file(path)?;
         if !remove {
-            std::fs::create_dir_all(&plan.target_home)?;
+            qb_core::ensure_private_dir_all(&plan.target_home)?;
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | if remove {
