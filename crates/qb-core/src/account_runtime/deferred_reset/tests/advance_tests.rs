@@ -19,7 +19,7 @@ fn try_register(
 }
 
 async fn consume_physical(f: &Fixture) -> (DeferredResetId, LaunchOwnerScope, ObservedHttp429) {
-    let (observed, reset) = f.physical(3).await;
+    let (observed, reset) = f.physical(SHORT_RESET_LEAD).await;
     let (id, scope) = f.register(&observed);
     let DeferredResetStatus::Waiting { wake, .. } = f.runtime.deferred_reset_status(&scope, THREAD)
     else {
@@ -41,7 +41,7 @@ async fn n5d_advance_refuses_missing_waiting_ready_and_cancelled_episodes() {
     let f = Fixture::new();
     let scope = f.lease.scope();
     assert!(!advance(&f, &scope, DeferredResetId(1)));
-    let (observed, reset) = f.physical(3).await;
+    let (observed, reset) = f.physical(SHORT_RESET_LEAD).await;
     let (id, scope) = f.register(&observed);
     assert!(!advance(&f, &scope, id));
     assert!(!advance(&f, &scope, DeferredResetId(0)));

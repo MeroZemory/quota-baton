@@ -1209,6 +1209,8 @@ mod tests {
     // between real Store writes and a one-second setup window. Keep the reset
     // beyond the registration deadline without changing the production gates.
     const NEAR_RESET_LEAD: i64 = 10;
+    // 짧은 리셋 리드. 부하 중 물리 429 관측 단계가 몇 초 걸려도 리셋 전에 끝나도록 둔다.
+    const SHORT_RESET_LEAD: i64 = 5;
     struct Fixture {
         runtime: Arc<AccountRuntime>,
         table: Arc<BindingTable>,
@@ -1216,12 +1218,50 @@ mod tests {
         lease: LaunchOwnerLease,
         id: String,
         _home: tempfile::TempDir,
+        // 마지막 필드라 다른 필드보다 늦게 해제된다.
+        _serial: Serial,
+    }
+    // 실제 시각 리셋 경계를 쓰는 테스트들이 서로 경합하지 않게 한 번에 하나씩 돌린다.
+    // 한 테스트(스레드)가 fixture를 여러 개 만들 수 있으므로 스레드 단위로 재진입한다.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    thread_local! {
+        static HELD: std::cell::RefCell<(usize, Option<std::sync::MutexGuard<'static, ()>>)> =
+            const { std::cell::RefCell::new((0, None)) };
+    }
+    struct Serial;
+    impl Serial {
+        fn acquire() -> Self {
+            HELD.with(|held| {
+                let mut held = held.borrow_mut();
+                if held.0 == 0 {
+                    held.1 = Some(
+                        SERIAL
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                }
+                held.0 += 1;
+            });
+            Self
+        }
+    }
+    impl Drop for Serial {
+        fn drop(&mut self) {
+            HELD.with(|held| {
+                let mut held = held.borrow_mut();
+                held.0 -= 1;
+                if held.0 == 0 {
+                    held.1 = None;
+                }
+            });
+        }
     }
     impl Fixture {
         fn new() -> Self {
             Self::with_reset_hold(60)
         }
         fn with_reset_hold(reset_hold_secs: u64) -> Self {
+            let serial = Serial::acquire();
             let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap()
@@ -1294,6 +1334,7 @@ mod tests {
                 lease,
                 id: account.id,
                 _home: home,
+                _serial: serial,
             }
         }
         fn request<'a>(&'a self, operation: &'a IssueOperation) -> HttpWaitRequest<'a> {
@@ -1685,7 +1726,7 @@ mod tests {
     #[tokio::test]
     async fn n5d_physical_deferred_native_expiry_readiness_then_single_fresh_consume() {
         let f = Fixture::new();
-        let (observed, reset) = f.physical(4).await;
+        let (observed, reset) = f.physical(SHORT_RESET_LEAD).await;
         let (id, scope) = f.register(&observed);
         let status = f.runtime.deferred_reset_status(&scope, THREAD);
         let DeferredResetStatus::Waiting { wake, reset_at, .. } = status else {
@@ -1762,7 +1803,7 @@ mod tests {
         // 2: independent expiry alone. No new quota report is issued in any case.
         for mode in 0..3 {
             let f = Fixture::new();
-            let (observed, reset) = f.physical(4).await;
+            let (observed, reset) = f.physical(SHORT_RESET_LEAD).await;
             let (id, scope) = f.register(&observed);
             let DeferredResetStatus::Waiting { wake, reset_at, .. } =
                 f.runtime.deferred_reset_status(&scope, THREAD)
