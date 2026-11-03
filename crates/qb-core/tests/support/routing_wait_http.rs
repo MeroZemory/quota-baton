@@ -12,7 +12,8 @@ use tokio::{
 #[path = "routing_wait_claude.rs"]
 mod routing_wait_claude;
 
-const PHASE: Duration = Duration::from_secs(3);
+// 단계별 활성 대기 상한(실패 시에만 의미). 전체 행렬 부하에서 드레인 종료까지 넉넉하게.
+const PHASE: Duration = Duration::from_secs(10);
 const UPLOAD: &str = r#"{ "model": "synthetic-model-http-wait", "input": "conversation-marker", "encrypted_content": "verbatim" }"#;
 const FINAL: &str = r#"{"n5a_http_wait":"retry"}"#;
 

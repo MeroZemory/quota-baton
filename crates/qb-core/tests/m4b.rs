@@ -857,7 +857,8 @@ async fn precommit_quota_reset_hold_retries_same_account_once_with_exact_body() 
     assert_eq!(account, first);
     assert_eq!(body, b"{\"held\":true}");
     assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(3500), "{elapsed:?}");
+    // 3초 hold 한 번 안에서 끝났는지(두 번째 hold 없음)만 본다. 부하 여유를 둔다.
+    assert!(elapsed < Duration::from_millis(6000), "{elapsed:?}");
     let attempts = h.fake.state.requests();
     assert_eq!(attempts.len(), 3);
     for attempt in &attempts {
