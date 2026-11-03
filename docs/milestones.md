@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: L1.6 준비 (R21 paired replay owner 수용·병합/설치 인계)
-목표: home server admin Unix socket·peer 자격 검증·자동 CLI 접근·권한 오류 및 box 안내 보완
-핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (owner 수용 전 지표 추가 없음)
-사용자 대기: 없음; R21 설치는 설계 세션·N7 점수11/05 13:49 이후·L1 실제수용·N12 O14
-갱신: 2026-11-03 17:03 KST (설치19da58d·R21 paired replay owner 수용: quiet e02 유효·core log 경계<1s/idle 확인; B2/3는 다음 설치 때·Linux는 home server)
+현재 마일스톤: L1.6 (관리 Unix 소켓·설정 권한 오류 안내·box 안내 보완)
+목표: home server admin Unix socket·peer 자격 검증·자동 CLI 접근·권한 오류 및 box 안내 보완; 병합 후 home server 바이너리 교체 업그레이드로 Linux 실제 수용 판정
+핵심 지표: 결정적 수용 2/3 · Linux 실제 수용 0/1 (home server P5: 업그레이드 시험만 남음)
+사용자 대기: 없음; N7 점수 11/05 13:49 이후·N12 O14
+갱신: 2026-11-03 17:14 KST (8fac42e PC 설치·B 2/3. 19da58d 설치는 실제로 적용되지 않았음: R23 Windows 비공개 폴더 검사가 Codex 샌드박스 상속 권한 때문에 거부. 데이터 폴더 ACL을 보호된 소유자 전용으로 고친 뒤 설치)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -292,6 +292,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-27 20:13 | R17.1 설치 결함 보완 (분모 3: 인코딩, 정리·트레이, 실제 클라이언트) | 3/3 | 사용자 추가 지시의 레거시 백업 형식 포함. 혼합 형식 최신 쌍·잠긴 이전 파일·제거 소유권 회귀, PS5.1/7 각각28통과·스크립트 독립 검수 |
 | 2026-10-28 02:40 | 결정적 수용 (분모 3: 연속 재개 수용, N6r 실제 재생 수용, N7 통합 예측 수용) | 1/3 | 루트 감사 2026-10-28에 따라 정의를 GOAL.md "Outcome series"에 고정. 연속 재개 10-24 cc12102 수용; N6r·N7은 수용 전. 이전 계열과 비교하지 않음 |
 | 2026-10-28 02:40 | Linux 실제 수용 (분모 1: L1 P5 서버 수용) | 0/1 | 합성 관문 5/5와 GPU 서버 설치는 준비이며 수용이 아님. 홈 서버가 꺼져 있어 대기 |
+| 2026-11-03 17:14 | 결정적 수용 (분모 3: 연속 재개 수용, N6r 실제 재생 수용, N7 통합 예측 수용) | 2/3 | N6r 수용: R21 쌍대 재생(24h02m 실제 기록, 동일성 3374/3374, 심은 차이 1건 검출, 이동 1/1, 차이 0) 통과 후 8fac42e를 PC에 설치(코어 PID 34588, 전환 중 접속 1369/실패 0, 기록 e06 손실 0). N7은 11-05 13:49부터 채점 |
 <!-- metric:end -->
 
 <!-- support:begin -->
