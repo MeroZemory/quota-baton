@@ -292,8 +292,12 @@ async fn a2_harness() -> (CombinedUpstream, A2Harness) {
     (upstream, harness)
 }
 
+// 지연 한도 측정이 같은 바이너리의 부하 스모크와 겹치지 않게 한다.
+static LOAD_EXCLUSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn m7c_synthetic_load_smoke_uses_idle_websockets_and_r7_http() {
+    let _exclusive = LOAD_EXCLUSION.lock().await;
     let (_upstream, h) = a2_harness().await;
     let mut sockets = Vec::with_capacity(50);
     for n in 0..50 {
@@ -340,6 +344,7 @@ async fn m7c_synthetic_load_smoke_uses_idle_websockets_and_r7_http() {
 
 #[tokio::test]
 async fn m7c_paced_small_body_additional_latency_is_bounded() {
+    let _exclusive = LOAD_EXCLUSION.lock().await;
     let (_upstream, h) = a2_harness().await;
     let shape = A2Shape::Plain(800 * 1024);
     let (direct_body, _) = a2_body_at_rate(shape, 200);
