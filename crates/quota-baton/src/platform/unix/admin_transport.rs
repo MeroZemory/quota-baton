@@ -5,6 +5,9 @@ pub(crate) fn admin_socket_client(
     port: u16,
 ) -> anyhow::Result<(reqwest::Client, bool)> {
     // A custom TCP endpoint must not silently target the managed default core.
+    if port != qb_core::config::Config::default().server.admin_port {
+        return Ok((builder.build()?, false));
+    }
     match qb_core::service::admin_socket_path_if_allowed() {
         Some(path) => client_at(builder, port, &path),
         None => Ok((builder.build()?, false)),
