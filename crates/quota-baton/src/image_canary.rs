@@ -972,18 +972,20 @@ fn tool_match(value: &Value, prefix: &str, depth: usize) -> bool {
 }
 
 fn code_declaration(description: &str) -> bool {
-    // Exact declaration observed in r12-provider-probe.py's captured metadata.
-    // A prose mention of the name is insufficient.
+    // Declaration shape observed in r12-provider-probe.py's captured metadata.
+    // A prose mention of the name is insufficient. Codex 0.163 declared the
+    // result as `Promise<unknown>`; 0.166 declares a typed result
+    // (`Promise<{ image_url: string; output_hint?: string; }>`), so only the
+    // argument object and a Promise result are required, inside one block.
     let compact: String = description.chars().filter(|c| !c.is_whitespace()).collect();
     compact
         .split("declareconsttools:{")
         .skip(1)
         .any(|declaration| {
-            declaration.starts_with("image_gen__imagegen(args:{")
-                && declaration
-                    .split("};")
-                    .next()
-                    .is_some_and(|signature| signature.ends_with("}):Promise<unknown>;"))
+            let block = declaration.split("```").next().unwrap_or(declaration);
+            block.starts_with("image_gen__imagegen(args:{")
+                && block.contains("}):Promise<")
+                && block.ends_with(">;};")
         })
 }
 
@@ -1526,6 +1528,25 @@ mod tests {
         assert!(tool_match(&tools, "", 0));
         let lite = json!({"input":[{"type":"additional_tools","role":"developer","tools":tools}]});
         assert!(advertised(&serde_json::to_vec(&lite).unwrap(), None).unwrap());
+    }
+
+    #[test]
+    fn codex_0166_typed_result_declaration_matches() {
+        // Captured from codex-cli 0.166.0 (2026-11-04): one declare block per
+        // tool, a typed Promise result, CRLF prose before it.
+        let description = "## image_gen\nTools in the image_gen namespace.\n\n### `image_gen__imagegen`\nThe `image_gen.imagegen` tool enables image generation.\r\n\n\nexec tool declaration:\n```ts\ndeclare const tools: { image_gen__imagegen(args: {\n  num_last_images_to_include?: number | null;\n  prompt: string;\n  referenced_image_paths?: Array<string> | null;\n  // Whether the output should have a transparent background. Defaults to false.\n  transparent_background?: boolean;\n}): Promise<{ image_url: string; output_hint?: string; }>; };\n```\n\n## clock\nexec tool declaration:\n```ts\ndeclare const tools: { clock__curr_time(args: {}): Promise<{\n  current_time: string;\n}>; };\n```";
+        let tools = json!([{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec","description":description}]}]);
+        let lite = json!({"input":[{"type":"additional_tools","role":"developer","tools":tools}]});
+        assert!(advertised(&serde_json::to_vec(&lite).unwrap(), None).unwrap());
+        // Without the image block, the other tools' declarations do not match.
+        let other = description.split("## clock").nth(1).unwrap();
+        let tools = json!([{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec","description":other}]}]);
+        assert!(!tool_match(&tools, "", 0));
+        // A truncated image declaration without a Promise result does not match.
+        let truncated =
+            "```ts\ndeclare const tools: { image_gen__imagegen(args: { prompt: string; }); };\n```";
+        let tools = json!([{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec","description":truncated}]}]);
+        assert!(!tool_match(&tools, "", 0));
     }
 
     #[test]
