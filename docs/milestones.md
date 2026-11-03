@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: home server admin Unix socket·peer 자격 검증·자동 CLI 접근·권한 오류 및 box 안내 보완; 병합 후 home server 바이너리 교체 업그레이드로 Linux 실제 수용 판정
 핵심 지표: 결정적 수용 2/3 · Linux 실제 수용 0/1 (home server P5: 업그레이드 시험만 남음)
 사용자 대기: 없음; N7 점수 11/05 13:49 이후·N12 O14
-갱신: 2026-11-03 17:14 KST (8fac42e PC 설치·B 2/3. 19da58d 설치는 실제로 적용되지 않았음: R23 Windows 비공개 폴더 검사가 Codex 샌드박스 상속 권한 때문에 거부. 데이터 폴더 ACL을 보호된 소유자 전용으로 고친 뒤 설치)
+갱신: 2026-11-03 19:02 KST (L1.6 home server systemd28검사·reload1835/0·Linux 최종 production 관문·Windows 실제 사전 점검·PS5.1/7 각37회귀 통과. Windows 원본 기본 행렬2319/1768 실패 보존·dev 기준 비교와 잠금 후 잔여 관문 진행; 설치 없음·B2/3)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -36,8 +36,9 @@ The Codex main updates this block at each unit and gate close; the design sessio
 10. **Independent review**, where the brief asks for one: a different model family from the implementer.
 11. **Routing changes (D29):** replay at least 24 complete hours of real, body-free decision inputs through the candidate and the installed router. Follow the evidence rules below. Missing inputs or incomplete coverage do not pass. The explicitly requested R14 first delivery ships its runtime protection before this second-delivery replay gate; its report must retain that outstanding requirement.
 
-For Linux phases, also run the following in the approved Linux container and
-single `qb-linux-target` volume, sequentially with the Windows checks:
+For Linux phases, also run the following on `ssh home-server`, using a `git archive`
+source copy and the single target under `~/quota-baton-ci/`, sequentially with
+the Windows checks (AGENTS.md). Do not use PC Docker for these checks.
 
 Check the actual packaged units first (from the gate's committed source):
 
@@ -45,9 +46,9 @@ Check the actual packaged units first (from the gate's committed source):
 git archive HEAD packaging/linux | python3 packaging/linux/check_archive.py
 ```
 
-On Windows, stream the archive bytes into the checker in the approved Linux
-container with the source mounted read-only. Do not pass the archive through a
-text pipeline. The same checker accepts the delivery tarball on stdin. Missing,
+Stream the archive bytes to the checker on the home server with the source mounted
+read-only. Do not pass the archive through a text pipeline. The same checker
+accepts the delivery tarball on stdin. Missing,
 duplicate, nonregular units or any CR byte fail the gate.
 
 ```sh

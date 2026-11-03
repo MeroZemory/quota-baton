@@ -128,7 +128,10 @@ to survive. A binary swap needs no `daemon-reload`. Unit, endpoint or policy
 changes need a separately validated maintenance stop/start. In particular, adding
 the admin Unix socket unit requires a stop/start to inherit its third descriptor;
 a binary-only reload of an older two-socket service keeps its existing TCP
-endpoints and does not invent a third listener. If reload fails,
+endpoints and does not invent a third listener. Before that maintenance restart,
+create `qb-admin` if it does not exist and install all four units from the new
+release using the unit-install commands above, then run `systemctl daemon-reload`.
+Keep the existing service user, master key and state. If reload fails,
 inspect the service before retrying; see [recovery](linux-internals.md#intentional-stop-and-recovery).
 
 ## Log in without a server browser
