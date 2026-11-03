@@ -274,7 +274,13 @@ fn peer_allowed(uid: u32, owner: u32, group: u32) -> io::Result<bool> {
 
 /// Optional client preference only. Failure retains the authenticated TCP path.
 pub(crate) fn admin_socket_path_if_allowed() -> Option<PathBuf> {
-    client_path_at(Path::new("/run/quota-baton/admin.sock"), admin_gid)
+    let runtime = std::env::var_os("RUNTIME_DIRECTORY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/quota-baton"));
+    if !runtime.is_absolute() {
+        return None;
+    }
+    client_path_at(&runtime.join("admin.sock"), admin_gid)
 }
 
 fn client_path_at(path: &Path, group: impl FnOnce() -> io::Result<u32>) -> Option<PathBuf> {
