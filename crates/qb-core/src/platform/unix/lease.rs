@@ -12,10 +12,14 @@ impl Lease {
     }
 
     pub fn acquire(dir: &Path) -> Result<Self, StoreError> {
-        let directory =
-            private_fs::private_directory(dir, false).map_err(|_| StoreError::LeaseUnavailable)?;
-        let file = private_fs::open_private_lock(&directory, c".lock")
-            .map_err(|_| StoreError::LeaseUnavailable)?;
+        let directory = private_fs::private_directory(dir, false)
+            .map_err(|error| private_fs::map_storage_error(error, StoreError::LeaseUnavailable))?;
+        let file = private_fs::open_private_lock(&directory, c".lock").map_err(|error| {
+            private_fs::map_storage_error(
+                private_fs::permission_path(error, &dir.join(".lock")),
+                StoreError::LeaseUnavailable,
+            )
+        })?;
         FileExt::try_lock_exclusive(&file).map_err(|error| {
             if error.kind() == io::ErrorKind::WouldBlock {
                 StoreError::LeaseBusy
@@ -47,16 +51,19 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_existing_lock_is_unavailable_and_not_chmod_repaired() {
+    fn unsafe_existing_lock_reports_permissions_and_is_not_chmod_repaired() {
         let fixture = fixture();
         let directory = prepare_account_directory(fixture.path()).unwrap();
         drop(Lease::acquire(&directory).unwrap());
         let path = directory.join(".lock");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(matches!(
-            Lease::acquire(&directory),
-            Err(StoreError::LeaseUnavailable)
-        ));
+        let error = match Lease::acquire(&directory) {
+            Err(StoreError::StoragePermission(error)) => error,
+            _ => panic!("expected typed storage permission refusal"),
+        };
+        let message = private_fs::startup_permission_diagnostic(&error).unwrap();
+        assert!(message.contains(path.to_str().unwrap()));
+        assert!(message.contains("0666"));
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o666

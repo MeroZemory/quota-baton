@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn credential_diagnostic_uses_descriptor_mode_and_reinstall_advice_never_chmod() {
+    let fixture = super::super::super::private_fs::tests::fixture();
+    let path = fixture.path().join("qb-master-key");
+    std::fs::write(&path, b"synthetic-private-credential").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let file = File::open(&path).unwrap();
+    let error = credential_permission(refused(), &path, Some(&file.metadata().unwrap()));
+    let message = super::super::super::private_fs::startup_permission_diagnostic(&error).unwrap();
+    assert!(message.contains(path.to_str().unwrap()));
+    assert!(message.contains("0644"));
+    assert!(message.contains("LoadCredentialEncrypted=qb-master-key"));
+    assert!(!message.contains("chmod"));
+    assert!(!message.contains("install -m 0600"));
+    assert!(!message.contains("synthetic-private-credential"));
+    assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o644);
+    assert_eq!(
+        credential_permission(io::Error::from(io::ErrorKind::UnexpectedEof), &path, None).kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[test]
 fn systemd_255_acl_modes_require_root_and_readonly_mount_flags() {
     for mode in [0o500, 0o550] {
         assert!(directory_policy(mode, 0));

@@ -1,5 +1,6 @@
 //! systemd's root-owned read-only credential mount has service-user read ACLs.
 //! This policy is separate from private writable account/key storage.
+use super::super::private_fs::credential_permission;
 use std::{
     ffi::{CStr, CString},
     fs::{File, Metadata, OpenOptions},
@@ -122,14 +123,17 @@ fn open_at(parent: &File, name: &CStr, directory: bool) -> io::Result<File> {
 
 pub(super) fn load(path: &Path) -> io::Result<Zeroizing<[u8; 32]>> {
     if !path.is_absolute() || path.as_os_str().as_bytes().len() > 4096 {
-        return Err(refused());
+        return Err(credential_permission(refused(), path, None));
     }
     let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open("/")?;
-    if !ancestor(&directory.metadata()?) {
-        return Err(refused());
+        .open("/")
+        .map_err(|error| credential_permission(error, Path::new("/"), None))?;
+    let mut checked_path = std::path::PathBuf::from("/");
+    let meta = directory.metadata()?;
+    if !ancestor(&meta) {
+        return Err(credential_permission(refused(), &checked_path, Some(&meta)));
     }
     let mut depth = 0;
     for component in path.components() {
@@ -138,46 +142,80 @@ pub(super) fn load(path: &Path) -> io::Result<Zeroizing<[u8; 32]>> {
             Component::Normal(name) => {
                 depth += 1;
                 if depth > 128 {
-                    return Err(refused());
+                    return Err(credential_permission(refused(), path, None));
                 }
-                let name = CString::new(name.as_bytes()).map_err(|_| refused())?;
-                directory = open_at(&directory, &name, true)?;
-                if !ancestor(&directory.metadata()?) {
-                    return Err(refused());
+                checked_path.push(name);
+                let name = CString::new(name.as_bytes())
+                    .map_err(|_| credential_permission(refused(), &checked_path, None))?;
+                directory = open_at(&directory, &name, true)
+                    .map_err(|error| credential_permission(error, &checked_path, None))?;
+                let meta = directory.metadata()?;
+                if !ancestor(&meta) {
+                    return Err(credential_permission(refused(), &checked_path, Some(&meta)));
                 }
             }
-            _ => return Err(refused()),
+            _ => return Err(credential_permission(refused(), path, None)),
         }
     }
     let directory_meta = directory.metadata()?;
     if !directory_policy(directory_meta.mode(), directory_meta.uid()) {
-        return Err(refused());
+        return Err(credential_permission(
+            refused(),
+            path,
+            Some(&directory_meta),
+        ));
     }
-    readonly_mount(&directory)?;
-    credential_acl(&directory, true)?;
-    let mut key_file = open_at(&directory, c"qb-master-key", false)?;
+    readonly_mount(&directory)
+        .map_err(|error| credential_permission(error, path, Some(&directory_meta)))?;
+    credential_acl(&directory, true)
+        .map_err(|error| credential_permission(error, path, Some(&directory_meta)))?;
+    let key_path = path.join("qb-master-key");
+    let mut key_file = open_at(&directory, c"qb-master-key", false)
+        .map_err(|error| credential_permission(error, &key_path, None))?;
     let meta = key_file.metadata()?;
     if !meta.is_file()
         || meta.dev() != directory_meta.dev()
         || !key_policy(meta.mode(), meta.uid(), meta.nlink(), meta.len())
     {
-        return Err(refused());
+        return Err(key_refusal(&meta, &directory_meta, &key_path));
     }
-    readonly_mount(&key_file)?;
-    credential_acl(&key_file, false)?;
+    readonly_mount(&key_file)
+        .map_err(|error| credential_permission(error, &key_path, Some(&meta)))?;
+    credential_acl(&key_file, false)
+        .map_err(|error| credential_permission(error, &key_path, Some(&meta)))?;
     // Kernel access checks enforce the service-user ACL. Never chmod/chown the
     // credential or silently fall back to the private-file backend.
     let mut key = Zeroizing::new([0; 32]);
-    key_file.read_exact(&mut key[..])?;
+    key_file
+        .read_exact(&mut key[..])
+        .map_err(|error| credential_permission(error, &key_path, Some(&meta)))?;
     let mut extra = Zeroizing::new([0; 1]);
-    if key_file.read(&mut extra[..])? != 0 {
+    if key_file
+        .read(&mut extra[..])
+        .map_err(|error| credential_permission(error, &key_path, Some(&meta)))?
+        != 0
+    {
         return Err(refused());
     }
     let after = key_file.metadata()?;
     if !key_policy(after.mode(), after.uid(), after.nlink(), after.len()) {
-        return Err(refused());
+        return Err(key_refusal(&after, &directory_meta, &key_path));
     }
     Ok(key)
+}
+
+fn key_refusal(meta: &Metadata, directory_meta: &Metadata, path: &Path) -> io::Error {
+    // A length-only failure remains a crypto-data error, not a permission
+    // diagnostic. Evaluate the unchanged policy with its required size to
+    // distinguish ownership/mode/link failures without exposing key bytes.
+    if !meta.is_file()
+        || meta.dev() != directory_meta.dev()
+        || !key_policy(meta.mode(), meta.uid(), meta.nlink(), 32)
+    {
+        credential_permission(refused(), path, Some(meta))
+    } else {
+        refused()
+    }
 }
 
 #[cfg(test)]

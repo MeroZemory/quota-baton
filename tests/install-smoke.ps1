@@ -1,9 +1,15 @@
-﻿# Pester-free. No release binaries, network, registry writes or real profile writes.
+# Pester-free. No release binaries, network, registry writes or real profile writes.
 [CmdletBinding()]
 param(
     [string]$EvidenceDir = 'C:/_projects/SampleUser/quota-baton/.sandbox/reports/R17.1-evidence/install-smoke/pwsh'
 )
 $ErrorActionPreference = 'Stop'
+# Load built-ins before synthetic profile/PATH isolation can hide their modules.
+foreach ($fixtureModuleName in @('Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security', 'Microsoft.PowerShell.Management')) {
+    $fixtureModuleManifest = [IO.Path]::Combine($PSHOME, 'Modules', $fixtureModuleName, ($fixtureModuleName + '.psd1'))
+    Import-Module -Name $fixtureModuleManifest -ErrorAction Stop
+}
+Get-Command -Name @('Get-FileHash', 'Get-Acl', 'Set-Acl', 'Get-Item', 'Get-ChildItem') -ErrorAction Stop | Out-Null
 $project = Split-Path $PSScriptRoot -Parent
 $installer = Join-Path $project 'install.ps1'
 $uninstaller = Join-Path $project 'uninstall.ps1'
@@ -76,7 +82,7 @@ try {
     $userPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
     $profileBefore = Tree $env:USERPROFILE
     Case 'ascii-no-bom-served-text-and-file-parse-identically' {
-        foreach ($file in @($installer, $uninstaller)) {
+        foreach ($file in @($installer, $uninstaller, $PSCommandPath, (Join-Path $PSScriptRoot 'installer-upgrade-smoke.ps1'))) {
             $bytes = [IO.File]::ReadAllBytes($file)
             Assert (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0) "Non-ASCII or BOM bytes: $file"
             $served = [Text.Encoding]::UTF8.GetString($bytes)
@@ -175,6 +181,85 @@ try {
         & $uninstaller -InstallDir $install -WhatIf
         & $uninstaller -InstallDir $install -RemoveData -Lang en -WhatIf
         Assert ((Tree $install) -eq $before) 'Uninstall dry run changed installation'
+    }
+    Case 'private-data-home-classifier-requires-current-user-owner' {
+        $tokens=$null; $errors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseFile($installer,[ref]$tokens,[ref]$errors)
+        $definition=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'PrivateDataHomeAcl'},$true)
+        . ([scriptblock]::Create($definition.Extent.Text))
+        $current=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        # Descriptor objects only: assigning a synthetic owner here performs no
+        # filesystem ACL operation and needs no ownership-changing privilege.
+        foreach ($owner in @($current,'S-1-5-32-544','S-1-5-18','S-1-5-21-111111111-222222222-333333333-1107')) {
+            $acl=New-Object Security.AccessControl.DirectorySecurity
+            $acl.SetSecurityDescriptorSddlForm(('O:' + $owner + 'D:P(A;OICI;FA;;;' + $owner + ')(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'))
+            Assert ((PrivateDataHomeAcl $acl) -eq ($owner -eq $current)) 'Private classifier accepted a different directory owner'
+        }
+    }
+    Case 'data-home-refuses-profile-roots-and-ancestors-before-acl-work' {
+        $tokens=$null; $errors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseFile($installer,[ref]$tokens,[ref]$errors)
+        foreach ($name in @('Korean','Message','Fail','CheckedDirectoryPath','CheckedDataHomePath','PrepareInstallerDataHome')) {
+            $definition=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true)
+            . ([scriptblock]::Create($definition.Extent.Text))
+        }
+        $Lang='en'
+        $aclGuard=[pscustomobject]@{ Calls=0 }
+        function Get-Acl { $aclGuard.Calls++; throw 'Unexpected protected-root ACL read' }
+        function Set-Acl { $aclGuard.Calls++; throw 'Unexpected protected-root ACL write' }
+        foreach ($unsafe in @([IO.Path]::GetPathRoot($fixture),$env:USERPROFILE,$env:LOCALAPPDATA,$env:APPDATA,(Split-Path $env:USERPROFILE -Parent))) {
+            $failed=$false
+            try { PrepareInstallerDataHome $unsafe }
+            catch { $failed=$_.Exception.Message -match 'dedicated data home|drive root' }
+            Assert $failed "Protected root was accepted as QB_HOME: $unsafe"
+        }
+        Assert ($aclGuard.Calls -eq 0) 'Protected-root rejection reached ACL work'
+    }
+    Case 'staged-check-binds-actual-home-and-restores-qb-home-on-success-and-failure' {
+        $tokens=$null; $errors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseFile($installer,[ref]$tokens,[ref]$errors)
+        foreach ($name in @('Korean','Message','Fail','Say','CheckStagedBinary')) {
+            $definition=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true)
+            . ([scriptblock]::Create($definition.Extent.Text))
+        }
+        $Lang='en'
+        $exe=Join-Path $fixture 'installed-old.exe'
+        $probeState=[pscustomobject]@{ Staged=(Join-Path $fixture 'staged-new.exe'); Home=(Join-Path $fixture 'actual-home'); Fail=$false; Calls=0 }
+        function WriteInstallLog([string]$message) { }
+        function RunCli([string[]]$Arguments) {
+            Assert (($Arguments -join ' ') -ceq 'serve --check') 'Probe arguments changed'
+            Assert ($exe -ceq $probeState.Staged) 'Probe used installed executable'
+            Assert ($env:QB_HOME -ceq $probeState.Home) 'Probe did not bind the actual data home'
+            $probeState.Calls++
+            if ($probeState.Fail) { throw 'synthetic read-only check refusal' }
+        }
+        $originalPresent=Test-Path Env:QB_HOME
+        $originalHome=[Environment]::GetEnvironmentVariable('QB_HOME','Process')
+        try {
+            foreach ($initial in @('absent','value','empty')) {
+                if ($initial -eq 'absent') { Remove-Item Env:QB_HOME -ErrorAction SilentlyContinue }
+                elseif ($initial -eq 'value') { $env:QB_HOME=Join-Path $fixture 'previous-home' }
+                else { $env:QB_HOME='' }
+                # PS 5.1 may model empty as absent; compare the actual starting
+                # presence/value so both runtimes must restore their exact state.
+                $present=Test-Path Env:QB_HOME
+                $value=[Environment]::GetEnvironmentVariable('QB_HOME','Process')
+                foreach ($fail in @($false,$true)) {
+                    $probeState.Fail=$fail
+                    $failed=$false
+                    try { CheckStagedBinary $probeState.Staged $probeState.Home }
+                    catch { $failed=$_.Exception.Message -match 'synthetic read-only check refusal' }
+                    Assert ($failed -eq $fail) 'Probe failure was not propagated'
+                    Assert ((Test-Path Env:QB_HOME) -eq $present) 'Probe changed QB_HOME presence'
+                    Assert ([string]::Equals([Environment]::GetEnvironmentVariable('QB_HOME','Process'),$value,[StringComparison]::Ordinal)) 'Probe changed QB_HOME value'
+                    Assert ($exe -ceq (Join-Path $fixture 'installed-old.exe')) 'Probe changed installed executable binding'
+                }
+            }
+            Assert ($probeState.Calls -eq 6) 'Success/failure environment matrix was incomplete'
+        } finally {
+            if ($originalPresent) { [Environment]::SetEnvironmentVariable('QB_HOME',$originalHome,'Process') }
+            else { Remove-Item Env:QB_HOME -ErrorAction SilentlyContinue }
+        }
     }
     Case 'snapshot-dto-shape-and-field-validation' {
         $tokens = $null; $errors = $null

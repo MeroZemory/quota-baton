@@ -9,10 +9,13 @@ macro_rules! println_utf8 {
 #[allow(dead_code)] // Compatibility fields preserve the existing tray decoder.
 mod account_display;
 mod accounts_cli;
+mod admin_transport;
 
 mod debug_snapshot;
 
 mod platform;
+#[cfg(test)]
+mod preflight_tests;
 mod routing_cli;
 mod takeover_client;
 #[allow(unused_imports)] // Windows feature roots retain their existing crate:: paths.
@@ -86,6 +89,12 @@ enum Command {
         phase0_close_after_response: bool,
         #[arg(long, help = "실행 중인 코어를 drain한 뒤 계정 lease를 넘겨받습니다")]
         takeover: bool,
+        #[arg(
+            long,
+            conflicts_with = "takeover",
+            help = "데이터 폴더 권한과 설정을 변경 없이 확인합니다"
+        )]
+        check: bool,
     },
     #[command(about = "상태를 확인합니다")]
     #[command(display_order = 6)]
@@ -170,6 +179,12 @@ async fn main_async() -> i32 {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if let Some(message) = error
+        .chain()
+        .find_map(qb_core::startup_permission_diagnostic)
+    {
+        return message;
+    }
     if let Some(message) = platform::friendly_error(error) {
         return message;
     }
@@ -296,7 +311,14 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(feature = "phase0")]
             phase0_close_after_response,
             takeover,
+            check,
         } => {
+            if check {
+                qb_core::check_private_data_home(&home)?;
+                qb_core::config::Config::load(&home)?;
+                println_utf8!("데이터 폴더 권한과 설정을 확인했습니다.");
+                return Ok(());
+            }
             #[cfg(all(feature = "testkit", debug_assertions))]
             match (
                 std::env::var_os("QB_TEST_TAKEOVER_HOME"),

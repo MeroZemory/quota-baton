@@ -23,6 +23,11 @@ pub async fn handle_takeover(home: &Path, config: &Config, takeover: bool) -> an
 pub fn initialize_listeners(config: &Config) -> anyhow::Result<()> {
     crate::platform::service::initialize_listeners(config)
 }
+
+/// Native peer authorization determines whether a CLI may prefer the admin socket.
+pub fn admin_socket_path_if_allowed() -> Option<std::path::PathBuf> {
+    crate::platform::admin_socket_path_if_allowed()
+}
 pub fn routes(relay: Arc<RelayState>) -> axum::Router {
     crate::platform::service::routes(relay)
 }

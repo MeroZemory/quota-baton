@@ -256,14 +256,8 @@ pub(crate) async fn running_admin(
     home: &Path,
     config: &Config,
 ) -> anyhow::Result<Option<(reqwest::Client, String, String)>> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let base = format!("http://127.0.0.1:{}/admin/v1", config.server.admin_port);
-    let token = std::fs::read_to_string(home.join("admin.token")).unwrap_or_default();
+    let (client, base, token, native_socket) =
+        crate::admin_transport::connection(home, config, Duration::from_secs(5), false).await?;
     match client
         .get(format!("{base}/health"))
         .bearer_auth(token.trim())
@@ -280,7 +274,7 @@ pub(crate) async fn running_admin(
             anyhow::ensure!(health.ok, "코어 상태를 확인해 주세요.");
             Ok(Some((client, base, token)))
         }
-        Err(error) if error.is_connect() => Ok(None),
+        Err(error) if error.is_connect() && !native_socket => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
