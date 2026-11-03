@@ -1,5 +1,8 @@
 use clap::{Args, Subcommand};
 
+mod admin_transport;
+pub(crate) use admin_transport::admin_socket_client;
+
 #[derive(Subcommand)]
 pub enum PlatformCommand {}
 #[derive(Args)]

@@ -35,9 +35,10 @@ enum Activation {
 }
 struct Bank {
     // Preserve original systemd order, not data/admin order, for final re-exec.
-    originals: [OwnedFd; 2],
+    originals: Vec<OwnedFd>,
     ports: ListenerPorts,
-    roles: [Role; 2],
+    roles: Vec<Role>,
+    admin_unix: Option<super::admin_socket::SocketIdentity>,
     boxes: Mutex<box_bank::BoxBank>,
 }
 
@@ -45,23 +46,29 @@ struct Bank {
 enum Role {
     Data,
     Admin,
+    AdminUnix,
 }
 impl Role {
     fn port(self, ports: ListenerPorts) -> u16 {
         match self {
             Self::Data => ports.data,
             Self::Admin => ports.admin,
+            Self::AdminUnix => unreachable!("Unix listener has no TCP port"),
         }
     }
 }
 
 impl Bank {
-    fn names(&self) -> &'static str {
-        match self.roles {
-            [Role::Data, Role::Admin] => "data:admin",
-            [Role::Admin, Role::Data] => "admin:data",
-            _ => unreachable!("bank roles validated at initialization"),
-        }
+    fn names(&self) -> String {
+        self.roles
+            .iter()
+            .map(|role| match role {
+                Role::Data => "data",
+                Role::Admin => "admin",
+                Role::AdminUnix => "admin-unix",
+            })
+            .collect::<Vec<_>>()
+            .join(":")
     }
 
     fn validate_for_exec(&self) -> io::Result<()> {
@@ -69,7 +76,14 @@ impl Bank {
             if original.as_raw_fd() != 3 + index as RawFd {
                 return Err(invalid("activation bank descriptor changed"));
             }
-            validate_socket(original.as_raw_fd(), self.roles[index].port(self.ports))?;
+            if self.roles[index] == Role::AdminUnix {
+                self.admin_unix
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing admin socket identity"))?
+                    .validate(original.as_raw_fd())?;
+            } else {
+                validate_socket(original.as_raw_fd(), self.roles[index].port(self.ports))?;
+            }
             require_cloexec(original.as_raw_fd())?;
         }
         Ok(())
@@ -91,7 +105,7 @@ impl Environment {
             names: std::env::var_os("LISTEN_FDNAMES"),
         }
     }
-    fn roles(&self, pid: u32) -> io::Result<Option<[Role; 2]>> {
+    fn roles(&self, pid: u32) -> io::Result<Option<Vec<Role>>> {
         if self.marker.is_none() {
             if self.pid.is_some() || self.fds.is_some() || self.names.is_some() {
                 return Err(invalid("activation requires managed mode"));
@@ -100,15 +114,35 @@ impl Environment {
         }
         if self.marker.as_deref() != Some(std::ffi::OsStr::new("1"))
             || self.pid.as_ref().and_then(|s| s.to_str()) != Some(pid.to_string().as_str())
-            || self.fds.as_deref() != Some(std::ffi::OsStr::new("2"))
         {
             return Err(invalid("invalid activation environment"));
         }
-        match self.names.as_ref().and_then(|s| s.to_str()) {
-            Some("data:admin") => Ok(Some([Role::Data, Role::Admin])),
-            Some("admin:data") => Ok(Some([Role::Admin, Role::Data])),
-            _ => Err(invalid("invalid activation names")),
+        let count = match self.fds.as_ref().and_then(|s| s.to_str()) {
+            Some("2") => 2,
+            Some("3") => 3,
+            _ => return Err(invalid("invalid activation descriptor count")),
+        };
+        let roles = self
+            .names
+            .as_ref()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| invalid("invalid activation names"))?
+            .split(':')
+            .map(|name| match name {
+                "data" => Ok(Role::Data),
+                "admin" => Ok(Role::Admin),
+                "admin-unix" => Ok(Role::AdminUnix),
+                _ => Err(invalid("invalid activation names")),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if roles.len() != count
+            || roles.iter().filter(|r| **r == Role::Data).count() != 1
+            || roles.iter().filter(|r| **r == Role::Admin).count() != 1
+            || roles.iter().filter(|r| **r == Role::AdminUnix).count() != count - 2
+        {
+            return Err(invalid("invalid activation names"));
         }
+        Ok(Some(roles))
     }
 }
 
@@ -134,24 +168,33 @@ pub(crate) fn initialize_activation(ports: ListenerPorts) -> io::Result<()> {
             if ports.data == 0 || ports.admin == 0 || ports.data == ports.admin {
                 return Err(invalid("invalid managed listener ports"));
             }
-            let descriptors = [3, 4];
+            let descriptors: Vec<RawFd> = (3..3 + roles.len() as RawFd).collect();
+            reject_box_overlap(box_manifest.as_deref(), descriptors.len())?;
             // Failures are terminal startup failures. Do not spawn any program
             // before initialization; valid bank fds stay CLOEXEC thereafter.
-            for fd in descriptors {
+            for &fd in &descriptors {
                 set_cloexec(fd)?;
             }
-            let mapped = [roles[0].port(ports), roles[1].port(ports)];
-            for (fd, port) in descriptors.into_iter().zip(mapped) {
-                validate_socket(fd, port)?;
+            let mut admin_unix = None;
+            for (&fd, &role) in descriptors.iter().zip(&roles) {
+                if role == Role::AdminUnix {
+                    admin_unix = Some(super::admin_socket::SocketIdentity::inherit(fd)?);
+                } else {
+                    validate_socket(fd, role.port(ports))?;
+                }
             }
             // Early prepare_inherited_box_fds restored CLOEXEC before runtime creation.
             let boxes = box_bank::BoxBank::inherit(box_manifest.as_deref())?;
             Activation::Managed(Bank {
                 // Exclusively claimed once; do not construct std listeners from
                 // these originals or close/shutdown them anywhere else.
-                originals: unsafe { [OwnedFd::from_raw_fd(3), OwnedFd::from_raw_fd(4)] },
+                originals: descriptors
+                    .into_iter()
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                    .collect(),
                 ports,
                 roles,
+                admin_unix,
                 boxes: Mutex::new(boxes),
             })
         }
@@ -178,7 +221,7 @@ pub(crate) async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
             let index = bank
                 .roles
                 .iter()
-                .position(|role| role.port(bank.ports) == port)
+                .position(|role| *role != Role::AdminUnix && role.port(bank.ports) == port)
                 .ok_or_else(|| invalid("port is outside activation bank"))?;
             let duplicate = duplicate_listener(bank.originals[index].as_raw_fd(), port)?;
             let listener = TcpListener::from_std(duplicate)?;
@@ -192,7 +235,63 @@ pub(crate) async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
 /// Must be called by service::prepare_process BEFORE threads/runtime are created.
 /// Stateless: does not own descriptors or publish a second bank.
 pub(crate) fn prepare_inherited_box_fds() -> io::Result<()> {
+    if let Some(roles) = Environment::read().roles(std::process::id())? {
+        reject_box_overlap(std::env::var_os("QB_BOX_LISTENERS").as_deref(), roles.len())?;
+        for index in 0..roles.len() {
+            set_cloexec(3 + index as RawFd)?;
+        }
+    }
     box_bank::prepare()
+}
+
+// The box parser validates the full manifest. Reject aliasing before either bank
+// claims ownership, including an old box fd 5 overlapping a new third listener.
+fn reject_box_overlap(raw: Option<&std::ffi::OsStr>, count: usize) -> io::Result<()> {
+    if let Some(raw) = raw
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("v1;"))
+    {
+        for entry in raw.split(',') {
+            if let Some(fd) = entry
+                .split_once('=')
+                .and_then(|(_, fields)| fields.split(':').next())
+                .and_then(|fd| fd.parse::<RawFd>().ok())
+            {
+                if (3..3 + count as RawFd).contains(&fd) {
+                    return Err(invalid("box descriptor overlaps activation bank"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn duplicate_admin_socket(
+    port: u16,
+) -> io::Result<Option<(std::os::unix::net::UnixListener, u32)>> {
+    let Some(Activation::Managed(bank)) = ACTIVATION.get() else {
+        box_activation_managed()?; // Reject uninitialized managed metadata.
+        return Ok(None);
+    };
+    if port != bank.ports.admin {
+        return Err(invalid("admin socket port mismatch"));
+    }
+    let Some(index) = bank.roles.iter().position(|role| *role == Role::AdminUnix) else {
+        return Ok(None);
+    };
+    let identity = bank
+        .admin_unix
+        .as_ref()
+        .ok_or_else(|| invalid("missing admin socket identity"))?;
+    let fd = bank.originals[index].as_raw_fd();
+    identity.validate(fd)?;
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 6) };
+    if copy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let copy = unsafe { std::os::unix::net::UnixListener::from_raw_fd(copy) };
+    identity.validate(copy.as_raw_fd())?;
+    Ok(Some((copy, identity.gid())))
 }
 
 fn managed_boxes() -> io::Result<std::sync::MutexGuard<'static, box_bank::BoxBank>> {
@@ -278,7 +377,7 @@ pub(crate) fn exec_activation(
         .args(serve_argv)
         .env("QB_SYSTEMD_MANAGED", "1")
         .env("LISTEN_PID", std::process::id().to_string())
-        .env("LISTEN_FDS", "2")
+        .env("LISTEN_FDS", bank.originals.len().to_string())
         .env("LISTEN_FDNAMES", bank.names())
         .env("QB_BOX_LISTENERS", box_manifest);
 

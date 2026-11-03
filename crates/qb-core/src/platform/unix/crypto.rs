@@ -34,7 +34,11 @@ pub(crate) struct SecretProtector {
 }
 
 pub(crate) fn account_secret_protector(home: &Path) -> Result<SecretProtector, StoreError> {
-    let config = crate::config::Config::load(home).map_err(|_| StoreError::InvalidData)?;
+    let config =
+        crate::config::Config::load(home).map_err(|error| match error.downcast::<io::Error>() {
+            Ok(error) => secure_key::map_storage_error(error, StoreError::InvalidData),
+            Err(_) => StoreError::InvalidData,
+        })?;
     SecretProtector::new(home, &config.secrets)
 }
 
@@ -51,16 +55,23 @@ impl SecretProtector {
         config: &SecretsConfig,
         credentials_dir: Option<&Path>,
     ) -> Result<Self, StoreError> {
-        let home = secure_key::private_directory(home, false).map_err(|_| StoreError::Crypto)?;
-        let accounts =
-            secure_key::private_child(&home, "accounts", false).map_err(|_| StoreError::Crypto)?;
+        let home_path = home;
+        let home = secure_key::private_directory(home_path, false)
+            .map_err(|error| secure_key::map_storage_error(error, StoreError::Crypto))?;
+        let accounts = secure_key::private_child(&home, "accounts", false).map_err(|error| {
+            secure_key::map_storage_error(
+                secure_key::permission_path(error, &home_path.join("accounts")),
+                StoreError::Crypto,
+            )
+        })?;
         let key = match &config.linux_backend {
             LinuxSecretBackend::SystemdCredential => {
                 systemd_key::load(credentials_dir.ok_or(StoreError::Crypto)?)
-                    .map_err(|_| StoreError::Crypto)?
+                    .map_err(|error| secure_key::map_storage_error(error, StoreError::Crypto))?
             }
             LinuxSecretBackend::File0600 => {
-                secure_key::load_or_create_key(&home, &accounts).map_err(|_| StoreError::Crypto)?
+                secure_key::load_or_create_key(&home, &accounts, home_path)
+                    .map_err(|error| secure_key::map_storage_error(error, StoreError::Crypto))?
             }
         };
         Ok(Self { key })

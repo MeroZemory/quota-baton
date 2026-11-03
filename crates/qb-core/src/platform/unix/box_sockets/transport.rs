@@ -75,7 +75,7 @@ impl SocketDirectory {
         if !runtime.is_absolute() {
             return Err(refused());
         }
-        let root = super::super::private_fs::private_directory(runtime, false)?;
+        let root = super::super::admin_socket::checked_runtime_directory(runtime)?;
         let name = c"boxes";
         let created = unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o750) };
         if created != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {

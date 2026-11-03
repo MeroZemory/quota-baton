@@ -16,6 +16,118 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// Only descriptor metadata and a bounded, escaped path may cross the CLI's
+/// diagnostic boundary. Never include file contents or arbitrary error strings.
+#[derive(Clone, Debug)]
+struct PermissionRefusal {
+    path: String,
+    mode: Option<u32>,
+    reason: &'static str,
+    repair: &'static str,
+}
+
+impl std::fmt::Display for PermissionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "permission refusal at '{}': {}", self.path, self.reason)?;
+        if let Some(mode) = self.mode {
+            write!(f, "; found mode {mode:04o}")?;
+        }
+        write!(f, "; {}", self.repair)
+    }
+}
+
+impl std::error::Error for PermissionRefusal {}
+
+pub(super) fn map_storage_error(
+    error: io::Error,
+    fallback: crate::accounts::StoreError,
+) -> crate::accounts::StoreError {
+    if startup_permission_diagnostic(&error).is_some() {
+        crate::accounts::StoreError::StoragePermission(error)
+    } else {
+        fallback
+    }
+}
+
+pub(super) fn credential_permission(
+    error: io::Error,
+    path: &Path,
+    meta: Option<&std::fs::Metadata>,
+) -> io::Error {
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return error;
+    }
+    let error = permission_path(error, path);
+    let mut refusal = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PermissionRefusal>())
+        .expect("permission_path produces a typed refusal")
+        .clone();
+    refusal.mode = meta.map(|meta| meta.mode() & 0o7777);
+    refusal.reason = "systemd credential ownership, mode, ACL or read-only mount policy refused";
+    refusal.repair = "reinstall the credential with LoadCredentialEncrypted=qb-master-key and restart the service; do not change permissions on the read-only credential";
+    io::Error::new(io::ErrorKind::PermissionDenied, refusal)
+}
+
+pub(crate) fn startup_permission_diagnostic(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<String> {
+    let refusal = error.downcast_ref::<PermissionRefusal>().or_else(|| {
+        error
+            .downcast_ref::<io::Error>()?
+            .get_ref()?
+            .downcast_ref::<PermissionRefusal>()
+    })?;
+    Some(refusal.to_string())
+}
+
+fn permission_refusal(meta: &std::fs::Metadata, reason: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        PermissionRefusal {
+            path: "<private entry>".into(),
+            mode: Some(meta.mode() & 0o7777),
+            reason,
+            repair: if meta.is_dir() {
+                "verify ownership and directory type; use chmod 700 on this directory; no permissions were changed"
+            } else {
+                "verify ownership, regular file type and single link; recreate with install -m 0600; no permissions were changed"
+            },
+        },
+    )
+}
+
+pub(super) fn permission_path(error: io::Error, path: &Path) -> io::Error {
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return error;
+    }
+    let mut refusal = match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PermissionRefusal>())
+    {
+        Some(refusal) if refusal.path != "<private entry>" => return error,
+        Some(refusal) => refusal.clone(),
+        None => PermissionRefusal {
+            path: String::new(),
+            mode: None,
+            reason: "access refused or unsafe path",
+            repair: "verify ownership, permissions and path components; no permissions were changed",
+        },
+    };
+    // Bound before escaping, so even hostile names cannot emit unbounded logs
+    // or inject terminal/journal control characters.
+    refusal.path = path
+        .to_string_lossy()
+        .chars()
+        .take(256)
+        .flat_map(char::escape_default)
+        .collect();
+    if path.to_string_lossy().chars().count() > 256 {
+        refusal.path.push_str("...");
+    }
+    io::Error::new(io::ErrorKind::PermissionDenied, refusal)
+}
+
 fn refused() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -35,7 +147,10 @@ fn owner_ok(owner: u32, allow_root: bool) -> bool {
 fn trusted_directory(file: &File) -> io::Result<()> {
     let meta = file.metadata()?;
     if !trusted_ancestor_policy(meta.is_dir(), meta.uid(), uid(), meta.mode()) {
-        return Err(refused());
+        return Err(permission_refusal(
+            &meta,
+            "untrusted ancestor: expected root or current owner and no group/world write",
+        ));
     }
     Ok(())
 }
@@ -54,7 +169,10 @@ fn private(file: &File, allow_root: bool) -> io::Result<()> {
         || meta.mode() & 0o7000 != 0
         || meta.mode() & 0o500 != 0o500
     {
-        return Err(refused());
+        return Err(permission_refusal(
+            &meta,
+            "expected private directory owned by the current user (or permitted root owner)",
+        ));
     }
     Ok(())
 }
@@ -62,27 +180,31 @@ fn private(file: &File, allow_root: bool) -> io::Result<()> {
 /// Caller supplies a prepared private directory. Relative paths are anchored to cwd
 /// once; parent traversal, symlinks and group/world-writable ancestors are refused.
 pub(super) fn private_directory(path: &Path, allow_root: bool) -> io::Result<File> {
-    walk_directory(path, false, allow_root)
+    walk_directory(path, false, allow_root).map_err(|error| permission_path(error, path))
+}
+
+pub(crate) fn check_private_data_home(path: &Path) -> io::Result<()> {
+    let mut anchors = vec![private_directory(path, false)?];
+    for name in ["accounts", "state", "logs"] {
+        let child = path.join(name);
+        match private_directory(&child, false) {
+            Ok(directory) => anchors.push(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn prepare_private_directory(path: &Path) -> io::Result<File> {
-    walk_directory(path, true, false)
+    walk_directory(path, true, false).map_err(|error| permission_path(error, path))
 }
 
 /// Create a private directory tree without following aliases or repairing modes.
 /// Existing system ancestors may be readable, but must remain trusted. Once a
 /// missing component is reached, every component in the new suffix is private.
 pub(crate) fn ensure_private_dir_all(path: &Path) -> io::Result<()> {
-    ensure_private_tree(path).map_err(|error| {
-        if error.kind() == io::ErrorKind::PermissionDenied {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "data directory is not private (expected owner-only permissions); no existing permissions were changed",
-            )
-        } else {
-            error
-        }
-    })
+    ensure_private_tree(path).map_err(|error| permission_path(error, path))
 }
 
 fn ensure_private_tree(path: &Path) -> io::Result<()> {
@@ -95,12 +217,14 @@ fn ensure_private_tree(path: &Path) -> io::Result<()> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")?;
-    trusted_directory(&directory)?;
+    let mut checked_path = std::path::PathBuf::from("/");
+    trusted_directory(&directory).map_err(|error| permission_path(error, &checked_path))?;
     let mut new_suffix = false;
     for component in absolute.components() {
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
+                let child_path = checked_path.join(name);
                 let name = CString::new(name.as_bytes()).map_err(|_| refused())?;
                 directory = match open_at(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
                 {
@@ -108,21 +232,26 @@ fn ensure_private_tree(path: &Path) -> io::Result<()> {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         // An existing data directory above a missing descendant
                         // must already be private; never normalize it implicitly.
-                        private(&directory, false)?;
+                        private(&directory, false)
+                            .map_err(|error| permission_path(error, &checked_path))?;
                         new_suffix = true;
-                        mkdir_private(&directory, &name)?
+                        mkdir_private(&directory, &name)
+                            .map_err(|error| permission_path(error, &child_path))?
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(permission_path(error, &child_path)),
                 };
-                trusted_directory(&directory)?;
+                checked_path = child_path;
+                trusted_directory(&directory)
+                    .map_err(|error| permission_path(error, &checked_path))?;
                 if new_suffix {
-                    private(&directory, false)?;
+                    private(&directory, false)
+                        .map_err(|error| permission_path(error, &checked_path))?;
                 }
             }
             _ => return Err(refused()),
         }
     }
-    private(&directory, false)
+    private(&directory, false).map_err(|error| permission_path(error, &checked_path))
 }
 
 fn walk_directory(path: &Path, create: bool, allow_root: bool) -> io::Result<File> {
@@ -135,26 +264,30 @@ fn walk_directory(path: &Path, create: bool, allow_root: bool) -> io::Result<Fil
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")?;
-    trusted_directory(&directory)?;
+    let mut checked_path = std::path::PathBuf::from("/");
+    trusted_directory(&directory).map_err(|error| permission_path(error, &checked_path))?;
     for component in absolute.components() {
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
+                checked_path.push(name);
                 let name = CString::new(name.as_bytes()).map_err(|_| refused())?;
                 directory = match open_at(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
                 {
                     Ok(child) => child,
                     Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
-                        mkdir_private(&directory, &name)?
+                        mkdir_private(&directory, &name)
+                            .map_err(|error| permission_path(error, &checked_path))?
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(permission_path(error, &checked_path)),
                 };
-                trusted_directory(&directory)?;
+                trusted_directory(&directory)
+                    .map_err(|error| permission_path(error, &checked_path))?;
             }
             _ => return Err(refused()),
         }
     }
-    private(&directory, allow_root)?;
+    private(&directory, allow_root).map_err(|error| permission_path(error, path))?;
     Ok(directory)
 }
 
@@ -254,7 +387,10 @@ fn check_file(file: &File, allow_root: bool) -> io::Result<()> {
         || meta.mode() & 0o7111 != 0
         || meta.mode() & 0o400 == 0
     {
-        return Err(refused());
+        return Err(permission_refusal(
+            &meta,
+            "expected private regular file owned by the current user (or permitted root owner), with one link",
+        ));
     }
     Ok(())
 }
@@ -306,25 +442,34 @@ pub(super) fn read_key(
 }
 
 /// Caller holds the account-store lease across the missing-key/data check and publish.
-pub(super) fn load_or_create_key(home: &File, accounts: &File) -> io::Result<Zeroizing<[u8; 32]>> {
-    match read_key(home, "master.key", false) {
+pub(super) fn load_or_create_key(
+    home: &File,
+    accounts: &File,
+    home_path: &Path,
+) -> io::Result<Zeroizing<[u8; 32]>> {
+    let key_path = home_path.join("master.key");
+    match read_key(home, "master.key", false).map_err(|error| permission_path(error, &key_path)) {
         Ok(key) => return Ok(key),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    if has_account_data(accounts)? {
+    if has_account_data(accounts)
+        .map_err(|error| permission_path(error, &home_path.join("accounts")))?
+    {
         return Err(invalid());
     }
     let mut key = Zeroizing::new([0; 32]);
     SystemRandom::new()
         .fill(&mut key[..])
         .map_err(|_| invalid())?;
-    match create_private_leaf(home, c"master.key", &key[..]) {
+    match create_private_leaf(home, c"master.key", &key[..])
+        .map_err(|error| permission_path(error, &key_path))
+    {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    read_key(home, "master.key", false)
+    read_key(home, "master.key", false).map_err(|error| permission_path(error, &key_path))
 }
 
 fn has_account_data(accounts: &File) -> io::Result<bool> {
@@ -484,14 +629,21 @@ pub(super) fn open_private_lock(directory: &File, name: &CStr) -> io::Result<Fil
         }
         Err(error) => return Err(error),
     };
-    if file.metadata()?.mode() & 0o200 == 0 {
-        return Err(refused());
+    let meta = file.metadata()?;
+    if meta.mode() & 0o200 == 0 {
+        return Err(permission_refusal(
+            &meta,
+            "expected writable private lock file",
+        ));
     }
     Ok(file)
 }
 
 #[cfg(test)]
 mod strict_ancestor_policy_tests;
+
+#[cfg(test)]
+mod permission_tests;
 
 #[cfg(test)]
 pub(super) mod tests;

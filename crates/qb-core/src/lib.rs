@@ -57,6 +57,16 @@ pub fn ensure_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
     platform::ensure_private_dir_all(path)
 }
 
+/// Return only a native, bounded permission diagnostic, never an arbitrary cause.
+pub fn startup_permission_diagnostic(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    platform::startup_permission_diagnostic(error)
+}
+
+/// Check an existing data home and its startup directories without changing them.
+pub fn check_private_data_home(path: &std::path::Path) -> std::io::Result<()> {
+    platform::check_private_data_home(path)
+}
+
 /// Exclusively create one new private data directory; never reuse an existing leaf.
 pub fn create_private_directory_new(path: &std::path::Path) -> std::io::Result<()> {
     platform::create_private_directory_new(path)

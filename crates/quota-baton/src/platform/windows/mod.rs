@@ -1,4 +1,6 @@
+mod admin_transport;
 pub(crate) mod autostart;
+pub(crate) use admin_transport::admin_socket_client;
 #[cfg(test)]
 mod autostart_cli_tests;
 use clap::{Args, Subcommand};

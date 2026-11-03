@@ -2,7 +2,8 @@
 
 quota-baton runs a shared Claude and Codex account proxy under systemd. The
 supplied units keep the data port at `127.0.0.1:10200` and the host admin port at
-`127.0.0.1:10201`.
+`127.0.0.1:10201`. Authorized host users can also use
+`/run/quota-baton/admin.sock` without reading the service's private admin token.
 
 ## Install
 
@@ -26,6 +27,7 @@ Do this once: keep the existing key and state when upgrading.
 ```bash
 sudo useradd --system --user-group --home-dir /var/lib/quota-baton \
   --no-create-home --shell /usr/sbin/nologin quota-baton
+sudo groupadd --system qb-admin
 sudo install -d -o quota-baton -g quota-baton -m 0700 /var/lib/quota-baton
 sudo install -d -o root -g root -m 0700 /etc/credstore.encrypted
 sudo systemd-creds setup
@@ -53,29 +55,51 @@ Install the binary and units, then start the service:
 sudo install -o root -g root -m 0755 ./quota-baton /usr/local/bin/quota-baton
 sudo install -o root -g root -m 0644 packaging/linux/quota-baton.service \
   packaging/linux/quota-baton-data.socket packaging/linux/quota-baton-admin.socket \
+  packaging/linux/quota-baton-admin-unix.socket \
   /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/quota-baton.service \
   /etc/systemd/system/quota-baton-data.socket \
-  /etc/systemd/system/quota-baton-admin.socket
+  /etc/systemd/system/quota-baton-admin.socket \
+  /etc/systemd/system/quota-baton-admin-unix.socket
 sudo systemctl daemon-reload
 sudo systemctl enable --now quota-baton.service
 ```
 
-Enable only the service; it starts both sockets. Systemd keeps state in
-`/var/lib/quota-baton` and runtime files in `/run/quota-baton`, with private
-0700 directories, and delivers the decrypted key through its credential directory.
+Enable only the service; it starts all three sockets. Systemd keeps state in
+`/var/lib/quota-baton` (0700) and delivers the decrypted key through its credential
+directory. `/run/quota-baton` is 0710 with group `qb-admin`: the group can traverse
+to the 0660 admin socket, but cannot list or change the runtime directory.
 The direct binary install above assumes there is no running installation.
 
-Check all three units and the application:
+Check all four units and the application:
 
 ```bash
-for unit in quota-baton.service quota-baton-data.socket quota-baton-admin.socket; do
+for unit in quota-baton.service quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket; do
   sudo systemctl is-active --quiet "$unit" || exit 1
 done
 sudo systemctl show quota-baton.service -p MainPID -p NRestarts
 sudo -u quota-baton env QB_HOME=/var/lib/quota-baton \
   /usr/local/bin/quota-baton status
 ```
+
+## Allow a host orchestrator to administer the service
+
+Add only trusted administrators to `qb-admin`; membership grants the same admin
+API access as the private bearer token. For the server orchestrator:
+
+```bash
+sudo usermod -aG qb-admin agentsrv
+sudo -u agentsrv /usr/local/bin/quota-baton status
+sudo -u agentsrv curl --fail --unix-socket /run/quota-baton/admin.sock \
+  http://127.0.0.1:10201/admin/v1/health
+```
+
+Restart an already-running orchestrator or log in again to pick up its new group.
+The CLI automatically uses the socket for the managed default endpoint. Peer
+credentials authorize the service user or a user in `qb-admin`; no token is read
+from `/var/lib/quota-baton`. The TCP admin endpoint still requires its bearer
+token. Keep `Host` as `127.0.0.1:10201` or `localhost:10201`, including for curl
+requests over the Unix socket.
 
 ## Upgrade
 
@@ -101,7 +125,10 @@ sudo -u quota-baton env QB_HOME=/var/lib/quota-baton \
 Reload success checks that the new application is ready with the same PID.
 Listeners stay open, but active streams and every connection are not guaranteed
 to survive. A binary swap needs no `daemon-reload`. Unit, endpoint or policy
-changes need a separately validated maintenance stop/start. If reload fails,
+changes need a separately validated maintenance stop/start. In particular, adding
+the admin Unix socket unit requires a stop/start to inherit its third descriptor;
+a binary-only reload of an older two-socket service keeps its existing TCP
+endpoints and does not invent a third listener. If reload fails,
 inspect the service before retrying; see [recovery](linux-internals.md#intentional-stop-and-recovery).
 
 ## Log in without a server browser
@@ -179,23 +206,55 @@ incus config device add sample-box qb proxy \
 configured data port for Host validation. Per-box `listen = "tcp:127.0.0.1:<port>"`
 is reserved for VM support and is refused by this build.
 
+Create or replace `config.toml` with explicit private permissions, rather than a
+new file through `tee` under the caller's umask:
+
+```bash
+sudo install -o quota-baton -g qb-admin -m 0600 ./config.toml \
+  /var/lib/quota-baton/config.toml
+```
+
+For Codex, register the launch with an explicit supported `model` when it has no
+prior binding. Use the returned scoped lease `base_url`. Fetch its model catalog
+using the box key and a `?client_version=` matching the box's Codex CLI version,
+and save the returned catalog to a private local file. Keep enrollment and launch
+responses out of shared logs.
+
+Inside the box, sign in with its API key through standard input:
+
+```bash
+read -r -s -p 'Box key: ' box_key; printf '\n'
+printf '%s' "$box_key" | codex login --with-api-key
+unset box_key
+codex -c 'openai_base_url="<scoped lease base_url>"' \
+  -c 'model_catalog_json="/private/path/to/catalog.json"' -m '<supported model>'
+```
+
+Replace the placeholders with the launch response, saved catalog and selected
+model. A bare `OPENAI_API_KEY` is insufficient for the custom Codex base URL.
+For Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:10200` and
+`ANTHROPIC_API_KEY` to that box's key in its private client environment. Never put
+the host admin token inside a box.
+
 ## Revoke a box
 
 Send `POST /admin/v1/boxes/sample-box/revoke` through the authenticated host admin
 API. This revokes the current epoch, blocks new requests and interrupts its
 active response streams and upgrades. Already admitted durable credential writes
 finish. An idle keepalive may stay open, but subsequent requests are refused.
+A revoked name cannot be enrolled again; use a new box name for its replacement.
 
 ## Uninstall
 
-Stop all three units and disable the service before removing its files:
+Stop all four units and disable the service before removing its files:
 
 ```bash
-sudo systemctl stop quota-baton.service quota-baton-data.socket quota-baton-admin.socket || exit 1
+sudo systemctl stop quota-baton.service quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket || exit 1
 sudo systemctl disable quota-baton.service
 sudo rm -f -- /etc/systemd/system/quota-baton.service \
   /etc/systemd/system/quota-baton-data.socket \
-  /etc/systemd/system/quota-baton-admin.socket
+  /etc/systemd/system/quota-baton-admin.socket \
+  /etc/systemd/system/quota-baton-admin-unix.socket
 sudo systemctl daemon-reload
 sudo rm -f -- /usr/local/bin/quota-baton \
   /usr/local/bin/.quota-baton.previous /usr/local/bin/.quota-baton.next
@@ -210,7 +269,7 @@ Do not delete a shared systemd host secret.
 ## Troubleshooting
 
 ```bash
-sudo systemctl status quota-baton.service quota-baton-data.socket quota-baton-admin.socket
+sudo systemctl status quota-baton.service quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket
 sudo journalctl -u quota-baton.service -n 100 --no-pager
 ```
 
