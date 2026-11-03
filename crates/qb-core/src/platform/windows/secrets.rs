@@ -86,7 +86,7 @@ pub(crate) fn prepare_account_directory(
     home: &Path,
 ) -> Result<std::path::PathBuf, crate::accounts::StoreError> {
     let dir = home.join("accounts");
-    super::ensure_private_dir_all(&dir).map_err(|_| crate::accounts::StoreError::Io)?;
+    super::ensure_private_dir_all(&dir).map_err(super::private_directory::map_storage_error)?;
     Ok(dir)
 }
 pub(crate) fn read_config(home: &Path) -> std::io::Result<Option<String>> {

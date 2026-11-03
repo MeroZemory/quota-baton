@@ -10,6 +10,8 @@ Windows PowerShell에서 설치 스크립트를 실행할 수 있습니다. 릴�
 
 업그레이드 중 사용 중인 이전 실행 파일은 남겨 두었다가 다음 설치 때 정리합니다. 클라이언트 탐지는 래퍼를 구분해 실제 실행 경로를 표시합니다. 트레이를 멈춘 뒤 설치가 실패해도 다시 시작을 시도하고 설치 상태를 알려 줍니다.
 
+데이터 폴더 권한 거절에 Codex sandbox 사용자나 SID가 나오면 최신 설치 스크립트를 다시 실행하세요. 설치기는 기존 ACL의 SDDL을 로그 옆에 보관한 뒤 quota-baton 데이터 폴더만 현재 사용자·SYSTEM·Administrators 전용의 보호된 ACL로 바꿉니다. 새 실행 파일의 `serve --check` 사전 점검이 성공해야 기존 실행 파일을 이름 변경합니다. 직접 확인할 때도 `quota-baton serve --check`를 쓰며, 코어는 기존 ACL을 자동 수정하지 않습니다.
+
 ```powershell
 irm https://raw.githubusercontent.com/MeroZemory/quota-baton/main/install.ps1 | iex
 ```

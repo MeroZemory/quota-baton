@@ -1,0 +1,17 @@
+# Peer-authorized host administration; enable only the service.
+[Unit]
+Description=quota-baton local admin socket
+PartOf=quota-baton.service
+
+[Socket]
+ListenStream=/run/quota-baton/admin.sock
+SocketUser=quota-baton
+SocketGroup=qb-admin
+SocketMode=0660
+DirectoryMode=0710
+Accept=no
+Service=quota-baton.service
+FileDescriptorName=admin-unix
+Backlog=4096
+FlushPending=no
+RemoveOnStop=yes

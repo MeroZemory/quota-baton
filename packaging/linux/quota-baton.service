@@ -1,23 +1,23 @@
 # Headless service qualified with systemd 255.
 [Unit]
 Description=quota-baton headless account proxy
-Requires=quota-baton-data.socket quota-baton-admin.socket
-After=quota-baton-data.socket quota-baton-admin.socket
+Requires=quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket
+After=quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket
 StartLimitIntervalSec=60s
 StartLimitBurst=5
 
 [Service]
 Type=notify
 NotifyAccess=main
-Sockets=quota-baton-data.socket quota-baton-admin.socket
+Sockets=quota-baton-data.socket quota-baton-admin.socket quota-baton-admin-unix.socket
 NonBlocking=yes
 User=quota-baton
-Group=quota-baton
+Group=qb-admin
 UMask=0077
 StateDirectory=quota-baton
 StateDirectoryMode=0700
 RuntimeDirectory=quota-baton
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=0710
 WorkingDirectory=/var/lib/quota-baton
 Environment=QB_SYSTEMD_MANAGED=1
 LoadCredentialEncrypted=qb-master-key:/etc/credstore.encrypted/qb-master-key
