@@ -2501,9 +2501,7 @@ mod tests {
         home_in(root)
     }
     pub(super) fn home_in(parent: impl AsRef<Path>) -> tempfile::TempDir {
-        let home = qb_testkit::fixture::tempdir_in(parent).unwrap();
-        crate::platform::create_private_directory_new(&home.path().join("state")).unwrap();
-        home
+        qb_testkit::fixture::tempdir_in(parent).unwrap()
     }
     fn settings(mode: Mode) -> Settings {
         Settings {

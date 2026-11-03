@@ -6,7 +6,25 @@ use tempfile::{NamedTempFile, TempDir};
 /// The caller creates the parent; missing parents remain errors. Return physical
 /// paths so a manifest-relative `..` does not become a credential-store input.
 pub fn tempdir_in(parent: impl AsRef<Path>) -> io::Result<TempDir> {
-    tempfile::tempdir_in(parent.as_ref().canonicalize()?)
+    prepare_tempdir(tempfile::tempdir_in(parent.as_ref().canonicalize()?)?)
+}
+
+/// Prepare only a newly created, empty owned fixture directory. This preserves
+/// Builder prefixes; never pass a populated home or an unsafe-path fixture.
+pub fn prepare_tempdir(home: TempDir) -> io::Result<TempDir> {
+    if !std::fs::symlink_metadata(home.path())?.file_type().is_dir()
+        || std::fs::read_dir(home.path())?
+            .next()
+            .transpose()?
+            .is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fixture directory must be newly created and empty",
+        ));
+    }
+    crate::platform::prepare_new_fixture_directory(&home)?;
+    Ok(home)
 }
 
 /// A fresh owned home explicitly opts into local file key storage. The product's

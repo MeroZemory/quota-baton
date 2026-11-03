@@ -4566,8 +4566,7 @@ mod tests {
             .prefix("bindings-")
             .tempdir_in(root.canonicalize().unwrap())
             .unwrap();
-        crate::platform::create_private_directory_new(&home.path().join("state")).unwrap();
-        home
+        qb_testkit::fixture::prepare_tempdir(home).unwrap()
     }
     fn strict_root_policy(home: &Path, key: &str) -> crate::routing::PolicyStore {
         let store = crate::routing::PolicyStore::new(

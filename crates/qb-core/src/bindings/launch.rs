@@ -1894,7 +1894,7 @@ mod r11_active_adoption_tests {
             .prefix("case-")
             .tempdir_in(root.canonicalize().unwrap())
             .unwrap();
-        crate::platform::create_private_directory_new(&home.path().join("state")).unwrap();
+        let home = qb_testkit::fixture::prepare_tempdir(home).unwrap();
         let config = RoutingConfig {
             mode: if mode == Mode::Strict {
                 Mode::Rebalance
@@ -3190,7 +3190,6 @@ mod issue_operation_binding_tests {
             .join(".sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = qb_testkit::fixture::tempdir_in(root).unwrap();
-        crate::platform::create_private_directory_new(&dir.path().join("state")).unwrap();
         let table = BindingTable::new(dir.path(), crate::config::RoutingConfig::default()).unwrap();
         let operation =
             IssueOperation::new(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
