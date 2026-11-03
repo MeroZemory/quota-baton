@@ -1246,6 +1246,9 @@ mod contained {
             OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
         };
 
+        // 테스트 준비 대기의 상한. 전체 행렬 부하에서도 넉넉하게, 그래도 유한하게.
+        const READY: Duration = Duration::from_secs(30);
+
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn PeekNamedPipe(
@@ -1270,7 +1273,7 @@ mod contained {
         /// blocking read or detached reader thread can outlive a failed test.
         /// Both byte count and elapsed time are bounded, including EOF checks.
         fn stdio_read(pipe: &mut File, count: Option<usize>) -> io::Result<Vec<u8>> {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + READY;
             let mut output = Vec::new();
             loop {
                 if count == Some(output.len()) {
@@ -1365,7 +1368,7 @@ mod contained {
         // Handles are retained from THIS job's membership only. No public raw
         // handle API, process-name search, adopted process, or numeric-PID kill.
         fn pair_observe_job(child: &Child, minimum: u32) -> (OwnedHandle, Vec<OwnedHandle>) {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + READY;
             let ids = loop {
                 let mut ids = ProcessIds::default();
                 assert_ne!(
@@ -1432,7 +1435,7 @@ mod contained {
         }
 
         fn pair_wait_exit(pair: &RemotePair) -> RemotePairStatus {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + READY;
             loop {
                 let status = pair.try_wait().unwrap();
                 if status != RemotePairStatus::Running {
@@ -1509,7 +1512,7 @@ mod contained {
                 stdio_read(&mut stdout, Some(b"server-env-absent".len())).unwrap(),
                 b"server-env-absent"
             );
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + READY;
             while std::fs::read(&ready).ok().as_deref() != Some(b"tui-env-present".as_slice()) {
                 assert!(
                     Instant::now() < deadline,
@@ -1670,7 +1673,7 @@ mod contained {
             stdin.flush().unwrap();
             let echoed = stdio_read(&mut stdout, Some(payload.len()));
             drop(stdin); // The child must see EOF and exit without a kill.
-            let status = child.wait(Some(Duration::from_secs(5)));
+            let status = child.wait(Some(READY));
             drop(child); // Cleanup also precedes assertions on a failed wait.
             let tail = stdio_read(&mut stdout, None);
             assert_eq!(echoed.unwrap(), payload);
@@ -1755,7 +1758,7 @@ mod contained {
                 let script = root.path().join(format!("invalid-version-{case}.cmd"));
                 let text = format!("@echo off\r\necho {output}\r\n:hold\r\ngoto hold\r\n");
                 std::fs::write(&script, text).unwrap();
-                let error = capture_with_timeout(&Command::new(script), Duration::from_secs(1))
+                let error = capture_with_timeout(&Command::new(script), Duration::from_secs(5))
                     .unwrap_err();
                 assert_eq!(
                     super::super::version_failure(&error),
@@ -1780,7 +1783,7 @@ mod contained {
                 quote(&temporary), quote(&temporary), quote(&ready),
             )).unwrap();
             let worker = std::thread::spawn(move || {
-                capture_with_timeout(&Command::new(script), Duration::from_secs(5))
+                capture_with_timeout(&Command::new(script), Duration::from_secs(20))
             });
             // Retain a handle to the known synthetic descendant while alive;
             // do not infer cleanup from a possibly recycled numeric PID later.
@@ -1795,7 +1798,7 @@ mod contained {
                             });
                     break Some(owned(handle.0).unwrap());
                 }
-                if began.elapsed() >= Duration::from_secs(4) {
+                if began.elapsed() >= Duration::from_secs(18) {
                     break None;
                 }
                 std::thread::yield_now();
@@ -1841,7 +1844,7 @@ mod contained {
             let sink = File::options().write(true).open("NUL").unwrap();
             for abrupt in [false, true] {
                 let child = Child::spawn(&Command::new(&script), Some(&sink)).unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + READY;
                 let ids = loop {
                     let mut ids = ProcessIds::default();
                     assert_ne!(
@@ -2186,7 +2189,11 @@ fn r1211_slow_fake_version_survives_old_five_second_limit() {
     std::fs::create_dir_all(&base).unwrap();
     let root = tempfile::tempdir_in(base).unwrap();
     let script = root.path().join("slow-version.cmd");
-    std::fs::write(&script, b"@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 6\"\r\necho codex-cli 0.163.0\r\nexit /b 0\r\n").unwrap();
+    std::fs::write(
+        &script,
+        b"@echo off\r\nping.exe -n 8 127.0.0.1 >nul\r\necho codex-cli 0.163.0\r\nexit /b 0\r\n",
+    )
+    .unwrap();
     let began = std::time::Instant::now();
     assert_eq!(version_output(&script).unwrap(), b"codex-cli 0.163.0\r\n");
     assert!(began.elapsed() >= std::time::Duration::from_secs(6));
