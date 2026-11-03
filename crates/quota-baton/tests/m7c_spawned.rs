@@ -1,5 +1,6 @@
 //! M7c.1: load the real release `serve` process from a separate test process.
 //! All homes, tokens, and upstreams in this file are synthetic.
+#![cfg(windows)]
 
 #[path = "../src/fixture_support.rs"]
 mod fixture_support;

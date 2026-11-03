@@ -2,11 +2,14 @@
 //! Synthetic numeric-loopback upstream and isolated spawned core.
 #[path = "../src/fixture_support.rs"]
 mod fixture_support;
+#[cfg(unix)]
+#[path = "r101_dashboard_core/unix.rs"]
+mod native;
+#[cfg(windows)]
+#[path = "r101_dashboard_core/windows.rs"]
+mod native;
 use futures_util::{SinkExt, StreamExt};
-use qb_core::{
-    accounts::{AccountStore, import},
-    dashboard::SessionId,
-};
+use qb_core::{accounts::AccountStore, dashboard::SessionId};
 use qb_testkit::websocket::WebSocketUpstream;
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Stdio, time::Duration};
@@ -55,13 +58,7 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
     qb_testkit::fixture::configure_home(&home).unwrap();
     {
         let store = AccountStore::acquire(&home).unwrap();
-        import::run(
-            &store,
-            &external,
-            &["codex:r101@example.invalid".into()],
-            false,
-        )
-        .unwrap();
+        native::seed_account(&store, &external);
     } // Release the lease before starting the real CLI process.
     fixture_support::write_private(home.join("client.key"), CLIENT).unwrap();
     fixture_support::write_private(home.join("admin.token"), ADMIN).unwrap();
@@ -101,8 +98,7 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
             command.env(name, value);
         }
     }
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    native::configure_command(&mut command);
     let mut core = command.spawn().unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
