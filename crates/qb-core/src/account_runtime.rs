@@ -2413,6 +2413,7 @@ impl AccountRuntime {
                     credits_in_use,
                 );
                 Ok(AdminAccount {
+                    placement_capacity_tokens: self.obs.placement_capacity_tokens(a, &quota, now),
                     outside_used: self.outside_used(&a.id),
                     pool_eligible: a.user_state == UserState::Active
                         && !pending

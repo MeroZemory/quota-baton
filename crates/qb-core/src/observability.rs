@@ -1360,7 +1360,6 @@ impl Observability {
         self.placement_capacity.lock().ok()?.facts(id)
     }
 
-    #[cfg(test)]
     pub(crate) fn placement_capacity_tokens(
         &self,
         account: &crate::accounts::Account,
@@ -1379,9 +1378,8 @@ impl Observability {
                 ))
             })
             .collect();
-        let room = crate::bindings::kernel::selection_capacity::remaining_tokens(
-            &facts, account, quota, &projected, now,
-        )?;
+        let room =
+            crate::placement_capacity::remaining_tokens(&facts, account, quota, &projected, now)?;
         (room.is_finite() && room >= 0.0 && room < u64::MAX as f64).then_some(room as u64)
     }
 

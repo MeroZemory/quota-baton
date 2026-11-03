@@ -95,9 +95,7 @@ async fn r21_native_claude_polls_measure_three_own_intervals_and_publish_capacit
         let view = &views[0];
         assert_eq!(&view.id, id);
         assert_eq!(
-            poller
-                .obs
-                .placement_capacity_tokens(&account, &snapshot, Utc::now()),
+            view.placement_capacity_tokens,
             if round < 3 { None } else { Some(720_000) }
         );
         assert!(view.pool_eligible);

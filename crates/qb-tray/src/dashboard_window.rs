@@ -1583,7 +1583,8 @@ fn mouse_move(hwnd: HWND, p: [f32; 2]) {
         }
         h.pointer_region = region;
         h.input.hover = hover;
-        h.input.pointer = Some(p);
+        let Host { frame, input, .. } = &mut *h;
+        input.move_pointer(&frame.as_ref().unwrap().scene, p);
         released = (frozen.0 && !h.state.table_freeze.frozen)
             || (frozen.1 && !h.state.recent_freeze.frozen);
     }
@@ -2284,7 +2285,7 @@ unsafe extern "system" fn wndproc(
                     h.state.pointer(region, false, time);
                 }
                 h.input.hover = None;
-                h.input.pointer = None;
+                h.input.clear_pointer();
                 released = (frozen.0 && !h.state.table_freeze.frozen)
                     || (frozen.1 && !h.state.recent_freeze.frozen);
             }

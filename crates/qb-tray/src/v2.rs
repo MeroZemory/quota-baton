@@ -81,6 +81,7 @@ pub struct Account {
     /// Authoritative actual paid-serving signal, including explicit false.
     pub credits_in_use: Option<bool>,
     pub usage_forecast: Option<qb_core::usage_forecast::AccountUsageForecast>,
+    pub placement_capacity_tokens: Option<u64>,
     pub pool_eligible: Option<bool>,
     pub eligible_for_new_session: Option<bool>,
     pub quota_cooling: Option<QuotaCooling>,
@@ -977,7 +978,7 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
     let english = crate::i18n::language() == crate::i18n::UiLanguage::En;
     let forecast_summary =
         qb_core::usage_forecast_display::summary(&summary_forecast(a, now), english);
-    let forecast_tooltip = a.usage_forecast.as_ref().map_or_else(
+    let mut forecast_tooltip = a.usage_forecast.as_ref().map_or_else(
         || forecast_summary.text.clone(),
         |forecast| {
             if english {
@@ -988,6 +989,10 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
             .join("\n")
         },
     );
+    if let Some(tokens) = a.placement_capacity_tokens {
+        forecast_tooltip.push_str(" · ");
+        forecast_tooltip.push_str(&placement_capacity_label(tokens, english));
+    }
     AccountRow {
         excluded_reason: exclusion_reason(a),
         raw: a.clone(),
@@ -1017,6 +1022,9 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         accessible_name: String::new(),
     }
 }
+
+/// Read-only measured room, rounded to two significant digits for both surfaces.
+pub use qb_proto::placement_capacity_label;
 
 /// Re-evaluate the typed display at the projection clock, honoring explicit
 /// model scope. Hidden/blocked rows retain their original detail in the tooltip.

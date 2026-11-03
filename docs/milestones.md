@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R22 재개 (R23 별도 제품 수정 관문 완료·dev 인계)
-목표: 제품 변경 없이 Windows 기본/전체기능·Linux all-targets 각각 clean3연속0
-핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (producer gate는 실제 수용으로 세지 않음)
-사용자 대기: R22 없음; schema9 >=24h export11/01 13:04 이후·N7 11/05 13:49 이후·L1 실제수용·N12 O14
-갱신: 2026-10-31 15:36 KST (R23 양OS 저장/보안/strict 통과·설치 보류; d96 schema9 1h 선택/permit409·nc/loss0·9.25MBh/40)
+현재 마일스톤: L1.6 준비 (R21 paired replay owner 수용·병합/설치 인계)
+목표: home server admin Unix socket·peer 자격 검증·자동 CLI 접근·권한 오류 및 box 안내 보완
+핵심 지표: 결정적 수용 1/3 · Linux 실제 수용 0/1 (owner 수용 전 지표 추가 없음)
+사용자 대기: 없음; R21 설치는 설계 세션·N7 점수11/05 13:49 이후·L1 실제수용·N12 O14
+갱신: 2026-11-03 17:03 KST (설치19da58d·R21 paired replay owner 수용: quiet e02 유효·core log 경계<1s/idle 확인; B2/3는 다음 설치 때·Linux는 home server)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -147,7 +147,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | R2 Part B | closed | user manual adoption 0e29393 | — | CPA stopped; four Claude accounts refreshed by qb |
 
-**Current S1 order**: R23 fixed the real private-state initialization defect that stopped R22; its Windows and Linux022/077 focused gates passed. Merge R23 to dev without installing before11-01 13:04, then resume impl/r22 WIP11974aa with the product fix and preserve the original failures. R22 still needs three clean consecutive passes per Windows default/all-features and Linux all-targets. No retry-until-pass. Owner installed d96a01f10-31 13:01 (886/0, both smokes); schema9/e01 health14:05 is selection/permit409, nc0/loss0, encoded9.25MB/hour within40 and compressed1.90MB. Scheduled seals10-31 19:03,11-01 01:03/07:03/13:04; no installs until final seal. Owner then exports for the R21 percent-vs-weighted margin0 gate; R21 stays unmerged1ad42fa. N7 scoring remains after11-05 13:49. Reports: MAIN `.sandbox/reports/R23.md`, `.sandbox/reports/R22.md`, `.sandbox/reports/N6r-T.vocabulary.md`.
+**Current S1 order**: R21 schema9 real recorded-decision paired run is closed: selection3374/3374 and permit3372/3372 identity, installed/candidate moves1/1 at margin0, exact global and per-active-epoch power pass. Keep quiet e02 native complete=false, observed epoch spans/gaps and no30guard insufficient_not_exercised explicit; Owner accepted the full24h scope using core-log handover evidence (old served until :03:00, new bound :03:01, under1s); event gaps are idle, quiet e02 valid. Merge R21 now; Series B stays1/3 until the owner installs it, then2/3. Next L1.6 on a new branch from dev, including the Nov3 permission-message and box-client addendum, then parked R22 (WIPaa42f53). Linux builds/tests run only on ssh home server via git archive with one target under ~/quota-baton-ci, never PC Docker. Installed19da58d Nov3 15:58KST (takeover1582/0, both smokes). N7 scoring remains after Nov5 13:49KST. Reports: MAIN `.sandbox/reports/R21.md`, `.sandbox/reports/R23.md`, `.sandbox/reports/R22.md`.
 
 **W status:** N7 root-audit backtest executed once on 2026-10-29; observational recent-rate results do not meet the experimental error/sample criteria. Pooled 1h/3h errors remain unavailable; no N7 acceptance. Receipt: `.sandbox/reports/R13.F-evidence/n7-root-audit-backtest-20261029/REPORT.md`. N5m evidence remains preserved.
 
@@ -572,7 +572,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | Linux 실제 로그인 | device-code 실제 시작 확인; 완료 로그인 0/2 | 공급자별 실제 완료 로그인 2/2 | 설계 세션이 사용자와 배포 묶음으로 P5 수용 |
 | Linux P5 서버 수용 | GPU 배포·재로드2442/0 수용; 실제 Incus·재부팅 미수용 | 실제 칸 접근·철회·업그레이드·재부팅·공유 계정 외부 사용 감지 | 설계 세션이 실제 서버에서 acceptance checklist 실행 |
-| N6r decision tape | schema8 실제24h identity 선택9969/permit11946·단일global fault1건 검출·loss0, 선택nc17.8763%/permit1.5899%로 insufficient | 매epoch nc<=1%와 실제후보 margin0; observed/native 투영 불일치·모델 소실 진단 | 다음 producer 단계 채택 검토·schema9 warm>=24h R21 별도, B1/3 유지 |
+| N6r decision tape | schema9 선택3374/permit3372 identity·moves1대1·power PASS·nc/loss0·owner 실제24h paired 수용 | 설치 후 SeriesB2/3 | R21 병합·설치 인계, quiet e02/core log 경계<1s 확인; 다음 L1.6 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

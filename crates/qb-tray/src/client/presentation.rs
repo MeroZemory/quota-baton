@@ -59,6 +59,8 @@ pub struct PresentationAccount {
     pub windows: Vec<QuotaWindow>,
     #[serde(default)]
     pub usage_forecast: Option<qb_core::usage_forecast::AccountUsageForecast>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_capacity_tokens: Option<u64>,
     #[serde(default)]
     pub credits: Option<serde_json::Value>,
     #[serde(default)]

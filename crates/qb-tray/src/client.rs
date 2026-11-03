@@ -1633,6 +1633,102 @@ mod r7_dashboard_client_tests {
         }
     }
 
+    #[tokio::test]
+    async fn r21_capacity_survives_real_client_projection_without_changing_eligibility_or_lines() {
+        use qb_tray::{dashboard_model, i18n, state::DashboardState, v2};
+        use serde_json::json;
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00+09:00").unwrap();
+        let clock = dashboard_model::Clock {
+            now,
+            day_start: now.to_utc() - chrono::Duration::hours(12),
+            day_end: now.to_utc() + chrono::Duration::hours(12),
+        };
+        for eligible in [false, true] {
+            let mut legacy = r18_account_fixture::account(
+                "sample-capacity",
+                "codex",
+                r18_account_fixture::measuring_forecast(),
+            );
+            legacy["pool_eligible"] = json!(eligible);
+            for capacity in [None, Some(0_u64), Some(123_456)] {
+                let mut account = legacy.clone();
+                if let Some(tokens) = capacity {
+                    account["placement_capacity_tokens"] = json!(tokens);
+                }
+                let (client, task) = fake(&json!({"accounts":[account]}).to_string(), None).await;
+                let raw = client.snapshot().await.unwrap();
+                task.await.unwrap();
+                let original = serde_json::to_value(&raw).unwrap();
+                assert_eq!(raw.accounts[0].placement_capacity_tokens, capacity);
+                let presentation = raw.presentation().unwrap();
+                assert_eq!(presentation.accounts[0].placement_capacity_tokens, capacity);
+                let baseline: TraySnapshot =
+                    serde_json::from_value(json!({"accounts":[legacy]})).unwrap();
+                for language in [i18n::UiLanguage::Ko, i18n::UiLanguage::En] {
+                    i18n::with_language(language, || {
+                        let project = |snapshot: &PresentationSnapshot| {
+                            v2::project(&serde_json::to_string(snapshot).unwrap(), now.into())
+                                .unwrap()
+                        };
+                        let baseline_cards = project(&baseline.presentation().unwrap());
+                        let cards = project(&presentation);
+                        let before = baseline_cards
+                            .sections
+                            .iter()
+                            .flat_map(|s| &s.rows)
+                            .next()
+                            .unwrap();
+                        let row = cards.sections.iter().flat_map(|s| &s.rows).next().unwrap();
+                        let expected = match (language, capacity) {
+                            (_, None) => before.forecast_tooltip.clone(),
+                            (i18n::UiLanguage::Ko, Some(0)) => {
+                                format!("{} · 약 0 토큰 남음 (추정)", before.forecast_tooltip)
+                            }
+                            (i18n::UiLanguage::Ko, _) => {
+                                format!("{} · 약 12만 토큰 남음 (추정)", before.forecast_tooltip)
+                            }
+                            (i18n::UiLanguage::En, Some(0)) => format!(
+                                "{} · about 0 tokens remaining (estimate)",
+                                before.forecast_tooltip
+                            ),
+                            (i18n::UiLanguage::En, _) => format!(
+                                "{} · about 120000 tokens remaining (estimate)",
+                                before.forecast_tooltip
+                            ),
+                        };
+                        assert_eq!(row.raw.placement_capacity_tokens, capacity);
+                        assert_eq!(row.raw.pool_eligible, Some(eligible));
+                        assert_eq!(row.state, before.state);
+                        assert_eq!(row.group, before.group);
+                        assert_eq!(row.forecast_lines, before.forecast_lines);
+                        assert_eq!(row.subscription_lines, before.subscription_lines);
+                        assert_eq!(row.windows.len(), before.windows.len());
+                        assert_eq!(row.forecast_tooltip, expected);
+                        let dashboard = |cards| {
+                            dashboard_model::project(
+                                &dashboard_model::DashboardSnapshot::new(cards),
+                                &mut DashboardState::default(),
+                                &clock,
+                            )
+                        };
+                        let before = dashboard(baseline_cards);
+                        let view = dashboard(cards);
+                        assert_eq!(view.groups[0].forecast_tooltip, expected);
+                        assert_eq!(view.usage[0].forecast_tooltip, expected);
+                        assert_eq!(
+                            view.groups[0].forecast_lines,
+                            before.groups[0].forecast_lines
+                        );
+                        assert_eq!(view.usage[0].forecast_lines, before.usage[0].forecast_lines);
+                        assert_eq!(view.groups[0].no_sessions, before.groups[0].no_sessions);
+                    });
+                }
+                assert_eq!(serde_json::to_value(&raw).unwrap(), original);
+            }
+        }
+    }
+
     fn detail_body(id: &str) -> String {
         let mut value: serde_json::Value = serde_json::from_str(r#"{"id":"123456abcdef","provider":"codex","client":{"kind":"codex_cli","product":"synthetic","version":"1"},"label":{"text":"synthetic-folder","source":"claude_project","best_effort":true},"account":"cx-000001","first_seen_at":"2026-10-24T00:00:00Z","bound_since":"2026-10-24T00:00:00Z","last_used_at":"2026-10-24T00:00:00Z","active":true,"inflight":{"requests":2,"oldest_started_at":"2026-10-24T00:00:00Z","ws_open":1,"ws_response_in_flight":true},"inflight_known":false,"pacing_wait":{"waiting":2,"since":"2026-10-24T00:00:00Z"},"routing":{"action_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","on_5h_limit":"move","mode":"recover"},"quota_wait":{"waiting":1,"reset_at":"2026-10-24T00:00:00Z"},"quota_wait_known":true,"model":"synthetic","subagents_today":1,"requests_today":5,"failures_today":2,"rate_wait_today":{"count":1,"total_ms":9},"moves_today":[{"at":"2026-10-24T00:00:00Z","from":"cl-000002","to":"cx-000001","reason":"reset_hold_timeout","next_turn_cache":"miss"}],"first_account_today":"cl-000002","marked_for_move":true,"counters_complete":false,"truncated":true,"subagents_known":false,"moves_known":false,"metadata_truncated":true,"original_short_id":"12345678","recent_requests":[{"ts":"2026-10-24T00:00:00Z","outcome":"relayed_rate429","status":429,"ttfb_ms":3,"dur_ms":17,"rate_wait_ms":10,"rate_retries":4294967295,"failover":{"from":"cl-000002","to":"cx-000001"}},{"ts":"2026-10-24T00:00:00Z","outcome":"ok","status":200,"ttfb_ms":1,"dur_ms":4,"rate_wait_ms":0,"rate_retries":0,"failover":null}],"timeline":[{"at":"2026-10-24T00:00:00Z","kind":"placed","account":"cl-000002","from":null,"reason":"new","next_turn_cache":null},{"at":"2026-10-24T00:00:00Z","kind":"move","account":"cx-000001","from":"cl-000002","reason":"reset_hold_timeout","next_turn_cache":"hit"}],"recent_requests_known":false,"timeline_known":false}"#).unwrap();
         value["id"] = serde_json::json!(id);
