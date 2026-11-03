@@ -431,7 +431,8 @@ async fn queued_request_cannot_dispatch_old_account_after_move_and_strict_edit()
     assert_credential(&h, 0, &first);
     h.state
         .accounts
-        .observe_429(&first, Some(Duration::from_secs(2)));
+        // 대기 요청이 풀리기 전에 일시정지·strict 편집·재개가 끝나도록 창을 둔다(클라이언트 한도 DEADLINE 안).
+        .observe_429(&first, Some(Duration::from_secs(5)));
     let waiting = h.send("/v1/responses", &headers, RAW);
     let edit = async {
         tokio::time::timeout(DEADLINE, async {

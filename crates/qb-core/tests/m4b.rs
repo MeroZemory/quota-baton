@@ -29,7 +29,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DEADLINE: Duration = Duration::from_secs(8);
+// 테스트 활성 대기·클라이언트 요청의 상한(실패 시에만 의미). 전체 행렬 부하를 감안한다.
+const DEADLINE: Duration = Duration::from_secs(15);
 const RAW: &str = r#"{ "input": "conversation-marker", "encrypted_content": "verbatim" }"#;
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
