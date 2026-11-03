@@ -2046,12 +2046,6 @@
       "function": "selected",
       "expression": "opaque-macro: assert_eq !Alone Parenthesis( account ,Alone expected ,Alone \"independent schedule account\" )",
       "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/kernel/selection_capacity.rs",
-      "function": "<module>",
-      "expression": "sensitive-import: use serde_json :Joint :Alone Value ;Alone",
-      "count": 1
     }
   ],
   "cases": [

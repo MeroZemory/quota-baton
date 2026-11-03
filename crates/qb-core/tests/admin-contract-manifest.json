@@ -1768,6 +1768,48 @@
       },
       "count": 1,
       "reason": "R21 additive measured placement room: older servers and archives omit this optional fact and remain unweighted (None), never zero or a fabricated estimate. The field is read-only and cannot affect placement eligibility."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_control.rs",
+        "line": 12,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "managed",
+        "field_type": "Option<Managed>",
+        "owner": "struct:LifecycleReply",
+        "attribute": "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+      },
+      "count": 1,
+      "reason": "Negotiated memory-only takeover extension: omission means no managed grant payload and retains legacy recovery for old incumbents/callers. Only the authenticated lifecycle path requests the typed optional payload; no authority is inferred from absence."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/relay/takeover_handover.rs",
+        "line": 55,
+        "rule": "admin-json",
+        "snippet": "json!([])",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Legacy lifecycle binding-list fallback only: the existing typed response still serializes an empty binding array if native export has none; no managed authority is created."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/relay/takeover_handover.rs",
+        "line": 130,
+        "rule": "admin-json",
+        "snippet": "json!({\"schema\":1,\"bindings\":legacy_bindings})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "Native legacy BindingTable import envelope only after bounded authenticated lifecycle decode. Real C8 rows survive; provisional launch rows without managed metadata are removed. Not an admin response shape or fabricated launch grant."
     }
   ]
 }
