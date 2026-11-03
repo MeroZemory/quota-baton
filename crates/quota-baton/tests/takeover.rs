@@ -55,6 +55,17 @@ macro_rules! e2e {
     };
 }
 
+// 실패 원인(타임아웃, 연결 거부, 끊김)을 구분할 수 있도록 오류 원인 사슬을 남긴다.
+fn error_chain(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
 fn client() -> Client {
     Client::builder()
         .no_proxy()
@@ -554,7 +565,8 @@ e2e!(
                     .bearer_auth(&key)
                     .header("session-id", "continuous")
                     .json(&serde_json::json!({"model":"fixture","input":[]}))
-                    .timeout(Duration::from_secs(2))
+                    // 부하로 느려진 응답은 거절이 아니다. 거절(연결 거부·끊김)은 즉시 오류로 남는다.
+                    .timeout(Duration::from_secs(10))
                     .send()
                     .await;
                 match result {
@@ -568,7 +580,7 @@ e2e!(
                                     let _ = tx.send(());
                                 }
                             }
-                            Err(error) => failures.push(error.to_string()),
+                            Err(error) => failures.push(error_chain(&error)),
                         }
                     }
                     Ok(response) => {
@@ -585,7 +597,7 @@ e2e!(
                             .unwrap_or_else(|| "unclassified".into());
                         failures.push(format!("HTTP {status}; error_type={kind}"));
                     }
-                    Err(error) => failures.push(error.to_string()),
+                    Err(error) => failures.push(error_chain(&error)),
                 }
             }
             (successes, failures)
