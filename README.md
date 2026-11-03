@@ -73,6 +73,7 @@ Both charts are drawn from quota-baton's own usage history on the author's machi
 ## Requirements
 
 - Windows 11. Tested on build 26200; Windows 10 is untested.
+- Linux (headless core only): Ubuntu 24.04 or newer with systemd 255, x86_64. It runs as a systemd service and serves Incus containers through per-box keys. See [docs/linux.md](docs/linux.md).
 - Claude Code and/or Codex CLI. Moving existing Codex conversations requires Codex CLI 0.163.0.
 - Prebuilt x64 binaries are on the [Releases](https://github.com/MeroZemory/quota-baton/releases) page. Building from source needs Rust 1.93 with the MSVC toolchain.
 
@@ -169,7 +170,7 @@ Settings live in `%LOCALAPPDATA%\quota-baton\config.toml`; set `QB_HOME` to use 
 
 ## Limits
 
-- **Windows only, for now.** The tray and the launchers are Windows-specific. A headless Linux build of the core (systemd service, per-container keys) is in testing and not released yet.
+- **The tray and launchers are Windows-only.** On Linux only the headless core runs: a systemd service with per-container keys, browserless login and an admin Unix socket. There is no tray, no `codex-qb`/`claude-qb` wiring and no conversation import there.
 - **Two providers, subscriptions only.** Claude subscriptions (Claude Code) and ChatGPT subscriptions (Codex CLI). Pay-per-token API keys are not supported yet; they are planned as a separate pool that never mixes with subscription accounts ([plan](docs/milestones.md#api-key-pools-n12)).
 - **A move costs one uncached turn.** Prompt caches belong to an account and cannot follow a session. Codex also drops hidden reasoning from the old account.
 - **Korean by default.** The tray and dashboard switch to English with `[ui] language = "en"` in `config.toml`. Most CLI messages are still Korean.
