@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: L1.6 관문 완료·dev 인계 (다음 R22)
 목표: 관리 Unix 소켓·권한 오류·Windows ACL 이행 구현 완료; home server 실제 바이너리 교체는 설계 세션, 다음은 R22 전체 테스트 fixture 복구
-핵심 지표: 결정적 수용 2/3 · Linux 실제 수용 0/1 (home server P5: 업그레이드 시험만 남음)
-사용자 대기: home server P5 바이너리 교체 설치·수용은 설계 세션; N7 점수 11/05 13:49 이후·N12 O14
-갱신: 2026-11-03 19:31 KST (L1.6 관문 완료: home server systemd28·reload1835/0·PS5.1/7 각37·양OS strict·일반 build/실제 launcher 읽기 점검 통과. 전체 행렬 원본 실패 보존·동일기능 dev 기준 core812/CLI232/m0 3 실패 이름 일치. 설치 없음·B2/3·C0/1)
+핵심 지표: 결정적 수용 2/3 · Linux 실제 수용 1/1
+사용자 대기: 없음; N7 점수 11/05 13:49 이후·N12 O14
+갱신: 2026-11-03 19:36 KST (설계 세션: home server 8e87837 바이너리 교체 업그레이드 수용, 관리 Unix 소켓 유지보수 재시작 완료 → C 1/1. 앞선 L1.6 관문: home server systemd28·reload1835/0·PS5.1/7 각37·양OS strict·일반 build/실제 launcher 읽기 점검 통과. 전체 행렬 원본 실패 보존·동일기능 dev 기준 core812/CLI232/m0 3 실패 이름 일치. PC에도 8e87837 설치: 사전 점검 serve --check 통과, 코어 PID 64180, 전환 중 접속 1847/실패 0, 기록 e07 손실 0)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -294,6 +294,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-28 02:40 | 결정적 수용 (분모 3: 연속 재개 수용, N6r 실제 재생 수용, N7 통합 예측 수용) | 1/3 | 루트 감사 2026-10-28에 따라 정의를 GOAL.md "Outcome series"에 고정. 연속 재개 10-24 cc12102 수용; N6r·N7은 수용 전. 이전 계열과 비교하지 않음 |
 | 2026-10-28 02:40 | Linux 실제 수용 (분모 1: L1 P5 서버 수용) | 0/1 | 합성 관문 5/5와 GPU 서버 설치는 준비이며 수용이 아님. 홈 서버가 꺼져 있어 대기 |
 | 2026-11-03 17:14 | 결정적 수용 (분모 3: 연속 재개 수용, N6r 실제 재생 수용, N7 통합 예측 수용) | 2/3 | N6r 수용: R21 쌍대 재생(24h02m 실제 기록, 동일성 3374/3374, 심은 차이 1건 검출, 이동 1/1, 차이 0) 통과 후 8fac42e를 PC에 설치(코어 PID 34588, 전환 중 접속 1369/실패 0, 기록 e06 손실 0). N7은 11-05 13:49부터 채점 |
+| 2026-11-03 19:36 | Linux 실제 수용 (분모 1: L1 P5 서버 수용) | 1/1 | home server 실제 경로: 브라우저 없는 로그인 2건, box 안 실제 Claude Code·Codex, 키 분리·폐기, 재부팅 복구, 8e87837 바이너리 교체 업그레이드(데이터·관리·box 접속 거부 0, 같은 PID, 새 실행 파일 확인). 외부 사용 감지는 사용량 1% 미만이라 미발생으로 기록 |
 <!-- metric:end -->
 
 <!-- support:begin -->
