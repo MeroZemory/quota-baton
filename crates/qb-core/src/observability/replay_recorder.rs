@@ -343,11 +343,17 @@ impl EpochStore {
         at: Stamp,
         schema: u16,
     ) -> io::Result<(Self, PathBuf)> {
-        match fs::create_dir(root) {
+        if !root.try_exists()?
+            && let Some(parent) = root.parent()
+        {
+            crate::platform::ensure_private_dir_all(parent)?;
+        }
+        match crate::platform::create_private_directory_new(root) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
+        crate::platform::ensure_private_dir_all(root)?;
         if !fs::symlink_metadata(root)?.file_type().is_dir() {
             return Err(io::Error::other("capture_root_type"));
         }
@@ -393,7 +399,7 @@ impl EpochStore {
             .find(|slot| !inventory.iter().any(|(used, _, _)| used == slot))
             .ok_or_else(|| io::Error::other("capture_epoch_slots_full"))?;
         let path = store.epoch_path(store.slot);
-        fs::create_dir(&path)?;
+        crate::platform::create_private_directory_new(&path)?;
         write_control(
             &path.join("epoch.json"),
             &EpochHeader {

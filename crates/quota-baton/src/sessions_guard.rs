@@ -258,6 +258,21 @@ mod platform {
         Ok(absolute)
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static DIRECTORY_RETRY_BLOCKER: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+    }
+    #[cfg(test)]
+    pub(super) fn release_writer_on_retry(file: File) {
+        DIRECTORY_RETRY_BLOCKER.with(|slot| {
+            assert!(slot.borrow_mut().replace(file).is_none());
+        });
+    }
+    #[cfg(test)]
+    pub(super) fn retry_writer_released() -> bool {
+        DIRECTORY_RETRY_BLOCKER.with(|slot| slot.borrow().is_none())
+    }
+
     fn directory_open(path: &Path, sharing: u32) -> io::Result<File> {
         use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -268,6 +283,8 @@ mod platform {
                 .open(path);
             match result {
                 Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {
+                    #[cfg(test)]
+                    DIRECTORY_RETRY_BLOCKER.with(|slot| drop(slot.borrow_mut().take()));
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         return Err(error);
                     };
@@ -326,7 +343,7 @@ mod platform {
                     if !create || !current.starts_with(&root) {
                         bail!("대상 폴더가 없습니다");
                     }
-                    match std::fs::create_dir(&current) {
+                    match qb_core::ensure_private_dir_all(&current) {
                         Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(inspection_error(error)),
@@ -961,7 +978,7 @@ mod platform {
             let parent = path
                 .parent()
                 .ok_or_else(|| anyhow!("Codex 잠금 폴더가 없습니다"))?;
-            std::fs::create_dir_all(parent)?;
+            qb_core::ensure_private_dir_all(parent)?;
             let (checked, _) = pin_path(home, path)?;
             pins.extend(checked);
         }
@@ -1599,20 +1616,19 @@ mod tests {
                 .unwrap()
         };
         let blocker = writer();
-        let held = std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                drop(blocker);
-            });
-            prepare_parent(&root, &parent).unwrap()
-        });
+        platform::release_writer_on_retry(blocker);
+        let held = prepare_parent(&root, &parent).unwrap();
+        assert!(
+            platform::retry_writer_released(),
+            "actual sharing error must trigger retry"
+        );
         // A lasting writer must not be accommodated with weaker sharing.
         let blocker = writer();
         let started = Instant::now();
         assert_live(prepare_parent(&root, &parent), &root);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "directory retry must be bounded"
+            started.elapsed() >= Duration::from_secs(1),
+            "persistent writer must consume the unchanged native retry budget"
         );
         drop(blocker);
         drop(held);

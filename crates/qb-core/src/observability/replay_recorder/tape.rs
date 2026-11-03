@@ -185,6 +185,9 @@ struct TapeState {
     manifest: Manifest,
 }
 struct TapeShared {
+    // Replay restores recorded opaque IDs and each decision's capacity map.
+    // It never hashes raw identities again. Keep this random key memory-only;
+    // exporting it would enable identity guessing and is not needed for replay.
     key: [u8; 32],
     state: Mutex<TapeState>,
 }
@@ -1526,3 +1529,7 @@ pub fn read_epoch(path: &Path) -> io::Result<crate::observability::decision_read
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tape/key_tests.rs"]
+mod key_tests;

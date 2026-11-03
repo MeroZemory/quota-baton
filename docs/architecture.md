@@ -538,6 +538,18 @@ Details are in contract C11.
   - Output goes under `.sandbox\` and is included in the A5 secret grep.
   - It is a declared exception to "Codex bodies are never decoded".
 
+### Decision-tape replay operations
+
+The recording boundary preserves the model value received by the native chooser: `None` for null/absent input, otherwise the literal string within the existing96-byte bound. Empty strings and the string `"null"` are distinct from `None`; model families/versions are not inferred by the codec. Native window origins, including the transient cooling label `observed`, are source-enumerated and checked against the tape grammar. Field-specific finite refusals diagnose the remaining projection limits without storing offending values. Old broad refusal codes remain readable, and erased historical inputs are never reconstructed.
+
+Run each sealed epoch through native `debug selection-run --epoch <epoch> --out <run.json>` and `debug permit-run` independently. Match the executing reference binary hash to the header; source association additionally needs the installation receipt. Keep each epoch's InitialWitness and identity domain. Aggregate counters only after those checks; never join opaque account/session names across epochs or fill refused inputs from the current profile.
+
+Selection and permit have different readsets and not-comparable counters. Selection includes supplied candidate/source rows and placements; permit includes source/target facts. Check each kind's unchanged 1% cap in every epoch before an aggregate verdict. Comparable-record identity does not waive refusals, loss, missing witnesses or missing candidate facts. State observation spans and inter-epoch gaps separately.
+
+Register a power target before building, execute the independently changed source on all intended epochs and require exactly the registered difference. Retain source restoration and input hashes. Multiple per-epoch controls do not alone prove one aggregate fault. Reference-versus-itself is a baseline/comparator control, not a real candidate verdict; the weighted candidate needs schema9 measured-capacity inputs.
+
+Census distinguishes allowed outcomes, readable raw proposals, commit markers and completed rebind markers. History snapshots repeat observations. A raw return match does not prove guard reach; erased move history stays unknown. Broad quota/model refusal codes narrow source paths but cannot recover an omitted historical literal or establish an external cause. The real24h gate report in the milestone records demonstrates these limits.
+
 ## 14. Lifecycle and upgrades
 
 - **Startup order.**
@@ -555,6 +567,8 @@ Details are in contract C11.
   4. After durable drain preparation, the old core releases the credential lease while retaining its acceptors. The successor acquires the lease, loads accounts, imports bindings and starts serving. It acknowledges readiness over the retained authenticated connection to the incumbent.
   5. The old core then closes its acceptors. An ordinary request not yet dispatched may forward its original body only after successor readiness and old data-listener closure. Box- or launch-scoped authority is not forwarded; those callers receive a retryable refusal. Already dispatched responses finish on the old core.
   6. WebSockets close with 1001 after their current response. The old core exits when idle or at the drain timeout (default 30 min).
+
+  Managed launch handover is capability-negotiated on the authenticated loopback drain response, separate from durable bindings. Full launch maps and existing token-digest associations stay memory-only. The encoder reserves its bounded allocation; the successor reads fixed-length HTTP directly into one wiping buffer, rejecting ambiguous framing and replies over 16 MiB before parsing. Partial typed fields wipe on refusal. A prepared grant set owns the wiping payload until native binding import succeeds; only then is the registry committed and attached before listeners serve. Source activity and elapsed downtime preserve retention and expiry. Unknown Box epochs are omitted, never converted to unscoped grants. Legacy fallback retains real C8 rows and removes orphan provisional rows. Ordinary heap/runtime library scratch is not a guaranteed-erasure boundary; no disk/log sink for these grants is introduced. The first upgrade from an incumbent without this exporter cannot recover its missing grant associations and retains legacy relaunch behavior; continuity starts between patched incumbents and successors.
 
   A failed durable preparation retains the old lease and cannot publish readiness. A later explicit attempt can replace only an unready grant whose original recipient is proven dead, using a different PID and nonce. A ready or live grant cannot be replaced.
 - **Listener continuity.** Windows uses `WSADuplicateSocketW`, retains descriptor owners through registration, and drops them when the corresponding acceptor closes. This avoids the close/rebind interval left by the earlier M3 path. Explicit `404` from an older incumbent uses the legacy drain/bind path; that first upgrade does not claim listener overlap. Cold startup and legacy binding still retry an occupied port for up to 2 s. Linux keeps its socket-preserving managed reload; see [Linux lifecycle internals](linux-internals.md).

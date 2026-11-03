@@ -16,6 +16,10 @@ use zeroize::Zeroizing;
 
 use crate::boxes::BoxScope;
 
+mod handover;
+pub(crate) use handover::PreparedHandover;
+pub use handover::{HandoverError, HandoverSnapshot, MAX_HANDOVER_BYTES};
+
 pub const CAPACITY: usize = 4096;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MAX_ANCHOR_BYTES: usize = 256;
@@ -29,7 +33,7 @@ type Clock = dyn Fn() -> Instant + Send + Sync;
 /// The sole account authority is the binding addressed by `binding_anchor_key`.
 /// Callers supply a nonsecret internal identifier, never credentials or a URL.
 /// Accepted anchors contain only ASCII letters, digits, `-`, `_`, `.` and `:`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LaunchMetadata {
     pub binding_anchor_key: String,
     pub advertised_models: BTreeSet<String>,
@@ -54,11 +58,20 @@ fn validate_anchor(anchor: &str) -> Result<(), LaunchTokenError> {
 }
 
 fn bounded_models(models: BTreeSet<String>) -> Result<BTreeSet<String>, LaunchTokenError> {
+    validate_models(&models)?;
+    // Discard excess caller allocation capacity as well as bounding text lengths.
+    Ok(models
+        .into_iter()
+        .map(|model| model.into_boxed_str().into_string())
+        .collect())
+}
+
+fn validate_models(models: &BTreeSet<String>) -> Result<(), LaunchTokenError> {
     if models.len() > MAX_ADVERTISED_MODELS {
         return Err(LaunchTokenError::InvalidMetadata);
     }
     let mut bytes = 0usize;
-    for model in &models {
+    for model in models {
         if model.is_empty()
             || model.len() > MAX_MODEL_ID_BYTES
             || model.chars().any(|c| c.is_control() || c.is_whitespace())
@@ -72,11 +85,7 @@ fn bounded_models(models: BTreeSet<String>) -> Result<BTreeSet<String>, LaunchTo
             return Err(LaunchTokenError::InvalidMetadata);
         }
     }
-    // Discard excess caller allocation capacity as well as bounding text lengths.
-    Ok(models
-        .into_iter()
-        .map(|model| model.into_boxed_str().into_string())
-        .collect())
+    Ok(())
 }
 
 /// Only issuance returns plaintext. No Display, serialization, or implicit dereference.

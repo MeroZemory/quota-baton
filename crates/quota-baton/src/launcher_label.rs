@@ -1510,7 +1510,7 @@ mod contained {
                 b"server-env-absent"
             );
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !ready.exists() {
+            while std::fs::read(&ready).ok().as_deref() != Some(b"tui-env-present".as_slice()) {
                 assert!(
                     Instant::now() < deadline,
                     "synthetic TUI did not become ready"
