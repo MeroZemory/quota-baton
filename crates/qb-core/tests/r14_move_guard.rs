@@ -61,7 +61,8 @@ impl Harness {
         provider: Provider,
         configure_routing: impl FnOnce(&mut qb_core::config::RoutingConfig),
     ) -> Self {
-        let serial = tokio::time::timeout(Duration::from_secs(30), SERIAL.lock())
+        // 직렬 대기 상한은 바이너리 전체 테스트가 차례를 기다리는 시간보다 길어야 한다.
+        let serial = tokio::time::timeout(Duration::from_secs(300), SERIAL.lock())
             .await
             .unwrap();
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r14-http-tests");
