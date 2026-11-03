@@ -112,6 +112,70 @@ fn file_backend_generates_owner_only_key_and_reopens() {
 }
 
 #[test]
+fn constructor_permissions_keep_accounts_and_master_key_paths_but_bad_data_stays_crypto() {
+    let fixture = Fixture::new();
+    let accounts = fixture.home.join("accounts");
+    fs::set_permissions(&accounts, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = SecretProtector::new_with_credentials(&fixture.home, &file_config(), None)
+        .err()
+        .expect("unsafe accounts must refuse");
+    let StoreError::StoragePermission(error) = error else {
+        panic!("expected typed accounts permission refusal");
+    };
+    let message = secure_key::startup_permission_diagnostic(&error).unwrap();
+    assert!(message.contains(accounts.to_str().unwrap()));
+    assert!(message.contains("0755"));
+    fs::set_permissions(&accounts, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let key = fixture.home.join("master.key");
+    write_private(&key, &[42; 32]);
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    let error = SecretProtector::new_with_credentials(&fixture.home, &file_config(), None)
+        .err()
+        .expect("unsafe key must refuse");
+    let StoreError::StoragePermission(error) = error else {
+        panic!("expected typed key permission refusal");
+    };
+    let message = secure_key::startup_permission_diagnostic(&error).unwrap();
+    assert!(message.contains(key.to_str().unwrap()));
+    assert!(message.contains("0644"));
+    assert!(message.contains("install -m 0600"));
+    assert_eq!(
+        fs::metadata(&key).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&key, [42; 31]).unwrap();
+    assert!(matches!(
+        SecretProtector::new_with_credentials(&fixture.home, &file_config(), None),
+        Err(StoreError::Crypto)
+    ));
+}
+
+#[test]
+fn config_permission_survives_account_constructor_but_config_data_is_still_invalid() {
+    let fixture = Fixture::new();
+    let path = fixture.home.join("config.toml");
+    write_private(&path, b"synthetic-invalid-config");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    let error = account_secret_protector(&fixture.home)
+        .err()
+        .expect("must refuse");
+    let StoreError::StoragePermission(error) = error else {
+        panic!("expected typed config permission refusal");
+    };
+    let message = secure_key::startup_permission_diagnostic(&error).unwrap();
+    assert!(message.contains(path.to_str().unwrap()));
+    assert!(message.contains("0664"));
+    assert!(!message.contains("synthetic-invalid-config"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(matches!(
+        account_secret_protector(&fixture.home),
+        Err(StoreError::InvalidData)
+    ));
+}
+
+#[test]
 fn systemd_backend_refuses_writable_fake_0400_credential_without_local_fallback() {
     let fixture = Fixture::new();
     fixture.key(&[42; 32]);

@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: L1.6 (관리 Unix 소켓·설정 권한 오류 안내·box 안내 보완)
-목표: home server admin Unix socket·peer 자격 검증·자동 CLI 접근·권한 오류 및 box 안내 보완; 병합 후 home server 바이너리 교체 업그레이드로 Linux 실제 수용 판정
+현재 마일스톤: L1.6 관문 완료·dev 인계 (다음 R22)
+목표: 관리 Unix 소켓·권한 오류·Windows ACL 이행 구현 완료; home server 실제 바이너리 교체는 설계 세션, 다음은 R22 전체 테스트 fixture 복구
 핵심 지표: 결정적 수용 2/3 · Linux 실제 수용 0/1 (home server P5: 업그레이드 시험만 남음)
-사용자 대기: 없음; N7 점수 11/05 13:49 이후·N12 O14
-갱신: 2026-11-03 17:14 KST (8fac42e PC 설치·B 2/3. 19da58d 설치는 실제로 적용되지 않았음: R23 Windows 비공개 폴더 검사가 Codex 샌드박스 상속 권한 때문에 거부. 데이터 폴더 ACL을 보호된 소유자 전용으로 고친 뒤 설치)
+사용자 대기: home server P5 바이너리 교체 설치·수용은 설계 세션; N7 점수 11/05 13:49 이후·N12 O14
+갱신: 2026-11-03 19:31 KST (L1.6 관문 완료: home server systemd28·reload1835/0·PS5.1/7 각37·양OS strict·일반 build/실제 launcher 읽기 점검 통과. 전체 행렬 원본 실패 보존·동일기능 dev 기준 core812/CLI232/m0 3 실패 이름 일치. 설치 없음·B2/3·C0/1)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -36,8 +36,9 @@ The Codex main updates this block at each unit and gate close; the design sessio
 10. **Independent review**, where the brief asks for one: a different model family from the implementer.
 11. **Routing changes (D29):** replay at least 24 complete hours of real, body-free decision inputs through the candidate and the installed router. Follow the evidence rules below. Missing inputs or incomplete coverage do not pass. The explicitly requested R14 first delivery ships its runtime protection before this second-delivery replay gate; its report must retain that outstanding requirement.
 
-For Linux phases, also run the following in the approved Linux container and
-single `qb-linux-target` volume, sequentially with the Windows checks:
+For Linux phases, also run the following on `ssh home-server`, using a `git archive`
+source copy and the single target under `~/quota-baton-ci/`, sequentially with
+the Windows checks (AGENTS.md). Do not use PC Docker for these checks.
 
 Check the actual packaged units first (from the gate's committed source):
 
@@ -45,9 +46,9 @@ Check the actual packaged units first (from the gate's committed source):
 git archive HEAD packaging/linux | python3 packaging/linux/check_archive.py
 ```
 
-On Windows, stream the archive bytes into the checker in the approved Linux
-container with the source mounted read-only. Do not pass the archive through a
-text pipeline. The same checker accepts the delivery tarball on stdin. Missing,
+Stream the archive bytes to the checker on the home server with the source mounted
+read-only. Do not pass the archive through a text pipeline. The same checker
+accepts the delivery tarball on stdin. Missing,
 duplicate, nonregular units or any CR byte fail the gate.
 
 ```sh

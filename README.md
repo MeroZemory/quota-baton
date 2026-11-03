@@ -92,6 +92,17 @@ The installer:
 
 Running it again upgrades in place without dropping open sessions. `uninstall.ps1` in the same place removes everything the installer set up and keeps your accounts unless you pass `-RemoveData`.
 
+If startup reports an unsafe data-directory ACL, run the updated installer. It
+saves the old ACL, removes inherited sandbox grants from quota-baton's data
+directory, and grants access only to your user, SYSTEM and Administrators. The
+new binary checks the data home before any installed binaries are renamed.
+`quota-baton serve --check` performs the same read-only pre-flight; the core
+itself never repairs an existing ACL.
+
+The installer needs release binaries that support `serve --check`. If the
+downloaded release is older, it stops before replacing binaries or stopping the
+running core. Use a compatible release rather than skipping the check.
+
 Then log in to each account. This opens the browser for OAuth; on a machine without a browser, add `--no-browser`.
 
 ```powershell

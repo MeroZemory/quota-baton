@@ -5,7 +5,9 @@ mod fs_identity;
 mod lease;
 mod memory;
 mod private_fs;
-pub(crate) use private_fs::ensure_private_dir_all;
+pub(crate) use private_fs::{
+    check_private_data_home, ensure_private_dir_all, startup_permission_diagnostic,
+};
 mod process;
 mod secrets;
 pub(crate) use atomic::*;
@@ -34,3 +36,6 @@ pub(crate) use listener::bind_listener;
 
 mod box_sockets;
 pub(crate) use box_sockets::SocketSet as NativeSocketSet;
+
+mod admin_socket;
+pub(crate) use admin_socket::{admin_socket_path_if_allowed, start_admin_socket};

@@ -68,16 +68,9 @@ pub async fn run(
     home: &Path,
     config: &qb_core::config::Config,
 ) -> anyhow::Result<()> {
-    let secrets = qb_core::local_secrets::load_existing(home)?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let url = format!(
-        "http://127.0.0.1:{}/admin/v1/routing",
-        config.server.admin_port
-    );
+    let (client, base, admin_token, _) =
+        crate::admin_transport::connection(home, config, Duration::from_secs(10), true).await?;
+    let url = format!("{base}/routing");
     let inherited_wait = if let RoutingCommand::Session {
         id,
         mode: Some(_),
@@ -85,13 +78,9 @@ pub async fn run(
         ..
     } = &command
     {
-        let response = client
-            .get(&url)
-            .bearer_auth(&secrets.admin_token)
-            .send()
-            .await?;
+        let response = client.get(&url).bearer_auth(&admin_token).send().await?;
         if !response.status().is_success() {
-            return Err(response_error(response, &secrets.admin_token).await.into());
+            return Err(response_error(response, &admin_token).await.into());
         }
         let value = routing_value(&response.bytes().await?)?;
         Some(
@@ -141,7 +130,7 @@ pub async fn run(
             )
         }
     };
-    send_request(&client, &url, &secrets.admin_token, body).await
+    send_request(&client, &url, &admin_token, body).await
 }
 
 // Omitted urgency must stay absent so the policy writer preserves its latest value.
@@ -163,20 +152,13 @@ pub async fn urgent(
     home: &Path,
     config: &qb_core::config::Config,
 ) -> anyhow::Result<()> {
-    let secrets = qb_core::local_secrets::load_existing(home)?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let url = format!(
-        "http://127.0.0.1:{}/admin/v1/routing",
-        config.server.admin_port
-    );
+    let (client, base, admin_token, _) =
+        crate::admin_transport::connection(home, config, Duration::from_secs(10), true).await?;
+    let url = format!("{base}/routing");
     send_request(
         &client,
         &url,
-        &secrets.admin_token,
+        &admin_token,
         Some(serde_json::json!({
             "kind":"urgent", "id":id, "on_5h_limit":if enabled { "move" } else { "wait" }
         })),

@@ -188,7 +188,10 @@ fn runtime_managed() -> bool {
 
 fn server_invocation(args: &[OsString]) -> bool {
     args.get(1).is_some_and(|arg| arg == "serve")
-        && !args.iter().skip(2).any(|arg| arg == "--takeover")
+        && !args
+            .iter()
+            .skip(2)
+            .any(|arg| arg == "--takeover" || arg == "--check")
 }
 
 fn capture_process(args: Vec<OsString>) -> Result<Process> {

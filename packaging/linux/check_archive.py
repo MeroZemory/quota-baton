@@ -6,6 +6,7 @@ UNITS = {
     "packaging/linux/quota-baton.service",
     "packaging/linux/quota-baton-data.socket",
     "packaging/linux/quota-baton-admin.socket",
+    "packaging/linux/quota-baton-admin-unix.socket",
 }
 
 
@@ -22,7 +23,7 @@ def main():
             seen.add(member.name)
     if seen != UNITS:
         raise SystemExit("Linux unit archive: required unit missing")
-    print("Linux unit archive: 3 units, no CR bytes")
+    print(f"Linux unit archive: {len(UNITS)} units, no CR bytes")
 
 
 if __name__ == "__main__":

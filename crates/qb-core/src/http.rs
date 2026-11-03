@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -26,7 +26,7 @@ pub struct RunningServers {
     pub data_task: JoinHandle<std::io::Result<()>>,
     pub admin_task: JoinHandle<std::io::Result<()>>,
     shutdown: watch::Sender<bool>,
-    listener_closed: [watch::Receiver<bool>; 2],
+    listener_closed: Vec<watch::Receiver<bool>>,
 }
 impl RunningServers {
     pub fn shutdown(&self) {
@@ -178,7 +178,7 @@ pub(crate) async fn spawn_with_box_registry(
         safety,
     ));
     let started_at = chrono::Utc::now().to_rfc3339();
-    let admin_app = Router::new()
+    let admin_routes = Router::new()
         .route(
             "/admin/v1/health",
             get(move || async move {
@@ -195,17 +195,32 @@ pub(crate) async fn spawn_with_box_registry(
             }),
         )
         .merge(extra_admin)
-        .fallback(not_found)
-        .layer(middleware::from_fn_with_state(
-            Safety {
-                port: admin_addr.port(),
-                key: admin_token,
-                other_key: client_key,
-                admin: true,
-                registry: None,
-            },
-            safety,
-        ));
+        .fallback(not_found);
+    // Native ingress authorizes SO_PEERCRED before exposing this same router.
+    // Its request boundary retains Host/Origin validation, without bearer files.
+    let native_admin = crate::platform::start_admin_socket(
+        admin_routes.clone().layer(middleware::from_fn_with_state(
+            admin_addr.port(),
+            native_admin_safety,
+        )),
+        admin_addr.port(),
+        shutdown.subscribe(),
+    )
+    .await?;
+    let mut listener_closed = vec![data_closed_rx, admin_closed_rx];
+    if let Some(server) = &native_admin {
+        listener_closed.push(server.closed.clone());
+    }
+    let admin_app = admin_routes.layer(middleware::from_fn_with_state(
+        Safety {
+            port: admin_addr.port(),
+            key: admin_token,
+            other_key: client_key,
+            admin: true,
+            registry: None,
+        },
+        safety,
+    ));
     let data_task = tokio::spawn(async move {
         axum::serve(
             HandoverListener {
@@ -227,7 +242,7 @@ pub(crate) async fn spawn_with_box_registry(
         .await
     });
     let admin_task = tokio::spawn(async move {
-        axum::serve(
+        let tcp = axum::serve(
             HandoverListener {
                 listener: Some(admin),
                 closed: admin_closed,
@@ -244,7 +259,13 @@ pub(crate) async fn spawn_with_box_registry(
                 }
             }
         })
-        .await
+        .into_future();
+        if let Some(mut server) = native_admin {
+            let (tcp, native) = tokio::join!(tcp, server.join());
+            tcp.and(native)
+        } else {
+            tcp.await
+        }
     });
     Ok(RunningServers {
         data_addr,
@@ -252,8 +273,20 @@ pub(crate) async fn spawn_with_box_registry(
         data_task,
         admin_task,
         shutdown,
-        listener_closed: [data_closed_rx, admin_closed_rx],
+        listener_closed,
     })
+}
+
+async fn native_admin_safety(
+    State(port): State<u16>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if let Some(response) = check_host_origin(&request, port) {
+        return response;
+    }
+    box_ingress::clear_box_extensions(&mut request);
+    next.run(request).await
 }
 
 async fn safety(

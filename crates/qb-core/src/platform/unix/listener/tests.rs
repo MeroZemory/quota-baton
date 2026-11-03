@@ -70,7 +70,13 @@ fn managed_names_map_both_orders_and_nondefault_ports() {
             .roles(123)
             .unwrap()
             .unwrap();
-        assert_eq!(roles.map(|role| role.port(ports)), expected);
+        assert_eq!(
+            roles
+                .iter()
+                .map(|role| role.port(ports))
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }
 
@@ -208,10 +214,63 @@ fn exec_metadata_retains_original_descriptor_role_order() {
                 data: data.local_addr().unwrap().port(),
                 admin: admin.local_addr().unwrap().port(),
             },
-            originals: [data.into(), admin.into()],
-            roles,
+            originals: vec![data.into(), admin.into()],
+            roles: roles.to_vec(),
+            admin_unix: None,
             boxes: Mutex::new(box_bank::BoxBank::inherit(None).unwrap()),
         };
         assert_eq!(bank.names(), expected);
     }
+}
+
+#[test]
+fn three_named_descriptors_preserve_every_role_order() {
+    for names in [
+        "data:admin:admin-unix",
+        "data:admin-unix:admin",
+        "admin:data:admin-unix",
+        "admin:admin-unix:data",
+        "admin-unix:data:admin",
+        "admin-unix:admin:data",
+    ] {
+        let roles = environment(Some("1"), Some("123"), Some("3"), Some(names))
+            .roles(123)
+            .unwrap()
+            .unwrap();
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles.iter().filter(|r| **r == Role::AdminUnix).count(), 1);
+        let originals = (0..3).map(|_| listening().into()).collect();
+        let bank = Bank {
+            originals,
+            ports: ListenerPorts {
+                data: 20200,
+                admin: 20201,
+            },
+            roles,
+            admin_unix: None,
+            boxes: Mutex::new(box_bank::BoxBank::inherit(None).unwrap()),
+        };
+        assert_eq!(bank.names(), names);
+        assert!(bank.validate_for_exec().is_err()); // arbitrary fds are not inherited originals
+    }
+    for names in [
+        "data:admin:admin",
+        "data:admin-unix:admin-unix",
+        "data:admin",
+        "data:admin:other",
+    ] {
+        assert!(
+            environment(Some("1"), Some("123"), Some("3"), Some(names))
+                .roles(123)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn third_descriptor_cannot_also_be_owned_by_box_bank() {
+    let raw = std::ffi::OsStr::new("v1;a@1=5:1:2");
+    reject_box_overlap(Some(raw), 2).unwrap(); // old two-FD packaging
+    assert!(reject_box_overlap(Some(raw), 3).is_err());
+    reject_box_overlap(Some(std::ffi::OsStr::new("v1;a@1=6:1:2")), 3).unwrap();
 }
