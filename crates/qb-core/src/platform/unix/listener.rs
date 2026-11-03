@@ -31,7 +31,7 @@ static ACTIVATION: OnceLock<Activation> = OnceLock::new();
 
 enum Activation {
     Standalone,
-    Managed(Bank),
+    Managed(Box<Bank>),
 }
 struct Bank {
     // Preserve original systemd order, not data/admin order, for final re-exec.
@@ -185,7 +185,7 @@ pub(crate) fn initialize_activation(ports: ListenerPorts) -> io::Result<()> {
             }
             // Early prepare_inherited_box_fds restored CLOEXEC before runtime creation.
             let boxes = box_bank::BoxBank::inherit(box_manifest.as_deref())?;
-            Activation::Managed(Bank {
+            Activation::Managed(Box::new(Bank {
                 // Exclusively claimed once; do not construct std listeners from
                 // these originals or close/shutdown them anywhere else.
                 originals: descriptors
@@ -196,7 +196,7 @@ pub(crate) fn initialize_activation(ports: ListenerPorts) -> io::Result<()> {
                 roles,
                 admin_unix,
                 boxes: Mutex::new(boxes),
-            })
+            }))
         }
     };
     ACTIVATION
@@ -256,10 +256,9 @@ fn reject_box_overlap(raw: Option<&std::ffi::OsStr>, count: usize) -> io::Result
                 .split_once('=')
                 .and_then(|(_, fields)| fields.split(':').next())
                 .and_then(|fd| fd.parse::<RawFd>().ok())
+                && (3..3 + count as RawFd).contains(&fd)
             {
-                if (3..3 + count as RawFd).contains(&fd) {
-                    return Err(invalid("box descriptor overlaps activation bank"));
-                }
+                return Err(invalid("box descriptor overlaps activation bank"));
             }
         }
     }
