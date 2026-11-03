@@ -99,6 +99,10 @@ new binary checks the data home before any installed binaries are renamed.
 `quota-baton serve --check` performs the same read-only pre-flight; the core
 itself never repairs an existing ACL.
 
+The installer needs release binaries that support `serve --check`. If the
+downloaded release is older, it stops before replacing binaries or stopping the
+running core. Use a compatible release rather than skipping the check.
+
 Then log in to each account. This opens the browser for OAuth; on a machine without a browser, add `--no-browser`.
 
 ```powershell
