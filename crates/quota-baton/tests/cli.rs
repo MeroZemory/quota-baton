@@ -82,6 +82,7 @@ struct Core {
 static SERVE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 impl Core {
     fn spawn(command: &mut Command) -> io::Result<Self> {
+        status_platform::configure_test_registry(command)?;
         let child = Arc::new(Mutex::new(command.spawn()?));
         let timed_out = Arc::new(AtomicBool::new(false));
         let (stop, stopped) = mpsc::channel();
@@ -165,6 +166,13 @@ impl BoundedOutput for Command {
 }
 
 fn capture_output(command: &mut Command, redirected: bool) -> io::Result<Output> {
+    let before = status_platform::real_run_snapshot()?;
+    let result = capture_output_inner(command, redirected);
+    status_platform::verify_real_run_unchanged(&before)?;
+    result
+}
+
+fn capture_output_inner(command: &mut Command, redirected: bool) -> io::Result<Output> {
     if !redirected {
         command.stdout(Stdio::piped());
     }

@@ -120,7 +120,7 @@ fn decode(bytes: &[u8], value_type: u32) -> Result<String> {
     String::from_utf16(&words[..words.len() - 1]).map_err(|_| anyhow::anyhow!(MALFORMED))
 }
 
-fn register(registry: &mut impl Registry, command: &str, value_type: u32) -> Result<()> {
+fn register(registry: &mut (impl Registry + ?Sized), command: &str, value_type: u32) -> Result<()> {
     validate(command, value_type)?;
     let (current, current_type) = registry.read(VALUE_NAME)?;
     if current.as_deref() != Some(command) || current_type != value_type {
@@ -168,7 +168,7 @@ fn owned(command: &str) -> bool {
             .is_some_and(|name| name.eq_ignore_ascii_case("quota-baton-tray.exe"))
 }
 
-fn remove_from(registry: &mut impl Registry, apply: bool) -> Result<Vec<String>> {
+fn remove_from(registry: &mut (impl Registry + ?Sized), apply: bool) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     for name in [VALUE_NAME, LEGACY_VALUE_NAME] {
         if let (Some(command), _) = registry.read(name)? {
@@ -189,8 +189,34 @@ fn remove_from(registry: &mut impl Registry, apply: bool) -> Result<Vec<String>>
 }
 
 #[cfg(not(test))]
-fn with_registry<T>(f: impl FnOnce(&mut native::NativeRegistry) -> Result<T>) -> Result<T> {
+fn with_registry<T>(f: impl FnOnce(&mut dyn Registry) -> Result<T>) -> Result<T> {
+    // Selection (including release refusal) must precede native construction.
+    if let Some(marker) = test_registry_marker(
+        std::env::var_os("QB_TEST_AUTOSTART_REGISTRY"),
+        cfg!(debug_assertions),
+    )? {
+        #[cfg(debug_assertions)]
+        return f(&mut test_file::FileRegistry::open(&marker)?);
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = marker;
+            bail!(TEST_REGISTRY_RELEASE);
+        }
+    }
     f(&mut native::NativeRegistry)
+}
+
+const TEST_REGISTRY_RELEASE: &str = "test autostart registry disabled in release builds";
+
+// Explicit input keeps policy tests independent of process-global environment.
+fn test_registry_marker(
+    marker: Option<std::ffi::OsString>,
+    enabled: bool,
+) -> Result<Option<std::ffi::OsString>> {
+    if marker.is_some() && !enabled {
+        bail!(TEST_REGISTRY_RELEASE);
+    }
+    Ok(marker)
 }
 
 #[cfg(test)]
@@ -264,6 +290,10 @@ pub(crate) fn fake_writes() -> usize {
 #[cfg(not(test))]
 #[path = "autostart/native.rs"]
 mod native;
+
+#[cfg(any(test, debug_assertions))]
+#[path = "autostart/test_file.rs"]
+mod test_file;
 
 #[cfg(test)]
 #[path = "autostart/tests.rs"]

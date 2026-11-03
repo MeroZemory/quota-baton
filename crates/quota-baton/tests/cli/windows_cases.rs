@@ -417,6 +417,7 @@ fn r3_apply_output(home: &Path, output: &Output) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_wire_none_apply_with_real_claude_only_core_and_exact_unwire() {
     let _serial = SERVE_SERIAL.lock().await;
+    let real_run_before = status_platform::real_run_snapshot().unwrap();
     let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
     let home = r3_apply_fixture(&fake.url);
     let profile = home
@@ -444,6 +445,13 @@ async fn r3_wire_none_apply_with_real_claude_only_core_and_exact_unwire() {
         .unwrap();
     let text = r3_apply_output(home.path(), &output);
     assert!(output.status.success(), "{text}");
+    assert!(
+        home.path()
+            .join(status_platform::TEST_REGISTRY_FILE)
+            .is_file(),
+        "wire must use the fixture registry, not HKCU"
+    );
+    status_platform::verify_real_run_unchanged(&real_run_before).unwrap();
     assert!(core.try_wait().unwrap().is_none());
     assert!(home.path().join("journal/wiring.json").is_file());
     let settings_path = profile.join(".claude/settings.json");
@@ -480,6 +488,14 @@ async fn r3_wire_none_apply_with_real_claude_only_core_and_exact_unwire() {
         "unwire did not restore exact source bytes"
     );
     assert!(!home.path().join("journal/wiring.json").exists());
+    assert!(
+        !home
+            .path()
+            .join(status_platform::TEST_REGISTRY_FILE)
+            .exists(),
+        "unwire must remove the now-empty fixture registry"
+    );
+    status_platform::verify_real_run_unchanged(&real_run_before).unwrap();
     assert!(core.try_wait().unwrap().is_none());
     drop(core);
 }
