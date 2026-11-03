@@ -35,7 +35,7 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
         };
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tray2-bridge");
         fs::create_dir_all(&base).unwrap();
-        let root = tempfile::tempdir_in(base).unwrap();
+        let root = qb_testkit::fixture::tempdir_in(base).unwrap();
         let home = root.path().join("home");
         let cpa = root.path().join("synthetic-cpa");
         fs::create_dir(&cpa).unwrap();

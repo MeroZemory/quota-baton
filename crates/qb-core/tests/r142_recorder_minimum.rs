@@ -64,11 +64,11 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
         let capture = home.join("state/decision-tape-v9");
         let legacy = home.join("state/routing-replay");
         if mode == "on" {
-            fs::create_dir_all(&legacy).unwrap();
+            qb_core::ensure_private_dir_all(&legacy).unwrap();
             fs::write(legacy.join("operator-file"), b"preserve-legacy-root").unwrap();
         }
         if mode == "foreign-storage" {
-            fs::create_dir_all(&capture).unwrap();
+            qb_core::ensure_private_dir_all(&capture).unwrap();
             fs::write(capture.join("operator-file"), b"preserve-this-file").unwrap();
         }
         let fake = ScriptedUpstream::start().await.unwrap();

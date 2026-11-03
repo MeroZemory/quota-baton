@@ -22,7 +22,7 @@ fn tray_product_pe_uses_gui_subsystem() {
 fn console_free_startup_failure_reaches_file_log_without_fixture_contents() {
     let sandbox = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r83-tests");
     fs::create_dir_all(&sandbox).unwrap();
-    let fixture = tempfile::tempdir_in(sandbox).unwrap();
+    let fixture = qb_testkit::fixture::tempdir_in(sandbox).unwrap();
     let input = fixture.path().join("invalid.json");
     fs::write(&input, b"SYNTHETIC-SECRET-MUST-NOT-BE-LOGGED").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_quota-baton-tray"))
@@ -47,7 +47,7 @@ fn console_free_startup_failure_reaches_file_log_without_fixture_contents() {
 fn assert_argument_failure_is_logged(args: &[&str]) {
     let sandbox = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r83-tests");
     fs::create_dir_all(&sandbox).unwrap();
-    let home = tempfile::tempdir_in(sandbox).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(sandbox).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_quota-baton-tray"))
         .args(args)
         .env("QB_HOME", home.path())
@@ -90,7 +90,7 @@ fn console_free_parser_failure_never_exposes_secret_arguments() {
 fn console_free_help_exits_successfully_without_startup_failure() {
     let sandbox = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r83-tests");
     fs::create_dir_all(&sandbox).unwrap();
-    let home = tempfile::tempdir_in(sandbox).unwrap();
+    let home = qb_testkit::fixture::tempdir_in(sandbox).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_quota-baton-tray"))
         .arg("--help")
         .env("QB_HOME", home.path())

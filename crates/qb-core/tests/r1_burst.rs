@@ -161,10 +161,10 @@ impl Harness {
             .unwrap();
         let id = account.id;
         if restored {
-            fs::create_dir_all(home.join("state")).unwrap();
-            fs::write(
+            qb_core::ensure_private_dir_all(&home.join("state")).unwrap();
+            qb_testkit::fixture::write_private(
                 home.join("state/bindings.json"),
-                serde_json::to_vec(&json!({
+                &serde_json::to_vec(&json!({
                     "schema": 1, "bindings": [{
                         "key": format!("{}:synthetic-restored", provider.as_str()),
                         "account": id, "last_used": chrono::Utc::now()
