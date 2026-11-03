@@ -5,7 +5,9 @@ pub(crate) fn admin_socket_client(
     port: u16,
 ) -> anyhow::Result<(reqwest::Client, bool)> {
     // A custom TCP endpoint must not silently target the managed default core.
-    if port != qb_core::config::Config::default().server.admin_port {
+    if port != qb_core::config::Config::default().server.admin_port
+        && std::env::var_os("RUNTIME_DIRECTORY").is_none()
+    {
         return Ok((builder.build()?, false));
     }
     match qb_core::service::admin_socket_path_if_allowed() {
@@ -19,7 +21,9 @@ fn client_at(
     port: u16,
     path: &Path,
 ) -> anyhow::Result<(reqwest::Client, bool)> {
-    if port != qb_core::config::Config::default().server.admin_port {
+    if port != qb_core::config::Config::default().server.admin_port
+        && std::env::var_os("RUNTIME_DIRECTORY").is_none()
+    {
         return Ok((builder.build()?, false));
     }
     match std::fs::symlink_metadata(path) {
