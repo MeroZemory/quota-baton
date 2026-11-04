@@ -101,6 +101,38 @@ from `/var/lib/quota-baton`. The TCP admin endpoint still requires its bearer
 token. Keep `Host` as `127.0.0.1:10201` or `localhost:10201`, including for curl
 requests over the Unix socket.
 
+### Orchestrator API
+
+These `/admin/v1` routes are stable for orchestrators. A breaking change gets
+a new version. Responses never contain tokens; treat login codes and redirect
+URLs as secrets and do not log them.
+
+| Need | Route | Shape |
+| --- | --- | --- |
+| Start a browserless login | `POST /admin/v1/accounts/login` | Body `{"provider":"codex"\|"claude","no_browser":true}`; Codex fallback adds `"paste_redirect":true`. Reply `{login_id, auth_url, device?:{verification_url, user_code, expires_in}}`. |
+| Finish a paste login | `POST /admin/v1/accounts/login/<login_id>/submit` | Body `{"input":"<code or final redirect URL>"}`; one submission per login. |
+| Poll or cancel a login | `GET /admin/v1/accounts/login/<login_id>`, `POST .../cancel` | `{status: pending\|completed\|failed\|cancelled\|expired, account_id?, error?}`. |
+| Account state and usage | `GET /admin/v1/state` | `accounts[]` with `id`, `label`, `provider`, `plan`, `health`, `user_state`, `windows[]` (`name` such as `5h`, `7d` or `<n>m`, `used_pct`, `reset_at`, `status`, `observed_at`), `usage_forecast`, `pacing`. |
+| Changes | `GET /admin/v1/events` | Event stream for state changes, including an account that needs a new login. |
+| Box keys and launches | see [Give each box its own key](#give-each-box-its-own-key) | Launch body `{model, model_is_explicit?, account_pref?, resume_id?, move_for_model?}`; `model` is required without a prior binding. Reply `{base_url, catalog_url, account, model}`. |
+
+Logins do not target an account: the identity the user authorizes is created
+or updated, and `account_id` in the result names it. Check it against the
+account you asked the user to log in again. A paste login expires after ten
+minutes, and a device code at its own expiry. After that, start a new login;
+no new code is requested automatically.
+
+Upstream errors reach box clients as the contract (C6) defines them:
+- 5xx, 529 and overload errors are relayed as is.
+- A request-rate 429 is relayed after the account's rate hold (at most 60 s),
+  with `retry-after` added when upstream gave none.
+- A quota-exhausted account is replaced by another one, so the client does not
+  see that 429.
+- When every account is exhausted, the genuine limit response is replayed with
+  `retry-after` set to the time until the soonest reset.
+- With no usable account at all, the reply is a terminal 400
+  `invalid_request_error`: ask the user to log in instead of retrying.
+
 ## Upgrade
 
 Use a compatible release with the same endpoint configuration. Have one
