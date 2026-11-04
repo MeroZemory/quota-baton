@@ -450,6 +450,118 @@ async fn c6_3_ws_upgrade_hold_capped_below_15s() {
     assert_eq!(result.unwrap().0, StatusCode::TOO_MANY_REQUESTS);
 }
 
+// R24: 강제 전송 한 번에 봉투 안 예비 시간(min(3초, 절반))을 준다.
+async fn r24_upgrade(
+    h: &Harness,
+) -> (
+    std::time::Duration,
+    std::time::Duration,
+    StatusCode,
+    HeaderMap,
+) {
+    let started = std::time::Instant::now();
+    let request = h.request();
+    let first_dial = {
+        let fake = h.fake.state.clone();
+        tokio::spawn(async move {
+            while fake.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            started.elapsed()
+        })
+    };
+    let result = tokio::time::timeout(Duration::from_secs(14), connect_async(request))
+        .await
+        .expect("upgrade must answer inside Codex's 15 s connect timeout");
+    let elapsed = started.elapsed();
+    let Error::Http(response) = result.unwrap_err() else {
+        panic!("HTTP rejection expected")
+    };
+    let dial = tokio::time::timeout(Duration::from_secs(1), first_dial)
+        .await
+        .expect("the forced send must have dialled")
+        .unwrap();
+    (elapsed, dial, response.status(), response.headers().clone())
+}
+
+fn r24_rate_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("retry-after", "30".parse().unwrap());
+    headers
+}
+
+#[tokio::test]
+async fn r24_slow_forced_handshake_relays_upstream_429_within_envelope() {
+    let h = Harness::new(1).await;
+    // 페이싱이 봉투(10초)보다 훨씬 뒤에 끝난다.
+    h.state
+        .accounts
+        .observe_429(&h.ids[0], Some(Duration::from_secs(60)));
+    h.fake.state.push_handshake_delayed(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+        r24_rate_headers(),
+        Duration::from_millis(1500),
+    );
+    let (elapsed, dial, status, headers) = r24_upgrade(&h).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "never 504");
+    assert_eq!(headers["retry-after"], "30");
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    assert!(
+        dial < Duration::from_secs(3),
+        "known-late pacing sends at once: {dial:?}"
+    );
+    assert_eq!(h.fake.state.requests().len(), 1, "exactly one forced send");
+}
+
+#[tokio::test]
+async fn r24_pacing_ending_inside_reserve_window_sends_at_once() {
+    let h = Harness::new(1).await;
+    // 예비 시점(10-3=7초) 뒤, 마감(10초) 전에 끝나는 페이싱.
+    h.state
+        .accounts
+        .observe_429(&h.ids[0], Some(Duration::from_millis(8500)));
+    let backoff = h
+        .state
+        .accounts
+        .pacing_snapshot(&h.ids[0])
+        .rate_backoff_until
+        .unwrap();
+    assert!(backoff.saturating_duration_since(std::time::Instant::now()) > Duration::from_secs(7));
+    h.fake.state.push_handshake(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+        r24_rate_headers(),
+    );
+    let (elapsed, dial, status, _) = r24_upgrade(&h).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        dial < Duration::from_secs(3),
+        "not at deadline - 100 ms: {dial:?}"
+    );
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    assert_eq!(h.fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn r24_forced_handshake_beyond_envelope_still_ends_in_504() {
+    let h = Harness::new(1).await;
+    h.state
+        .accounts
+        .observe_429(&h.ids[0], Some(Duration::from_secs(60)));
+    h.fake.state.push_handshake_delayed(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+        r24_rate_headers(),
+        Duration::from_secs(12),
+    );
+    let (elapsed, _, status, _) = r24_upgrade(&h).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert!(elapsed >= Duration::from_secs(9), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+    assert_eq!(h.fake.state.requests().len(), 1, "no second forced send");
+}
+
 #[tokio::test]
 async fn c6_3_ws_precommit_rate_frame_resent_on_open_socket() {
     let h = Harness::new(1).await;
@@ -2951,7 +3063,8 @@ async fn r1_ws_upgrade_http_date_observed_and_forced_initial_send_is_final() {
         .await
         .unwrap();
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert!(started.elapsed() >= Duration::from_millis(900));
+    // R24: 페이싱(60초)이 예비 시점보다 늦게 끝나므로 바로 강제 전송한다.
+    assert!(started.elapsed() < Duration::from_millis(500));
     assert_eq!(
         h.fake.state.requests().len(),
         1,
@@ -2973,7 +3086,7 @@ async fn r1_ws_upgrade_http_date_observed_and_forced_initial_send_is_final() {
         .unwrap();
     assert_eq!(row["attempts"], 1);
     assert_eq!(row["rate_retries"], 0);
-    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() < 500);
     assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
 }
 
@@ -2981,9 +3094,10 @@ async fn r1_ws_upgrade_http_date_observed_and_forced_initial_send_is_final() {
 async fn r1_ws_upgrade_retries_share_the_original_pacing_deadline() {
     let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
     let id = &h.ids[0];
-    // Set a synthetic window whose remaining backoff is 600ms. The first
-    // upgrade consumes that budget before receiving a fresh Rate 429.
-    let old = std::time::Instant::now() - Duration::from_millis(1400);
+    // Set a synthetic window whose remaining backoff is about 300ms, inside the
+    // 1 s envelope's reserve point (500 ms, R24). The first upgrade consumes
+    // that budget before receiving a fresh Rate 429.
+    let old = std::time::Instant::now() - Duration::from_millis(1700);
     h.state.accounts.observe_429_at(id, old, old, None, 1.0);
     for _ in 0..2 {
         h.fake.state.push_handshake(
@@ -2997,7 +3111,7 @@ async fn r1_ws_upgrade_retries_share_the_original_pacing_deadline() {
         .await
         .unwrap();
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert!(started.elapsed() >= Duration::from_millis(250));
     assert_eq!(h.fake.state.requests().len(), 2);
     let row = h
         .ledger()
@@ -3006,9 +3120,9 @@ async fn r1_ws_upgrade_retries_share_the_original_pacing_deadline() {
         .unwrap();
     assert_eq!(row["attempts"], 2);
     assert_eq!(row["rate_retries"], 1);
-    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 250);
     assert!(
-        row["rate_wait_ms"].as_u64().unwrap() < 1400,
+        row["rate_wait_ms"].as_u64().unwrap() < 1000,
         "admission must not restart its hold on retry"
     );
 }

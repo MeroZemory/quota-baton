@@ -396,11 +396,10 @@ async fn upgrade_inner(
     let mut last_error = None;
     // One pacing deadline for the entire upgrade, including retries and
     // account selection. C7 reset-hold and token/network budgets stay separate.
-    // Leave a small envelope for the hold's final forced attempt before the
-    // independent overall connect deadline cancels the future.
-    let upgrade_deadline = deadline
-        .checked_sub(Duration::from_millis(100))
-        .unwrap_or(deadline);
+    // 강제 전송 한 번의 다이얼·핸드셰이크 예비 시간을 봉투 안에 남긴다(C6.3).
+    let reserve =
+        forced_send_reserve(deadline.saturating_duration_since(std::time::Instant::now()));
+    let upgrade_deadline = deadline.checked_sub(reserve).unwrap_or(deadline);
     let mut quota_source: Option<String> = None;
     let mut own_wait: Option<capacity::OwnWait> = None;
     let mut capacity_wait_deadline = None;
@@ -717,9 +716,20 @@ async fn upgrade_inner(
         loop {
             let admission_started = std::time::Instant::now();
             completion.record.timeout_phase = Some("rate_admission".into());
+            // 페이싱이 예비 시점보다 늦게 끝날 것이 이미 확실하면 기다리지 않고 바로 강제 전송한다.
+            let admission_deadline = if state
+                .accounts
+                .pacing_snapshot(&account.id)
+                .rate_backoff_until
+                .is_some_and(|until| until > upgrade_deadline)
+            {
+                admission_started
+            } else {
+                upgrade_deadline
+            };
             let admission = state
                 .accounts
-                .admit_until(&account.id, upgrade_deadline)
+                .admit_until(&account.id, admission_deadline)
                 .await;
             completion.rate_wait(
                 u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1401,6 +1411,42 @@ impl HandshakeError {
         *response.status_mut() = status;
         *response.headers_mut() = headers::filtered(&response_headers, false);
         response
+    }
+}
+
+/// 업그레이드의 단 한 번 강제 전송이 다이얼·핸드셰이크에 쓸 예비 시간:
+/// min(3초, 봉투의 절반) (계약 C6.3 "WebSocket upgrade").
+fn forced_send_reserve(envelope: Duration) -> Duration {
+    (envelope / 2).min(Duration::from_secs(3))
+}
+
+#[cfg(test)]
+mod forced_send_reserve_tests {
+    use super::*;
+
+    #[test]
+    fn reserve_is_three_seconds_or_half_a_small_envelope() {
+        assert_eq!(
+            forced_send_reserve(Duration::from_secs(10)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            forced_send_reserve(Duration::from_secs(14)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            forced_send_reserve(Duration::from_secs(6)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            forced_send_reserve(Duration::from_secs(4)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            forced_send_reserve(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(forced_send_reserve(Duration::ZERO), Duration::ZERO);
     }
 }
 

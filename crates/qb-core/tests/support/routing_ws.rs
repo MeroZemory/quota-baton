@@ -15,9 +15,10 @@ async fn upgrade_rate_hold_expiry_sends_once_before_the_overall_deadline() {
             .unwrap();
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
     assert_eq!(response.headers()["x-quota-baton-account"], id.as_str());
+    // R24: 페이싱(30초)이 예비 시점보다 늦게 끝나므로 기다리지 않고 바로 한 번 보낸다.
     assert!(
-        began.elapsed() >= Duration::from_millis(800),
-        "admission cannot skip the one-second hold's final-send boundary"
+        began.elapsed() < Duration::from_millis(500),
+        "known-late pacing sends the one forced upgrade at once"
     );
     assert_eq!(h.fake.state.requests().len(), 1);
     assert_credential(&h, 0, id);
@@ -35,7 +36,7 @@ async fn upgrade_rate_hold_expiry_sends_once_before_the_overall_deadline() {
     assert_eq!(row["attempts"], 1);
     assert_eq!(row["rate_retries"], 0);
     assert_eq!(row["relayed_rate_429s"], 0);
-    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() < 500);
     assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
     let _ = client.close(None).await;
 }
@@ -85,7 +86,8 @@ async fn slow_forced_upgrade_still_expires_at_the_original_overall_deadline() {
     assert_eq!(row["attempts"], 1);
     assert_eq!(row["rate_retries"], 0);
     assert_eq!(row["relayed_rate_429s"], 0);
-    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    // R24: 강제 전송은 바로 시작하고, 봉투 전체가 그 다이얼 예산이다.
+    assert!(row["rate_wait_ms"].as_u64().unwrap() < 500);
     assert!(row["dur_ms"].as_u64().unwrap() < 1800);
     assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
 }
