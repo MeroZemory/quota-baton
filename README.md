@@ -74,7 +74,7 @@ Both charts are drawn from quota-baton's own usage history on the author's machi
 
 - Windows 11. Tested on build 26200; Windows 10 is untested.
 - Linux (headless core only): Ubuntu 24.04 or newer with systemd 255, x86_64. It runs as a systemd service and serves Incus containers through per-box keys. See [docs/linux.md](docs/linux.md).
-- Claude Code and/or Codex CLI. Moving existing Codex conversations requires Codex CLI 0.163.0.
+- Claude Code and/or Codex CLI. Moving existing Codex conversations automatically checks native compatibility; compatible Codex updates do not require a qb version-list update.
 - Prebuilt x64 binaries are on the [Releases](https://github.com/MeroZemory/quota-baton/releases) page. Building from source needs Rust 1.93 with the MSVC toolchain.
 
 ## Setup

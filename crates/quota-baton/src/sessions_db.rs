@@ -33,6 +33,45 @@ const STATE: &str = "state_5.sqlite";
 const GOALS: &str = "goals_1.sqlite";
 const DB_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Debug)]
+pub(crate) struct IncompatibleLayout;
+impl std::fmt::Display for IncompatibleLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("이 대화 홈의 데이터베이스 형식은 qb의 대화 이전 기능과 호환되지 않습니다. qb 업데이트가 필요합니다")
+    }
+}
+impl std::error::Error for IncompatibleLayout {}
+
+/// Do not mistake a newer database generation for an empty/rollout-only home.
+/// Old generations alongside the current database may be migration leftovers.
+pub(crate) fn check_layout(home: &Path) -> Result<()> {
+    if !home.try_exists()? {
+        return Ok(());
+    }
+    crate::sessions_guard::safe_path(home, home)?;
+    for entry in std::fs::read_dir(home)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        for (prefix, expected, current) in [("state_", 5u32, STATE), ("goals_", 1u32, GOALS)] {
+            if let Some(version) = name
+                .strip_prefix(prefix)
+                .and_then(|v| v.strip_suffix(".sqlite"))
+            {
+                if version.is_empty() || !version.bytes().all(|v| v.is_ascii_digit()) {
+                    return Err(IncompatibleLayout.into());
+                }
+                let version = version.parse::<u32>().map_err(|_| IncompatibleLayout)?;
+                if version > expected
+                    || (version != expected && !home.join(current).try_exists()?)
+                {
+                    return Err(IncompatibleLayout.into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // Exact official bodies from Codex state migrations 0025 and 0039 above.
 // SQLite omits the final semicolon in sqlite_schema; whitespace is normalized.
 const OFFICIAL_TRIGGERS: [(&str, &str); 5] = [
@@ -950,6 +989,8 @@ fn plan_with_mode(
     ids: &[String],
     preserve_current_state: bool,
 ) -> Result<DbPlan> {
+    check_layout(source_home)?;
+    check_layout(target_home)?;
     let destination_provider = destination_provider(target_home)?;
     ensure!(
         source_home.is_absolute() && target_home.is_absolute(),
@@ -1139,6 +1180,7 @@ fn plan_with_mode(
 /// through destination verification and source removal, and restores names
 /// before restoring source rows on unimport.
 pub(crate) fn source_snapshot(home: &Path, root_ids: &[String]) -> Result<DbPlan> {
+    check_layout(home)?;
     ensure!(home.is_absolute(), "metadata home must be absolute");
     let state = readonly(&home.join(STATE))?;
     let goals = readonly(&home.join(GOALS))?;
@@ -1722,6 +1764,23 @@ pub(crate) fn rollback_after_resume(plan: &DbPlan, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incompatible_database_generation_is_not_treated_as_missing_metadata() -> Result<()> {
+        let (_root, source, target) = homes()?;
+        std::fs::write(source.join("state_6.sqlite"), b"future format")?;
+        let error = plan(&source, &target, &[]).err().unwrap();
+        assert!(error.downcast_ref::<IncompatibleLayout>().is_some());
+        assert!(!target.exists());
+        std::fs::remove_file(source.join("state_6.sqlite"))?;
+        std::fs::write(source.join("state_4.sqlite"), [])?;
+        assert!(check_layout(&source).is_err());
+        std::fs::write(source.join(STATE), [])?;
+        check_layout(&source)?;
+        std::fs::write(source.join("goals_2.sqlite"), [])?;
+        assert!(check_layout(&source).is_err());
+        Ok(())
+    }
 
     #[test]
     fn r12_destination_provider_is_bounded_and_unknown_ids_are_safely_named() -> Result<()> {

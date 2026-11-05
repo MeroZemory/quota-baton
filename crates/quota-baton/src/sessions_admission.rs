@@ -18,7 +18,7 @@ const WIRING: &str = "전용 Codex 홈 연결을 확인하지 못했습니다. �
 const WRONG_HOME: &str = "관리 Codex 실행의 CODEX_HOME이 연결된 전용 홈과 다릅니다";
 const COMMAND: &str = "관리 Codex 실행 파일을 확인하지 못했습니다";
 const VERSION: &str =
-    "이 대화 기능은 Codex CLI 0.163.0만 지원합니다. 설치된 Codex 버전을 확인하세요";
+    "Codex 실행 파일의 버전을 확인하지 못했습니다. 설치 상태를 확인한 뒤 다시 시도하세요";
 
 #[derive(Debug)]
 struct Refusal(&'static str);
@@ -118,23 +118,24 @@ fn wiring(home: &Path) -> Result<Wiring> {
     Ok(wiring)
 }
 
-/// Compatibility only, not executable authentication. Never accept a supplied
-/// version string, testkit environment variable, or cached probe result.
+/// Compatibility only, not executable authentication. The historical release
+/// suite covers 0.163.0; other versions qualify through an isolated native
+/// capability probe, never by their version number or a supplied environment.
 pub(crate) fn verify_version(command: &Path) -> Result<()> {
+    verify_version_with_home(command, qb_core::home)
+}
+
+fn verify_version_with_home(command: &Path, home: impl FnOnce() -> Result<PathBuf>) -> Result<()> {
     if !command.is_absolute() || !command.is_file() {
         #[cfg(all(feature = "testkit", debug_assertions))]
         eprintln!("qb-version-probe stage=precondition");
         return Err(refusal(VERSION));
     }
     let output = crate::launcher_label::version_output(command).map_err(|_| refusal(VERSION))?;
+    let version =
+        crate::launcher_label::parse_version_output(&output).ok_or_else(|| refusal(VERSION))?;
     if !pinned_version(&output) {
-        #[cfg(all(feature = "testkit", debug_assertions))]
-        eprintln!(
-            "qb-version-probe stage=shape bytes={} trimmed_matches={}",
-            output.len(),
-            output.trim_ascii() == b"codex-cli 0.163.0"
-        );
-        return Err(refusal(VERSION));
+        crate::sessions_canary::check(command, &home()?, &version)?;
     }
     Ok(())
 }
@@ -528,7 +529,7 @@ mod tests {
         assert_eq!(friendly_error(&error).as_deref(), Some(WIRING));
         // Positive control: the explicit move API still probes and refuses.
         let error = verify_version(&command).unwrap_err();
-        assert_eq!(friendly_error(&error).as_deref(), Some(VERSION));
+        assert!(crate::sessions_canary::friendly_error(&error).is_some());
         assert!(home.join("version-probed").exists());
     }
 
@@ -602,7 +603,7 @@ mod tests {
         )
         .unwrap();
         for command in [&command, &verbatim] {
-            assert!(verify_version(command).is_err());
+            assert!(verify_version_with_home(command, || Ok(root.path().to_owned())).is_err());
         }
         fs::write(
             &command,

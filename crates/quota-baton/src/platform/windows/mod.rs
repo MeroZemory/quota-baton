@@ -26,6 +26,8 @@ pub(crate) mod resume_selection;
 pub(crate) mod sessions;
 #[path = "../../sessions_admission.rs"]
 pub(crate) mod sessions_admission;
+#[path = "../../sessions_canary.rs"]
+pub(crate) mod sessions_canary;
 #[path = "../../sessions_confirm.rs"]
 pub(crate) mod sessions_confirm;
 #[path = "../../sessions_db.rs"]
@@ -373,6 +375,12 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
     }
     if let Some(message) = sessions_admission::friendly_error(error) {
         return Some(message);
+    }
+    if let Some(message) = sessions_canary::friendly_error(error) {
+        return Some(message);
+    }
+    if let Some(layout) = error.downcast_ref::<sessions_db::IncompatibleLayout>() {
+        return Some(layout.to_string());
     }
     if let Some(message) = sessions::friendly_error(error) {
         return Some(message);

@@ -20,7 +20,7 @@ const SCHEME: &str = "d23-image-discovery-1";
 const LIMIT: usize = 2 * 1024 * 1024;
 const REFUSAL: &str = "현재 Codex의 이미지 도구(image_gen__imagegen)를 확인하지 못했습니다. 이미지 작업은 codex-mz를 사용하세요.";
 const FAKE_KEY: &str = "qb-image-canary-not-a-credential";
-const PATH_ENV: &[&str] = &[
+pub(crate) const PATH_ENV: &[&str] = &[
     "CODEX_HOME",
     "USERPROFILE",
     "HOME",
@@ -517,7 +517,7 @@ impl Drop for Scratch {
     }
 }
 
-fn remove_owned(root: &Path, path: &Path, depth: usize) -> Result<()> {
+pub(crate) fn remove_owned(root: &Path, path: &Path, depth: usize) -> Result<()> {
     ensure!(depth < 64, "scratch depth");
     crate::sessions_guard::safe_path(root, path)?;
     let metadata = fs::symlink_metadata(path)?;
@@ -536,7 +536,7 @@ fn remove_owned(root: &Path, path: &Path, depth: usize) -> Result<()> {
     Ok(())
 }
 
-fn settings(port: u16) -> Vec<String> {
+pub(crate) fn settings(port: u16) -> Vec<String> {
     let base = format!("http://127.0.0.1:{port}");
     vec![
         "model=\"gpt-6.1-sol\"".into(),
@@ -580,7 +580,7 @@ fn settings(port: u16) -> Vec<String> {
     ]
 }
 
-fn environment(path: &Path, port: u16) -> Vec<(&'static str, OsString)> {
+pub(crate) fn environment(path: &Path, port: u16) -> Vec<(&'static str, OsString)> {
     let proxy = OsString::from(format!("http://127.0.0.1:{port}"));
     let mut env = vec![];
     for &key in PATH_ENV {
@@ -703,14 +703,14 @@ fn server_failure(error: anyhow::Error) -> ProbeStage {
     }
 }
 
-struct Server {
-    port: u16,
+pub(crate) struct Server {
+    pub(crate) port: u16,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<Result<bool>>>,
 }
 
 impl Server {
-    fn start() -> Result<Self> {
+    pub(crate) fn start() -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
@@ -750,7 +750,7 @@ impl Server {
         })
     }
 
-    fn finish(mut self) -> Result<bool> {
+    pub(crate) fn finish(mut self) -> Result<bool> {
         self.stop.store(true, Ordering::Release);
         self.worker
             .take()

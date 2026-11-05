@@ -385,6 +385,103 @@ pub(crate) fn version_output(program: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// A compatibility receipt follows executable contents, not just `--version`
+/// or the npm shim (which often remains unchanged during an update). Unknown
+/// launcher layouts get no persistent receipt; they can still run the probe.
+pub(crate) fn compatibility_fingerprint(program: &Path) -> Option<String> {
+    let mut inputs = vec![program.to_owned()];
+    if program
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return fingerprint_files(&inputs);
+    }
+    let (node, script) = resolve_codex_node(program)?;
+    // Resolve the platform package with Node's own module lookup, including
+    // nested and hoisted npm dependencies. Do not execute the CLI entrypoint.
+    const RESOLVE: &str = r#"
+const fs = require('node:fs'), path = require('node:path');
+const script = process.argv[1];
+const root = path.dirname(path.dirname(script));
+const text = fs.readFileSync(script, 'utf8');
+if (!text.includes('function findCodexExecutable()') ||
+    !text.includes('const binaryPath = findCodexExecutable();')) process.exit(1);
+const target = process.arch === 'x64' ? 'x86_64-pc-windows-msvc' :
+    process.arch === 'arm64' ? 'aarch64-pc-windows-msvc' : null;
+if (!target || process.platform !== 'win32') process.exit(1);
+let vendor;
+try {
+    const req = require('node:module').createRequire(script);
+    vendor = path.join(path.dirname(req.resolve('@openai/codex-win32-' + process.arch + '/package.json')), 'vendor');
+} catch { vendor = path.join(root, 'vendor'); }
+process.stdout.write(JSON.stringify(path.join(vendor, target, 'bin', 'codex.exe')));
+"#;
+    #[cfg(windows)]
+    let bytes = {
+        let mut command = std::process::Command::new(&node);
+        command.args(["-e", RESOLVE]).arg(&script);
+        // Loader injection must not alter the resolver's observations.
+        command.env_remove("NODE_OPTIONS").env_remove("NODE_PATH");
+        contained::capture(&command).ok()?
+    };
+    #[cfg(not(windows))]
+    let bytes: Vec<u8> = {
+        let _ = RESOLVE;
+        return None;
+    };
+    let native: std::path::PathBuf = serde_json::from_slice(&bytes).ok()?;
+    if !native.is_absolute() || !native.is_file() {
+        return None;
+    }
+    // NODE_OPTIONS/NODE_PATH can redirect the actual launcher. Such launches
+    // are probed every time instead of caching a possibly different program.
+    if ["NODE_OPTIONS", "NODE_PATH"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    {
+        return None;
+    }
+    inputs.extend([node, script, native]);
+    fingerprint_files(&inputs)
+}
+
+fn fingerprint_files(inputs: &[std::path::PathBuf]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut digest = Sha256::new();
+    digest.update(b"qb-session-native-files-v1");
+    for input in inputs {
+        let path = std::fs::canonicalize(input).ok()?;
+        let name = path.as_os_str().as_encoded_bytes();
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name);
+        let mut file = std::fs::File::open(&path).ok()?;
+        let before = file.metadata().ok()?;
+        if !before.is_file() {
+            return None;
+        }
+        digest.update(before.len().to_le_bytes());
+        let mut buffer = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+            total += count as u64;
+        }
+        let after = file.metadata().ok()?;
+        if total != before.len()
+            || after.len() != before.len()
+            || after.modified().ok()? != before.modified().ok()?
+        {
+            return None;
+        }
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
 /// Isolated D23 capability probe. The job owns the complete process tree and
 /// output goes to NUL; callers retain only the loopback tool-presence boolean.
 #[derive(Debug)]
@@ -2040,6 +2137,24 @@ fn is_cmd_title(current: &str, cmd_titles: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compatibility_fingerprint_changes_when_native_changes_under_same_shim() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let shim = dir.path().join("codex.cmd");
+        let native = dir.path().join("codex.exe");
+        std::fs::write(&shim, "unchanged shim").unwrap();
+        std::fs::write(&native, "native v1").unwrap();
+        let files = [shim, native.clone()];
+        let first = fingerprint_files(&files).unwrap();
+        std::fs::write(&native, "native v2").unwrap();
+        assert_ne!(fingerprint_files(&files).unwrap(), first);
+        assert!(compatibility_fingerprint(&native).is_some());
+        std::fs::remove_file(native).unwrap();
+        assert!(fingerprint_files(&files).is_none());
+    }
+
     #[test]
     fn r11_title_uses_only_a_configured_two_letter_short() {
         assert_eq!(

@@ -568,8 +568,16 @@ User: "이동은 강제로 시키는 게 아니라 터미널로 사람이 실수
 - **G7** is reworded to: a resume of a moved id in the old home leaves the moved rollout and rows unchanged. Auxiliary files created by native startup are allowed, and a plain raw startup need not fail.
 - **Managed enforcement must cover every resume path:** explicit resume, `--last`, the session picker, automatic resume and the per-home daemon. If ancestor-only ids cannot be blocked on one of these paths, refuse the affected moves.
 - **Raw-native claims are evidence-bound.** For moved threads, qb claims protection against raw native runs only for scenarios that pass the protection tests on the pinned Codex version (Opus R1–R3b and R10–R12 in `answer-opus-r2.md`). Counterexamples 1 and 2 must pass as **protection** tests. The raw resume of a Q-side ancestor, and the stale-path case if R3b fails, are documented boundaries reproduced as **boundary** tests.
-- **Version gate.** Moves are disabled on a native Codex version that has not passed the suite.
+- **Version gate (superseded by the automatic compatibility amendment below).** Moves were disabled on a native Codex version that had not passed the suite.
 - **`qb doctor`.** It detects rows in the wrong home, staging files with no journal, unreferenced Q ancestors and descendants that were missed. It recognises intentional ancestor aliases, so completed moves are not flagged.
+
+### D21 amendment: automatic session compatibility (user direction, 2026-11-05)
+
+Compatible Codex updates must not require a manually maintained version allowlist. Keep the historical 0.163.0 suite evidence, and qualify other installed versions with a bounded, offline native probe before offering an import, share, bulk move or return. The probe uses synthetic private homes and a loopback Responses server with a fake credential. It exercises native session creation, the real metadata adapter, private staging, target resume with physical identity and history-prefix preservation, and stale source resume/last/fork without changing the moved conversation. Actual operations retain all schema, dependency, journal and exclusive-file checks. Unknown database generations must not be treated as absent metadata.
+
+Reuse only successful probes, bound to probe revision, platform, reported version and executable contents (including the actual native npm binary, not just its shim). Unknown executable layouts are probed without persistent caching. Publish a pass only after cleanup; never cache a negative or incomplete probe. A failed inspection is reported as unconfirmed compatibility, not proof that the Codex release is incompatible.
+
+This is observed compatibility for the managed move path. It does not extend the historical raw-native picker, daemon, ancestor or stale-path guarantees beyond their recorded acceptance evidence. No finite runtime probe guarantees every future native behavior; per-operation checks remain mandatory.
 
 ## D22. The account is chosen at codex-qb launch, and the model catalog is that account's (resolves O13) — Accepted (user direction plus panel, 2026-10-21)
 
