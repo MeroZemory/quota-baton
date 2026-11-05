@@ -63,16 +63,19 @@ fn ask_with_io(
         bail!(NO_TERMINAL);
     }
 
-    let prompt = if default == Mode::Resolve {
-        "이 대화의 소유 위치를 복구하려면 'resolve'를 정확히 입력하세요: "
+    let english = crate::sessions_progress::english();
+    let prompt = if default == Mode::Resolve && english {
+        "Waiting for input. Enter resolve to recover this conversation's owner. (Enter alone cancels)\nChoice > "
+    } else if default == Mode::Resolve {
+        "입력을 기다립니다. 소유 위치를 복구하려면 resolve를 정확히 입력한 뒤 Enter를 누르세요. (Enter만 누르면 취소)\n선택 > "
     } else if allow_share && crate::sessions_progress::english() {
-        "Enter move or share (cancel: Enter) > "
+        "Waiting for input. Enter move or share, then press Enter. (Enter alone cancels)\nChoice > "
     } else if allow_share {
-        "move 또는 share를 입력하세요 (취소: Enter) > "
+        "입력을 기다립니다. move 또는 share를 입력한 뒤 Enter를 누르세요. (Enter만 누르면 취소)\n선택 > "
     } else if crate::sessions_progress::english() {
-        "Move out of the source home. Enter move to continue (cancel: Enter) > "
+        "Waiting for input. This moves the conversation out of the source home. Enter move, then press Enter. (Enter alone cancels)\nChoice > "
     } else {
-        "원본 홈에서 빼고 옮깁니다. 계속하려면 move를 입력하세요 (취소: Enter) > "
+        "입력을 기다립니다. 원본 홈에서 빼고 옮기려면 move를 입력한 뒤 Enter를 누르세요. (Enter만 누르면 취소)\n선택 > "
     };
     for attempt in 0..2 {
         output
@@ -104,6 +107,9 @@ fn ask_with_io(
 
 /// Returns true for finish. Rollback is never permitted after publication.
 pub(crate) fn recovery(yes: bool, can_rollback: bool) -> Result<bool> {
+    if !yes {
+        crate::sessions_progress::phase(crate::sessions_progress::Phase::Confirmation, None)?;
+    }
     recovery_with_io(
         yes,
         can_rollback,
@@ -151,7 +157,9 @@ fn recovery_with_io(
         )
         .map_err(|_| anyhow!(OUTPUT_FAILED))?;
     }
-    output.flush().map_err(|_| anyhow!(OUTPUT_FAILED))?;
+    write!(output, "{}", if english { "Choice > " } else { "선택 > " })
+        .and_then(|()| output.flush())
+        .map_err(|_| anyhow!(OUTPUT_FAILED))?;
     let mut line = String::new();
     if read(&mut line).is_err() {
         crate::sessions_progress::check()?;
@@ -211,9 +219,9 @@ mod tests {
         for input in ["resolve", "resolve\n", "resolve\r\n"] {
             let (result, output) = with_resolve_text(input);
             assert_eq!(result.unwrap(), Mode::Resolve);
-            assert_eq!(output.matches("입력하세요").count(), 1);
-            assert!(output.contains("'resolve'"));
-            assert!(!output.contains("'move'") && !output.contains("'share'"));
+            assert_eq!(output.matches("선택 > ").count(), 1);
+            assert!(output.contains("resolve"));
+            assert!(!output.contains("move") && !output.contains("share"));
         }
     }
 
@@ -230,6 +238,48 @@ mod tests {
             &mut output,
         );
         (result, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn r251_static_prompt_names_only_allowed_choices_in_both_languages() {
+        for english in [false, true] {
+            let _scope = crate::sessions_progress::test_cancellation(english);
+            for (mode, share, word) in [
+                (Mode::Move, false, "move"),
+                (Mode::Share, true, "share"),
+                (Mode::Resolve, false, "resolve"),
+            ] {
+                let mut output = Vec::new();
+                let answer = ask_with_io(
+                    false,
+                    mode,
+                    share,
+                    "",
+                    (true, true),
+                    |line| {
+                        line.push_str(word);
+                        Ok(word.len())
+                    },
+                    &mut output,
+                )
+                .unwrap();
+                assert_eq!(answer, mode);
+                let output = String::from_utf8(output).unwrap();
+                assert!(output.ends_with(if english {
+                    "\nChoice > "
+                } else {
+                    "\n선택 > "
+                }));
+                assert!(output.contains(if english {
+                    "Waiting for input."
+                } else {
+                    "입력을 기다립니다."
+                }));
+                assert_eq!(output.contains("share"), share);
+                assert_eq!(output.contains("resolve"), mode == Mode::Resolve);
+                assert!(!output.contains('\r') && !output.contains('\u{1b}'));
+            }
+        }
     }
 
     #[test]
@@ -250,7 +300,7 @@ mod tests {
         ] {
             let (result, output) = with_resolve_text(input);
             assert_eq!(result.unwrap_err().to_string(), CANCELLED, "{input:?}");
-            assert_eq!(output.matches("입력하세요").count(), 1);
+            assert_eq!(output.matches("선택 > ").count(), 1);
         }
     }
 
@@ -271,7 +321,7 @@ mod tests {
             assert_eq!(result.unwrap_err().to_string(), NO_TERMINAL);
             let output = String::from_utf8(output).unwrap();
             assert!(output.contains(manual));
-            assert!(!output.contains("입력하세요"));
+            assert!(!output.contains("선택 > "));
         }
     }
 
@@ -280,7 +330,7 @@ mod tests {
         for input in ["move", "move\n", "move\r\n"] {
             let (result, output) = with_text(input, false);
             assert_eq!(result.unwrap(), Mode::Move);
-            assert_eq!(output.matches("입력하세요").count(), 1);
+            assert_eq!(output.matches("선택 > ").count(), 1);
             assert!(!output.contains("share"));
         }
     }
@@ -290,7 +340,7 @@ mod tests {
         for input in ["share", "share\n", "share\r\n"] {
             let (result, output) = with_text(input, true);
             assert_eq!(result.unwrap(), Mode::Share);
-            assert_eq!(output.matches("입력하세요").count(), 1);
+            assert_eq!(output.matches("선택 > ").count(), 1);
             assert!(output.contains("move") && output.contains("share"));
             assert_eq!(
                 with_text(input, false).0.unwrap_err().to_string(),
@@ -322,7 +372,7 @@ mod tests {
             } else {
                 2
             };
-            assert_eq!(output.matches("입력하세요").count(), prompts);
+            assert_eq!(output.matches("선택 > ").count(), prompts);
         }
     }
 
@@ -350,7 +400,7 @@ mod tests {
             assert_eq!(result.unwrap_err().to_string(), NO_TERMINAL);
             let output = String::from_utf8(output).unwrap();
             assert!(output.contains(manual));
-            assert!(!output.contains("입력하세요"));
+            assert!(!output.contains("선택 > "));
         }
     }
 
@@ -536,7 +586,7 @@ mod tests {
     fn unknown_input_then_exact_move_is_accepted_on_second_prompt() {
         let (result, out) = with_text("typo\nmove\n", true);
         assert_eq!(result.unwrap(), Mode::Move);
-        assert_eq!(out.matches("입력하세요").count(), 2);
+        assert_eq!(out.matches("선택 > ").count(), 2);
         assert!(!out.contains('\r') && !out.contains('\u{1b}'));
     }
 }

@@ -641,6 +641,12 @@ const ALLOWED: &[Allowed] = &[
         expression: "libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o750)",
         reason: "Runtime IPC socket directory under /run intentionally shares traversal with the socket group (0750); this descriptor-anchored native socket primitive does not create private data directories.",
     },
+    Allowed {
+        file: "quota-baton/src/sessions_canary.rs",
+        context: "probe",
+        expression: "fs :: create_dir_all (published . parent () . ok_or_else (| | anyhow :: anyhow ! (\"missing parent\")) ? ,)",
+        reason: "The native compatibility canary publishes only under its newly owned private Scratch target, removed before any pass receipt. Native-created synthetic sessions directories may carry sandbox ACLs; this exact temporary probe site never creates qb data or touches user homes. Actual moves use anchored private-leaf creation.",
+    },
 ];
 
 fn unreviewed(sites: &[Site], allowed: &[Allowed]) -> Vec<String> {

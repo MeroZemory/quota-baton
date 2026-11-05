@@ -343,7 +343,10 @@ mod platform {
                     if !create || !current.starts_with(&root) {
                         bail!("대상 폴더가 없습니다");
                     }
-                    match qb_core::ensure_private_dir_all(&current) {
+                    // The pinned parent may be native Codex-owned (sandbox
+                    // ACLs). Create only this missing leaf privately; never
+                    // validate or rewrite the native parent's ACL as qb data.
+                    match qb_core::create_private_directory_new(&current) {
                         Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(inspection_error(error)),
@@ -978,7 +981,15 @@ mod platform {
             let parent = path
                 .parent()
                 .ok_or_else(|| anyhow!("Codex 잠금 폴더가 없습니다"))?;
-            qb_core::ensure_private_dir_all(parent)?;
+            // Existing native lock directories have Codex sandbox ACLs, not
+            // qb private-data ACLs. pin_path still validates every component.
+            if !parent.try_exists()? {
+                match qb_core::create_private_directory_new(parent) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(inspection_error(error)),
+                }
+            }
             let (checked, _) = pin_path(home, path)?;
             pins.extend(checked);
         }
@@ -2444,6 +2455,23 @@ mod tests {
         assert!(OpenOptions::new().append(true).open(&source).is_err());
         assert_eq!(fs::read(&source).unwrap(), b"synthetic\n");
         drop(guards);
+    }
+
+    #[test]
+    fn r251_native_lock_acl_is_preserved_with_exclusive_and_contended_locks() {
+        let temp = fixture();
+        let home = home(temp.path(), "native");
+        let locks = home.join("thread-writer-locks");
+        crate::fixture_support::private_directory(&locks).unwrap();
+        let before = crate::fixture_support::native_sandbox_acl(&locks);
+        let homes = std::slice::from_ref(&home);
+        let ids = [ID.to_owned()];
+        let held = reserve_commit(homes, &ids, &[]).unwrap();
+        assert_live(probe_all(homes, &ids, &[]), &home);
+        assert_eq!(crate::fixture_support::native_acl_snapshot(&locks), before);
+        drop(held);
+        drop(reserve_commit(homes, &ids, &[]).unwrap());
+        assert_eq!(crate::fixture_support::native_acl_snapshot(&locks), before);
     }
 
     #[test]

@@ -961,6 +961,7 @@ fn preview(
             }),
         },
     );
+    crate::sessions_progress::pause_output()?;
     crate::print_stdout(format_args!("{body}"))?;
     Ok(())
 }
@@ -1231,6 +1232,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
             let show_summary = ids.len() > 1 || verbose;
             let mut preflight_refused = [0; 3];
             if apply {
+                crate::sessions_progress::pause_output()?;
                 crate::print_stdout(format_args!("가져오기 계획 · 대화 {}개", ids.len()))?;
                 (ids, preflight_refused) =
                     preview_imports(&store, &catalog, &ids, bulk, keep_source, clean_stale, all)?;

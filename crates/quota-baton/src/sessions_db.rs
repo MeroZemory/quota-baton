@@ -1524,9 +1524,17 @@ fn prepare_with_operational_rebase<'a>(
             continue;
         }
         destination_file(path)?;
-        if !remove {
-            qb_core::ensure_private_dir_all(&plan.target_home)?;
-        }
+        // Native Codex homes may grant sandbox principals access. Preserve
+        // their ACLs, pin the existing home, and create only missing leaves
+        // privately. qb-owned journals/state keep their strict private checks.
+        let _home = if !remove {
+            Some(crate::sessions_guard::prepare_parent(
+                &plan.target_home,
+                &plan.target_home,
+            )?)
+        } else {
+            None
+        };
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | if remove {
                 OpenFlags::empty()

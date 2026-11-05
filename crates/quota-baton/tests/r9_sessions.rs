@@ -1111,6 +1111,152 @@ fn r9_bulk_move_reports_moved_live_diverged_and_failed_separately() {
 }
 
 #[test]
+fn r251_actual_apply_preserves_native_source_and_target_acls() {
+    for (existing_target_db, interrupted) in [(false, false), (true, false), (true, true)] {
+        let f = Fixture::new();
+        if existing_target_db {
+            Connection::open(f.target.join("state_5.sqlite")).unwrap().execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,model_provider TEXT NOT NULL,archived INTEGER DEFAULT 0);").unwrap();
+        }
+        {
+            let db = Connection::open(f.source.join("goals_1.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,objective TEXT NOT NULL,status TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);").unwrap();
+            db.execute(
+                "INSERT INTO thread_goals VALUES(?1,'synthetic completed goal','complete',1)",
+                [A],
+            )
+            .unwrap();
+        }
+        fs::write(
+            f.source.join("session_index.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"id":A,"thread_name":"synthetic ACL regression"})
+            ),
+        )
+        .unwrap();
+        let flat = f.add(A, false, "openai");
+        let source = f
+            .source
+            .join("sessions/2026/11/05")
+            .join(flat.file_name().unwrap());
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::rename(&flat, &source).unwrap();
+        Connection::open(f.source.join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+                rusqlite::params![source.to_str().unwrap(), A],
+            )
+            .unwrap();
+        let original = fs::read(&source).unwrap();
+        let file_identity = |path: &Path| {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::{
+                Foundation::HANDLE,
+                Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+            };
+            let file = fs::File::open(path).unwrap();
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.unwrap();
+            (
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            )
+        };
+        let identity = file_identity(&source);
+        let snapshots: Vec<_> = [&f.source, &f.target]
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.to_owned(),
+                    home.join("sessions"),
+                    home.join("thread-writer-locks"),
+                ]
+            })
+            .map(|path| {
+                fixture_support::private_directory(&path).unwrap();
+                let acl = fixture_support::native_sandbox_acl(&path);
+                (path, acl)
+            })
+            .collect();
+        let lock = f.source.join("thread-writer-locks/.coordination.lock");
+        let writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(lock)
+            .unwrap();
+        writer.lock().unwrap();
+        let refused = f.import(A, true);
+        assert!(!refused.status.success());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        drop(writer);
+        let busy = interrupted.then(|| {
+            let db = Connection::open(f.target.join("state_5.sqlite")).unwrap();
+            db.execute_batch("BEGIN IMMEDIATE").unwrap();
+            db
+        });
+        let moved = f.import(A, true);
+        if interrupted {
+            assert!(
+                !moved.status.success(),
+                "planted target DB write lock must interrupt"
+            );
+            assert!(
+                !source.exists(),
+                "interruption must be after source retirement"
+            );
+            let published = f
+                .target
+                .join("sessions/2026/11/05")
+                .join(flat.file_name().unwrap());
+            assert_eq!(fs::read(&published).unwrap(), original);
+            let journal: serde_json::Value = serde_json::from_slice(
+                &fs::read(f.qb.join(format!("journal/session-moves/{A}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(journal["open"], true);
+            drop(busy);
+            assert_success(&f.cli(&["sessions".as_ref(), "recover".as_ref(), A.as_ref()]));
+        } else {
+            assert_success(&moved);
+        }
+        let target = f
+            .target
+            .join("sessions/2026/11/05")
+            .join(flat.file_name().unwrap());
+        assert!(!source.exists());
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert_eq!(identity, file_identity(&target));
+        assert!(thread_path(&f.source, A).is_none());
+        assert_eq!(thread_path(&f.target, A), Some(target));
+        let goal: String = Connection::open(f.target.join("goals_1.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT status FROM thread_goals WHERE thread_id=?1",
+                [A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(goal, "complete");
+        assert!(
+            fs::read_to_string(f.target.join("session_index.jsonl"))
+                .unwrap()
+                .contains(A)
+        );
+        let journal: serde_json::Value = serde_json::from_slice(
+            &fs::read(f.qb.join(format!("journal/session-moves/{A}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal["open"], false);
+        for (path, before) in snapshots {
+            assert_eq!(fixture_support::native_acl_snapshot(&path), before);
+        }
+    }
+}
+
+#[test]
 fn r9_explicit_move_succeeds_and_conflicts_with_keep_source_without_journal() {
     let f = Fixture::new();
     let source = f.add(A, false, "openai");

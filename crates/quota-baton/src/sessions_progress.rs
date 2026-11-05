@@ -33,7 +33,7 @@ impl Phase {
             (Self::Checking, false) => "조상과 잠금 확인",
             (Self::Compatibility, false) => "Codex 대화 호환성 확인",
             (Self::Preview, false) => "미리보기 준비",
-            (Self::Confirmation, false) => "move 입력 대기",
+            (Self::Confirmation, false) => "입력 대기",
             (Self::Linking, false) => "파일 연결",
             (Self::Records, false) => "대화 항목 기록",
             (Self::Starting, false) => "Codex 시작",
@@ -42,7 +42,7 @@ impl Phase {
             (Self::Checking, true) => "checking ancestors and locks",
             (Self::Compatibility, true) => "checking Codex conversation compatibility",
             (Self::Preview, true) => "building preview",
-            (Self::Confirmation, true) => "waiting for move",
+            (Self::Confirmation, true) => "waiting for input",
             (Self::Linking, true) => "linking files",
             (Self::Records, true) => "writing records",
             (Self::Starting, true) => "starting Codex",
@@ -58,9 +58,18 @@ struct State {
     mutated: bool,
     stopped: bool,
     reported: bool,
+    output_paused: bool,
+    confirmation_started: Option<Instant>,
+    confirmation_elapsed: Duration,
 }
 impl State {
     fn update_phase(&mut self, phase: Phase, bytes: Option<u64>, now: Instant) -> bool {
+        if phase == Phase::Confirmation {
+            self.confirmation_started.get_or_insert(now);
+        } else if let Some(start) = self.confirmation_started.take() {
+            self.confirmation_elapsed += now.duration_since(start);
+        }
+        self.output_paused = phase == Phase::Confirmation;
         let report = !self.reported
             || self.phase != phase
             || now.duration_since(self.changed) >= PROGRESS_INTERVAL;
@@ -71,6 +80,17 @@ impl State {
             self.reported = true;
         }
         report
+    }
+    fn processing_elapsed(&self, start: Instant, now: Instant) -> Duration {
+        now.duration_since(start)
+            .saturating_sub(self.confirmation_elapsed)
+            .saturating_sub(
+                self.confirmation_started
+                    .map_or(Duration::ZERO, |at| now.duration_since(at)),
+            )
+    }
+    fn heartbeat_due(&self, now: Instant) -> bool {
+        !self.output_paused && now.duration_since(self.changed) >= PROGRESS_INTERVAL
     }
 }
 struct Inner {
@@ -157,7 +177,9 @@ fn pending_warnings(inner: &Inner, state: &State, seen: &mut usize) -> usize {
 }
 fn render(inner: &Inner, state: &State, heartbeat: bool) -> String {
     let phase = state.phase.name(inner.english);
-    let elapsed = inner.start.elapsed().as_secs();
+    let elapsed = state
+        .processing_elapsed(inner.start, Instant::now())
+        .as_secs();
     let size = state
         .bytes
         .map(|b| format!(" · {:.1} MB", b as f64 / 1048576.))
@@ -233,6 +255,9 @@ impl Operation {
                 mutated: false,
                 stopped: false,
                 reported: false,
+                output_paused: false,
+                confirmation_started: None,
+                confirmation_elapsed: Duration::ZERO,
             }),
             wake: Condvar::new(),
             interrupts: AtomicUsize::new(0),
@@ -253,7 +278,7 @@ impl Operation {
                     for _ in 0..pending_warnings(&observed, &state, &mut seen) {
                         write_line(&observed, warning(observed.english));
                     }
-                    if state.changed.elapsed() >= PROGRESS_INTERVAL {
+                    if state.heartbeat_due(Instant::now()) {
                         write_line(&observed, &render(&observed, &state, true));
                         state.changed = Instant::now();
                         state.reported = true;
@@ -298,9 +323,33 @@ pub(crate) fn phase(phase: Phase, bytes: Option<u64>) -> Result<()> {
     check()?;
     if let Some(inner) = current() {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.update_phase(phase, bytes, Instant::now()) {
+        let report = state.update_phase(phase, bytes, Instant::now());
+        if phase == Phase::Confirmation {
+            finish_progress_line(&inner)?;
+        } else if report {
             write_line(&inner, &render(&inner, &state, false));
         }
+    }
+    Ok(())
+}
+
+fn finish_progress_line(inner: &Inner) -> std::io::Result<()> {
+    if inner.terminal {
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "\r\x1b[2K")?;
+        stderr.flush()?;
+    }
+    Ok(())
+}
+
+/// Serialize with the heartbeat worker before printing a multiline preview or
+/// prompting. The next processing phase resumes output on its own fresh line.
+pub(crate) fn pause_output() -> Result<()> {
+    check()?;
+    if let Some(inner) = current() {
+        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.output_paused = true;
+        finish_progress_line(&inner)?;
     }
     Ok(())
 }
@@ -486,6 +535,9 @@ pub(crate) fn test_cancellation(english: bool) -> TestCancellation {
             mutated: false,
             stopped: false,
             reported: false,
+            output_paused: false,
+            confirmation_started: None,
+            confirmation_elapsed: Duration::ZERO,
         }),
         wake: Condvar::new(),
         interrupts: AtomicUsize::new(0),
@@ -601,6 +653,44 @@ mod tests {
         let mut terminal = Vec::new();
         write_progress(&mut terminal, true, "progress").unwrap();
         assert_eq!(terminal, b"\r\x1b[2Kprogress");
+    }
+
+    #[test]
+    fn r251_confirmation_pauses_heartbeats_and_excludes_input_wait_time() {
+        let cancellation = test_cancellation(true);
+        let start = cancellation.inner.start;
+        let mut state = cancellation.inner.state.lock().unwrap();
+        state.update_phase(Phase::Confirmation, None, start + Duration::from_secs(6));
+        assert!(!state.heartbeat_due(start + Duration::from_secs(399)));
+        assert_eq!(
+            state.processing_elapsed(start, start + Duration::from_secs(399)),
+            Duration::from_secs(6)
+        );
+        state.update_phase(Phase::Confirmation, None, start + Duration::from_secs(399));
+        state.update_phase(Phase::Linking, None, start + Duration::from_secs(400));
+        assert_eq!(
+            state.processing_elapsed(start, start + Duration::from_secs(402)),
+            Duration::from_secs(8)
+        );
+        assert!(state.heartbeat_due(start + Duration::from_secs(405)));
+    }
+
+    #[test]
+    fn r251_preview_pause_is_shared_with_reader_threads_until_processing_resumes() {
+        let cancellation = test_cancellation(true);
+        pause_output().unwrap();
+        let context = reader_context();
+        std::thread::spawn(move || {
+            context.run(|| {
+                let inner = current().unwrap();
+                let state = inner.state.lock().unwrap();
+                assert!(!state.heartbeat_due(state.changed + PROGRESS_INTERVAL));
+            })
+        })
+        .join()
+        .unwrap();
+        phase(Phase::Linking, None).unwrap();
+        assert!(!cancellation.inner.state.lock().unwrap().output_paused);
     }
 
     #[test]

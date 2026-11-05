@@ -1175,6 +1175,7 @@ pub(super) fn return_current(
         return Ok(());
     }
     let m = make_plan(store, &store.target, &origin, id, true, &origin)?;
+    crate::sessions_progress::pause_output()?;
     crate::print_stdout(format_args!(
         "대화 {id}: 현재 qb 상태를 {}로 옮깁니다",
         origin.display()
