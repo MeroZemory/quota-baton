@@ -47,6 +47,7 @@ pub enum PollError {
 #[derive(Default)]
 struct Clock {
     next: Option<Instant>,
+    manual_next: Option<Instant>,
     failure_until: Option<Instant>,
     last: Option<Instant>,
     failures: u32,
@@ -90,6 +91,7 @@ struct Reservation<'a> {
     unsupported: bool,
     started: bool,
     placement: bool,
+    manual: bool,
 }
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
@@ -113,6 +115,9 @@ impl Drop for Reservation<'_> {
         clock.failure_until = (!self.succeeded).then_some(next);
         if !self.placement {
             clock.next = Some(next);
+            if self.manual {
+                clock.manual_next = Some(next);
+            }
         }
         if self.unsupported {
             clock.disabled_until = Some(Instant::now() + Duration::from_secs(6 * 3600));
@@ -215,6 +220,19 @@ impl UsagePoller {
     fn reserve(&self, id: &str) -> Result<Reservation<'_>, PollError> {
         self.reserve_reason(id, false)
     }
+    fn reserve_manual(&self, id: &str) -> Result<Reservation<'_>, PollError> {
+        self.reserve_mode_at(id, false, true, Instant::now())
+    }
+    pub(crate) fn clear_manual_cooldown(&self, id: &str) {
+        if let Some(clock) = self
+            .clocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
+            clock.manual_next = None;
+        }
+    }
     fn reserve_reason(&self, id: &str, placement: bool) -> Result<Reservation<'_>, PollError> {
         self.reserve_reason_at(id, placement, Instant::now())
     }
@@ -222,6 +240,15 @@ impl UsagePoller {
         &self,
         id: &str,
         placement: bool,
+        now: Instant,
+    ) -> Result<Reservation<'_>, PollError> {
+        self.reserve_mode_at(id, placement, false, now)
+    }
+    fn reserve_mode_at(
+        &self,
+        id: &str,
+        placement: bool,
+        manual: bool,
         now: Instant,
     ) -> Result<Reservation<'_>, PollError> {
         let mut clocks = self.clocks.lock().unwrap_or_else(|e| e.into_inner());
@@ -240,6 +267,13 @@ impl UsagePoller {
                 .disabled_until
                 .into_iter()
                 .chain(clock.failure_until)
+                .max()
+        } else if manual {
+            clock
+                .manual_next
+                .into_iter()
+                .chain(clock.failure_until)
+                .chain(clock.disabled_until)
                 .max()
         } else {
             clock
@@ -266,6 +300,7 @@ impl UsagePoller {
             unsupported: false,
             started: false,
             placement,
+            manual,
         })
     }
     async fn load(&self, id: &str) -> Result<Account, PollError> {
@@ -370,8 +405,13 @@ impl UsagePoller {
     pub async fn poll(&self, id: &str) -> Result<Account, PollError> {
         self.poll_reason(id, None).await
     }
+    pub async fn poll_manual(&self, id: &str) -> Result<Account, PollError> {
+        self.poll_reason_observed(id, None, false, true)
+            .await
+            .map(|(account, _)| account)
+    }
     async fn poll_reason(&self, id: &str, placement: Option<u64>) -> Result<Account, PollError> {
-        self.poll_reason_observed(id, placement, false)
+        self.poll_reason_observed(id, placement, false, false)
             .await
             .map(|(account, _)| account)
     }
@@ -379,13 +419,14 @@ impl UsagePoller {
         &self,
         id: &str,
     ) -> Result<(Account, Option<crate::account_runtime::ObservedUsagePoll>), PollError> {
-        self.poll_reason_observed(id, None, true).await
+        self.poll_reason_observed(id, None, true, false).await
     }
     async fn poll_reason_observed(
         &self,
         id: &str,
         placement: Option<u64>,
         capture_receipt: bool,
+        manual: bool,
     ) -> Result<(Account, Option<crate::account_runtime::ObservedUsagePoll>), PollError> {
         let account = self.load(id).await?;
         if account.user_state == UserState::Disabled
@@ -403,6 +444,8 @@ impl UsagePoller {
         }
         let mut reservation = if placement.is_some() {
             self.reserve_reason(id, true)?
+        } else if manual {
+            self.reserve_manual(id)?
         } else {
             self.reserve(id)?
         };
@@ -1142,6 +1185,18 @@ mod tests {
         ));
         assert_eq!(f.fake.state.requests().len(), 1);
         assert_eq!(poller.clocks.lock().unwrap()[&f.ids[0]].failures, 0);
+        // An automatic poll cooldown must not block an explicit manual refresh.
+        f.fake.state.push(Fixture::usage());
+        poller.poll_manual(&f.ids[0]).await.unwrap();
+        assert_eq!(f.fake.state.requests().len(), 2);
+        assert!(matches!(
+            poller.poll_manual(&f.ids[0]).await,
+            Err(PollError::TooSoon { .. })
+        ));
+        poller.clear_manual_cooldown(&f.ids[0]);
+        f.fake.state.push(Fixture::usage());
+        poller.poll_manual(&f.ids[0]).await.unwrap();
+        assert_eq!(f.fake.state.requests().len(), 3);
     }
 
     #[tokio::test]

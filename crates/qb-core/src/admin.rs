@@ -620,19 +620,22 @@ async fn release_hold(
         return error(StatusCode::BAD_REQUEST, "계정 ID 확인이 일치하지 않습니다.");
     }
     match state.relay.accounts.release_quota_hold(&id).await {
-        Ok(account) => Json(ReleaseHoldReply {
-            id: account.id,
-            released: true,
-            provider: account.provider,
-            label: account.label,
-            email: account.email,
-            plan: account.plan,
-            user_state: account.user_state,
-            health: account.health,
-            drain: account.drain,
-            allow_credits: account.allow_credits,
-        })
-        .into_response(),
+        Ok(account) => {
+            state.relay.quota.clear_manual_cooldown(&id);
+            Json(ReleaseHoldReply {
+                id: account.id,
+                released: true,
+                provider: account.provider,
+                label: account.label,
+                email: account.email,
+                plan: account.plan,
+                user_state: account.user_state,
+                health: account.health,
+                drain: account.drain,
+                allow_credits: account.allow_credits,
+            })
+            .into_response()
+        }
         Err(()) => error(
             StatusCode::CONFLICT,
             "해제할 사용량 한도가 없거나 저장하지 못했습니다.",
@@ -712,7 +715,7 @@ fn account_refresh_error(
 
 async fn refresh_usage(state: RuntimeAdmin, id: String) -> Response {
     use crate::quota::PollError;
-    match state.relay.quota.poll(&id).await {
+    match state.relay.quota.poll_manual(&id).await {
         Ok(_) => match state
             .relay
             .accounts

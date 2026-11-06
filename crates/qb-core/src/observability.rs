@@ -801,6 +801,9 @@ impl Observability {
             }
         };
         for snapshot in state.accounts.values_mut() {
+            snapshot
+                .windows
+                .retain(|w| !matches!(w.name.as_str(), "0m" | "0s"));
             let mut credit = serde_json::to_value(&snapshot.credits).unwrap_or_default();
             crate::credits::normalize(&mut credit);
             snapshot.credits = serde_json::from_value(credit).unwrap_or_default();
@@ -1410,6 +1413,8 @@ impl Observability {
             matches!(
                 *plan,
                 "pro"
+                    | "prolite"
+                    | "promax"
                     | "max_5x"
                     | "max_20x"
                     | "team"
@@ -1689,13 +1694,16 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
             for slot in ["primary", "secondary"] {
                 let prefix = format!("x-codex-{slot}");
                 let used_pct = number(h, &format!("{prefix}-used-percent")).filter(|v| *v >= 0.0);
-                let minutes = header(h, &format!("{prefix}-window-minutes"))
-                    .and_then(|v| v.parse::<u32>().ok());
-                let name = match minutes {
-                    Some(300) => "5h".into(),
-                    Some(10080) => "7d".into(),
-                    Some(n) => format!("{n}m"),
-                    _ => slot.into(),
+                let name = match header(h, &format!("{prefix}-window-minutes")) {
+                    Some(raw) => match raw.parse::<u32>().ok().filter(|n| *n > 0) {
+                        Some(300) => "5h".into(),
+                        Some(10080) => "7d".into(),
+                        Some(n) => format!("{n}m"),
+                        // Explicit zero/invalid window duration is a placeholder
+                        // (e.g., prolite primary slot with window_minutes = 0).
+                        None => continue,
+                    },
+                    None => slot.into(),
                 };
                 let reset_at = timestamp(h, &format!("{prefix}-reset-at")).or_else(|| {
                     header(h, &format!("{prefix}-reset-after-seconds"))
@@ -1719,7 +1727,16 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                 .filter(|v| {
                     matches!(
                         *v,
-                        "free" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu" | "go"
+                        "free"
+                            | "plus"
+                            | "pro"
+                            | "prolite"
+                            | "promax"
+                            | "team"
+                            | "business"
+                            | "enterprise"
+                            | "edu"
+                            | "go"
                     )
                 })
                 .map(str::to_owned);
@@ -3308,6 +3325,26 @@ mod tests {
         );
         h.remove("x-codex-secondary-reset-at");
         assert!(snapshot(Provider::Codex, &h, now).is_none());
+        // Explicit zero/invalid window-minutes placeholders (e.g., prolite primary slot) are skipped.
+        h.clear();
+        h.insert("x-codex-plan-type", "prolite".parse().unwrap());
+        h.insert("x-codex-primary-window-minutes", "0".parse().unwrap());
+        h.insert("x-codex-primary-used-percent", "0".parse().unwrap());
+        h.insert(
+            "x-codex-primary-reset-at",
+            "2000000000".parse().unwrap(),
+        );
+        h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        h.insert("x-codex-secondary-used-percent", "1".parse().unwrap());
+        h.insert(
+            "x-codex-secondary-reset-at",
+            "2000000000".parse().unwrap(),
+        );
+        let prolite = snapshot(Provider::Codex, &h, now).unwrap();
+        assert_eq!(prolite.plan.as_deref(), Some("prolite"));
+        assert_eq!(prolite.windows.len(), 1);
+        assert_eq!(prolite.windows[0].name, "7d");
+        assert_eq!(prolite.windows[0].used_pct, Some(1.0));
     }
 
     #[cfg(feature = "shape-capture")]
