@@ -324,6 +324,42 @@
       "json": true,
       "defaults": true,
       "coverage": "Entire transient authenticated handover grant wire schema and custom bounded wiping deserializers. No JSON literals or serde defaults are approved; malformed fields refuse restoration."
+    },
+    {
+      "file": "crates/qb-core/src/admin/reset_credits.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
+    },
+    {
+      "file": "crates/qb-core/src/quota/reset_credits.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
+    },
+    {
+      "file": "crates/qb-core/src/reset_credits.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
+    },
+    {
+      "file": "crates/qb-core/src/reset_credits/model.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
+    },
+    {
+      "file": "crates/qb-proto/src/reset_credits.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
+    },
+    {
+      "file": "crates/qb-proto/src/reset_credit_action.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
     }
   ],
   "baseline": [
@@ -456,7 +492,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3254,
+        "line": 3255,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_updated\",\"data\":{\"id\":id,\"snapshot\":snapshot}})",
         "field": "",
@@ -470,7 +506,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3377,
+        "line": 3378,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: bound account is cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -484,7 +520,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3379,
+        "line": 3380,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: bound account is cooling\"}})",
         "field": "",
@@ -498,7 +534,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3445,
+        "line": 3446,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: all accounts are cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -512,7 +548,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3447,
+        "line": 3448,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: all accounts are cooling\"}})",
         "field": "",
@@ -526,7 +562,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3457,
+        "line": 3458,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"invalid_request_error\",\"message\":format!(\"quota-baton: no usable {0} account — run quota-baton accounts login {0} --no-browser\",provider.as_str())}})",
         "field": "",
@@ -540,7 +576,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4315,
+        "line": 4316,
         "rule": "admin-json",
         "snippet": "json!(\"quota_notice\")",
         "field": "",
@@ -554,7 +590,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4316,
+        "line": 4317,
         "rule": "admin-json",
         "snippet": "json!(account.id)",
         "field": "",
@@ -568,7 +604,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4317,
+        "line": 4318,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\",\"data\":data})",
         "field": "",
@@ -582,7 +618,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4354,
+        "line": 4355,
         "rule": "admin-json",
         "snippet": "json!([\r\n        account.health,\r\n        account.user_state,\r\n        account.drain,\r\n        account.allow_credits,\r\n        account.quota_cooling,\r\n        account.payment_until\r\n    ])",
         "field": "",
@@ -638,7 +674,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 21,
+        "line": 22,
         "rule": "serde-default",
         "snippet": "default",
         "field": "replace_linked",
@@ -652,7 +688,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 23,
+        "line": 24,
         "rule": "serde-default",
         "snippet": "default",
         "field": "no_browser",
@@ -666,7 +702,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 213,
+        "line": 230,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\r\n                    \"code\": error.code(), \"message\": error.message()\r\n                }})",
         "field": "",
@@ -680,7 +716,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 245,
+        "line": 262,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\r\n                \"code\":error.code(),\"message\":error.message(),\r\n            }})",
         "field": "",
@@ -694,7 +730,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 272,
+        "line": 289,
         "rule": "serde-default",
         "snippet": "default",
         "field": "inherit",
@@ -708,7 +744,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 347,
+        "line": 364,
         "rule": "serde-default",
         "snippet": "default = \"default_drain_timeout\"",
         "field": "drain_timeout_secs",
@@ -722,7 +758,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 562,
+        "line": 591,
         "rule": "admin-json",
         "snippet": "json!({\"changed\":[],\"removed\":[],\"resync\":true})",
         "field": "",
@@ -736,7 +772,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 646,
+        "line": 675,
         "rule": "serde-default",
         "snippet": "default",
         "field": "force",
@@ -1254,7 +1290,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 2025,
+        "line": 2027,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\"type\": kind, \"message\": message}})",
         "field": "",
@@ -1338,7 +1374,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/admin_account.rs",
-        "line": 177,
+        "line": 179,
         "rule": "serde-default",
         "snippet": "default",
         "field": "organization_uuid",
@@ -1352,7 +1388,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/admin_account.rs",
-        "line": 213,
+        "line": 215,
         "rule": "serde-default",
         "snippet": "default",
         "field": "probe_pending",
@@ -1366,7 +1402,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 39,
+        "line": 41,
         "rule": "serde-default",
         "snippet": "default",
         "field": "session_key",
@@ -1380,7 +1416,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 55,
+        "line": 57,
         "rule": "serde-default",
         "snippet": "default",
         "field": "dir",
@@ -1394,7 +1430,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 57,
+        "line": 59,
         "rule": "serde-default",
         "snippet": "default",
         "field": "activate",
@@ -1408,7 +1444,7 @@
     {
       "key": {
         "file": "crates/qb-proto/src/lib.rs",
-        "line": 59,
+        "line": 61,
         "rule": "serde-default",
         "snippet": "default",
         "field": "dry_run",
@@ -1646,7 +1682,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 25,
+        "line": 26,
         "rule": "serde-default",
         "snippet": "default",
         "field": "paste_redirect",
@@ -1716,7 +1752,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3005,
+        "line": 3006,
         "rule": "admin-json",
         "snippet": "json!({\"name\":cause.window,\"observed_at\":cause.started_at})",
         "field": "",
@@ -1730,7 +1766,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3030,
+        "line": 3031,
         "rule": "admin-json",
         "snippet": "json!(report.started_at)",
         "field": "",
@@ -1744,7 +1780,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3240,
+        "line": 3241,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_hold_cleared\",\"data\":{\n                        \"id\":account_id,\"reason\":\"window_gone_after_plan_change\"\n                    }})",
         "field": "",
@@ -1810,6 +1846,48 @@
       },
       "count": 1,
       "reason": "Native legacy BindingTable import envelope only after bounded authenticated lifecycle decode. Real C8 rows survive; provisional launch rows without managed metadata are removed. Not an admin response shape or fabricated launch grant."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/admin_account.rs",
+        "line": 52,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "reset_credits",
+        "field_type": "Option<crate::reset_credits::ResetCreditInventory>",
+        "owner": "struct:AdminAccount",
+        "attribute": "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+      },
+      "count": 1,
+      "reason": "R26 additive optional reset-credit facts: older servers/archives omit the whole member and remain unobserved None, never zero or send authority; all inner inventory/action members stay required."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/quota/reset_credits.rs",
+        "line": 586,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "_windows_reset",
+        "field_type": "u64",
+        "owner": "struct:Redemption",
+        "attribute": "#[serde(default, rename = \"windows_reset\")]"
+      },
+      "count": 1,
+      "reason": "R26 backend reply compatibility at pinned public types.rs: windows_reset omitted means0; non-integer/null/negative values refuse. This ignored count never fabricates usage/window resets; actual usage GET supplies facts."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/reset_credits/model.rs",
+        "line": 47,
+        "rule": "admin-json",
+        "snippet": "json!({\"available_count\": summary.get(\"available_count\")})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "R26 incoming usage-summary normalization only: copies the allowlisted available_count into the strict details parser with no grant rows, so unexpected summary details cannot authorize use. Not an admin reply or arbitrary native subtree."
     }
   ]
 }

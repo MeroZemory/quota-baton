@@ -2,19 +2,27 @@ use super::*;
 use crate::reset_credits::Error;
 use axum::extract::Path;
 use qb_proto::reset_credit_action::ResetCreditCommitRequest;
+use qb_proto::reset_credit_action::{
+    ResetCreditErrorCode as Code, ResetCreditErrorDetail, ResetCreditErrorReply,
+};
 
 fn refused(value: Error) -> Response {
     let (status, code) = match value {
-        Error::Stale => (StatusCode::CONFLICT, "reset_credit_stale"),
-        Error::Unknown => (StatusCode::CONFLICT, "reset_credit_unknown"),
-        Error::Busy => (StatusCode::CONFLICT, "reset_credit_busy"),
-        Error::Unsupported => (StatusCode::CONFLICT, "reset_credit_unsupported"),
-        Error::Ineligible => (StatusCode::CONFLICT, "reset_credit_ineligible"),
-        Error::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "reset_credit_unavailable"),
+        Error::Stale => (StatusCode::CONFLICT, Code::Stale),
+        Error::Unknown => (StatusCode::CONFLICT, Code::Unknown),
+        Error::Busy => (StatusCode::CONFLICT, Code::Busy),
+        Error::Unsupported => (StatusCode::CONFLICT, Code::Unsupported),
+        Error::Ineligible => (StatusCode::CONFLICT, Code::Ineligible),
+        Error::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable),
     };
     (
         status,
-        Json(serde_json::json!({"error":{"code":code,"message":code}})),
+        Json(ResetCreditErrorReply {
+            error: ResetCreditErrorDetail {
+                code,
+                message: "Reset-credit request refused".into(),
+            },
+        }),
     )
         .into_response()
 }

@@ -3,7 +3,7 @@ use super::*;
 use crate::reset_credits::{self as reset, Error, Preview, model};
 use qb_proto::{reset_credit_action::*, reset_credits::*};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const DETAILS: &str = "/backend-api/wham/rate-limit-reset-credits";
@@ -19,6 +19,12 @@ struct Fence {
     grant: String,
     request: String,
     outcome: ResetCreditOutcome,
+}
+
+#[derive(Serialize)]
+struct RedemptionRequest<'a> {
+    redeem_request_id: &'a str,
+    credit_id: &'a str,
 }
 
 impl UsagePoller {
@@ -407,7 +413,10 @@ impl UsagePoller {
                 reqwest::Method::POST,
                 &format!("{DETAILS}/consume"),
             )?
-            .json(&json!({"redeem_request_id":fence.request,"credit_id":fence.grant}));
+            .json(&RedemptionRequest {
+                redeem_request_id: &fence.request,
+                credit_id: &fence.grant,
+            });
         self.reset_fence(&id, Some(fence.clone())).await?;
         // If takeover stopped this store while the durable write ran, leave
         // Unknown and refuse to send. The process lock spans both boundaries.

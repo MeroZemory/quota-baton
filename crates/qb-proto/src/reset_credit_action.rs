@@ -40,3 +40,32 @@ pub struct ResetCreditResult {
     pub inventory: ResetCreditInventory,
     pub refresh_failed: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResetCreditErrorCode {
+    #[serde(rename = "reset_credit_stale")]
+    Stale,
+    #[serde(rename = "reset_credit_unknown")]
+    Unknown,
+    #[serde(rename = "reset_credit_busy")]
+    Busy,
+    #[serde(rename = "reset_credit_unsupported")]
+    Unsupported,
+    #[serde(rename = "reset_credit_ineligible")]
+    Ineligible,
+    #[serde(rename = "reset_credit_unavailable")]
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetCreditErrorReply {
+    pub error: ResetCreditErrorDetail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetCreditErrorDetail {
+    pub code: ResetCreditErrorCode,
+    pub message: String,
+}

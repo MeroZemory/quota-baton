@@ -484,6 +484,10 @@ fn enforce(manifest: &Manifest, sources: &BTreeMap<String, String>) -> Result<()
 // Explicit response-producing graph roots/helpers from the route inventory.
 // Entire production files are scanned; this list is not an item-name wildcard.
 const REQUIRED_PRODUCERS: &[&str] = &[
+    "crates/qb-core/src/admin/reset_credits.rs",
+    "crates/qb-core/src/quota/reset_credits.rs",
+    "crates/qb-core/src/reset_credits.rs",
+    "crates/qb-core/src/reset_credits/model.rs",
     "crates/qb-core/src/admin.rs",
     "crates/qb-core/src/http.rs",
     "crates/qb-core/src/account_runtime.rs",
