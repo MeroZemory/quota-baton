@@ -1864,7 +1864,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/quota/reset_credits.rs",
-        "line": 620,
+        "line": 622,
         "rule": "serde-default",
         "snippet": "default",
         "field": "_windows_reset",

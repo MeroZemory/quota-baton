@@ -468,7 +468,7 @@ impl UsagePoller {
             outcome,
             ResetCreditOutcome::Reset | ResetCreditOutcome::AlreadyRedeemed
         ) {
-            refresh_failed |= self.reset_success_usage(&account, &tokens).await.is_err();
+            refresh_failed |= self.reset_success_usage(&account).await.is_err();
         }
         Ok(ResetCreditResult {
             account: id,
@@ -478,13 +478,14 @@ impl UsagePoller {
         })
     }
 
-    async fn reset_success_usage(
-        &self,
-        account: &Account,
-        tokens: &crate::accounts::Tokens,
-    ) -> Result<(), Error> {
+    async fn reset_success_usage(&self, account: &Account) -> Result<(), Error> {
         // A confirmed reset gets one fresh read independent of the ordinary
         // auto/manual 5-minute budget. This is a GET, never a POST retry.
+        let (current, tokens) = self.reset_credentials(&account.id).await?;
+        if current.identity != account.identity || current.source != account.source {
+            return Err(Error::Unavailable);
+        }
+        let account = &current;
         let table = self.binding_table();
         let asof = table
             .as_ref()
@@ -495,7 +496,7 @@ impl UsagePoller {
         let response = self
             .reset_request(
                 account,
-                tokens,
+                &tokens,
                 reqwest::Method::GET,
                 "/backend-api/wham/usage",
             )?
@@ -523,7 +524,8 @@ impl UsagePoller {
             )
             .await
             .map_err(|_| Error::Unavailable)?;
-        if let (Some(table), Some(asof), Some(snapshot)) = (table, asof, reconciled) {
+        let snapshot = reconciled.ok_or(Error::Unavailable)?;
+        if let (Some(table), Some(asof)) = (table, asof) {
             if complete {
                 table.replace_usage_windows_asof_token(&account.id, &snapshot, asof);
             } else {

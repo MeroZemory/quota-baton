@@ -26,6 +26,100 @@ mod r26_reset_credit_admin_tests {
     }
 
     #[tokio::test]
+    async fn fresh_usage_rejected_by_native_generation_fence_is_not_reported_as_refresh_success() {
+        let f = Fixture::new(1).await;
+        let mut initial = persistence_usage();
+        initial["plan_type"] = json!("plus");
+        initial["rate_limit"]["primary_window"]["used_percent"] = json!(88);
+        f.fake.state.push(ScriptedResponse::json(
+            reqwest::StatusCode::OK,
+            initial.to_string(),
+        ));
+        f.relay.quota.poll(&f.ids[0]).await.unwrap();
+        let preview = persistence_preview(&f).await;
+        let mut redeemed = persistence_details();
+        redeemed["available_count"] = json!(0);
+        redeemed["credits"][0]["status"] = json!("redeemed");
+        let mut fresh = persistence_usage();
+        fresh["plan_type"] = json!("plus");
+        fresh["rate_limit"]["primary_window"]["used_percent"] = json!(17);
+        for value in [
+            persistence_details(),
+            persistence_usage(),
+            json!({"code":"reset","windows_reset":1}),
+            redeemed,
+            fresh,
+        ] {
+            f.fake.state.push(ScriptedResponse::json(
+                reqwest::StatusCode::OK,
+                value.to_string(),
+            ));
+        }
+        let (mut arrived, mut release) = f.fake.state.pause_next_response();
+        let poller = f.relay.quota.clone();
+        let sending = tokio::spawn(async move {
+            poller
+                .commit_reset_credit(
+                    preview.account,
+                    qb_proto::reset_credit_action::ResetCreditCommitRequest {
+                        preview_token: preview.preview_token,
+                        confirm: true,
+                    },
+                )
+                .await
+        });
+        // Chain existing one-shot gates through the two reads, POST, and detail
+        // refresh. Stop at the actual final usage GET, with no sleep/race guess.
+        for _ in 0..4 {
+            tokio::time::timeout(Duration::from_secs(5), arrived)
+                .await
+                .unwrap()
+                .unwrap();
+            let (next_arrived, next_release) = f.fake.state.pause_next_response();
+            release.send(()).unwrap();
+            arrived = next_arrived;
+            release = next_release;
+        }
+        tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        f.relay
+            .quota
+            .store
+            .update_metadata(&f.ids[0], |account| {
+                account.label = "synthetic late label".into()
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), sending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.outcome, ResetCreditOutcome::Reset);
+        assert!(
+            result.refresh_failed,
+            "descriptive-only acceptance is not usage publication"
+        );
+        assert_eq!(f.account(0).label, "synthetic late label");
+        let observed = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+        assert_eq!(
+            observed["windows"][0]["used_pct"], 88.0,
+            "rejected usage must not look refreshed"
+        );
+        assert_eq!(
+            f.fake
+                .state
+                .requests()
+                .iter()
+                .filter(|r| r.method == reqwest::Method::POST)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn paused_and_draining_accounts_allow_explicit_actions_without_changing_placement_settings()
      {
         for state in [UserState::Active, UserState::Paused] {
