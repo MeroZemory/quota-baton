@@ -1595,6 +1595,11 @@ impl RelayState {
                     }
                 }
                 crate::bindings::Decision::Blocked => {
+                    #[cfg(feature = "testkit")]
+                    tracing::warn!(
+                        code = "test_strict_selection_blocked",
+                        "Selection refused before dispatch"
+                    );
                     completion.policy_blocked = true;
                     return Ok(None);
                 }
@@ -1606,6 +1611,11 @@ impl RelayState {
                         .mode
                         == crate::routing::Mode::Strict =>
                 {
+                    #[cfg(feature = "testkit")]
+                    tracing::warn!(
+                        code = "test_strict_selection_none",
+                        "Strict selection has no admitted candidate"
+                    );
                     completion.policy_blocked = true;
                     let plan = self.bindings.routing_plan(session.key.as_deref());
                     if !self.bindings.policies.strict_dispatch_blocked()

@@ -425,8 +425,24 @@ async fn legacy_strict_data_account(
                 request.method == reqwest::Method::POST && request.path_and_query == "/responses"
             })
             .count();
+        let diagnostics: Vec<String> = ["owner.stderr", "successor.stderr"]
+            .iter()
+            .flat_map(|file| {
+                fs::read_to_string(home.path.join(file))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| {
+                        line.contains("test_selection_generation_conflict")
+                            || line.contains("test_strict_selection_blocked")
+                            || line.contains("test_strict_selection_none")
+                    })
+                    .map(|line| line.chars().take(512).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .take(16)
+            .collect();
         panic!(
-            "legacy strict phase={phase} status={status} fake_responses={inference_requests} body={body}"
+            "legacy strict phase={phase} status={status} fake_responses={inference_requests} body={body} diagnostics={diagnostics:?}"
         );
     }
     let account = response.headers()["x-quota-baton-account"]
