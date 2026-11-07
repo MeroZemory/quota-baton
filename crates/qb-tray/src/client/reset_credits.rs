@@ -264,7 +264,7 @@ pub fn preview_body(p: &ResetCreditPreview) -> String {
     crate::i18n::format(
         "{0}\n{1}\n만료 {2}\n영향: 해당되는 Codex 한도\n만료가 가장 빠른 리셋권 1개를 사용합니다.\n확인 유효 시각 {3}",
         &[
-            p.label.clone(),
+            format!("{} ({})", p.label, p.account),
             p.email.clone(),
             expiry(&p.grant.expires_at),
             p.expires_at.clone(),
@@ -646,10 +646,12 @@ mod tests {
     fn preview_copy_has_identity_exact_expiry_and_only_evidenced_effect_in_both_languages() {
         for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
             crate::i18n::with_language(language, || {
-                let p = preview();
+                let mut p = preview();
+                p.account = "cx-synthetic-selected".into();
                 let body = preview_body(&p);
                 assert!(
                     body.contains(&p.label)
+                        && body.contains(&p.account)
                         && body.contains(&p.email)
                         && body.contains(&p.expires_at)
                 );
