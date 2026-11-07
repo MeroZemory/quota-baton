@@ -6,6 +6,7 @@ mod lease;
 mod memory;
 mod private_directory;
 mod process;
+mod reset_credits;
 mod secrets;
 pub(crate) use atomic::*;
 pub(crate) use browser::*;
@@ -15,6 +16,7 @@ pub(crate) use lease::Lease;
 pub(crate) use memory::*;
 pub(crate) use private_directory::ensure_private_dir_all;
 pub(crate) use process::*;
+pub(crate) use reset_credits::open_reset_credit_lock;
 pub(crate) use secrets::*;
 
 pub(crate) use private_directory::{check_private_data_home, startup_permission_diagnostic};

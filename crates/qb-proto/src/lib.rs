@@ -23,6 +23,8 @@ pub use admin_account::{AdminAccount, AdminSubscription};
 pub mod admin_warning;
 pub mod history_response;
 pub mod native_reset;
+pub mod reset_credit_action;
+pub mod reset_credits;
 pub use admin_state::{AdminState, StateBindings, StateCapabilities, StateInflight, StateMemory};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

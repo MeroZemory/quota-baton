@@ -1,6 +1,7 @@
 //! Active usage observations. Polls share the relay credential gates and client.
 mod parse;
 mod profile;
+mod reset_credits;
 
 use crate::{
     account_runtime::AccountRuntime,
@@ -73,6 +74,7 @@ pub struct UsagePoller {
     semaphore: Semaphore,
     profile_semaphore: Semaphore,
     bindings: Mutex<Option<Weak<crate::bindings::BindingTable>>>,
+    reset_credits: crate::reset_credits::ResetCredits,
 }
 
 pub(crate) struct EventGuard(Weak<UsagePoller>);
@@ -166,6 +168,7 @@ impl UsagePoller {
             semaphore: Semaphore::new(2),
             profile_semaphore: Semaphore::new(1),
             bindings: Mutex::new(None),
+            reset_credits: Default::default(),
         })
     }
     pub(crate) fn set_bindings(&self, bindings: &Arc<crate::bindings::BindingTable>) {
@@ -576,6 +579,7 @@ impl UsagePoller {
                 if !status.is_success() {
                     return Err(PollError::Unavailable);
                 }
+                self.observe_reset_credit_summary(id, account.provider, &body);
                 let Some(mut snapshot) = parse::snapshot(account.provider, &body, Utc::now())
                 else {
                     if account.provider == Provider::Claude {
@@ -1469,6 +1473,8 @@ mod tests {
     mod profile_linked_tests;
 
     include!("quota/profile_tests.rs");
+    include!("quota/tests/reset_credit_tests.rs");
+    include!("quota/tests/reset_credit_admin_tests.rs");
     mod r18_profile_tests;
     mod r18_relay_tests;
     mod r21_capacity_tests;

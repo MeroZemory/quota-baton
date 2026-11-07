@@ -12,6 +12,7 @@ use qb_proto::admin_action::{
     AccountActionReply, ClearedReply, ProjectReply, ReleaseHoldReply, RoutingMutationReply,
     UpdatedReply,
 };
+mod reset_credits;
 
 pub use source_features::{account_routes, account_routes_with_poller};
 
@@ -181,6 +182,22 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
             .route("/admin/v1/state", axum::routing::get(runtime_state))
             .route("/admin/v1/events", axum::routing::get(runtime_events))
             .route("/admin/v1/accounts/{id}/{action}", post(account_action))
+            .route(
+                "/admin/v1/accounts/{id}/reset-credits",
+                axum::routing::get(reset_credits::cached),
+            )
+            .route(
+                "/admin/v1/accounts/{id}/reset-credits/refresh",
+                post(reset_credits::refresh),
+            )
+            .route(
+                "/admin/v1/accounts/{id}/reset-credits/preview",
+                post(reset_credits::preview),
+            )
+            .route(
+                "/admin/v1/accounts/{id}/reset-credits/commit",
+                post(reset_credits::commit),
+            )
             .route(
                 "/admin/v1/accounts/{id}",
                 axum::routing::patch(account_patch),
@@ -399,7 +416,19 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
         .typed_views_with_bindings(&state.relay.bindings)
         .await
     {
-        Ok(accounts) => {
+        Ok(mut accounts) => {
+            for account in &mut accounts {
+                let provider = match account.provider {
+                    qb_proto::admin_account::AdminProvider::Claude => {
+                        crate::accounts::Provider::Claude
+                    }
+                    qb_proto::admin_account::AdminProvider::Codex => {
+                        crate::accounts::Provider::Codex
+                    }
+                };
+                account.reset_credits =
+                    Some(state.relay.quota.reset_credit_cached(&account.id, provider));
+            }
             let pools = crate::account_runtime::account_pools(&accounts);
             Json(qb_proto::AdminState {
                 pools,

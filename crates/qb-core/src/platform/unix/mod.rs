@@ -9,6 +9,7 @@ pub(crate) use private_fs::{
     check_private_data_home, ensure_private_dir_all, startup_permission_diagnostic,
 };
 mod process;
+mod reset_credits;
 mod secrets;
 pub(crate) use atomic::*;
 pub(crate) use browser::*;
@@ -17,6 +18,7 @@ pub(crate) use fs_identity::*;
 pub(crate) use lease::Lease;
 pub(crate) use memory::*;
 pub(crate) use process::*;
+pub(crate) use reset_credits::open_reset_credit_lock;
 pub(crate) use secrets::*;
 
 pub(crate) mod linked;

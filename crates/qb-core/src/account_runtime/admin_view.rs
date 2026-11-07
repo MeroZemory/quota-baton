@@ -200,6 +200,7 @@ mod tests {
             email: "sample-acct@example.test".into(),
             plan: None,
             subscription: None,
+            reset_credits: None,
             user_state: AdminUserState::Active,
             source: AdminSource::Oauth,
             health: AdminHealth::Ready {},

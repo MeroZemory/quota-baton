@@ -2453,6 +2453,7 @@ impl AccountRuntime {
                         quota["plan"].as_str().map(str::to_owned).or(a.plan.clone())
                     },
                     subscription: admin_view::subscription(a.subscription.as_ref()),
+                    reset_credits: None,
                     user_state: match a.user_state {
                         UserState::Active => AdminUserState::Active,
                         UserState::Paused => AdminUserState::Paused,

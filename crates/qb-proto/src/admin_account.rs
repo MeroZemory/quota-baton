@@ -49,6 +49,8 @@ pub struct AdminAccount {
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<AdminSubscription>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<crate::reset_credits::ResetCreditInventory>,
     pub user_state: AdminUserState,
     pub source: AdminSource,
     pub health: AdminHealth,

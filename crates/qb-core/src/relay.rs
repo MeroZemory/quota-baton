@@ -368,6 +368,7 @@ impl RelayState {
             .start_refresh_scheduler(self.store.clone(), self.observability.clone())
     }
     pub async fn shutdown_refreshes(&self) -> Result<(), ()> {
+        self.quota.close_reset_credits().await;
         self.tokens.shutdown_refreshes().await
     }
     pub fn start_memory_guard(&self) -> tokio::task::JoinHandle<()> {
@@ -478,6 +479,7 @@ impl RelayState {
             self.drain_started.store(true, Ordering::Release);
             self.drain_start_notify.notify_waiters();
         }
+        self.quota.close_reset_credits().await;
         if self.tokens.shutdown_refreshes().await.is_err() {
             return Err(());
         }
