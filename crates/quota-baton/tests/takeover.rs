@@ -425,6 +425,7 @@ async fn legacy_strict_data_account(
                 request.method == reqwest::Method::POST && request.path_and_query == "/responses"
             })
             .count();
+        // The production logger redacts the code field; match only fixed safe messages.
         let diagnostics: Vec<String> = ["owner.stderr", "successor.stderr"]
             .iter()
             .flat_map(|file| {
@@ -432,9 +433,9 @@ async fn legacy_strict_data_account(
                     .unwrap_or_default()
                     .lines()
                     .filter(|line| {
-                        line.contains("test_selection_generation_conflict")
-                            || line.contains("test_strict_selection_blocked")
-                            || line.contains("test_strict_selection_none")
+                        line.contains("Selection credential snapshot changed")
+                            || line.contains("Selection refused before dispatch")
+                            || line.contains("Strict selection has no admitted candidate")
                     })
                     .map(|line| line.chars().take(512).collect::<String>())
                     .collect::<Vec<_>>()
