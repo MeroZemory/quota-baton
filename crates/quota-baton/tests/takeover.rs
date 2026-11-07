@@ -402,6 +402,40 @@ async fn data_account(client: &Client, home: &Home, session: &str) -> String {
     response.bytes().await.unwrap();
     account
 }
+// Preserve the failing phase and synthetic provider evidence before Home is dropped.
+async fn legacy_strict_data_account(
+    client: &Client,
+    home: &Home,
+    upstream: &ScriptedUpstream,
+    phase: &str,
+) -> String {
+    let response = request(client, home, "held:agent:independent")
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    if status != StatusCode::OK {
+        let body = response.bytes().await.unwrap();
+        let body = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+        let inference_requests = upstream
+            .state
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == reqwest::Method::POST && request.path_and_query == "/responses"
+            })
+            .count();
+        panic!(
+            "legacy strict phase={phase} status={status} fake_responses={inference_requests} body={body}"
+        );
+    }
+    let account = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    account
+}
 fn ledger(home: &Home) -> Vec<serde_json::Value> {
     fs::read_dir(home.path.join("ledger"))
         .into_iter()
@@ -837,7 +871,7 @@ e2e!(
         let client = client();
         let (a, token) = start(&home, &client).await;
         assert_eq!(
-            data_account(&client, &home, "held:agent:independent").await,
+            legacy_strict_data_account(&client, &home, &upstream, "before_takeover").await,
             ids[0]
         );
         assert_eq!(client.post(home.admin_url("/admin/v1/routing")).bearer_auth(&token)
@@ -848,7 +882,7 @@ e2e!(
         a.wait(Duration::from_secs(5)).await;
         until(|| phase(&home, b.pid, "bindings_imported")).await;
         assert_eq!(
-            data_account(&client, &home, "held:agent:independent").await,
+            legacy_strict_data_account(&client, &home, &upstream, "after_takeover_import").await,
             ids[0]
         );
         let turns: Vec<_> = upstream
