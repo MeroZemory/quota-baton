@@ -109,6 +109,9 @@ impl UsagePoller {
         if original.provider != Provider::Codex {
             return Err(Error::Unsupported);
         }
+        if !reset_account_allowed(&original) {
+            return Err(Error::Ineligible);
+        }
         let gates = self.tokens.lock().map_err(|_| Error::Unavailable)?.clone();
         if crate::relay::credentials::is_linked(&original) {
             gates
@@ -125,11 +128,7 @@ impl UsagePoller {
             .before_request(self.store.clone(), self.obs.clone(), id.into())
             .await
             .map_err(|_| Error::Unavailable)?;
-        if account.provider != Provider::Codex
-            || account.drain
-            || account.user_state != UserState::Active
-            || matches!(account.health, Health::NeedsRelogin { .. })
-        {
+        if !reset_account_allowed(&account) {
             return Err(Error::Ineligible);
         }
         Ok((account, tokens))
@@ -152,12 +151,22 @@ impl UsagePoller {
         let Identity::Codex { account_id, .. } = &account.identity else {
             return Err(Error::Unsupported);
         };
-        Ok(self
-            .client
+        // Only the mutating transport overrides reqwest's default protocol-NACK
+        // policy. Ordinary relay/poll traffic keeps its incumbent client.
+        let client = if method == reqwest::Method::POST {
+            redemption_client()?
+        } else {
+            self.client.clone()
+        };
+        Ok(client
             .request(method, url)
             .bearer_auth(&tokens.access_token)
             .header("ChatGPT-Account-Id", account_id)
             .header("Accept", "application/json")
+            .header(
+                "User-Agent",
+                concat!("quota-baton/", env!("CARGO_PKG_VERSION")),
+            )
             .timeout(Duration::from_secs(20)))
     }
 
@@ -423,7 +432,10 @@ impl UsagePoller {
         if self.store.writes_stopped() {
             return Err(Error::Unknown);
         }
-        if Utc::now() >= valid_until
+        let current = self.load(&id).await.map_err(|_| Error::Unknown)?;
+        if !same_confirmation_account(&current, &account)
+            || !reset_account_allowed(&current)
+            || Utc::now() >= valid_until
             || model::choose(&inventory, Utc::now()).ok() != Some(&preview.wire.grant)
         {
             fence.outcome = ResetCreditOutcome::NothingToReset;
@@ -556,6 +568,9 @@ impl UsagePoller {
                 crate::platform::ensure_private_dir_all(&directory)
                     .map_err(|_| Error::Unavailable)?;
                 let bytes = serde_json::to_vec(&value).map_err(|_| Error::Unavailable)?;
+                if bytes.len() > 16 * 1024 {
+                    return Err(Error::Unavailable);
+                }
                 crate::platform::atomic_write_binding(&file, &bytes)
                     .map_err(|_| Error::Unavailable)?;
                 Ok(Some(value))
@@ -580,6 +595,25 @@ impl UsagePoller {
     }
 }
 
+fn redemption_client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .tcp_nodelay(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .no_proxy()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(16)
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|_| Error::Unavailable)
+}
+
 #[derive(Deserialize)]
 struct Redemption {
     code: ResetCreditOutcome,
@@ -602,6 +636,12 @@ fn same_confirmation_account(a: &Account, b: &Account) -> bool {
         && a.health == b.health
         && a.auth_failures == b.auth_failures
         && a.auth_probe_pending == b.auth_probe_pending
+}
+
+fn reset_account_allowed(account: &Account) -> bool {
+    account.provider == Provider::Codex
+        && matches!(account.user_state, UserState::Active | UserState::Paused)
+        && matches!(account.health, Health::Ready | Health::Cooling { .. })
 }
 
 async fn reset_body(mut response: reqwest::Response) -> Result<Value, Error> {

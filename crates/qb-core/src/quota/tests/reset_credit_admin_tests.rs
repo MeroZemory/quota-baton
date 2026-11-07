@@ -26,6 +26,124 @@ mod r26_reset_credit_admin_tests {
     }
 
     #[tokio::test]
+    async fn paused_and_draining_accounts_allow_explicit_actions_without_changing_placement_settings()
+     {
+        for state in [UserState::Active, UserState::Paused] {
+            for drain in [false, true] {
+                let f = Fixture::new(1).await;
+                f.relay
+                    .quota
+                    .store
+                    .update_metadata(&f.ids[0], |account| {
+                        account.user_state = state;
+                        account.drain = drain;
+                    })
+                    .unwrap();
+                f.fake.state.push(ScriptedResponse::json(
+                    reqwest::StatusCode::OK,
+                    persistence_details().to_string(),
+                ));
+                let refreshed = f
+                    .relay
+                    .quota
+                    .refresh_reset_credits(&f.ids[0])
+                    .await
+                    .unwrap();
+                assert_eq!(refreshed.available_count, Some(1));
+                let preview = persistence_preview(&f).await;
+                let mut redeemed = persistence_details();
+                redeemed["available_count"] = json!(0);
+                redeemed["credits"][0]["status"] = json!("redeemed");
+                let mut usage = persistence_usage();
+                usage["rate_limit"]["primary_window"]["used_percent"] = json!(15);
+                for value in [
+                    persistence_details(),
+                    persistence_usage(),
+                    json!({"code":"reset","windows_reset":1}),
+                    redeemed,
+                    usage,
+                ] {
+                    f.fake.state.push(ScriptedResponse::json(
+                        reqwest::StatusCode::OK,
+                        value.to_string(),
+                    ));
+                }
+                let reply = f
+                    .relay
+                    .quota
+                    .commit_reset_credit(
+                        f.ids[0].clone(),
+                        qb_proto::reset_credit_action::ResetCreditCommitRequest {
+                            preview_token: preview.preview_token,
+                            confirm: true,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(reply.outcome, ResetCreditOutcome::Reset);
+                assert!(!reply.refresh_failed);
+                let account = f.account(0);
+                assert_eq!(account.user_state, state);
+                assert_eq!(account.drain, drain);
+                let observed = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+                assert_eq!(observed["windows"][0]["used_pct"], 15.0);
+                assert_eq!(
+                    f.fake
+                        .state
+                        .requests()
+                        .iter()
+                        .filter(|r| r.method == reqwest::Method::POST)
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_or_needs_relogin_accounts_refuse_reads_and_use_without_upstream_requests() {
+        for disabled in [false, true] {
+            let f = Fixture::new(1).await;
+            f.relay
+                .quota
+                .store
+                .update_metadata(&f.ids[0], |account| {
+                    if disabled {
+                        account.user_state = UserState::Disabled;
+                    } else {
+                        account.health = Health::NeedsRelogin {
+                            reason: "synthetic".into(),
+                            since: Utc::now(),
+                        };
+                    }
+                })
+                .unwrap();
+            let before = f.account(0);
+            assert_eq!(
+                f.relay.quota.refresh_reset_credits(&f.ids[0]).await,
+                Err(crate::reset_credits::Error::Ineligible)
+            );
+            assert_eq!(
+                f.relay.quota.preview_reset_credit(&f.ids[0]).await,
+                Err(crate::reset_credits::Error::Ineligible)
+            );
+            let fake_confirm = qb_proto::reset_credit_action::ResetCreditCommitRequest {
+                preview_token: "0".repeat(32),
+                confirm: true,
+            };
+            assert_eq!(
+                f.relay
+                    .quota
+                    .commit_reset_credit(f.ids[0].clone(), fake_confirm)
+                    .await,
+                Err(crate::reset_credits::Error::Stale)
+            );
+            assert!(f.fake.state.requests().is_empty());
+            assert_eq!(f.account(0), before);
+        }
+    }
+
+    #[tokio::test]
     async fn successful_reset_preserves_unrelated_holds_and_paid_credit_settings() {
         for reason in [
             HealthReason::Auth,

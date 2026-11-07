@@ -1,15 +1,10 @@
 //! Client presentation copy only; protocol codes and account metadata stay unchanged.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
     ("먼저 다시 로그인해 주세요.", "Sign in again first."),
-    ("계정을 먼저 재개해 주세요.", "Resume this account first."),
     ("계정을 먼저 켜 주세요.", "Enable this account first."),
     (
         "계정 상태를 먼저 확인해 주세요.",
         "Check the account status first.",
-    ),
-    (
-        "새 대화 받지 않기를 먼저 꺼 주세요.",
-        "Turn off No new sessions first.",
     ),
     ("리셋권 사용 중…", "Using reset credit…"),
     ("기록된 만료 {0}", "Recorded expiry {0}"),

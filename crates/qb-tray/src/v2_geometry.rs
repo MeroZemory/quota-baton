@@ -3141,34 +3141,70 @@ mod r26_geometry_tests {
         );
     }
     #[test]
-    fn r26_reset_account_gates_disable_use_and_refresh_with_localized_recovery() {
+    fn r26_reset_account_gates_preserve_pause_and_drain_with_localized_refusals() {
         for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
             crate::i18n::with_language(language, || {
-                for (state, drain, health, reason) in [
-                    ("paused", false, "ready", Some("계정을 먼저 재개해 주세요.")),
-                    ("disabled", false, "ready", Some("계정을 먼저 켜 주세요.")),
+                for (provider, state, drain, health, reason) in [
+                    ("codex", "active", false, "ready", None),
+                    ("codex", "active", true, "ready", None),
+                    ("codex", "paused", false, "ready", None),
+                    ("codex", "paused", true, "ready", None),
                     (
-                        "active",
-                        true,
+                        "codex",
+                        "disabled",
+                        false,
                         "ready",
-                        Some("새 대화 받지 않기를 먼저 꺼 주세요."),
+                        Some("계정을 먼저 켜 주세요."),
                     ),
                     (
+                        "codex",
+                        "disabled",
+                        true,
+                        "ready",
+                        Some("계정을 먼저 켜 주세요."),
+                    ),
+                    (
+                        "codex",
                         "active",
                         false,
                         "needs_relogin",
                         Some("먼저 다시 로그인해 주세요."),
                     ),
-                    ("active", false, "ready", None),
+                    (
+                        "codex",
+                        "paused",
+                        true,
+                        "needs_relogin",
+                        Some("먼저 다시 로그인해 주세요."),
+                    ),
+                    (
+                        "codex",
+                        "unknown",
+                        false,
+                        "ready",
+                        Some("계정 상태를 먼저 확인해 주세요."),
+                    ),
+                    (
+                        "claude",
+                        "active",
+                        false,
+                        "ready",
+                        Some("리셋권 · 지원 안 함"),
+                    ),
                 ] {
-                    let wire = serde_json::json!({"accounts":[{"id":"a","provider":"codex","user_state":state,"drain":drain,"health":{"kind":health},"reset_credits":{"state":"fresh","observed_at":"1970-01-01T00:00:00Z","available_count":1,"grants":[{"id":"credit","expires_at":{"type":"never"},"status":"available","reset_type":"codex_rate_limits"}],"refusal":null}}]});
+                    let wire = serde_json::json!({"accounts":[{"id":"a","provider":provider,"user_state":state,"drain":drain,"health":{"kind":health},"reset_credits":{"state":"fresh","observed_at":"1970-01-01T00:00:00Z","available_count":1,"grants":[{"id":"credit","expires_at":{"type":"never"},"status":"available","reset_type":"codex_rate_limits"}],"refusal":null}}]});
                     let view =
                         v2::project(&wire.to_string(), std::time::SystemTime::UNIX_EPOCH).unwrap();
                     let row = find_row(&view, "a").unwrap();
                     let inventory = row.reset_credits.as_ref().unwrap();
-                    assert!(
+                    assert_eq!(
                         inventory.can_use,
+                        provider == "codex",
                         "account gates must not overwrite known grant facts"
+                    );
+                    assert_eq!(
+                        v2::reset_credit_account_refusal(&row.raw),
+                        reason.map(crate::i18n::static_text)
                     );
                     let before = format!("{:?}", view.raw);
                     let scene = Scene::build(
@@ -3181,20 +3217,43 @@ mod r26_geometry_tests {
                     );
                     let popup = scene.popup.unwrap();
                     for kind in [MenuAction::UseResetCredit, MenuAction::RefreshResetCredits] {
-                        let item = popup
-                            .items
-                            .iter()
-                            .find(|i| {
-                                i.target
-                                    == Target::Menu {
-                                        id: Some("a".into()),
-                                        action: kind.clone(),
-                                    }
-                            })
-                            .unwrap();
-                        assert_eq!(item.enabled, reason.is_none());
+                        let item = popup.items.iter().find(|i| {
+                            i.target
+                                == Target::Menu {
+                                    id: Some("a".into()),
+                                    action: kind.clone(),
+                                }
+                        });
+                        if provider == "codex" {
+                            assert_eq!(item.unwrap().enabled, reason.is_none());
+                        } else {
+                            assert!(item.is_none());
+                        }
                     }
-                    if let Some(reason) = reason {
+                    if reason.is_none() {
+                        let now = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+                        let facts = row.raw.reset_credits.as_ref().unwrap();
+                        let mut consent = crate::client::reset_credits::Consent::default();
+                        let generation = consent.begin("a", false).unwrap();
+                        consent.finish_read("a", generation, None);
+                        assert!(consent.ready(
+                            generation,
+                            qb_proto::reset_credit_action::ResetCreditPreview {
+                                account: "a".into(),
+                                label: "synthetic".into(),
+                                email: "sample@example.invalid".into(),
+                                preview_token: "synthetic-preview".into(),
+                                expires_at: (now + chrono::Duration::seconds(60)).to_rfc3339(),
+                                grant: facts.grants[0].clone(),
+                                inventory: facts.clone(),
+                                effect: "eligible_codex_limits".into(),
+                            },
+                            now
+                        ));
+                        assert!(consent.confirm("a", now).unwrap().confirm);
+                        assert!(consent.confirm("a", now).is_none());
+                    }
+                    if let Some(reason) = reason.filter(|_| provider == "codex") {
                         let localized = crate::i18n::static_text(reason);
                         if language == crate::i18n::UiLanguage::En {
                             assert_ne!(localized, reason);

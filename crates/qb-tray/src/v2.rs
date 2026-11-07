@@ -103,20 +103,16 @@ pub struct Account {
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
-/// Matches reset_credentials' account gates; grant evidence supplies plan eligibility.
+/// Explicit reset actions preserve pause/drain placement controls; grants supply plan eligibility.
 pub fn reset_credit_account_refusal(account: &Account) -> Option<&'static str> {
     let reason = if account.provider != "codex" {
         "리셋권 · 지원 안 함"
     } else if account.health.kind == "needs_relogin" {
         "먼저 다시 로그인해 주세요."
-    } else if account.user_state == "paused" {
-        "계정을 먼저 재개해 주세요."
     } else if account.user_state == "disabled" {
         "계정을 먼저 켜 주세요."
-    } else if account.user_state != "active" {
+    } else if !matches!(account.user_state.as_str(), "active" | "paused") {
         "계정 상태를 먼저 확인해 주세요."
-    } else if account.drain {
-        "새 대화 받지 않기를 먼저 꺼 주세요."
     } else {
         return None;
     };
