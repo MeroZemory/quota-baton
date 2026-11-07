@@ -54,7 +54,7 @@ impl UsagePoller {
         value
     }
 
-    fn observe_reset_credit_summary(&self, id: &str, provider: Provider, body: &[u8]) {
+    pub(super) fn observe_reset_credit_summary(&self, id: &str, provider: Provider, body: &[u8]) {
         if provider != Provider::Codex {
             return;
         }

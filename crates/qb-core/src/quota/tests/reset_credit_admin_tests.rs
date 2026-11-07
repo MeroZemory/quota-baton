@@ -11,7 +11,7 @@ mod r26_reset_credit_admin_tests {
         let mut config = Config::default();
         config.server.data_port = 0;
         config.server.admin_port = 0;
-        let servers = http::spawn_with_admin(
+        let mut servers = http::spawn_with_admin(
             &config,
             LocalSecrets {
                 client_key: "synthetic-r26-client".into(),
@@ -138,7 +138,7 @@ mod r26_reset_credit_admin_tests {
             .unwrap();
         assert_eq!(state["accounts"][0]["reset_credits"]["available_count"], 0);
         servers.shutdown();
-        servers.data_task.await.unwrap().unwrap();
-        servers.admin_task.await.unwrap().unwrap();
+        (&mut servers.data_task).await.unwrap().unwrap();
+        (&mut servers.admin_task).await.unwrap().unwrap();
     }
 }
