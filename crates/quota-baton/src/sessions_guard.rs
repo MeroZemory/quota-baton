@@ -2463,15 +2463,15 @@ mod tests {
         let home = home(temp.path(), "native");
         let locks = home.join("thread-writer-locks");
         crate::fixture_support::private_directory(&locks).unwrap();
-        let before = crate::fixture_support::windows::native_sandbox_acl(&locks);
+        let before = crate::fixture_support::native_sandbox_acl(&locks);
         let homes = std::slice::from_ref(&home);
         let ids = [ID.to_owned()];
         let held = reserve_commit(homes, &ids, &[]).unwrap();
         assert_live(probe_all(homes, &ids, &[]), &home);
-        assert_eq!(crate::fixture_support::windows::native_acl_snapshot(&locks), before);
+        assert_eq!(crate::fixture_support::native_acl_snapshot(&locks), before);
         drop(held);
         drop(reserve_commit(homes, &ids, &[]).unwrap());
-        assert_eq!(crate::fixture_support::windows::native_acl_snapshot(&locks), before);
+        assert_eq!(crate::fixture_support::native_acl_snapshot(&locks), before);
     }
 
     #[test]
