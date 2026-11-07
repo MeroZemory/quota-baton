@@ -70,13 +70,25 @@ impl UsagePoller {
         match (entry.inventory.as_mut(), summary) {
             (Some(old), Some(new))
                 if old.available_count == new.available_count
-                    && new.state == ResetCreditState::Fresh => {}
+                    && new.state == ResetCreditState::Fresh
+                    && model::choose(old, Utc::now()).is_ok() => {}
+            (_, Some(new)) if new.state == ResetCreditState::Fresh => entry.inventory = Some(new),
             (Some(old), _) => {
                 old.state = ResetCreditState::Stale;
                 old.refusal = Some(ResetCreditRefusal::Stale);
             }
             (None, Some(new)) => entry.inventory = Some(new),
             (None, None) => {}
+        }
+    }
+
+    pub(super) fn stale_reset_credit_inventory(&self, id: &str) {
+        if let Ok(entry) = self.reset_credits.entry(id)
+            && let Ok(mut entry) = entry.try_lock()
+            && let Some(value) = &mut entry.inventory
+        {
+            value.state = ResetCreditState::Stale;
+            value.refusal = Some(ResetCreditRefusal::Stale);
         }
     }
 

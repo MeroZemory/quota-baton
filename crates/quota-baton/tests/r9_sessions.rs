@@ -1176,7 +1176,7 @@ fn r251_actual_apply_preserves_native_source_and_target_acls() {
             })
             .map(|path| {
                 fixture_support::private_directory(&path).unwrap();
-                let acl = fixture_support::native_sandbox_acl(&path);
+                let acl = fixture_support::windows::native_sandbox_acl(&path);
                 (path, acl)
             })
             .collect();
@@ -1251,7 +1251,7 @@ fn r251_actual_apply_preserves_native_source_and_target_acls() {
         .unwrap();
         assert_eq!(journal["open"], false);
         for (path, before) in snapshots {
-            assert_eq!(fixture_support::native_acl_snapshot(&path), before);
+            assert_eq!(fixture_support::windows::native_acl_snapshot(&path), before);
         }
     }
 }

@@ -699,6 +699,9 @@ impl UsagePoller {
         drop(probe);
         drop(reservation);
         drop(_permit);
+        if provider == Provider::Codex && result.is_err() {
+            self.stale_reset_credit_inventory(id);
+        }
         if provider == Provider::Claude {
             let profile = self.refresh_permission_plan(id).await;
             if let (Ok((_, receipt)), Ok(account)) = (&result, profile) {

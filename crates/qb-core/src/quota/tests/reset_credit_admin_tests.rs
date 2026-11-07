@@ -6,6 +6,63 @@ mod r26_reset_credit_admin_tests {
     };
 
     #[tokio::test]
+    async fn automatic_summary_updates_known_counts_but_missing_and_failed_reads_preserve_stale_facts()
+     {
+        let f = Fixture::new(1).await;
+        let id = &f.ids[0];
+        let usage = |count: Option<u64>| {
+            let mut value = json!({"rate_limit":{"primary_window":{"used_percent":15,"limit_window_seconds":18000}}});
+            if let Some(count) = count {
+                value["rate_limit_reset_credits"] = json!({"available_count":count});
+            }
+            ScriptedResponse::json(reqwest::StatusCode::OK, value.to_string())
+        };
+        for count in [3, 1, 0] {
+            f.fake.state.push(usage(Some(count)));
+            f.relay.quota.clear_manual_cooldown(id);
+            f.relay.quota.poll_manual(id).await.unwrap();
+            let current = f.relay.quota.reset_credit_cached(id, Provider::Codex);
+            assert_eq!(current.available_count, Some(count));
+            assert!(
+                current.grants.is_empty(),
+                "a summary cannot retain a stale smallest grant"
+            );
+            assert_eq!(
+                current.state,
+                qb_proto::reset_credits::ResetCreditState::Fresh
+            );
+        }
+        f.fake.state.push(usage(None));
+        f.relay.quota.clear_manual_cooldown(id);
+        f.relay.quota.poll_manual(id).await.unwrap();
+        let current = f.relay.quota.reset_credit_cached(id, Provider::Codex);
+        assert_eq!(current.available_count, Some(0));
+        assert_eq!(
+            current.state,
+            qb_proto::reset_credits::ResetCreditState::Stale
+        );
+        f.fake.state.push(ScriptedResponse::json(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+        ));
+        f.relay.quota.clear_manual_cooldown(id);
+        assert!(f.relay.quota.poll_manual(id).await.is_err());
+        let failed = f.relay.quota.reset_credit_cached(id, Provider::Codex);
+        assert_eq!(failed.available_count, Some(0));
+        assert_eq!(
+            failed.state,
+            qb_proto::reset_credits::ResetCreditState::Stale
+        );
+        assert!(
+            f.fake
+                .state
+                .requests()
+                .iter()
+                .all(|request| request.method == reqwest::Method::GET)
+        );
+    }
+
+    #[tokio::test]
     async fn authenticated_native_admin_confirmation_has_zero_cancel_and_one_explicit_post() {
         let f = Fixture::new(1).await;
         let mut config = Config::default();
