@@ -562,6 +562,11 @@ fn overlay(state: Option<&str>) -> Overlay {
             replace: false,
         },
         Some(s) if s.starts_with("takeover-") => windows_takeover::card(s),
+        Some(s) if s.starts_with("reset-credits:") => Overlay::ResetCredits {
+            id: s[14..].into(),
+            body: String::new(),
+            ready: false,
+        },
         Some(s) if s.starts_with("confirm-credits:") => Overlay::CreditsConfirm(s[16..].into()),
         Some(s) if s.starts_with("confirm-delete:") => Overlay::DeleteConfirm(s[15..].into()),
         Some(s) if s.starts_with("login:") => {
@@ -585,15 +590,62 @@ fn presentation(
     } else {
         session.update(view);
     }
+    let mut active_overlay = overlay(state);
+    if let Some(id) = state.and_then(|s| s.strip_prefix("reset-credits:")) {
+        let consent = &session.reset_credits;
+        let body = if consent.busy {
+            i18n::static_text(if consent.unknown.contains_key(id) {
+                "리셋권 사용 중…"
+            } else {
+                "리셋권 확인 중…"
+            })
+            .into()
+        } else if let Some(preview) = &consent.preview {
+            qb_tray::client::reset_credits::preview_body(preview)
+        } else if let Some(message) = consent.messages.get(id) {
+            i18n::static_text(message).into()
+        } else {
+            row_view(view, id).map_or_else(String::new, |row| {
+                qb_tray::client::reset_credits::inventory_line(
+                    &row.raw.provider,
+                    row.raw.reset_credits.as_ref(),
+                    chrono::Utc::now(),
+                )
+                .tooltip
+            })
+        };
+        active_overlay = Overlay::ResetCredits {
+            id: id.into(),
+            body,
+            ready: row_view(view, id)
+                .is_some_and(|row| v2::reset_credit_account_refusal(&row.raw).is_none())
+                && consent.preview.as_ref().is_some_and(|p| p.account == id)
+                && !consent.busy
+                && !consent.unknown.contains_key(id),
+        };
+    }
     let mut p = geometry::Presentation {
         expanded: session.expansion.clone(),
         pending_ids: session.pending_ids(),
+        reset_busy: session.reset_credits.busy,
+        reset_blocked: session.reset_credits.unknown.keys().cloned().collect(),
+        reset_messages: session
+            .reset_credits
+            .messages
+            .iter()
+            .map(|(id, message)| (id.clone(), i18n::static_text(message).into()))
+            .collect(),
         core_ok,
-        overlay: overlay(state),
+        overlay: active_overlay,
         offset: VIEWPORT.with(|v| v.borrow().offset),
         popup_offset: INPUT.with(|i| i.borrow().popup_offset),
         ..Default::default()
     };
+    if session.reset_credits.busy
+        && let Some(id) = &session.reset_credits.account
+    {
+        p.pending_ids.insert(id.clone());
+    }
     for slot in &session.slots {
         let section = p.frozen.entry(slot.provider.clone()).or_default();
         if slot.disabled_on_open {
@@ -689,7 +741,10 @@ fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
         h.enabled
             && matches!(
                 h.target,
-                HitTarget::ConfirmDelete(_) | HitTarget::TakeoverNext | HitTarget::TakeoverCommit
+                HitTarget::ConfirmResetCredit(_)
+                    | HitTarget::ConfirmDelete(_)
+                    | HitTarget::TakeoverNext
+                    | HitTarget::TakeoverCommit
             )
     }) {
         return scene
@@ -1300,7 +1355,166 @@ fn ask_credits(id: &str, origin: ReturnTo) {
         set_view(Some(format!("confirm-credits:{id}")));
     }
 }
+fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
+    let view = projected();
+    let Some(row) = row_view(&view, &id) else {
+        return;
+    };
+    if v2::reset_credit_account_refusal(&row.raw).is_some()
+        || !model().lock().unwrap_or_else(|e| e.into_inner()).2
+    {
+        return;
+    }
+    let generation = {
+        let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
+        if state.pending(&id) {
+            return;
+        }
+        let Some(generation) = state.reset_credits.begin(&id, refresh) else {
+            return;
+        };
+        generation
+    };
+    set_view(Some(format!("reset-credits:{id}")));
+    let handle = hwnd.0 as isize;
+    let failed_id = id.clone();
+    let accepted = WORKER.get().is_some_and(|worker| {
+        worker.submit(async move {
+            use qb_tray::client::reset_credits::ActionError;
+            let client = super::client::AdminClient::from_home();
+            if refresh {
+                let result = match &client {
+                    Ok(client) => client.refresh_reset_credits(&id).await,
+                    Err(_) => Err(ActionError::Read(
+                        super::client::ClientError::AccountAction(
+                            "리셋권을 확인하지 못했습니다. 새로고침하세요.",
+                        ),
+                    )),
+                };
+                let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .reset_credits
+                    .finish_read(&id, generation, result.as_ref().err());
+                if let Ok(inventory) = &result {
+                    state.reset_credits.reconciled(&id, inventory);
+                }
+            } else {
+                let result = match &client {
+                    Ok(client) => client.preview_reset_credit(&id).await,
+                    Err(_) => Err(ActionError::Read(
+                        super::client::ClientError::AccountAction(
+                            "리셋권을 확인하지 못했습니다. 새로고침하세요.",
+                        ),
+                    )),
+                };
+                let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .reset_credits
+                    .finish_read(&id, generation, result.as_ref().err());
+                if let Ok(preview) = result {
+                    state
+                        .reset_credits
+                        .ready(generation, preview, chrono::Utc::now());
+                }
+            }
+            if let Ok(client) = client
+                && let Ok(read) = client.read().await
+            {
+                let _ = publish_read(read);
+            }
+            invalidate_model();
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(handle as *mut c_void)),
+                    STATE_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        })
+    });
+    if !accepted {
+        let error = qb_tray::client::reset_credits::ActionError::Read(
+            super::client::ClientError::AccountAction(
+                "리셋권을 확인하지 못했습니다. 새로고침하세요.",
+            ),
+        );
+        session()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset_credits
+            .finish_read(&failed_id, generation, Some(&error));
+        invalidate_model();
+    }
+}
+fn confirm_reset_credit(hwnd: HWND, id: String) {
+    if view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        != Some(format!("reset-credits:{id}").as_str())
+    {
+        return;
+    }
+    let request = session()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reset_credits
+        .confirm(&id, chrono::Utc::now());
+    let Some(request) = request else {
+        invalidate_model();
+        return;
+    };
+    let handle = hwnd.0 as isize;
+    let failed_id = id.clone();
+    let accepted = WORKER.get().is_some_and(|worker| {
+        worker.submit(async move {
+            let client = super::client::AdminClient::from_home();
+            let result = match &client {
+                Ok(client) => client.commit_reset_credit(&id, request).await,
+                Err(_) => Err(qb_tray::client::reset_credits::ActionError::Unknown),
+            };
+            session()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset_credits
+                .result(&id, &result);
+            if let Ok(client) = client
+                && let Ok(read) = client.read().await
+            {
+                let _ = publish_read(read);
+            }
+            invalidate_model();
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(handle as *mut c_void)),
+                    STATE_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        })
+    });
+    if !accepted {
+        session()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset_credits
+            .result(
+                &failed_id,
+                &Err(qb_tray::client::reset_credits::ActionError::Unknown),
+            );
+        invalidate_model();
+    }
+}
 fn dispatch_account(hwnd: HWND, id: String, action: MenuAction, ticket: Option<Ticket>) {
+    if matches!(
+        action,
+        MenuAction::RefreshResetCredits | MenuAction::UseResetCredit
+    ) {
+        dispatch_reset_credit(hwnd, id, action == MenuAction::RefreshResetCredits);
+        return;
+    }
     let drain_target = if action == MenuAction::ToggleDrain {
         let Some(target) = painted_frame(hwnd).and_then(|frame| drain_intent(&frame.view, &id))
         else {
@@ -1823,6 +2037,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         },
         HitTarget::TakeoverNext => windows_takeover::next(),
         HitTarget::TakeoverCommit => windows_takeover::commit(hwnd),
+        HitTarget::ConfirmResetCredit(id) => confirm_reset_credit(hwnd, id),
         HitTarget::ConfirmCredits(id) => {
             let confirmed = session()
                 .lock()
@@ -1848,6 +2063,11 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
             }
         }
         HitTarget::CancelDialog => {
+            session()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset_credits
+                .cancel();
             let dialog = session()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1921,6 +2141,11 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
     redraw_now(hwnd);
 }
 fn dismiss_overlay() {
+    session()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reset_credits
+        .cancel();
     let state = view_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2082,6 +2307,10 @@ fn tooltip_content(
         }
         for (rect, text) in [
             (boxrow.chip, row.chip_tooltip.clone()),
+            (
+                boxrow.reset_credits,
+                row.reset_credits.as_ref().map(|c| c.tooltip.clone()),
+            ),
             (
                 boxrow.credits,
                 row.credits.as_ref().map(|c| c.tooltip.clone()),
@@ -2439,6 +2668,7 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
             .and_then(|d| d.buttons.iter().find(|b| &b.target == target))
             .map(|b| b.label.clone())
             .unwrap_or_default(),
+        HitTarget::ConfirmResetCredit(_) => i18n::text("1개 사용").into_owned(),
         HitTarget::ConfirmCredits(_) => i18n::text("크레딧 사용").into_owned(),
         HitTarget::ConfirmDelete(_) => i18n::text("계정 삭제").into_owned(),
         HitTarget::CancelDialog | HitTarget::LoginCancel => i18n::text("취소").into_owned(),
@@ -3702,5 +3932,25 @@ mod tests {
         }
         assert!(login_animation_needed(true, Some("login:codex")));
         assert!(!login_animation_needed(true, Some("list")));
+    }
+}
+
+#[test]
+fn r26_reset_credit_modal_always_defaults_to_cancel() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    for ready in [true, false] {
+        let scene = geometry::Scene::build(
+            &view,
+            geometry::Presentation {
+                overlay: Overlay::ResetCredits {
+                    id: "synthetic".into(),
+                    body: "synthetic preview".into(),
+                    ready,
+                },
+                ..Default::default()
+            },
+            800.,
+        );
+        assert_eq!(modal_default_focus(&scene), Some(HitTarget::CancelDialog));
     }
 }

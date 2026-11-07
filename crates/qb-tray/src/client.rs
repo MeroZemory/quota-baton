@@ -12,6 +12,9 @@ use serde::{
     de::{DeserializeOwned, Deserializer},
 };
 
+#[path = "client/reset_credits.rs"]
+pub mod reset_credits;
+
 #[path = "client/history.rs"]
 mod history;
 
@@ -77,6 +80,8 @@ impl AdminClient {
         anyhow::ensure!(admin_port != 0, "admin port must be non-zero");
         let http = reqwest::Client::builder()
             .no_proxy()
+            // Account mutations must not inherit protocol-level replay.
+            .retry(reqwest::retry::never())
             // The authenticated admin API is local; redirects must never escape it.
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))

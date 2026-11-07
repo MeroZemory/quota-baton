@@ -1,5 +1,102 @@
 //! Client presentation copy only; protocol codes and account metadata stay unchanged.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
+    ("먼저 다시 로그인해 주세요.", "Sign in again first."),
+    ("계정을 먼저 재개해 주세요.", "Resume this account first."),
+    ("계정을 먼저 켜 주세요.", "Enable this account first."),
+    (
+        "계정 상태를 먼저 확인해 주세요.",
+        "Check the account status first.",
+    ),
+    (
+        "새 대화 받지 않기를 먼저 꺼 주세요.",
+        "Turn off No new sessions first.",
+    ),
+    ("리셋권 사용 중…", "Using reset credit…"),
+    ("기록된 만료 {0}", "Recorded expiry {0}"),
+    ("리셋권 · 확인 전", "Reset credits · not observed"),
+    ("리셋권을 새로고침해 주세요.", "Refresh reset credits."),
+    ("리셋권 · 지원 안 함", "Reset credits · unsupported"),
+    ("만료 없음", "Never expires"),
+    ("만료 확인 전", "Expiry unknown"),
+    (
+        "리셋권 · 오래된 정보 · 제공자 보고 {0}",
+        "Reset credits · stale · provider reported {0}",
+    ),
+    ("리셋권 0개", "Reset credits: 0"),
+    (
+        "리셋권 {0}개 · 가장 빠른 만료 {1}",
+        "Reset credits: {0} · earliest expiry {1}",
+    ),
+    (
+        "리셋권 · 제공자 보고 {0} · 상세·만료 확인 필요",
+        "Reset credits · provider reported {0} · details/expiry unverified",
+    ),
+    (
+        "수량·자격·만료를 확인하려면 새로고침하세요.",
+        "Refresh to verify count, eligibility and expiry.",
+    ),
+    ("확인 시각 {0}", "Observed {0}"),
+    (
+        "만료가 가장 빠른 리셋권 1개를 사용합니다.",
+        "Use one reset credit with the earliest verified expiry.",
+    ),
+    (
+        "리셋권 정보가 변경되었거나 만료되었습니다. 새 미리보기를 열어 주세요.",
+        "Reset-credit information changed or expired. Open a new preview.",
+    ),
+    ("사용 가능한 리셋권이 없습니다.", "No usable reset credits."),
+    (
+        "리셋권 상세 정보가 불완전하여 가장 빠른 만료를 확인할 수 없습니다.",
+        "Reset-credit details are incomplete; earliest expiry cannot be verified.",
+    ),
+    (
+        "리셋권 사용 자격을 확인하지 못했습니다.",
+        "Reset-credit eligibility could not be verified.",
+    ),
+    (
+        "리셋권 만료를 확인하지 못했습니다.",
+        "Reset-credit expiry could not be verified.",
+    ),
+    (
+        "리셋권 정보가 올바르지 않습니다. 새로고침하세요.",
+        "Reset-credit information is invalid. Refresh it.",
+    ),
+    (
+        "사용 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.",
+        "Could not confirm the outcome. Refresh the status before using another credit.",
+    ),
+    (
+        "리셋권을 확인하지 못했습니다. 새로고침하세요.",
+        "Could not check reset credits. Refresh the status.",
+    ),
+    (
+        "리셋권 응답이 너무 큽니다",
+        "Reset-credit response is too large",
+    ),
+    ("계정 번호가 올바르지 않습니다", "Invalid account ID"),
+    (
+        "리셋권을 사용했습니다. 사용량·리셋권 정보는 새로고침이 필요합니다.",
+        "Reset credit used. Usage and reset-credit information need refreshing.",
+    ),
+    ("리셋권 1개를 사용했습니다.", "Used one reset credit."),
+    (
+        "이 리셋권은 이미 사용되었습니다.",
+        "This reset credit was already used.",
+    ),
+    (
+        "초기화할 Codex 한도가 없습니다.",
+        "No eligible Codex limits to reset.",
+    ),
+    ("리셋권 확인 중…", "Checking reset credits…"),
+    ("리셋권 새로고침", "Refresh reset credits"),
+    ("리셋권 사용…", "Use reset credit…"),
+    ("리셋권 1개 사용", "Use one reset credit"),
+    ("1개 사용", "Use one"),
+    ("리셋권 · 계정 메뉴…", "Reset credits · account menu…"),
+    (
+        "{0}\n{1}\n만료 {2}\n영향: 해당되는 Codex 한도\n만료가 가장 빠른 리셋권 1개를 사용합니다.\n확인 유효 시각 {3}",
+        "{0}\n{1}\nExpiry {2}\nEffect: eligible Codex limits\nUse one reset credit with the earliest verified expiry.\nConfirmation valid until {3}",
+    ),
     ("세션 번호가 올바르지 않습니다", "Invalid session ID"),
     (
         "대시보드 세션 응답이 요청과 다릅니다",

@@ -640,6 +640,10 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `PATCH /accounts/{id}` `{label?, drain?, allow_credits?}` | Edits account settings |
 | `DELETE /accounts/{id}` | Removes the account file. This does not revoke the account upstream. |
 | `POST /accounts/{id}/refresh-usage` | Polls usage now, subject to the minimum interval |
+| `GET /accounts/{id}/reset-credits` | Cached reset-credit facts only: unknown, unsupported, fresh or stale; a provider-reported count alone does not prove usable inventory or earliest expiry (C9.1). |
+| `POST /accounts/{id}/reset-credits/refresh` | Read-only provider detail lookup and reconciliation of a prior uncertain attempt. Never redeems or retries a redemption. |
+| `POST /accounts/{id}/reset-credits/preview` | Fresh read-only account/inventory/window-set validation. Returns the exact grant, account identity and one-use preview token with a 60-second deadline; no consumption. |
+| `POST /accounts/{id}/reset-credits/commit` `{preview_token, confirm:true}` | Revalidates the preview and dispatches one explicit grant-ID redemption under a durable unknown fence. Stale, expired, replayed, concurrent or draining requests refuse; uncertain dispatches are never automatically retried. Success refreshes actual inventory and usage independently of the ordinary poll cooldown. |
 | `POST /lifecycle/drain` | Takeover handover, in this order:<br>1. stop refresh-ahead and 401-triggered refresh (a 401 during drain is relayed without refresh or health change)<br>2. stop writing account and state files<br>3. flush bindings<br>4. close the data listener<br>5. **release the credential lease**<br>6. return `{bindings:[...], lease_released:true}`<br>In-flight streams continue until done or `drain_timeout_secs`. |
 | `POST /lifecycle/shutdown` `{drain_timeout_secs}` | Graceful exit; flushes bindings |
 | `POST /debug/pin` `{session_key?, account_id}` / `DELETE /debug/pin` | **Phase 0 only.** Forces selection for that session key, or for all sessions if the key is omitted, to the given account, overriding C7. Logged at warn level and shown in the tray. Cleared on restart. |

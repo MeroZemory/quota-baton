@@ -2417,6 +2417,8 @@ fn group_usage_height(g: &m::AccountGroup, available: f32) -> f32 {
 }
 fn group_header_height(b: &mut Builder<'_>, g: &m::AccountGroup, available: f32) -> f32 {
     group_usage_height(g, available)
+        + b.measured_height(&g.reset_credits.text, (available - 46.).max(1.), 12., false)
+        + 32.
         + g.subscription_lines
             .iter()
             .map(|line| b.measured_height(line, (available - 46.).max(1.), 12., false) + 4.)
@@ -2722,6 +2724,38 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         );
         forecast_y += 20.;
     }
+    let reset_h = b.measured_height(&g.reset_credits.text, (width(r) - 44.).max(1.), 12., false);
+    let reset_rect = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), reset_h);
+    b.text(
+        reset_rect,
+        &g.reset_credits.text,
+        12.,
+        false,
+        Color::Secondary,
+        true,
+    );
+    b.tooltip(reset_rect, g.reset_credits.tooltip.clone());
+    b.semantic(
+        format!("{}:reset-credits:{}", b.scope, g.id),
+        Some(format!("group:{}", g.id)),
+        Role::Text,
+        g.reset_credits.tooltip.clone(),
+        reset_rect,
+        None,
+    );
+    forecast_y += reset_h + 4.;
+    let reset_scope = b.scope.clone();
+    b.scope.push_str(":reset-credits");
+    b.control(
+        rect(r.left + 32., forecast_y, (width(r) - 44.).min(260.), 24.),
+        crate::i18n::static_text("리셋권 · 계정 메뉴…"),
+        Target::OpenTrayAccount(g.id.clone()),
+        Role::Button,
+        false,
+        None,
+    );
+    b.scope = reset_scope;
+    forecast_y += 28.;
     for (index, line) in g.subscription_lines.iter().enumerate() {
         let h = b.measured_height(line, (width(r) - 44.).max(1.), 12., false);
         let bounds = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), h);

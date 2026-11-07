@@ -1753,3 +1753,59 @@ fn r19_empty_guidance_and_global_excluded_rows_have_separate_nonoverlapping_geom
         assert!(scene.session_rows.is_empty());
     }
 }
+
+#[test]
+fn r26_inventory_is_near_quota_and_accessible_on_dashboard_with_account_menu_entry() {
+    for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+        crate::i18n::with_language(language, || {
+            let clock = fixtures::clock();
+            for inventory in [
+                serde_json::json!(null),
+                serde_json::json!({"state":"fresh","observed_at":clock.utc().to_rfc3339(),"available_count":0,"grants":[],"refusal":"no_credits"}),
+                serde_json::json!({"state":"fresh","observed_at":clock.utc().to_rfc3339(),"available_count":7,"grants":[],"refusal":"incomplete"}),
+                serde_json::json!({"state":"stale","observed_at":clock.utc().to_rfc3339(),"available_count":3,"grants":[],"refusal":"stale"}),
+            ] {
+                let wire = serde_json::json!({"accounts":[{"id":"cx-a","provider":"codex","label":"very-long-synthetic-account-name ".repeat(20),"email":"sample@example.invalid","user_state":"active","health":{"kind":"ready"},"pool_eligible":true,"reset_credits":inventory}]});
+                let mut data = fixtures::snapshot();
+                data.accounts = v2::project(&wire.to_string(), clock.utc().into()).unwrap();
+                data.sessions.sessions.retain(|s| s.account == "cx-a");
+                for tab in [Tab::Overview, Tab::Usage] {
+                    let mut state = DashboardState {
+                        tab,
+                        grouped: true,
+                        range: Range::All,
+                        ..Default::default()
+                    };
+                    let mut v = m::project(&data, &mut state, &clock);
+                    v.provider_usage.clear();
+                    assert!(!v.groups[0].reset_credits.can_use);
+                    assert_eq!(
+                        v.groups[0].reset_credits.text,
+                        v.usage[0].reset_credits.text
+                    );
+                    for size in [[1024., 640.], [1320., 960.]] {
+                        let scene = Scene::build(&v, &state, size, &Metrics::default());
+                        let nodes: Vec<_> = scene
+                            .accessibility
+                            .iter()
+                            .filter(|n| {
+                                n.key.ends_with("reset-credits:cx-a")
+                                    || n.key == "chart:cx-a:reset-credits"
+                            })
+                            .collect();
+                        assert!(!nodes.is_empty());
+                        for node in nodes {
+                            assert_eq!(node.role, Role::Text);
+                            assert!(node.target.is_none());
+                            assert!(node.rect.left >= 0. && node.rect.right <= size[0]);
+                            assert!(node.name.contains(&v.groups[0].reset_credits.text));
+                        }
+                        assert!(scene.accessibility.iter().any(
+                            |node| node.target == Some(Target::OpenTrayAccount("cx-a".into()))
+                        ));
+                    }
+                }
+            }
+        });
+    }
+}

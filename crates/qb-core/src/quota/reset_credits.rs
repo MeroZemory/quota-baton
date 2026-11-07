@@ -286,11 +286,10 @@ impl UsagePoller {
         let _process_lock = self.reset_process_lock(id).await?;
         entry.preview = None;
         let (account, tokens) = self.reset_credentials(id).await?;
-        if self
-            .reset_fence(id, None)
-            .await?
-            .is_some_and(|f| f.outcome == ResetCreditOutcome::Unknown)
-        {
+        if self.reset_fence(id, None).await?.is_some_and(|f| {
+            f.outcome == ResetCreditOutcome::Unknown
+                || f.identity != account.identity.canonical_key()
+        }) {
             return Err(Error::Unknown);
         }
         let inventory = match self.reset_details(&account, &tokens).await {
@@ -373,11 +372,10 @@ impl UsagePoller {
         if !same_confirmation_account(&account, &preview.account) {
             return Err(Error::Stale);
         }
-        if self
-            .reset_fence(&id, None)
-            .await?
-            .is_some_and(|f| f.outcome == ResetCreditOutcome::Unknown)
-        {
+        if self.reset_fence(&id, None).await?.is_some_and(|f| {
+            f.outcome == ResetCreditOutcome::Unknown
+                || f.identity != account.identity.canonical_key()
+        }) {
             return Err(Error::Unknown);
         }
         let inventory = self.reset_details(&account, &tokens).await?;
@@ -529,6 +527,17 @@ impl UsagePoller {
     }
 
     async fn reset_fence(&self, id: &str, update: Option<Fence>) -> Result<Option<Fence>, Error> {
+        #[cfg(test)]
+        if update
+            .as_ref()
+            .is_some_and(|value| value.outcome != ResetCreditOutcome::Unknown)
+            && self
+                .reset_credits
+                .fail_terminal_write
+                .swap(false, Ordering::AcqRel)
+        {
+            return Err(Error::Unavailable);
+        }
         let home = self.store.home().to_path_buf();
         let id = id.to_owned();
         crate::boxes::spawn_blocking(move || {

@@ -185,7 +185,9 @@ impl Renderer {
         Ok(out)
     }
     pub fn measure(&self, view: &v2::View, p: &mut g::Presentation) -> Result<()> {
-        if let g::Overlay::TakeoverCard { body, .. } = &p.overlay {
+        if let g::Overlay::TakeoverCard { body, .. } | g::Overlay::ResetCredits { body, .. } =
+            &p.overlay
+        {
             let mut s = style(13., false, 20.);
             s.wrap = Wrap::KeepAll;
             p.credits_body_lines = self
@@ -257,6 +259,15 @@ impl Renderer {
                     .measure(line, bounds(r(0., 0., 328., 65536.)), s)?
                     .total_lines;
                 p.subtitle_lines.insert(line.clone(), lines.max(1));
+            }
+            if let Some(line) = &row.reset_credits {
+                let mut s = style(12., false, 16.);
+                s.wrap = Wrap::KeepAll;
+                let lines = self
+                    .text
+                    .measure(&line.text, bounds(r(0., 0., 328., 65536.)), s)?
+                    .total_lines;
+                p.subtitle_lines.insert(line.text.clone(), lines.max(1));
             }
             if let Some(note) = &row.outside_note {
                 let mut s = style(12., false, 16.);
@@ -1068,6 +1079,11 @@ impl Renderer {
                 alpha,
             )?;
         }
+        if let (Some(line), Some(area)) = (&row.reset_credits, b.reset_credits) {
+            let mut s = style(12., false, 16.);
+            s.wrap = Wrap::KeepAll;
+            self.text(target, area, &line.text, s, p.secondary, alpha)?;
+        }
         if let (Some(reason), Some(rect)) = (&row.reason, b.reason) {
             self.text(
                 target,
@@ -1438,7 +1454,9 @@ impl Renderer {
         let credit = credit_id
             .and_then(|id| account(view, id))
             .and_then(|row| row.menu.credits_enable_confirmation.as_ref());
-        let title = if d.takeover_body.is_some() {
+        let title = if matches!(d.buttons[0].target, g::Target::ConfirmResetCredit(_)) {
+            crate::i18n::static_text("리셋권 1개 사용")
+        } else if d.takeover_body.is_some() {
             if d.buttons[0].target == g::Target::TakeoverCommit {
                 crate::i18n::static_text("가져오기 확인")
             } else {
@@ -1608,6 +1626,7 @@ impl Renderer {
 
 fn menu_glyph(action: &g::MenuAction) -> &'static str {
     match action {
+        g::MenuAction::RefreshResetCredits | g::MenuAction::UseResetCredit => "\u{e72c}",
         g::MenuAction::RefreshUsage => "\u{e72c}",
         g::MenuAction::Relogin => "\u{e8d7}",
         g::MenuAction::RefreshToken => "\u{e895}",
@@ -2011,6 +2030,11 @@ mod r19_immutable_metrics_tests {
                     .cloned()
                     .map(|s| (s, 328., 65536., false, true)),
             );
+            if row.excluded_reason.is_none()
+                && let Some(line) = &row.reset_credits
+            {
+                cases.push((line.text.clone(), 328., 65536., false, true));
+            }
             if let Some(s) = &row.outside_note {
                 cases.push((s.clone(), 328., 65536., false, true));
             }
@@ -2201,6 +2225,55 @@ mod r19_immutable_metrics_tests {
                 assert_eq!(p.credits_body_lines, expected.total_lines);
                 let scene = g::Scene::build(&view, p, 800.);
                 assert!(g::h(scene.dialog.as_ref().unwrap().body) >= expected.required_height);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod r26_native_metrics_tests {
+    use super::*;
+    #[test]
+    fn r26_native_preview_long_identity_wraps_and_scrolls_without_losing_cancel() -> Result<()> {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || -> Result<()> {
+                let view =
+                    v2::project("{\"accounts\":[]}", std::time::SystemTime::UNIX_EPOCH).unwrap();
+                let renderer = Renderer::new(false)?;
+                let body = format!(
+                    "{}\n{}\n{}",
+                    "synthetic-long-account-name-".repeat(60),
+                    "long-email@example.invalid".repeat(60),
+                    crate::i18n::static_text("만료가 가장 빠른 리셋권 1개를 사용합니다.")
+                );
+                for cap in [240., 480., 800.] {
+                    let mut p = g::Presentation {
+                        overlay: g::Overlay::ResetCredits {
+                            id: "synthetic".into(),
+                            body: body.clone(),
+                            ready: true,
+                        },
+                        ..Default::default()
+                    };
+                    renderer.measure(&view, &mut p)?;
+                    assert!(p.credits_body_lines > 12);
+                    let scene = g::Scene::build(&view, p, cap);
+                    let d = scene.dialog.unwrap();
+                    assert!(d.body_height > g::h(d.body));
+                    assert!(
+                        d.buttons.iter().any(
+                            |button| button.target == g::Target::CancelDialog && button.enabled
+                        )
+                    );
+                    assert!(
+                        d.buttons
+                            .iter()
+                            .all(|button| button.visual.top >= d.body.bottom
+                                && button.visual.bottom <= d.card.bottom)
+                    );
+                }
                 Ok(())
             })?;
         }

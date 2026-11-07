@@ -36,6 +36,7 @@ pub struct Session {
     pub manual_expansion: BTreeMap<String, bool>,
     pub expansion: BTreeMap<String, bool>,
     pub credits_dialog: Option<CreditsDialog>,
+    pub reset_credits: crate::client::reset_credits::Consent,
     pending: BTreeMap<String, u64>,
     pending_actions: BTreeMap<String, (u64, String)>,
     errors: BTreeMap<String, Duration>,
@@ -81,6 +82,7 @@ impl Session {
         self.credits_dialog = None;
     }
     pub fn hide(&mut self) {
+        self.reset_credits.cancel();
         self.open = false;
         self.credits_dialog = None;
     }

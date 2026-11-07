@@ -58,6 +58,8 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         .iter()
         .map(|tile| {
             288. + english_window_extra(tile)
+                + b.measured_height(&tile.reset_credits.text, (tw - 24.).max(1.), 12., false)
+                + 32.
                 + tile
                     .subscription_lines
                     .iter()
@@ -163,12 +165,15 @@ fn usage_tile(
     table: &history::Table,
     stamps: &mut BTreeMap<DateTime<Utc>, String>,
 ) {
+    let chartkey = format!("chart:{}", t.id);
     let tile_clip = intersection(r, b.clip);
     if let Some(clip) = tile_clip {
         b.scene.draw.push(Draw::Clip(clip));
     }
     b.fill(r, Color::Surface, 6.);
-    let header_height = 60. + english_window_extra(t);
+    let reset_h = b.measured_height(&t.reset_credits.text, (width(r) - 24.).max(1.), 12., false);
+    let reset_extra = reset_h + 32.;
+    let header_height = 60. + english_window_extra(t) + reset_extra;
     b.fill(
         rect(r.left, r.top, width(r), header_height),
         Color::Footer,
@@ -308,9 +313,44 @@ fn usage_tile(
             left += reset_width + 16.;
         }
     }
-    // English windows each own a line; move all chart annotations with them.
+    let reset_rect = rect(
+        r.left + 12.,
+        r.top + 56. + english_window_extra(t),
+        (width(r) - 24.).max(1.),
+        reset_h,
+    );
+    b.text(
+        reset_rect,
+        &t.reset_credits.text,
+        12.,
+        false,
+        Color::Secondary,
+        true,
+    );
+    b.tooltip(reset_rect, t.reset_credits.tooltip.clone());
+    b.semantic(
+        format!("chart:{}:reset-credits", t.id),
+        Some(chartkey.clone()),
+        Role::Text,
+        t.reset_credits.tooltip.clone(),
+        reset_rect,
+        None,
+    );
+    let action_y = reset_rect.bottom + 4.;
+    let prior_scope = b.scope.clone();
+    b.scope.push_str(":reset-credits");
+    b.control(
+        rect(r.left + 12., action_y, (width(r) - 24.).min(260.), 24.),
+        crate::i18n::static_text("리셋권 · 계정 메뉴…"),
+        Target::OpenTrayAccount(t.id.clone()),
+        Role::Button,
+        false,
+        None,
+    );
+    b.scope = prior_scope;
+    // Move chart annotations below account quota and reset-credit information.
     let r = Rect {
-        top: r.top + english_window_extra(t),
+        top: r.top + english_window_extra(t) + reset_extra,
         ..r
     };
     let future_resets: BTreeSet<_> = t
@@ -709,7 +749,6 @@ fn usage_tile(
             tooltip: None,
         });
     }
-    let chartkey = format!("chart:{}", t.id);
     b.semantic(
         chartkey.clone(),
         None,

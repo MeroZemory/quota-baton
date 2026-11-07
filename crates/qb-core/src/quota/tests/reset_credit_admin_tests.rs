@@ -5,6 +5,226 @@ mod r26_reset_credit_admin_tests {
         ResetCreditOutcome, ResetCreditPreview, ResetCreditResult,
     };
 
+    fn persistence_details() -> serde_json::Value {
+        json!({"available_count":1,"credits":[{"id":"synthetic-persistence-grant",
+            "reset_type":"codex_rate_limits","status":"available","granted_at":"2020-01-01T00:00:00Z",
+            "expires_at":"2099-01-01T00:00:00Z"}]})
+    }
+
+    fn persistence_usage() -> serde_json::Value {
+        json!({"rate_limit":{"primary_window":{"used_percent":95,"limit_window_seconds":18000}}})
+    }
+
+    async fn persistence_preview(f: &Fixture) -> ResetCreditPreview {
+        for value in [persistence_details(), persistence_usage()] {
+            f.fake.state.push(ScriptedResponse::json(
+                reqwest::StatusCode::OK,
+                value.to_string(),
+            ));
+        }
+        f.relay.quota.preview_reset_credit(&f.ids[0]).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn unreadable_native_fence_never_dispatches_a_redemption() {
+        use sha2::{Digest, Sha256};
+        let f = Fixture::new(1).await;
+        let preview = persistence_preview(&f).await;
+        let file = f
+            .relay
+            .quota
+            .store
+            .home()
+            .join("state/reset-credits")
+            .join(format!("{:x}.json", Sha256::digest(f.ids[0].as_bytes())));
+        // Deliberately wrong native leaf type, confined to this owned home.
+        crate::platform::create_private_directory_new(&file).unwrap();
+        for value in [persistence_details(), persistence_usage()] {
+            f.fake.state.push(ScriptedResponse::json(
+                reqwest::StatusCode::OK,
+                value.to_string(),
+            ));
+        }
+        let result = f
+            .relay
+            .quota
+            .commit_reset_credit(
+                f.ids[0].clone(),
+                qb_proto::reset_credit_action::ResetCreditCommitRequest {
+                    preview_token: preview.preview_token,
+                    confirm: true,
+                },
+            )
+            .await;
+        assert_eq!(result, Err(crate::reset_credits::Error::Unknown));
+        assert!(
+            f.fake
+                .state
+                .requests()
+                .iter()
+                .all(|r| r.method == reqwest::Method::GET)
+        );
+        assert_eq!(
+            f.relay.quota.preview_reset_credit(&f.ids[0]).await,
+            Err(crate::reset_credits::Error::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_write_preserves_unknown_fence_after_provider_success() {
+        use sha2::{Digest, Sha256};
+        let f = Fixture::new(1).await;
+        let preview = persistence_preview(&f).await;
+        for value in [
+            persistence_details(),
+            persistence_usage(),
+            json!({"code":"reset","windows_reset":1}),
+        ] {
+            f.fake.state.push(ScriptedResponse::json(
+                reqwest::StatusCode::OK,
+                value.to_string(),
+            ));
+        }
+        f.relay
+            .quota
+            .reset_credits
+            .fail_terminal_write
+            .store(true, Ordering::Release);
+        let result = f
+            .relay
+            .quota
+            .commit_reset_credit(
+                f.ids[0].clone(),
+                qb_proto::reset_credit_action::ResetCreditCommitRequest {
+                    preview_token: preview.preview_token,
+                    confirm: true,
+                },
+            )
+            .await;
+        assert_eq!(result, Err(crate::reset_credits::Error::Unknown));
+        assert_eq!(
+            f.fake
+                .state
+                .requests()
+                .iter()
+                .filter(|r| r.method == reqwest::Method::POST)
+                .count(),
+            1
+        );
+        let file = f
+            .relay
+            .quota
+            .store
+            .home()
+            .join("state/reset-credits")
+            .join(format!("{:x}.json", Sha256::digest(f.ids[0].as_bytes())));
+        let fence: serde_json::Value =
+            serde_json::from_slice(&crate::platform::read_private_bytes(&file, 16384).unwrap())
+                .unwrap();
+        assert_eq!(fence["outcome"], "unknown");
+        assert_eq!(fence["grant"], "synthetic-persistence-grant");
+        assert_eq!(
+            f.relay.quota.preview_reset_credit(&f.ids[0]).await,
+            Err(crate::reset_credits::Error::Unknown)
+        );
+        assert_eq!(
+            f.fake
+                .state
+                .requests()
+                .iter()
+                .filter(|r| r.method == reqwest::Method::POST)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn native_takeover_drain_retains_lease_until_cancelled_callers_commit_is_terminal() {
+        let f = Fixture::new(1).await;
+        let id = f.ids[0].clone();
+        let details = json!({"available_count":1,"credits":[{"id":"synthetic-takeover-grant",
+            "reset_type":"codex_rate_limits","status":"available","granted_at":"2020-01-01T00:00:00Z",
+            "expires_at":"2099-01-01T00:00:00Z"}]});
+        let usage = json!({"rate_limit":{"primary_window":{"used_percent":95,"limit_window_seconds":18000}}});
+        for value in [&details, &usage] {
+            f.fake.state.push(ScriptedResponse::json(
+                reqwest::StatusCode::OK,
+                value.to_string(),
+            ));
+        }
+        let preview = f.relay.quota.preview_reset_credit(&id).await.unwrap();
+        let (arrived, release) = f.fake.state.pause_next_response();
+        for value in [
+            &details,
+            &usage,
+            &json!({"code":"no_credit","windows_reset":0}),
+            &details,
+        ] {
+            f.fake.state.push(ScriptedResponse::json(
+                reqwest::StatusCode::OK,
+                value.to_string(),
+            ));
+        }
+        let poller = f.relay.quota.clone();
+        let sending = tokio::spawn(async move {
+            poller
+                .commit_reset_credit(
+                    preview.account,
+                    qb_proto::reset_credit_action::ResetCreditCommitRequest {
+                        preview_token: preview.preview_token,
+                        confirm: true,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        sending.abort();
+        assert!(sending.await.unwrap_err().is_cancelled());
+        let relay = f.relay.clone();
+        let draining = tokio::spawn(async move { relay.begin_drain().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !f.relay.is_draining() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!draining.is_finished());
+        let home = f.relay.quota.store.home().to_owned();
+        let attempted = home.clone();
+        let successor = tokio::task::spawn_blocking(move || AccountStore::acquire(&attempted))
+            .await
+            .unwrap();
+        assert!(matches!(
+            successor,
+            Err(crate::accounts::StoreError::LeaseBusy)
+        ));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), draining)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.fake
+                .state
+                .requests()
+                .iter()
+                .filter(|r| r.method == reqwest::Method::POST)
+                .count(),
+            1
+        );
+        f.relay.release_lease_after_drain();
+        let successor = tokio::task::spawn_blocking(move || AccountStore::acquire(&home))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(successor);
+    }
+
     #[tokio::test]
     async fn automatic_summary_updates_known_counts_but_missing_and_failed_reads_preserve_stale_facts()
      {

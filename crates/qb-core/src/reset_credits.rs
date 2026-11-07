@@ -13,6 +13,8 @@ pub(crate) struct ResetCredits {
     accounts: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<Entry>>>>,
     admission: Arc<tokio::sync::RwLock<()>>,
     closed: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_terminal_write: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]

@@ -78,6 +78,7 @@ pub struct Account {
     pub health: Health,
     pub windows: Vec<Window>,
     pub credits: Option<Credits>,
+    pub reset_credits: Option<qb_proto::reset_credits::ResetCreditInventory>,
     /// Authoritative actual paid-serving signal, including explicit false.
     pub credits_in_use: Option<bool>,
     pub usage_forecast: Option<qb_core::usage_forecast::AccountUsageForecast>,
@@ -102,6 +103,26 @@ pub struct Account {
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
+/// Matches reset_credentials' account gates; grant evidence supplies plan eligibility.
+pub fn reset_credit_account_refusal(account: &Account) -> Option<&'static str> {
+    let reason = if account.provider != "codex" {
+        "리셋권 · 지원 안 함"
+    } else if account.health.kind == "needs_relogin" {
+        "먼저 다시 로그인해 주세요."
+    } else if account.user_state == "paused" {
+        "계정을 먼저 재개해 주세요."
+    } else if account.user_state == "disabled" {
+        "계정을 먼저 켜 주세요."
+    } else if account.user_state != "active" {
+        "계정 상태를 먼저 확인해 주세요."
+    } else if account.drain {
+        "새 대화 받지 않기를 먼저 꺼 주세요."
+    } else {
+        return None;
+    };
+    Some(crate::i18n::static_text(reason))
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Health {
@@ -318,6 +339,7 @@ pub struct AccountRow {
     pub usage: Option<Usage>,
     pub windows: Vec<WindowMetric>,
     pub credits: Option<CreditsLine>,
+    pub reset_credits: Option<crate::client::reset_credits::InventoryLine>,
     /// Exactly one compact shared core summary; detail is hover-only.
     pub forecast_lines: Vec<String>,
     pub forecast_tooltip: String,
@@ -1012,6 +1034,11 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         usage,
         windows,
         credits,
+        reset_credits: Some(crate::client::reset_credits::inventory_line(
+            &a.provider,
+            a.reset_credits.as_ref(),
+            now,
+        )),
         forecast_lines: vec![forecast_summary.text],
         forecast_tooltip,
         forecast_warning: forecast_summary.warning,
@@ -1503,6 +1530,7 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         row.chip.as_ref().map(|c| c.text.clone()),
         usage_accessibility,
         row.forecast_lines.first().cloned(),
+        row.reset_credits.as_ref().map(|line| line.text.clone()),
     ]
     .into_iter()
     .flatten()

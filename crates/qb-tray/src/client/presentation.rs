@@ -63,6 +63,8 @@ pub struct PresentationAccount {
     pub placement_capacity_tokens: Option<u64>,
     #[serde(default)]
     pub credits: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<qb_proto::reset_credits::ResetCreditInventory>,
     #[serde(default)]
     pub credits_in_use: Option<bool>,
     #[serde(default)]

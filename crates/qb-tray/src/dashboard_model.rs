@@ -549,6 +549,7 @@ pub struct AccountGroup {
     pub name: String,
     pub plan: String,
     pub subscription_lines: Vec<String>,
+    pub reset_credits: crate::client::reset_credits::InventoryLine,
     pub outside_used: bool,
     pub chip: String,
     pub tone: v2::Tone,
@@ -627,6 +628,7 @@ pub struct UsageTile {
     pub name: String,
     pub plan: String,
     pub subscription_lines: Vec<String>,
+    pub reset_credits: crate::client::reset_credits::InventoryLine,
     pub chip: String,
     pub tone: v2::Tone,
     pub windows: Vec<AccountUsageWindow>,
@@ -1330,6 +1332,11 @@ pub fn project(
         };
         groups.push(AccountGroup {
             subscription_lines: v2::subscription_lines(&a.raw, clock.now),
+            reset_credits: crate::client::reset_credits::inventory_line(
+                &a.raw.provider,
+                a.raw.reset_credits.as_ref(),
+                clock.utc(),
+            ),
             id: a.raw.id.clone(),
             provider: a.raw.provider.clone(),
             name: folder(&a.name),
@@ -2630,6 +2637,11 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 .unwrap_or_default();
             UsageTile {
                 subscription_lines: v2::subscription_lines(&a.raw, clock.now),
+                reset_credits: crate::client::reset_credits::inventory_line(
+                    &a.raw.provider,
+                    a.raw.reset_credits.as_ref(),
+                    clock.utc(),
+                ),
                 id: a.raw.id.clone(),
                 provider: a.raw.provider.clone(),
                 name: folder(&a.name),

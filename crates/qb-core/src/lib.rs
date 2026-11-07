@@ -26,6 +26,16 @@ pub mod provider_forecast;
 pub mod quota;
 pub mod relay;
 mod reset_credits;
+
+/// Pure presentation evidence only. A returned grant is not send authority;
+/// redemption still requires the authenticated, durably fenced confirmation API.
+pub fn reset_credit_display_choice(
+    inventory: &qb_proto::reset_credits::ResetCreditInventory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<qb_proto::reset_credits::ResetCreditGrant, qb_proto::reset_credits::ResetCreditRefusal>
+{
+    reset_credits::model::choose(inventory, now).cloned()
+}
 pub mod routing;
 pub mod service;
 pub mod session;
