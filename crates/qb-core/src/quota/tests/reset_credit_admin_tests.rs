@@ -26,6 +26,85 @@ mod r26_reset_credit_admin_tests {
     }
 
     #[tokio::test]
+    async fn successful_reset_preserves_unrelated_holds_and_paid_credit_settings() {
+        for reason in [
+            HealthReason::Auth,
+            HealthReason::Payment,
+            HealthReason::Quota,
+        ] {
+            let f = Fixture::new(1).await;
+            f.relay
+                .quota
+                .store
+                .update_metadata(&f.ids[0], |account| {
+                    account.allow_credits = true;
+                    account.health = Health::Cooling {
+                        reason,
+                        until: Utc::now() + chrono::Duration::hours(1),
+                        scope: if reason == HealthReason::Quota {
+                            "model:synthetic-unrelated"
+                        } else {
+                            "account"
+                        }
+                        .into(),
+                    };
+                    if reason == HealthReason::Payment {
+                        account.payment_failures = 1;
+                        account.payment_until = Some(Utc::now() + chrono::Duration::hours(1));
+                    }
+                })
+                .unwrap();
+            let preview = persistence_preview(&f).await;
+            let before = f.account(0);
+            let mut redeemed = persistence_details();
+            redeemed["available_count"] = json!(0);
+            redeemed["credits"][0]["status"] = json!("redeemed");
+            for value in [
+                persistence_details(),
+                persistence_usage(),
+                json!({"code":"reset","windows_reset":1}),
+                redeemed,
+                persistence_usage(),
+            ] {
+                f.fake.state.push(ScriptedResponse::json(
+                    reqwest::StatusCode::OK,
+                    value.to_string(),
+                ));
+            }
+            let result = f
+                .relay
+                .quota
+                .commit_reset_credit(
+                    f.ids[0].clone(),
+                    qb_proto::reset_credit_action::ResetCreditCommitRequest {
+                        preview_token: preview.preview_token,
+                        confirm: true,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, ResetCreditOutcome::Reset);
+            assert!(!result.refresh_failed);
+            let after = f.account(0);
+            assert_eq!(after.health, before.health);
+            assert_eq!(after.payment_until, before.payment_until);
+            assert_eq!(after.payment_failures, before.payment_failures);
+            assert_eq!(after.user_state, before.user_state);
+            assert_eq!(after.allow_credits, before.allow_credits);
+            assert_eq!(after.drain, before.drain);
+            assert_eq!(
+                f.fake
+                    .state
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method == reqwest::Method::POST)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unreadable_native_fence_never_dispatches_a_redemption() {
         use sha2::{Digest, Sha256};
         let f = Fixture::new(1).await;
