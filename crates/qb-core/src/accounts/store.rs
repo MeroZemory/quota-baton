@@ -505,20 +505,7 @@ impl AccountStore {
         }
         match self.tokens_unlocked(account) {
             Ok(tokens) if !tokens.access_token.is_empty() => (true, None),
-            Err(StoreError::GenerationConflict {
-                expected: _expected,
-                actual: _actual,
-            }) => {
-                #[cfg(feature = "testkit")]
-                tracing::warn!(
-                    code = "test_selection_generation_conflict",
-                    account = %account.id,
-                    expected = ?_expected,
-                    actual = ?_actual,
-                    "Selection credential snapshot changed"
-                );
-                (false, None)
-            }
+            Err(StoreError::GenerationConflict { .. }) => (false, None),
             _ => (false, Some(self.selection.credential(account))),
         }
     }

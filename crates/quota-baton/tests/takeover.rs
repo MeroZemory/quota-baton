@@ -425,25 +425,8 @@ async fn legacy_strict_data_account(
                 request.method == reqwest::Method::POST && request.path_and_query == "/responses"
             })
             .count();
-        // The production logger redacts the code field; match only fixed safe messages.
-        let diagnostics: Vec<String> = ["owner.stderr", "successor.stderr"]
-            .iter()
-            .flat_map(|file| {
-                fs::read_to_string(home.path.join(file))
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|line| {
-                        line.contains("Selection credential snapshot changed")
-                            || line.contains("Selection refused before dispatch")
-                            || line.contains("Strict selection has no admitted candidate")
-                    })
-                    .map(|line| line.chars().take(512).collect::<String>())
-                    .collect::<Vec<_>>()
-            })
-            .take(16)
-            .collect();
         panic!(
-            "legacy strict phase={phase} status={status} fake_responses={inference_requests} body={body} diagnostics={diagnostics:?}"
+            "legacy strict phase={phase} status={status} fake_responses={inference_requests} body={body}"
         );
     }
     let account = response.headers()["x-quota-baton-account"]
