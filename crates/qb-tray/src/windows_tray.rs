@@ -1,3 +1,6 @@
+#[path = "windows_tray/dpi.rs"]
+mod dpi;
+
 #[cfg(feature = "testkit")]
 #[path = "flyout_perf.rs"]
 mod flyout_perf;
@@ -61,10 +64,7 @@ use windows::{
         System::{LibraryLoader::GetModuleHandleW, Threading::CREATE_NO_WINDOW},
         UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
         UI::{
-            HiDpi::{
-                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
-                SetProcessDpiAwarenessContext,
-            },
+            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_WARNING,
                 NIM_ADD, NIM_DELETE, NIM_MODIFY, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT,
@@ -252,7 +252,7 @@ fn painted_frame(hwnd: HWND) -> Option<PaintedFrame> {
     let offset = VIEWPORT.with(|v| v.borrow().offset);
     if frame.revision != REVISION.load(Ordering::Acquire)
         || frame.pixels != (size.width, size.height)
-        || frame.dpi != unsafe { GetDpiForWindow(hwnd).max(96) }
+        || frame.dpi != dpi::effective(hwnd)
         || (frame.offset - offset).abs() > 0.01
     {
         return None;
@@ -434,6 +434,7 @@ fn test_shell(hwnd: HWND, event: &str, kind: Option<crate::tray_icon::signals::K
         "state": state, "accounts": count, "kind": kind.map(|k| format!("{k:?}")),
         "menu_checked": menu_checked, "menu_pending": menu_pending, "scene":scene_trace,
         "file_launch_hook": true,
+        "native_dpi": dpi::proof(hwnd),
         "input": INPUT.with(|i| { let i=i.borrow(); serde_json::json!({"pointer":i.pointer_mode,"hover":format!("{:?}",i.hover),"since_ms":i.since.map(|at|at.elapsed().as_millis())}) }),
     });
     if let Some(worker) = WORKER.get() {
@@ -994,7 +995,7 @@ fn pending_toggle_labels(scene: &mut geometry::Scene, pending: &Session) {
     }
 }
 fn window_scale(hwnd: HWND) -> f32 {
-    unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
+    dpi::effective(hwnd) as f32 / 96.0
 }
 fn client_pixel_size(client: RECT) -> D2D_SIZE_U {
     D2D_SIZE_U {
@@ -1034,7 +1035,7 @@ unsafe fn resize_flyout(hwnd: HWND) {
     let Ok((_, _, scene, _)) = measured_scene(hwnd) else {
         return;
     };
-    let dpi = unsafe { GetDpiForWindow(hwnd).max(96) } as f32;
+    let dpi = dpi::effective(hwnd) as f32;
     let width = pixel_ceil(360., dpi).max(1) as i32;
     let height = pixel_ceil(scene.rect.bottom, dpi).max(1) as i32;
     let mut window = RECT::default();
@@ -1085,7 +1086,7 @@ unsafe fn position_flyout(hwnd: HWND) {
     if !unsafe { GetMonitorInfoW(monitor, &mut info).as_bool() } {
         return;
     }
-    let dpi = unsafe { GetDpiForWindow(hwnd).max(96) } as f32;
+    let dpi = dpi::effective(hwnd) as f32;
     let width = pixel_ceil(360.0, dpi).max(1) as i32;
     let height = measured_scene(hwnd)
         .map(|(_, _, scene, _)| pixel_ceil(scene.rect.bottom, dpi).max(1) as i32)
@@ -1145,7 +1146,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client)?;
         let pixels = client_pixel_size(client);
-        let dpi = GetDpiForWindow(hwnd).max(96);
+        let dpi = dpi::effective(hwnd);
         #[cfg(all(debug_assertions, feature = "testkit"))]
         let target_started = Instant::now();
         let target = RENDER_TARGET.with(|slot| -> Result<ID2D1HwndRenderTarget> {
@@ -1157,7 +1158,6 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                 });
                 #[cfg(not(all(debug_assertions, feature = "testkit")))]
                 let _ = resized;
-                target.SetDpi(dpi as f32, dpi as f32);
                 return Ok(target.clone());
             }
             renderer.clear_target_resources();
@@ -1182,6 +1182,8 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             *slot.borrow_mut() = Some(target.clone());
             Ok(target)
         })?;
+        target.SetDpi(dpi as f32, dpi as f32);
+        dpi::record_target(hwnd, &target);
         #[cfg(all(debug_assertions, feature = "testkit"))]
         FRAME_TIMINGS.with(|t| {
             t.borrow_mut()
@@ -3855,8 +3857,9 @@ unsafe extern "system" fn window_proc(
                 RENDER_TARGET.with(|slot| {
                     if let Some(target) = slot.borrow().as_ref() {
                         let _ = resize_target(target, client_pixel_size(client));
-                        let dpi = GetDpiForWindow(hwnd).max(96) as f32;
+                        let dpi = dpi::effective(hwnd) as f32;
                         target.SetDpi(dpi, dpi);
+                        dpi::record_target(hwnd, target);
                     }
                 });
             }
@@ -3960,6 +3963,7 @@ pub fn run(
     fixture: Option<PathBuf>,
     now: SystemTime,
 ) -> Result<()> {
+    dpi::initialize(fixture.is_some())?;
     let _apartment = UiApartment::enter()?;
     #[cfg(feature = "testkit")]
     flyout_perf::init()?;

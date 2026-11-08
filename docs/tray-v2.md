@@ -534,6 +534,8 @@ This is a normative implementation target, not a claim of native acceptance: R26
 - Outer ring: 2 DIP focus-outer, centred on the rect inflated by2, radius r+2.
 - V2 rows use their x4–356 hover rectangle; v2 keyboard order is §12.
 
+Verification may use an isolated debug+testkit effective-DPI fixture at144/192 for the real core/AdminClient/native HWND path. It requires numeric-loopback fake login and both browser/clipboard suppression; prepared DTO mode is refused. The same effective DPI drives HWND sizing, Direct2D, frame validity, hit testing and UIA. Record OS DPI separately from actual target GetDpi/pixel readback; this proves native scaled layout, not a physical-monitor transition. Default/release retain the OS query with no fixture environment lookup, and no shared display/registry setting changes.
+
 ## 19. R19 amendment: ownership and accounts not used for placement
 
 User direction, 2026-10-29. This section supersedes the paused/full-row and
