@@ -830,6 +830,7 @@ fn r7_usage_maximum_accounts_windows_and_points_stay_within_global_node_budget()
         .map(|account| {
             let mut tile = template.clone();
             tile.id = format!("synthetic-{account}");
+            tile.subscription_lines = vec!["Synthetic observed provider date".into(); 3];
             tile.series = (0..16)
                 .map(|window| {
                     let index = account * 16 + window;
@@ -927,8 +928,33 @@ fn r7_usage_charts_have_table_children_whole_plot_hit_and_remaining_values() {
         ..Default::default()
     };
     let v = view(&mut state);
+    let initial = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    let chart = initial.charts.iter().find(|c| c.id == "cx-a").unwrap();
+    let region = initial
+        .content
+        .iter()
+        .find(|r| r.region == ScrollRegion::Usage)
+        .unwrap();
+    let point = (chart.rect.left + 1., chart.rect.top + 1.);
+    // Measured reset content moves this account below the initial viewport. A
+    // retained offscreen chart must not get a hit target through that clip.
+    assert!(point.1 >= region.viewport.bottom);
+    assert_eq!(initial.hit_test(point.0, point.1), None);
+    state.usage_offset =
+        (region.offset + chart.rect.top - region.viewport.top - 8.).clamp(0., region.max_offset);
     let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
     let chart = scene.charts.iter().find(|c| c.id == "cx-a").unwrap();
+    let viewport = scene
+        .content
+        .iter()
+        .find(|r| r.region == ScrollRegion::Usage)
+        .unwrap()
+        .viewport;
+    assert!(contains(
+        viewport,
+        chart.rect.left + 1.,
+        chart.rect.top + 1.
+    ));
     assert_eq!(
         scene.hit_test(chart.rect.left + 1., chart.rect.top + 1.),
         Some(&Target::Chart("cx-a".into()))

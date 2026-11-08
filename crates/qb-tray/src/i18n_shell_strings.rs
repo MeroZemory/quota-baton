@@ -8,7 +8,6 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
         "로그인 시간이 만료되었습니다. 다시 시도하거나 로그인 방법을 변경해 주세요.",
         "Sign-in expired. Try again or change the sign-in method.",
     ),
-    ("Codex 계정 추가", "Add Codex account"),
     (
         "다른 계정의 로그인이 완료되었습니다. 선택한 계정의 재로그인은 확인되지 않았습니다.",
         "Another account signed in. Re-login of the selected account was not confirmed.",

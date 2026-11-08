@@ -47,7 +47,7 @@ fn scene(v: &m::DashboardView, t: &m::UsageTile) -> Scene {
 }
 fn scene_at_width(v: &m::DashboardView, t: &m::UsageTile, tile_width: f32) -> Scene {
     let metrics = Metrics::default();
-    let outer = rect(0., 0., tile_width, 288.);
+    let outer = rect(0., 0., tile_width, 0.);
     let mut b = Builder {
         scene: Scene {
             modal: false,
@@ -66,6 +66,11 @@ fn scene_at_width(v: &m::DashboardView, t: &m::UsageTile, tile_width: f32) -> Sc
         scope: "usage-test".into(),
         enabled: true,
     };
+    // The component receives the same measured allocation as a production tile.
+    // A fixed 288-DIP box predates reset status/action and metadata lines.
+    let outer = rect(0., 0., tile_width, tile_height(&mut b, t, tile_width));
+    b.scene.rect = outer;
+    b.clip = outer;
     usage_tile(
         &mut b,
         v,
@@ -124,8 +129,22 @@ fn series_lines(s: &Scene) -> Vec<SeriesLine<'_>> {
 fn r10_usage_header_has_sixty_dip_divider_all_windows_and_limit_chip() {
     let (v, t) = fixture();
     let s = scene(&v, &t);
+    let reset = s
+        .accessibility
+        .iter()
+        .find(|n| n.key == format!("chart:{}:reset-credits", t.id))
+        .unwrap();
+    let action = s
+        .targets
+        .iter()
+        .find(|hit| hit.target == Target::OpenTrayAccount(t.id.clone()))
+        .unwrap();
+    assert!(reset.name.contains(&t.reset_credits.text));
+    assert!(reset.rect.top >= 52. && reset.rect.bottom + 4. == action.rect.top);
+    let divider = action.rect.bottom + 8.;
     assert!(s.draw.iter().any(|d| matches!(d,
-        Draw::Line { from, to, .. } if from == &[0., 60.] && to == &[406., 60.])));
+        Draw::Line { from, to, .. } if from == &[0., divider] && to == &[406., divider])));
+    assert!(s.charts[0].rect.top >= divider + 20.);
     assert!(s.draw.iter().any(|d| matches!(d,
         Draw::Stroke { color: Color::GroupBorder, radius, .. } if *radius == 6.)));
     let (chip_index, chip_rect, chip_color) = text(&s, "한도 도달");
@@ -523,46 +542,84 @@ fn r10_usage_future_annotation_and_bounded_accessible_history_survive() {
 
 #[test]
 fn r10_usage_tiles_share_row_height_at_wide_and_narrow_widths() {
-    let (mut v, tile) = fixture();
-    v.usage = vec![tile.clone(); 4];
-    for (i, t) in v.usage.iter_mut().enumerate() {
-        t.id = format!("tile-{i}");
-    }
-    v.usage[1].unconfirmed = true;
-    v.usage[2].series.clear();
-    let state = DashboardState {
-        tab: Tab::Usage,
-        ..Default::default()
-    };
-    for size in [[1320., 960.], [1024., 640.]] {
-        let s = Scene::build(&v, &state, size, &Metrics::default());
-        let tiles: Vec<_> = s
-            .draw
-            .iter()
-            .filter_map(|d| match d {
-                Draw::Stroke {
-                    rect,
-                    color: Color::GroupBorder,
-                    radius,
-                    ..
-                } if *radius == 6. => Some(rect),
-                _ => None,
-            })
-            .collect();
-        assert!(tiles.len() >= 2);
-        // Every fixture account now has one 16-DIP compact summary plus its gap.
-        assert!(v.usage.iter().all(|tile| tile.forecast_lines.len() == 1));
-        assert!(tiles.iter().all(|r| height(**r) == 308.));
-        assert_eq!(tiles[0].top, tiles[1].top);
-        assert_eq!(s.charts.len(), 6);
-        assert_eq!(
-            s.charts
-                .iter()
-                .filter(|c| c.provider_summary.is_none())
-                .count(),
-            4
-        );
-        assert!(s.accessibility.len() <= history::SCENE_NODE_BUDGET);
+    for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+        crate::i18n::with_language(language, || {
+            let (mut v, tile) = fixture();
+            v.usage = vec![tile.clone(); 4];
+            for (i, t) in v.usage.iter_mut().enumerate() {
+                t.id = format!("tile-{i}");
+            }
+            // EN gives each confirmed window a caption row; unconfirmed copy
+            // intentionally uses fewer rows. Keep both windows and check each allocation.
+            v.usage[1].unconfirmed = true;
+            v.usage[2].series.clear();
+            let state = DashboardState {
+                tab: Tab::Usage,
+                ..Default::default()
+            };
+            for size in [[1320., 960.], [1024., 640.]] {
+                let s = Scene::build(&v, &state, size, &Metrics::default());
+                let tiles: Vec<_> = s
+                    .draw
+                    .iter()
+                    .filter_map(|d| match d {
+                        Draw::Stroke {
+                            rect,
+                            color: Color::GroupBorder,
+                            radius,
+                            ..
+                        } if *radius == 6. => Some(rect),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(tiles.len() >= 2);
+                assert!(v.usage.iter().all(|tile| tile.forecast_lines.len() == 1));
+                if language == crate::i18n::UiLanguage::Ko {
+                    assert!(tiles.iter().all(|r| height(**r) == height(*tiles[0])));
+                }
+                assert_eq!(tiles[0].top, tiles[1].top);
+                // Verify the allocation against independently retained content bounds,
+                // rather than replacing the old 308 constant with another magic height.
+                for tile in &v.usage {
+                    let component = scene_at_width(&v, tile, width(*tiles[0]));
+                    let reset = component
+                        .accessibility
+                        .iter()
+                        .find(|n| n.key == format!("chart:{}:reset-credits", tile.id))
+                        .unwrap();
+                    let action = component
+                        .targets
+                        .iter()
+                        .find(|hit| hit.target == Target::OpenTrayAccount(tile.id.clone()))
+                        .unwrap();
+                    assert!(reset.rect.top >= 52. && reset.rect.bottom + 4. == action.rect.top);
+                    assert!(action.rect.bottom <= component.charts[0].rect.top);
+                    let forecast = component
+                        .accessibility
+                        .iter()
+                        .find(|n| n.key == format!("chart:{}:forecast:0", tile.id))
+                        .unwrap();
+                    assert_eq!(forecast.rect.bottom + 4., component.rect.bottom);
+                    if let Some(index) = v
+                        .usage
+                        .iter()
+                        .position(|candidate| candidate.id == tile.id)
+                        .filter(|index| *index < tiles.len())
+                    {
+                        assert_eq!(height(component.rect), height(*tiles[index]));
+                    }
+                }
+                assert_eq!(s.charts.len(), 6);
+                assert_eq!(
+                    s.charts
+                        .iter()
+                        .filter(|c| c.provider_summary.is_none())
+                        .count(),
+                    4
+                );
+                assert!(s.accessibility.len() <= history::SCENE_NODE_BUDGET);
+            }
+        });
     }
 }
 

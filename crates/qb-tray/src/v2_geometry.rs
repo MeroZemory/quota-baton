@@ -2733,10 +2733,10 @@ mod tests {
             if let Some(lead) = item.lead {
                 assert!(inside(lead, item.rect));
                 let (x, y) = center(lead);
-                assert_eq!(scene.hit_test(x, y), Some(&item.target));
+                assert_eq!(scene.hit_test(x, y), item.enabled.then_some(&item.target));
             }
             let (x, y) = center(item.label);
-            assert_eq!(scene.hit_test(x, y), Some(&item.target));
+            assert_eq!(scene.hit_test(x, y), item.enabled.then_some(&item.target));
             assert_eq!(item.rect.left, popup.rect.left + 5.);
             assert_eq!(item.rect.right, popup.rect.right - 5.);
         }

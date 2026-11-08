@@ -4276,7 +4276,12 @@ mod tests {
             900.,
         );
         let popup = scene.popup.as_ref().unwrap();
-        let line = popup.info.iter().find(|i| i.tooltip.is_some()).unwrap();
+        let sessions_line = &row_view(&view, "crowded").unwrap().menu.sessions_line;
+        let line = popup
+            .info
+            .iter()
+            .find(|i| &i.text == sessions_line && i.tooltip.is_some())
+            .unwrap();
         let x = line.rect.right - 1.;
         let y = (line.rect.top + line.rect.bottom) / 2.;
         let hint = tooltip_content(&view, &scene, x, y).unwrap();

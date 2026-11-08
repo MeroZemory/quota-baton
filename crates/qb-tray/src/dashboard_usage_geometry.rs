@@ -56,23 +56,7 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
     let tile_heights: Vec<_> = v
         .usage
         .iter()
-        .map(|tile| {
-            288. + english_window_extra(tile)
-                + b.measured_height(&tile.reset_credits.text, (tw - 24.).max(1.), 12., false)
-                + 32.
-                + tile
-                    .subscription_lines
-                    .iter()
-                    .map(|line| b.measured_height(line, (tw - 24.).max(1.), 12., false) + 4.)
-                    .sum::<f32>()
-                + tile
-                    .forecast_lines
-                    .iter()
-                    .map(|line| {
-                        b.measured_height(line, (tw - 24.).max(1.), 12., tile.forecast_warning) + 4.
-                    })
-                    .sum::<f32>()
-        })
+        .map(|tile| tile_height(b, tile, tw))
         .collect();
     let row_heights: Vec<_> = tile_heights
         .chunks(columns)
@@ -106,7 +90,13 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         );
         provider_geometry::panel(b, v, projection, bounds);
     }
-    let available_nodes = history::SCENE_NODE_BUDGET.saturating_sub(b.scene.accessibility.len());
+    // row_limit already reserves chart/table/columns/notice. Reserve every other
+    // account node before dividing the remaining budget among history tables,
+    // including controls that may become visible after scrolling.
+    let account_nodes: usize = v.usage.iter().map(additional_account_nodes).sum();
+    let available_nodes = history::SCENE_NODE_BUDGET
+        .saturating_sub(b.scene.accessibility.len())
+        .saturating_sub(account_nodes);
     // All account charts share this frame's clock. Format each sampled instant
     // once, rather than twice per row in every account's hidden UIA table.
     let mut stamps = BTreeMap::new();
@@ -149,6 +139,34 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
     }
     b.end_region(old);
 }
+fn tile_height(b: &mut Builder<'_>, tile: &m::UsageTile, w: f32) -> f32 {
+    let inner = (w - 24.).max(1.);
+    288. + english_window_extra(tile)
+        + b.measured_height(&tile.reset_credits.text, inner, 12., false)
+        + 32.
+        + tile
+            .subscription_lines
+            .iter()
+            .map(|line| b.measured_height(line, inner, 12., false) + 4.)
+            .sum::<f32>()
+        + tile
+            .forecast_lines
+            .iter()
+            .map(|line| b.measured_height(line, inner, 12., tile.forecast_warning) + 4.)
+            .sum::<f32>()
+}
+fn additional_account_nodes(tile: &m::UsageTile) -> usize {
+    // Reset status + menu control, subscription/forecast text, and at most one
+    // overflow caption. Full chart series/points are never removed for this budget.
+    2 + tile.subscription_lines.len()
+        + tile.forecast_lines.len()
+        + usize::from(
+            tile.series
+                .iter()
+                .any(|series| !series.future_resets.is_empty()),
+        )
+}
+
 fn english_window_extra(tile: &m::UsageTile) -> f32 {
     if crate::i18n::language() == crate::i18n::UiLanguage::En && !tile.unconfirmed {
         tile.windows.len().saturating_sub(1) as f32 * 18.
