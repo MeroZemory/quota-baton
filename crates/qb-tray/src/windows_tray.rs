@@ -16,7 +16,7 @@ use qb_proto::admin_login::LoginState;
 use qb_tray::client::login::{LoginFailure, LoginMethod};
 use qb_tray::i18n;
 use qb_tray::v2_session::login_flow::{
-    Action as LoginAction, CloseState as LoginCloseState, Flow as CodexLoginFlow,
+    Action as LoginAction, CloseState as LoginCloseState, Flow as CodexLoginFlow, PendingCancel,
     Phase as LoginPhase, PointerPress as LoginPointerPress,
 };
 use qb_tray::{
@@ -158,6 +158,7 @@ struct PaintedFrame {
     revision: usize,
     epoch: usize,
     login_generation: u64,
+    pending_cancel: Option<PendingCancel>,
     pixels: (u32, u32),
     dpi: u32,
     offset: f32,
@@ -603,19 +604,31 @@ fn presentation(
     view: &mut v2::View,
     state: Option<&str>,
     core_ok: bool,
-) -> (geometry::Presentation, BTreeSet<String>) {
+) -> (
+    geometry::Presentation,
+    BTreeSet<String>,
+    Option<PendingCancel>,
+) {
     let mut session = session().lock().unwrap_or_else(|e| e.into_inner());
     if !session.open {
         session.show(view);
     } else {
         session.update(view);
     }
-    let mut active_overlay = overlay(state);
-    if let Overlay::CodexLogin(card) = &mut active_overlay {
-        let (origin, completed_account) = {
+    let (mut active_overlay, pending_cancel, origin, completed_account) =
+        if state == Some("codex-login") {
             let flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
-            (flow.origin.clone(), flow.completed_account.clone())
+            let (card, pending_cancel) = flow.card_with_pending_cancel(elapsed());
+            (
+                Overlay::CodexLogin(card),
+                pending_cancel,
+                flow.origin.clone(),
+                flow.completed_account.clone(),
+            )
+        } else {
+            (overlay(state), None, None, None)
         };
+    if let Overlay::CodexLogin(card) = &mut active_overlay {
         if let Some(row) = completed_account
             .as_deref()
             .and_then(|id| row_view(view, id))
@@ -712,7 +725,7 @@ fn presentation(
             }
         }
     }
-    (p, errors)
+    (p, errors, pending_cancel)
 }
 fn apply_row_error(row: &mut v2::AccountRow, error: &'static str) {
     row.reason = Some(error.into());
@@ -891,7 +904,13 @@ fn sync_login_animation(hwnd: HWND, visible: bool) {
 }
 fn measured_scene(
     hwnd: HWND,
-) -> Result<(Rc<Renderer>, v2::View, geometry::Scene, BTreeSet<String>)> {
+) -> Result<(
+    Rc<Renderer>,
+    v2::View,
+    geometry::Scene,
+    BTreeSet<String>,
+    Option<PendingCancel>,
+)> {
     #[cfg(all(debug_assertions, feature = "testkit"))]
     let started = Instant::now();
     let state = view_state()
@@ -906,7 +925,7 @@ fn measured_scene(
     flyout_perf::phase("project_us", perf_project);
     #[cfg(feature = "testkit")]
     let perf_presentation = flyout_perf::start();
-    let (mut p, errors) = presentation(&mut view, state.as_deref(), core_ok);
+    let (mut p, errors, pending_cancel) = presentation(&mut view, state.as_deref(), core_ok);
     #[cfg(feature = "testkit")]
     flyout_perf::phase("presentation_us", perf_presentation);
     #[cfg(feature = "testkit")]
@@ -977,7 +996,7 @@ fn measured_scene(
     }
     #[cfg(feature = "testkit")]
     flyout_perf::phase("geometry_us", perf_geometry);
-    Ok((renderer, view, scene, errors))
+    Ok((renderer, view, scene, errors, pending_cancel))
 }
 fn toggle_key(action: &MenuAction) -> Option<&'static str> {
     match action {
@@ -1039,7 +1058,7 @@ unsafe fn resize_flyout(hwnd: HWND) {
     if !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return;
     }
-    let Ok((_, _, scene, _)) = measured_scene(hwnd) else {
+    let Ok((_, _, scene, _, _)) = measured_scene(hwnd) else {
         return;
     };
     let dpi = dpi::effective(hwnd) as f32;
@@ -1096,7 +1115,7 @@ unsafe fn position_flyout(hwnd: HWND) {
     let dpi = dpi::effective(hwnd) as f32;
     let width = pixel_ceil(360.0, dpi).max(1) as i32;
     let height = measured_scene(hwnd)
-        .map(|(_, _, scene, _)| pixel_ceil(scene.rect.bottom, dpi).max(1) as i32)
+        .map(|(_, _, scene, _, _)| pixel_ceil(scene.rect.bottom, dpi).max(1) as i32)
         .unwrap_or(298)
         .min(
             ((info.rcWork.bottom - info.rcWork.top) as f32 * 0.8)
@@ -1146,7 +1165,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         (view.clone(), view.owner())
     };
     let revision = REVISION.load(Ordering::Acquire);
-    let (renderer, view, scene, errors) = measured_scene(hwnd)?;
+    let (renderer, view, scene, errors, pending_cancel) = measured_scene(hwnd)?;
     #[cfg(feature = "testkit")]
     let perf_target = flyout_perf::start();
     unsafe {
@@ -1325,6 +1344,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                     revision,
                     epoch,
                     login_generation: *LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner()),
+                    pending_cancel,
                     pixels: (pixels.width, pixels.height),
                     dpi,
                     offset,
@@ -3187,6 +3207,7 @@ fn same_action_frame(previous: &PaintedFrame, next: &PaintedFrame) -> bool {
         && previous.state == next.state
         && previous.revision == next.revision
         && previous.login_generation == next.login_generation
+        && previous.pending_cancel == next.pending_cancel
         && previous.pixels == next.pixels
         && previous.dpi == next.dpi
         && previous.offset == next.offset
@@ -3203,6 +3224,126 @@ fn same_action_frame(previous: &PaintedFrame, next: &PaintedFrame) -> bool {
             .iter()
             .zip(&next.scene.targets)
             .all(|(a, b)| a.target == b.target && a.rect == b.rect && a.enabled == b.enabled)
+}
+
+fn pending_cancel_context(
+    frame: &PaintedFrame,
+    origin: POINT,
+    elements: &[accessibility::Element],
+) -> Option<accessibility::PendingCancelContext> {
+    if frame.state.as_deref() != Some("codex-login") {
+        return None;
+    }
+    let flow = frame.pending_cancel.clone()?;
+    if codex_login_flow()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_cancel(elapsed())
+        .as_ref()
+        != Some(&flow)
+    {
+        return None;
+    }
+    let id = frame
+        .elements
+        .iter()
+        .find(|(_, target)| *target == HitTarget::CodexLogin(LoginAction::Cancel))?
+        .0;
+    let mut element = elements.iter().find(|e| e.id == id && e.enabled)?.clone();
+    element.focused = false;
+    let expires_at = STARTED
+        .get_or_init(Instant::now)
+        .checked_add(flow.deadline)?;
+    Some(accessibility::PendingCancelContext {
+        flow,
+        owner: frame.owner,
+        view: frame.state.clone()?,
+        pixels: frame.pixels,
+        dpi: frame.dpi,
+        offset: frame.offset,
+        root_bounds: physical(frame.scene.rect, origin, frame.dpi as f64 / 96.),
+        element,
+        expires_at,
+    })
+}
+
+// Presentation revision/countdown text do not authorize Cancel. Exact session
+// authority is checked separately under Flow's mutex, after these host checks.
+fn pending_cancel_host_matches(
+    context: &accessibility::PendingCancelContext,
+    frame: &PaintedFrame,
+    owner_view: (usize, Option<&str>),
+    pixels: (u32, u32),
+    dpi: u32,
+    origin: POINT,
+    offset: f32,
+) -> bool {
+    let (owner, state) = owner_view;
+    if state != Some("codex-login")
+        || state != Some(context.view.as_str())
+        || owner != context.owner
+        || frame.owner != owner
+        || frame.state.as_deref() != state
+        || frame.pending_cancel.as_ref() != Some(&context.flow)
+        || frame.pixels != pixels
+        || pixels != context.pixels
+        || frame.dpi != dpi
+        || dpi != context.dpi
+        || frame.offset != offset
+        || offset != context.offset
+    {
+        return false;
+    }
+    let target = HitTarget::CodexLogin(LoginAction::Cancel);
+    frame
+        .elements
+        .iter()
+        .any(|(id, t)| *id == context.element.id && *t == target)
+        && context.element.enabled
+        && context.element.kind == accessibility::Kind::Button
+        && context.element.action.and_then(|i| frame.actions.get(i)) == Some(&target)
+        && element_name(frame, &target) == context.element.name
+        && frame.scene.targets.iter().any(|h| {
+            h.enabled
+                && h.target == target
+                && physical(h.rect, origin, dpi as f64 / 96.) == context.element.bounds
+        })
+        && physical(frame.scene.rect, origin, dpi as f64 / 96.) == context.root_bounds
+}
+
+fn consume_pending_cancel(hwnd: HWND, context: accessibility::PendingCancelContext) -> bool {
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return false;
+    }
+    let Some(frame) = PAINTED.with(|slot| slot.borrow().clone()) else {
+        return false;
+    };
+    let mut client = RECT::default();
+    let mut origin = POINT::default();
+    unsafe {
+        if GetClientRect(hwnd, &mut client).is_err()
+            || !windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut origin).as_bool()
+        {
+            return false;
+        }
+    }
+    let pixels = client_pixel_size(client);
+    let view = view_state().lock().unwrap_or_else(|e| e.into_inner());
+    if !pending_cancel_host_matches(
+        &context,
+        &frame,
+        (view.owner(), view.as_deref()),
+        (pixels.width, pixels.height),
+        dpi::effective(hwnd),
+        origin,
+        VIEWPORT.with(|v| v.borrow().offset),
+    ) {
+        return false;
+    }
+    // Do not unlock and dispatch the generic Cancel action: Completed can keep
+    // this generation. Validate all live flow facts and mutate under one guard.
+    let mut flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+    flow.cancel_pending(&context.flow, elapsed())
 }
 
 fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
@@ -3329,6 +3470,7 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             expanded: None,
         });
     }
+    let pending_cancel = pending_cancel_context(frame, origin, &elements);
     UIA.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -3348,17 +3490,22 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
                     return None;
                 }
                 let prepared = accessibility::prepare_snapshot(snapshot.clone()).ok()?;
-                if root
-                    .republish_focus_prepared(&prepared, previous.epoch)
-                    .ok()?
-                {
-                    Some(previous.epoch)
+                let reused = if let Some(context) = pending_cancel.as_ref() {
+                    root.republish_pending_cancel_focus_prepared(
+                        &prepared,
+                        previous.epoch,
+                        context.clone(),
+                    )
                 } else {
-                    None
+                    root.republish_focus_prepared(&prepared, previous.epoch)
                 }
+                .ok()?;
+                if reused { Some(previous.epoch) } else { None }
             });
             if let Some(epoch) = reused {
                 frame.epoch = epoch;
+            } else if let Some(context) = pending_cancel {
+                let _ = root.publish_pending_cancel(snapshot, frame.epoch, context);
             } else {
                 let _ = root.publish(snapshot, frame.epoch);
             }
@@ -3723,6 +3870,23 @@ unsafe extern "system" fn window_proc(
                 return result;
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        accessibility::WM_UIA_PENDING_CANCEL => {
+            let context = UIA.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|root| root.take_pending_cancel(wparam, lparam).ok().flatten())
+            });
+            if let Some(context) = context
+                && consume_pending_cancel(hwnd, context)
+            {
+                invalidate_login_press();
+                set_view(None);
+                invalidate_model();
+                resize_flyout(hwnd);
+                redraw_now(hwnd);
+            }
+            LRESULT(0)
         }
         accessibility::WM_UIA_INVOKE | accessibility::WM_UIA_FOCUS => {
             if let Some(frame) = painted_frame(hwnd)
@@ -4181,6 +4345,7 @@ mod tests {
             revision: 4,
             epoch: 6,
             login_generation: 8,
+            pending_cancel: None,
             pixels: (360, 600),
             dpi: 96,
             offset: 0.,
@@ -4200,6 +4365,15 @@ mod tests {
             ("revision", |f| f.revision += 1),
             ("state", |f| f.state = Some("menu:focus-account:0".into())),
             ("login generation", |f| f.login_generation += 1),
+            ("rendered Pending authority", |f| {
+                f.pending_cancel = Some(PendingCancel {
+                    generation: 41,
+                    id: "synthetic-session".into(),
+                    method: LoginMethod::Device,
+                    origin: None,
+                    deadline: std::time::Duration::from_secs(1000),
+                })
+            }),
             ("pixels", |f| f.pixels.0 += 1),
             ("dpi", |f| f.dpi = 144),
             ("scroll", |f| f.offset = 1.),
@@ -4236,6 +4410,223 @@ mod tests {
     }
 
     #[test]
+    fn pending_cancel_host_rechecks_owner_view_identity_and_physical_geometry() {
+        let flow = CodexLoginFlow {
+            generation: 41,
+            phase: LoginPhase::Pending,
+            visible: true,
+            leased: true,
+            id: Some("synthetic-session".into()),
+            method: Some(LoginMethod::Device),
+            origin: Some("synthetic-origin".into()),
+            deadline: Some(std::time::Duration::from_secs(1000)),
+            ..CodexLoginFlow::default()
+        };
+        let view = v2::project(r#"{"accounts":[]}"#, SystemTime::now()).unwrap();
+        let scene = geometry::Scene::build(
+            &view,
+            geometry::Presentation {
+                overlay: Overlay::CodexLogin(flow.card(std::time::Duration::ZERO)),
+                ..Default::default()
+            },
+            900.,
+        );
+        let actions: Vec<_> = scene
+            .targets
+            .iter()
+            .filter(|h| !matches!(h.target, HitTarget::Blocked | HitTarget::DismissOverlay))
+            .map(|h| h.target.clone())
+            .collect();
+        let frame = PaintedFrame {
+            #[cfg(all(debug_assertions, feature = "testkit"))]
+            tooltip_rect: None,
+            view,
+            scene,
+            state: Some("codex-login".into()),
+            owner: 11,
+            revision: 4,
+            epoch: 6,
+            login_generation: 7,
+            pending_cancel: flow.pending_cancel(std::time::Duration::ZERO),
+            pixels: (360, 600),
+            dpi: 96,
+            offset: 0.,
+            elements: actions
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i as i32 + 1, t.clone()))
+                .collect(),
+            actions,
+        };
+        let target = HitTarget::CodexLogin(LoginAction::Cancel);
+        let index = frame.actions.iter().position(|t| *t == target).unwrap();
+        let hit = frame
+            .scene
+            .targets
+            .iter()
+            .find(|h| h.target == target)
+            .unwrap();
+        let origin = POINT { x: 10, y: 20 };
+        let context = accessibility::PendingCancelContext {
+            flow: flow.pending_cancel(std::time::Duration::ZERO).unwrap(),
+            owner: frame.owner,
+            view: "codex-login".into(),
+            pixels: frame.pixels,
+            dpi: frame.dpi,
+            offset: frame.offset,
+            root_bounds: physical(frame.scene.rect, origin, 1.),
+            element: accessibility::Element {
+                id: frame.elements[index].0,
+                parent: None,
+                name: element_name(&frame, &target),
+                kind: accessibility::Kind::Button,
+                bounds: physical(hit.rect, origin, 1.),
+                enabled: true,
+                action: Some(index),
+                focusable: true,
+                focused: false,
+                value: None,
+                selected: None,
+                expanded: None,
+            },
+            expires_at: Instant::now() + std::time::Duration::from_secs(1000),
+        };
+        let mut starting_frame = frame.clone();
+        starting_frame.pending_cancel = None;
+        assert!(flow.pending_cancel(std::time::Duration::ZERO).is_some());
+        assert!(
+            pending_cancel_context(&starting_frame, origin, &[context.element.clone()]).is_none()
+        );
+        let matches = |f: &PaintedFrame| {
+            pending_cancel_host_matches(
+                &context,
+                f,
+                (context.owner, Some("codex-login")),
+                context.pixels,
+                context.dpi,
+                origin,
+                context.offset,
+            )
+        };
+        assert!(matches(&frame));
+        let mut countdown = frame.clone();
+        countdown.revision += 1;
+        countdown.epoch += 1;
+        assert!(
+            matches(&countdown),
+            "presentation changes do not replace Cancel authority"
+        );
+        type Change = (&'static str, fn(&mut PaintedFrame));
+        let changes: &[Change] = &[
+            ("owner", |f| f.owner += 1),
+            ("view", |f| f.state = None),
+            ("Starting frame", |f| f.pending_cancel = None),
+            ("rendered flow generation", |f| {
+                f.pending_cancel.as_mut().unwrap().generation += 1
+            }),
+            ("pixels", |f| f.pixels.0 += 1),
+            ("dpi", |f| f.dpi = 144),
+            ("scroll", |f| f.offset += 1.),
+            ("root geometry", |f| f.scene.rect.left += 1.),
+            ("Cancel identity", |f| {
+                let (_, t) = f
+                    .elements
+                    .iter_mut()
+                    .find(|(_, t)| *t == HitTarget::CodexLogin(LoginAction::Cancel))
+                    .unwrap();
+                *t = HitTarget::LoginCancel;
+            }),
+            ("Cancel action map", |f| {
+                let t = f
+                    .actions
+                    .iter_mut()
+                    .find(|t| **t == HitTarget::CodexLogin(LoginAction::Cancel))
+                    .unwrap();
+                *t = HitTarget::LoginCancel;
+            }),
+            ("Cancel enabled", |f| {
+                f.scene
+                    .targets
+                    .iter_mut()
+                    .find(|h| h.target == HitTarget::CodexLogin(LoginAction::Cancel))
+                    .unwrap()
+                    .enabled = false
+            }),
+            ("Cancel geometry", |f| {
+                f.scene
+                    .targets
+                    .iter_mut()
+                    .find(|h| h.target == HitTarget::CodexLogin(LoginAction::Cancel))
+                    .unwrap()
+                    .rect
+                    .left += 1.
+            }),
+            ("Cancel name", |f| {
+                f.scene
+                    .dialog
+                    .as_mut()
+                    .unwrap()
+                    .buttons
+                    .iter_mut()
+                    .find(|b| b.target == HitTarget::CodexLogin(LoginAction::Cancel))
+                    .unwrap()
+                    .label
+                    .push('!')
+            }),
+        ];
+        for (name, change) in changes {
+            let mut changed = countdown.clone();
+            change(&mut changed);
+            assert!(!matches(&changed), "{name}");
+        }
+        assert!(!pending_cancel_host_matches(
+            &context,
+            &frame,
+            (12, Some("codex-login")),
+            context.pixels,
+            context.dpi,
+            origin,
+            0.
+        ));
+        assert!(!pending_cancel_host_matches(
+            &context,
+            &frame,
+            (11, None),
+            context.pixels,
+            context.dpi,
+            origin,
+            0.
+        ));
+        assert!(!pending_cancel_host_matches(
+            &context,
+            &frame,
+            (11, Some("codex-login")),
+            (361, 600),
+            context.dpi,
+            origin,
+            0.
+        ));
+        assert!(!pending_cancel_host_matches(
+            &context,
+            &frame,
+            (11, Some("codex-login")),
+            context.pixels,
+            144,
+            origin,
+            0.
+        ));
+        assert!(!pending_cancel_host_matches(
+            &context,
+            &frame,
+            (11, Some("codex-login")),
+            context.pixels,
+            context.dpi,
+            POINT { x: 11, y: 20 },
+            0.
+        ));
+    }
+
+    #[test]
     fn chooser_timer_keeps_the_retained_action_frame_domain() {
         let flow = CodexLoginFlow::default();
         let before = flow.card(std::time::Duration::ZERO);
@@ -4267,6 +4658,7 @@ mod tests {
             revision: 4,
             epoch: 6,
             login_generation: flow.generation,
+            pending_cancel: None,
             pixels: (360, 600),
             dpi: 96,
             offset: 0.,

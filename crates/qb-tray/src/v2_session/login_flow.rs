@@ -58,6 +58,17 @@ pub async fn retain_cleanup(mut leased: impl FnMut() -> bool) {
     }
 }
 
+/// Exact authority for one visible Pending session. Deliberately no Debug:
+/// session identity and relogin origin must never enter diagnostic output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingCancel {
+    pub generation: u64,
+    pub id: String,
+    pub method: LoginMethod,
+    pub origin: Option<String>,
+    pub deadline: Duration,
+}
+
 // Deliberately no Debug: code/URL are ephemeral, never diagnostic content.
 pub struct Flow {
     pub close_requested: bool,
@@ -221,6 +232,35 @@ impl Flow {
             _ => Phase::Failed,
         };
     }
+    pub fn pending_cancel(&self, now: Duration) -> Option<PendingCancel> {
+        if self.phase != Phase::Pending
+            || !self.visible
+            || !self.leased
+            || self.cancel_requested
+            || self.close_requested
+            || self.expired(now)
+        {
+            return None;
+        }
+        Some(PendingCancel {
+            generation: self.generation,
+            id: self.id.clone()?,
+            method: self.method?,
+            origin: self.origin.clone(),
+            deadline: self.deadline?,
+        })
+    }
+
+    /// The host holds the same Flow mutex for validation and mutation. Terminal
+    /// state (including Completed with the same generation) always wins first.
+    pub fn cancel_pending(&mut self, expected: &PendingCancel, now: Duration) -> bool {
+        if self.pending_cancel(now).as_ref() != Some(expected) {
+            return false;
+        }
+        self.cancel(false);
+        true
+    }
+
     pub fn cancel(&mut self, chooser: bool) {
         self.prompt = None;
         self.deadline = None;
@@ -314,6 +354,12 @@ impl Flow {
         self.copied = false;
         true
     }
+    /// Capture the rendered card and its capability from one immutable flow
+    /// observation and clock value while the host holds the Flow guard.
+    pub fn card_with_pending_cancel(&self, now: Duration) -> (Card, Option<PendingCancel>) {
+        (self.card(now), self.pending_cancel(now))
+    }
+
     pub fn card(&self, now: Duration) -> Card {
         use crate::i18n::static_text as t;
         let mut card = Card {
@@ -417,6 +463,98 @@ mod tests {
         assert!(f.started(generation, start(method), now()));
         (f, generation)
     }
+    #[test]
+    fn starting_projection_cannot_gain_pending_cancel_after_same_generation_start() {
+        let mut flow = Flow::default();
+        flow.chooser(Some("existing-account".into()));
+        let generation = flow.begin(LoginMethod::Device).unwrap();
+        let (starting_card, starting_ticket) = flow.card_with_pending_cancel(now());
+        assert!(starting_ticket.is_none());
+        assert!(flow.started(generation, start(LoginMethod::Device), now()));
+        assert_eq!(flow.generation, generation);
+        let (pending_card, pending_ticket) = flow.card_with_pending_cancel(now());
+        assert!(pending_ticket.is_some());
+        assert_ne!(starting_card, pending_card);
+        assert!(
+            starting_ticket.is_none(),
+            "the rendered Starting projection stays unprivileged"
+        );
+        let (_, expired_ticket) = flow.card_with_pending_cancel(flow.deadline.unwrap());
+        assert!(expired_ticket.is_none());
+    }
+
+    #[test]
+    fn pending_cancel_ticket_survives_countdown_and_cancels_exactly_once() {
+        let (mut flow, generation) = pending(LoginMethod::Device);
+        let ticket = flow.pending_cancel(now()).unwrap();
+        let later = now() + Duration::from_secs(2);
+        assert!(flow.pending_cancel(later).as_ref() == Some(&ticket));
+        assert!(flow.cancel_pending(&ticket, later));
+        assert!(flow.phase == Phase::Cancelling && flow.leased && flow.cancel_requested);
+        assert!(!flow.visible && flow.prompt.is_none());
+        assert!(!flow.cancel_pending(&ticket, later));
+        // Acknowledging Cancel is not terminal authority; Completed still wins.
+        assert!(flow.terminal_with_account(
+            generation,
+            LoginState::Completed,
+            Some("linked".into())
+        ));
+        assert!(flow.phase == Phase::Completed);
+        assert_eq!(flow.completed_account.as_deref(), Some("linked"));
+    }
+
+    #[test]
+    fn pending_cancel_ticket_rejects_changed_authority_and_same_generation_completed() {
+        type Change = (&'static str, fn(&mut Flow));
+        let changes: &[Change] = &[
+            ("actual generation", |f| f.generation += 1),
+            ("session id", |f| f.id = Some("replacement-session".into())),
+            ("missing id", |f| f.id = None),
+            ("method", |f| f.method = Some(LoginMethod::Web)),
+            ("missing method", |f| f.method = None),
+            ("origin", |f| f.origin = Some("other-account".into())),
+            ("deadline", |f| {
+                f.deadline = f.deadline.map(|at| at + Duration::from_secs(1))
+            }),
+            ("missing deadline", |f| f.deadline = None),
+            ("hidden", |f| f.visible = false),
+            ("lease", |f| f.leased = false),
+            ("cancel requested", |f| f.cancel_requested = true),
+            ("close requested", |f| f.close_requested = true),
+        ];
+        for (name, change) in changes {
+            let (mut flow, _) = pending(LoginMethod::Device);
+            let ticket = flow.pending_cancel(now()).unwrap();
+            change(&mut flow);
+            assert!(!flow.cancel_pending(&ticket, now()), "{name}");
+        }
+        for phase in [
+            Phase::Chooser,
+            Phase::Starting,
+            Phase::Cancelling,
+            Phase::Completed,
+            Phase::Failed,
+            Phase::Expired,
+            Phase::Cancelled,
+            Phase::Unknown,
+        ] {
+            let (mut flow, _) = pending(LoginMethod::Device);
+            let ticket = flow.pending_cancel(now()).unwrap();
+            flow.phase = phase;
+            assert!(!flow.cancel_pending(&ticket, now()));
+            assert!(flow.phase == phase);
+        }
+        let (mut flow, generation) = pending(LoginMethod::Device);
+        let ticket = flow.pending_cancel(now()).unwrap();
+        assert!(!flow.cancel_pending(&ticket, ticket.deadline));
+        assert!(flow.phase == Phase::Pending && !flow.cancel_requested);
+        flow.terminal_with_account(generation, LoginState::Completed, Some("completed".into()));
+        assert_eq!(flow.generation, ticket.generation);
+        assert!(!flow.cancel_pending(&ticket, now()));
+        assert!(flow.phase == Phase::Completed && !flow.cancel_requested);
+        assert_eq!(flow.completed_account.as_deref(), Some("completed"));
+    }
+
     #[test]
     fn chooser_has_zero_start_authority_until_explicit_choice_and_double_click_admits_one() {
         let mut f = Flow::default();

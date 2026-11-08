@@ -42,6 +42,9 @@ pub const WM_UIA_FOCUS: u32 = WM_APP + 0x3b2;
 /// At most eight requests are retained; values contain at most 256 Unicode
 /// scalar values (512 UTF-16 units). Successful SetValue only admits a message.
 pub const WM_UIA_VALUE: u32 = WM_APP + 0x3b3;
+/// Pending Codex Cancel only: WPARAM is a one-use opaque token, LPARAM is zero.
+pub const WM_UIA_PENDING_CANCEL: u32 = WM_APP + 0x3b4;
+static NEXT_PENDING_CANCEL: AtomicUsize = AtomicUsize::new(1);
 
 const MAX_VALUE_REQUESTS: usize = 8;
 const MAX_VALUE_CHARS: usize = 256;
@@ -109,12 +112,83 @@ pub fn prepare_snapshot(snapshot: Snapshot) -> Result<PreparedSnapshot> {
     Ok(PreparedSnapshot(Arc::new(snapshot)))
 }
 
+// No Debug: this authority contains exact session identity, never log it.
+#[derive(Clone, PartialEq)]
+pub struct PendingCancelContext {
+    pub flow: qb_tray::v2_session::login_flow::PendingCancel,
+    pub owner: usize,
+    pub view: String,
+    pub pixels: (u32, u32),
+    pub dpi: u32,
+    pub offset: f32,
+    pub root_bounds: [f64; 4],
+    /// Exact Cancel element, with only focused normalized to false.
+    pub element: Element,
+    pub expires_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct PendingCancelDomain {
+    token: usize,
+    context: PendingCancelContext,
+    admitted: bool,
+    pending: bool,
+}
+
+fn pending_cancel_domain(
+    previous: Option<&PendingCancelDomain>,
+    snapshot: &Snapshot,
+    context: Option<PendingCancelContext>,
+) -> Result<Option<PendingCancelDomain>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let mut element = snapshot
+        .elements
+        .iter()
+        .find(|e| e.id == context.element.id)
+        .cloned()
+        .ok_or_else(unavailable)?;
+    element.focused = false;
+    if context.view != "codex-login"
+        || snapshot.automation_id != "quota-baton.flyout"
+        || context.root_bounds != snapshot.bounds
+        || context.element != element
+        || element.kind != Kind::Button
+        || !element.enabled
+        || element.action.is_none()
+        || element.bounds[2] <= 0.0
+        || element.bounds[3] <= 0.0
+        || context.pixels.0 == 0
+        || context.pixels.1 == 0
+        || context.dpi == 0
+        || !context.offset.is_finite()
+    {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    if let Some(previous) = previous.filter(|p| p.context == context) {
+        return Ok(Some(previous.clone()));
+    }
+    let token = NEXT_PENDING_CANCEL
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| uia_error(UIA_E_INVALIDOPERATION))?;
+    Ok(Some(PendingCancelDomain {
+        token,
+        context,
+        admitted: false,
+        pending: false,
+    }))
+}
+
 struct Cache {
     hwnd: isize,
     alive: bool,
     epoch: usize,
     snapshot: Arc<Snapshot>,
     value_requests: Vec<ValueRequest>,
+    pending_cancel: Option<PendingCancelDomain>,
 }
 
 struct ValueRequest {
@@ -146,6 +220,7 @@ pub fn create_root_provider(hwnd: isize) -> Result<RootProvider> {
             elements: Vec::new(),
         }),
         value_requests: Vec::new(),
+        pending_cancel: None,
     }));
     Ok(RootProvider {
         root: Node::new(cache, None, None),
@@ -165,6 +240,24 @@ impl RootProvider {
     /// Reuse a validated frame, consuming a fresh epoch on every publication.
     /// Liveness, epoch checks and pending-value invalidation still apply.
     pub fn publish_prepared(&self, snapshot: &PreparedSnapshot, epoch: usize) -> Result<()> {
+        self.publish_prepared_with_cancel(snapshot, epoch, None)
+    }
+
+    pub fn publish_pending_cancel(
+        &self,
+        snapshot: Snapshot,
+        epoch: usize,
+        context: PendingCancelContext,
+    ) -> Result<()> {
+        self.publish_prepared_with_cancel(&prepare_snapshot(snapshot)?, epoch, Some(context))
+    }
+
+    fn publish_prepared_with_cancel(
+        &self,
+        snapshot: &PreparedSnapshot,
+        epoch: usize,
+        context: Option<PendingCancelContext>,
+    ) -> Result<()> {
         let mut cache = self.root.cache.lock().map_err(|_| unavailable())?;
         if !cache.alive {
             return Err(unavailable());
@@ -172,6 +265,9 @@ impl RootProvider {
         if epoch <= cache.epoch || epoch > isize::MAX as usize {
             return Err(Error::from_hresult(E_INVALIDARG));
         }
+        let pending_cancel =
+            pending_cancel_domain(cache.pending_cancel.as_ref(), &snapshot.0, context)?;
+        cache.pending_cancel = pending_cancel;
         cache.snapshot = Arc::clone(&snapshot.0);
         cache.epoch = epoch;
         cache.value_requests.clear();
@@ -186,11 +282,34 @@ impl RootProvider {
         snapshot: &PreparedSnapshot,
         expected_epoch: usize,
     ) -> Result<bool> {
+        self.republish_focus_with_cancel(snapshot, expected_epoch, None)
+    }
+
+    pub fn republish_pending_cancel_focus_prepared(
+        &self,
+        snapshot: &PreparedSnapshot,
+        expected_epoch: usize,
+        context: PendingCancelContext,
+    ) -> Result<bool> {
+        self.republish_focus_with_cancel(snapshot, expected_epoch, Some(context))
+    }
+
+    fn republish_focus_with_cancel(
+        &self,
+        snapshot: &PreparedSnapshot,
+        expected_epoch: usize,
+        context: Option<PendingCancelContext>,
+    ) -> Result<bool> {
         let mut cache = self.root.cache.lock().map_err(|_| unavailable())?;
         if !cache.alive {
             return Err(unavailable());
         }
         if expected_epoch == 0 || cache.epoch != expected_epoch {
+            return Ok(false);
+        }
+        // A same-looking replacement Flow must retire generic indexed tickets,
+        // too. Never rely on the host's legacy generation or model revision.
+        if cache.pending_cancel.as_ref().map(|d| &d.context) != context.as_ref() {
             return Ok(false);
         }
         // Whole-value equality includes any future snapshot/element fields.
@@ -204,10 +323,40 @@ impl RootProvider {
         if nonfocus != *cache.snapshot {
             return Ok(false);
         }
+        let pending_cancel =
+            pending_cancel_domain(cache.pending_cancel.as_ref(), &snapshot.0, context)?;
+        cache.pending_cancel = pending_cancel;
         cache.snapshot = Arc::clone(&snapshot.0);
         // Identity, value, enabled state and action mapping are unchanged;
         // pending value requests still refer to this same epoch and domain.
         Ok(true)
+    }
+
+    /// Consume an admitted semantic Cancel exactly once, independently of the
+    /// presentation epoch. Replacement publication/teardown invalidate the slot.
+    pub fn take_pending_cancel(
+        &self,
+        token: WPARAM,
+        reserved: LPARAM,
+    ) -> Result<Option<PendingCancelContext>> {
+        let mut cache = self.root.cache.lock().map_err(|_| unavailable())?;
+        if !cache.alive {
+            return Err(unavailable());
+        }
+        if token.0 == 0 || reserved.0 != 0 {
+            return Ok(None);
+        }
+        let Some(domain) = cache.pending_cancel.as_mut() else {
+            return Ok(None);
+        };
+        if domain.token != token.0 || !domain.pending {
+            return Ok(None);
+        }
+        domain.pending = false; // Remains admitted: a duplicate cannot enqueue again.
+        if std::time::Instant::now() >= domain.context.expires_at {
+            return Ok(None);
+        }
+        Ok(Some(domain.context.clone()))
     }
 
     /// Consume only this owner's admitted WM_UIA_VALUE request, once. Unknown,
@@ -313,6 +462,7 @@ fn deactivate_cache(cache: &Mutex<Cache>) -> isize {
     });
     cache.value_requests.clear();
     cache.value_requests.shrink_to_fit();
+    cache.pending_cancel = None;
     hwnd // Guard is dropped before either cleanup callback can run.
 }
 
@@ -463,6 +613,7 @@ struct Ticket {
     // Freeze QueryInterface support for the lifetime of this COM object. Method
     // calls still validate the current owner/epoch and cached capabilities.
     patterns: Patterns,
+    pending_cancel: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -540,15 +691,20 @@ impl Node {
         }
     }
 
-    fn child(&self, e: &Element, epoch: usize) -> Arc<Node> {
+    fn child(&self, e: &Element, cache: &Cache) -> Arc<Node> {
         Self::new(
             self.cache.clone(),
             Some(self.root_arc()),
             Some(Ticket {
                 id: e.id,
-                epoch,
+                epoch: cache.epoch,
                 action: e.action,
                 patterns: Patterns::of(Some(e)),
+                pending_cancel: cache
+                    .pending_cancel
+                    .as_ref()
+                    .filter(|d| d.context.element.id == e.id)
+                    .map(|d| d.token),
             }),
         )
     }
@@ -595,7 +751,7 @@ impl Node {
                 }
                 _ => return Err(Error::from_hresult(E_INVALIDARG)),
             };
-            Ok(target.map(|e| self.child(e, cache.epoch)))
+            Ok(target.map(|e| self.child(e, &cache)))
         } else {
             let target = match direction {
                 NavigateDirection_FirstChild => elements.iter().find(|e| e.parent.is_none()),
@@ -605,7 +761,7 @@ impl Node {
                 | NavigateDirection_PreviousSibling => None,
                 _ => return Err(Error::from_hresult(E_INVALIDARG)),
             };
-            Ok(target.map(|e| self.child(e, cache.epoch)))
+            Ok(target.map(|e| self.child(e, &cache)))
         }
     }
 
@@ -625,7 +781,7 @@ impl Node {
                 .rev()
                 .find(|e| contains(e.bounds, x, y))
             {
-                Some(e) => self.child(e, cache.epoch),
+                Some(e) => self.child(e, &cache),
                 None => self.root_arc(),
             },
         ))
@@ -638,7 +794,7 @@ impl Node {
             .elements
             .iter()
             .find(|e| e.focused)
-            .map(|e| self.child(e, cache.epoch)))
+            .map(|e| self.child(e, &cache)))
     }
 
     fn host_bridge<T>(&self, lookup: impl FnOnce(isize) -> Result<T>) -> Result<Option<T>> {
@@ -775,8 +931,39 @@ impl Node {
     }
 
     fn post_invoke(&self) -> Result<()> {
+        if let Some(token) = self.ticket.and_then(|t| t.pending_cancel) {
+            return self.post_pending_cancel(token);
+        }
         let cache = self.read()?;
         self.post_invoke_cached(&cache)
+    }
+
+    fn post_pending_cancel(&self, token: usize) -> Result<()> {
+        // Only this minted Cancel capability bypasses the presentation epoch.
+        // Node::read and every other indexed action retain their exact checks.
+        let mut cache = self.cache.try_lock().map_err(|e| match e {
+            TryLockError::WouldBlock => uia_error(UIA_E_TIMEOUT),
+            TryLockError::Poisoned(_) => unavailable(),
+        })?;
+        if !cache.alive {
+            return Err(unavailable());
+        }
+        let hwnd = cache.hwnd;
+        let domain = cache.pending_cancel.as_mut().ok_or_else(unavailable)?;
+        if domain.token != token
+            || domain.admitted
+            || std::time::Instant::now() >= domain.context.expires_at
+        {
+            return Err(unavailable());
+        }
+        domain.admitted = true;
+        domain.pending = true;
+        if let Err(error) = post_message(hwnd, WM_UIA_PENDING_CANCEL, WPARAM(token), LPARAM(0)) {
+            domain.admitted = false;
+            domain.pending = false;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn post_invoke_cached(&self, cache: &Cache) -> Result<()> {
@@ -830,7 +1017,7 @@ impl Node {
                     .iter()
                     .find(|e| e.id == id)
                     .ok_or_else(unavailable)?,
-                cache.epoch,
+                &cache,
             ),
             None => self.root_arc(),
         }))
@@ -2737,6 +2924,256 @@ mod tests {
         );
         assert!(owner.root.hit_test(0.0, 0.0)?.is_none());
         assert!(first.navigate(NavigateDirection_PreviousSibling)?.is_none());
+        Ok(())
+    }
+
+    fn pending_cancel_fixture() -> (
+        Snapshot,
+        PendingCancelContext,
+        qb_tray::v2_session::login_flow::Flow,
+    ) {
+        use qb_tray::{
+            client::login::LoginMethod,
+            v2_session::login_flow::{Flow, Phase},
+        };
+        let mut snapshot = scene();
+        snapshot.elements[2].name = "Cancel".into();
+        let flow = Flow {
+            generation: 41,
+            phase: Phase::Pending,
+            visible: true,
+            leased: true,
+            id: Some("synthetic-pending-session".into()),
+            method: Some(LoginMethod::Device),
+            origin: Some("synthetic-origin".into()),
+            deadline: Some(std::time::Duration::from_secs(1000)),
+            ..Flow::default()
+        };
+        let context = PendingCancelContext {
+            flow: flow.pending_cancel(std::time::Duration::ZERO).unwrap(),
+            owner: 11,
+            view: "codex-login".into(),
+            pixels: (360, 400),
+            dpi: 96,
+            offset: 0.,
+            root_bounds: snapshot.bounds,
+            element: snapshot.elements[2].clone(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(100),
+        };
+        (snapshot, context, flow)
+    }
+
+    #[test]
+    fn pending_cancel_once_only_survives_countdown_before_and_after_enqueue() -> Result<()> {
+        for enqueue_first in [false, true] {
+            let posts = PostCapture::new();
+            let owner = create_root_provider(1)?;
+            let (snapshot, context, mut flow) = pending_cancel_fixture();
+            owner.publish_pending_cancel(snapshot.clone(), 6, context.clone())?;
+            let retained = owner.root.navigate(NavigateDirection_LastChild)?.unwrap();
+            let generic = owner.root.focus()?.unwrap();
+            let invoke =
+                com_pattern::<IInvokeProvider>(&com_element(&owner, 3)?, UIA_InvokePatternId)?;
+            if enqueue_first {
+                unsafe { invoke.Invoke()? };
+            }
+            let mut countdown = snapshot.clone();
+            countdown.elements[0].name = "Time remaining: 81s".into();
+            owner.publish_pending_cancel(countdown, 7, context.clone())?;
+            let mut focused = (*owner.root.read()?.snapshot).clone();
+            focused.elements[1].focused = false;
+            focused.elements[2].focused = true;
+            assert!(owner.republish_pending_cancel_focus_prepared(
+                &prepare_snapshot(focused)?,
+                7,
+                context.clone()
+            )?);
+            assert!(
+                retained.read().is_err(),
+                "ordinary reads remain epoch strict"
+            );
+            assert!(
+                generic.post_invoke().is_err(),
+                "other actions remain epoch strict"
+            );
+            if !enqueue_first {
+                unsafe { invoke.Invoke()? };
+            }
+            let messages = posts.messages();
+            assert_eq!(messages.len(), 1);
+            let (hwnd, message, token, reserved) = messages[0];
+            assert_eq!((hwnd, message, reserved), (1, WM_UIA_PENDING_CANCEL, 0));
+            assert!(
+                owner
+                    .take_pending_cancel(WPARAM(token), LPARAM(1))?
+                    .is_none()
+            );
+            let admitted = owner
+                .take_pending_cancel(WPARAM(token), LPARAM(0))?
+                .unwrap();
+            assert!(admitted == context);
+            assert!(flow.cancel_pending(&admitted.flow, std::time::Duration::from_secs(2)));
+            assert!(!flow.cancel_pending(&admitted.flow, std::time::Duration::from_secs(2)));
+            assert!(
+                owner
+                    .take_pending_cancel(WPARAM(token), LPARAM(0))?
+                    .is_none()
+            );
+            assert!(unsafe { invoke.Invoke() }.is_err());
+            assert_eq!(posts.messages().len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pending_cancel_focus_reuse_requires_identical_actual_flow_context() -> Result<()> {
+        type Change = (&'static str, fn(&mut PendingCancelContext));
+        let changes: &[Change] = &[
+            ("actual generation", |c| c.flow.generation += 1),
+            ("session", |c| c.flow.id.push('x')),
+            ("method", |c| {
+                c.flow.method = qb_tray::client::login::LoginMethod::Web
+            }),
+            ("origin", |c| c.flow.origin = None),
+            ("deadline", |c| {
+                c.flow.deadline += std::time::Duration::from_secs(1)
+            }),
+            ("owner", |c| c.owner += 1),
+        ];
+        for (name, change) in changes {
+            let owner = create_root_provider(1)?;
+            let (snapshot, context, _) = pending_cancel_fixture();
+            owner.publish_pending_cancel(snapshot.clone(), 6, context.clone())?;
+            let prepared = prepare_snapshot(snapshot.clone())?;
+            let mut replacement = context.clone();
+            change(&mut replacement);
+            assert!(
+                !owner.republish_pending_cancel_focus_prepared(
+                    &prepared,
+                    6,
+                    replacement.clone()
+                )?,
+                "{name}"
+            );
+            assert_eq!(owner.root.read()?.epoch, 6);
+            assert!(owner.root.read()?.pending_cancel.as_ref().unwrap().context == context);
+            let generic = owner.root.focus()?.unwrap();
+            owner.publish_pending_cancel(snapshot, 7, replacement)?;
+            assert!(generic.post_invoke().is_err());
+        }
+        let owner = create_root_provider(1)?;
+        let (snapshot, context, _) = pending_cancel_fixture();
+        let prepared = prepare_snapshot(snapshot.clone())?;
+        owner.publish(snapshot.clone(), 6)?;
+        assert!(!owner.republish_pending_cancel_focus_prepared(&prepared, 6, context.clone())?);
+        owner.publish_pending_cancel(snapshot.clone(), 7, context)?;
+        // Terminal/non-Pending context is None, even if the last frame looks identical.
+        assert!(!owner.republish_focus_prepared(&prepared, 7)?);
+        owner.publish(snapshot, 8)?;
+        assert!(owner.republish_focus_prepared(&prepared, 8)?);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_cancel_replacement_context_retires_admitted_and_minted_tickets() -> Result<()> {
+        type Change = (&'static str, fn(&mut PendingCancelContext));
+        let changes: &[Change] = &[
+            ("actual generation", |c| c.flow.generation += 1),
+            ("session", |c| c.flow.id.push('x')),
+            ("method", |c| {
+                c.flow.method = qb_tray::client::login::LoginMethod::Web
+            }),
+            ("origin", |c| c.flow.origin = None),
+            ("absolute deadline", |c| {
+                c.flow.deadline += std::time::Duration::from_secs(1)
+            }),
+            ("owner", |c| c.owner += 1),
+            ("pixels", |c| c.pixels.0 += 1),
+            ("dpi", |c| c.dpi = 144),
+            ("scroll", |c| c.offset += 1.),
+            ("window bounds", |c| c.root_bounds[0] += 1.),
+            ("Cancel id", |c| c.element.id += 10),
+            ("Cancel name", |c| c.element.name.push('!')),
+            ("Cancel bounds", |c| c.element.bounds[0] += 1.),
+            ("Cancel action", |c| c.element.action = Some(99)),
+        ];
+        for (name, change) in changes {
+            let posts = PostCapture::new();
+            let owner = create_root_provider(1)?;
+            let (mut snapshot, mut context, _) = pending_cancel_fixture();
+            owner.publish_pending_cancel(snapshot.clone(), 6, context.clone())?;
+            let retained = owner.root.navigate(NavigateDirection_LastChild)?.unwrap();
+            retained.post_invoke()?;
+            let token = posts.messages()[0].2;
+            change(&mut context);
+            snapshot.bounds = context.root_bounds;
+            snapshot.elements[2] = context.element.clone();
+            owner.publish_pending_cancel(snapshot, 7, context)?;
+            assert!(retained.post_invoke().is_err(), "{name}");
+            assert!(
+                owner
+                    .take_pending_cancel(WPARAM(token), LPARAM(0))?
+                    .is_none(),
+                "{name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pending_cancel_expiry_teardown_and_generic_publication_invalidate_tokens() -> Result<()> {
+        for mode in 0..5 {
+            let posts = PostCapture::new();
+            let owner = create_root_provider(1)?;
+            let (mut snapshot, mut context, _) = pending_cancel_fixture();
+            if mode == 0 {
+                context.expires_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            }
+            owner.publish_pending_cancel(snapshot.clone(), 6, context.clone())?;
+            let retained = owner.root.navigate(NavigateDirection_LastChild)?.unwrap();
+            if mode == 0 {
+                assert!(retained.post_invoke().is_err());
+                assert!(posts.messages().is_empty());
+                continue;
+            }
+            retained.post_invoke()?;
+            let token = posts.messages()[0].2;
+            match mode {
+                1 => owner.deactivate(),
+                2 => {
+                    snapshot.elements[2].enabled = false;
+                    owner.publish(snapshot, 7)?;
+                }
+                3 => {
+                    snapshot.automation_id = "quota-baton.dashboard";
+                    owner.publish(snapshot, 7)?;
+                }
+                _ => {
+                    // Generic publication invalidates even an otherwise identical
+                    // context; reintroduction receives a new, nonreusable token.
+                    owner.publish(snapshot.clone(), 7)?;
+                    owner.publish_pending_cancel(snapshot, 8, context)?;
+                }
+            }
+            assert!(retained.post_invoke().is_err());
+            assert!(
+                owner
+                    .take_pending_cancel(WPARAM(token), LPARAM(0))
+                    .ok()
+                    .flatten()
+                    .is_none()
+            );
+        }
+        // A generic confirmation remains indexed/epoch-bound.
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        let mut snapshot = scene();
+        snapshot.elements[2].name = "Use one reset credit".into();
+        owner.publish(snapshot.clone(), 6)?;
+        let confirmation = owner.root.navigate(NavigateDirection_LastChild)?.unwrap();
+        owner.publish(snapshot, 7)?;
+        assert!(confirmation.post_invoke().is_err());
+        assert!(posts.messages().is_empty());
         Ok(())
     }
 
