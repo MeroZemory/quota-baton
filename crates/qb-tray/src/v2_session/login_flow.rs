@@ -34,11 +34,37 @@ pub struct Card {
     pub code: Option<String>,
     pub actions: Vec<(Action, String, bool)>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseState {
+    Waiting,
+    Ready,
+    Unresolved,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerPress {
+    pub action: Action,
+    pub generation: u64,
+}
+impl PointerPress {
+    pub fn matches(self, action: Action, generation: u64) -> bool {
+        self.action == action && self.generation == generation
+    }
+}
+/// Unlike the ordinary action drain, exact login cleanup has no five-second abort.
+/// The HTTP start itself is bounded; a known session keeps reconciling to terminal.
+pub async fn retain_cleanup(mut leased: impl FnMut() -> bool) {
+    while leased() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // Deliberately no Debug: code/URL are ephemeral, never diagnostic content.
 pub struct Flow {
+    pub close_requested: bool,
     pub phase: Phase,
     pub method: Option<LoginMethod>,
     pub origin: Option<String>,
+    pub completed_account: Option<String>,
     pub visible: bool,
     pub leased: bool,
     pub cancel_requested: bool,
@@ -57,9 +83,11 @@ pub struct Flow {
 impl Default for Flow {
     fn default() -> Self {
         Self {
+            close_requested: false,
             phase: Phase::Chooser,
             method: None,
             origin: None,
+            completed_account: None,
             visible: false,
             leased: false,
             cancel_requested: false,
@@ -78,6 +106,26 @@ impl Default for Flow {
     }
 }
 impl Flow {
+    pub fn request_close(&mut self) {
+        if self.close_requested {
+            return;
+        }
+        self.cancel(false);
+        self.close_requested = true;
+    }
+    pub fn close_state(&self) -> CloseState {
+        if self.leased {
+            CloseState::Waiting
+        } else if self.phase == Phase::Unknown {
+            CloseState::Unresolved
+        } else {
+            CloseState::Ready
+        }
+    }
+    pub fn abandon_close(&mut self) {
+        self.close_requested = false;
+        self.visible = true;
+    }
     pub fn chooser(&mut self, origin: Option<String>) {
         if self.leased {
             self.cancel(true);
@@ -101,7 +149,8 @@ impl Flow {
         };
     }
     pub fn begin(&mut self, method: LoginMethod) -> Option<u64> {
-        if self.leased
+        if self.close_requested
+            || self.leased
             || !self.visible
             || !matches!(
                 self.phase,
@@ -124,6 +173,7 @@ impl Flow {
         self.status_uncertain = false;
         self.failure = None;
         self.opened = false;
+        self.completed_account = None;
         self.completion_reported = false;
         Some(self.generation)
     }
@@ -167,7 +217,7 @@ impl Flow {
         self.leased = false;
         self.failure = Some(failure);
         self.phase = match failure {
-            LoginFailure::Busy | LoginFailure::Unknown => Phase::Unknown,
+            LoginFailure::Unknown => Phase::Unknown,
             _ => Phase::Failed,
         };
     }
@@ -200,6 +250,18 @@ impl Flow {
         }
         self.opened = true;
         self.prompt.as_ref().map(|p| p.auth_url.clone())
+    }
+    pub fn terminal_with_account(
+        &mut self,
+        generation: u64,
+        status: LoginState,
+        account: Option<String>,
+    ) -> bool {
+        let completed = self.terminal(generation, status);
+        if completed {
+            self.completed_account = account;
+        }
+        completed
     }
     pub fn terminal(&mut self, generation: u64, status: LoginState) -> bool {
         if generation != self.generation || status == LoginState::Pending {
@@ -267,7 +329,11 @@ impl Flow {
             }
             Phase::Starting => card.body = t("로그인 요청 중…").into(),
             Phase::Cancelling => card.body = t("이전 로그인 종료를 확인하는 중…").into(),
-            Phase::Completed => card.body = t("로그인이 완료되었습니다.").into(),
+            Phase::Completed => card.body = t(match (self.origin.as_deref(), self.completed_account.as_deref()) {
+                (Some(selected), Some(completed)) if selected != completed => "다른 계정의 로그인이 완료되었습니다. 선택한 계정의 재로그인은 확인되지 않았습니다.",
+                (Some(_), None) => "로그인은 완료되었지만 선택한 계정의 결과는 확인하지 못했습니다. 계정 목록을 확인해 주세요.",
+                _ => "로그인이 완료되었습니다.",
+            }).into(),
             Phase::Unknown => card.body = t("로그인 요청 결과를 확인하지 못했습니다. 새 요청을 만들 수 없습니다. 코어 연결과 기존 로그인 요청이 종료되었는지 확인해 주세요.").into(),
             Phase::Pending if !self.expired(now) => {
                 let device = self.prompt.as_ref().and_then(|p| p.device.as_ref());
@@ -446,23 +512,21 @@ mod tests {
         assert!(f.begin(LoginMethod::Web).is_none());
     }
     #[test]
-    fn unknown_no_id_and_busy_latch_survive_dismiss_and_reopen_without_new_session() {
-        for failure in [LoginFailure::Unknown, LoginFailure::Busy] {
-            let mut f = Flow::default();
-            f.chooser(None);
-            let generation = f.begin(LoginMethod::Device).unwrap();
-            f.start_failed(generation, failure);
-            f.cancel(false);
-            f.chooser(None);
-            assert!(f.phase == Phase::Unknown && f.prompt.is_none());
-            assert!(f.begin(LoginMethod::Device).is_none() && f.begin(LoginMethod::Web).is_none());
-            assert!(
-                f.card(now())
-                    .actions
-                    .iter()
-                    .all(|(action, _, enabled)| !enabled || *action == Action::Cancel)
-            );
-        }
+    fn unknown_no_id_latch_survives_dismiss_and_reopen_without_new_session() {
+        let mut f = Flow::default();
+        f.chooser(None);
+        let generation = f.begin(LoginMethod::Device).unwrap();
+        f.start_failed(generation, LoginFailure::Unknown);
+        f.cancel(false);
+        f.chooser(None);
+        assert!(f.phase == Phase::Unknown && f.prompt.is_none());
+        assert!(f.begin(LoginMethod::Device).is_none() && f.begin(LoginMethod::Web).is_none());
+        assert!(
+            f.card(now())
+                .actions
+                .iter()
+                .all(|(action, _, enabled)| !enabled || *action == Action::Cancel)
+        );
     }
     #[test]
     fn expiry_and_finite_failure_require_explicit_retry_or_web_alternative() {
@@ -495,5 +559,225 @@ mod tests {
         f.started(next, start(LoginMethod::Web), now());
         let debug = format!("{:?}", f.card(now()));
         assert!(!debug.contains("SYNTHETIC-CODE") && !debug.contains("auth.openai.com"));
+    }
+    #[test]
+    fn definite_callback_busy_allows_explicit_device_choice_without_automatic_start() {
+        let mut f = Flow::default();
+        f.chooser(None);
+        let generation = f.begin(LoginMethod::Web).unwrap();
+        f.start_failed(generation, LoginFailure::Busy);
+        assert!(f.phase == Phase::Failed && !f.leased && f.id.is_none());
+        assert!(
+            f.card(now())
+                .actions
+                .iter()
+                .any(|(action, _, enabled)| *action == Action::Change && *enabled)
+        );
+        f.cancel(true);
+        assert!(f.phase == Phase::Chooser && !f.leased);
+        assert!(f.begin(LoginMethod::Device).is_some());
+    }
+    #[test]
+    fn held_pointer_action_cannot_transfer_between_login_generations_or_actions() {
+        let (mut f, generation_a) = pending(LoginMethod::Device);
+        let press = PointerPress {
+            action: Action::CopyCode,
+            generation: generation_a,
+        };
+        assert!(press.matches(Action::CopyCode, generation_a));
+        assert!(!press.matches(Action::Open, generation_a));
+        f.cancel(true);
+        f.terminal(generation_a, LoginState::Cancelled);
+        let generation_b = f.begin(LoginMethod::Device).unwrap();
+        f.started(generation_b, start(LoginMethod::Device), now());
+        assert!(f.interactive(now()));
+        assert!(!press.matches(Action::CopyCode, generation_b));
+        assert!(
+            PointerPress {
+                action: Action::CopyCode,
+                generation: generation_b
+            }
+            .matches(Action::CopyCode, generation_b)
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn close_retains_delayed_start_past_five_seconds_then_cancels_exact_late_id() {
+        use std::sync::{Arc, Mutex};
+        let mut f = Flow::default();
+        f.chooser(None);
+        let generation = f.begin(LoginMethod::Device).unwrap();
+        let flow = Arc::new(Mutex::new(f));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let job_flow = flow.clone();
+        let job_events = events.clone();
+        let job = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            {
+                let mut f = job_flow.lock().unwrap();
+                assert!(!f.started(generation, start(LoginMethod::Device), now()));
+                assert!(f.prompt.is_none() && f.cancel_requested);
+                job_events.lock().unwrap().push(("cancel", f.id.clone()));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            job_events
+                .lock()
+                .unwrap()
+                .push(("status", Some("synthetic-session".into())));
+            assert!(
+                !job_flow
+                    .lock()
+                    .unwrap()
+                    .terminal(generation, LoginState::Cancelled)
+            );
+        });
+        flow.lock().unwrap().request_close();
+        let wait_flow = flow.clone();
+        let drain = tokio::spawn(async move {
+            retain_cleanup(|| wait_flow.lock().unwrap().leased).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(!drain.is_finished());
+        assert_eq!(flow.lock().unwrap().close_state(), CloseState::Waiting);
+        assert!(events.lock().unwrap().is_empty());
+        job.await.unwrap();
+        drain.await.unwrap();
+        assert_eq!(flow.lock().unwrap().close_state(), CloseState::Ready);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                ("cancel", Some("synthetic-session".into())),
+                ("status", Some("synthetic-session".into()))
+            ]
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn close_known_pending_retains_cleanup_until_authoritative_completed_race() {
+        use std::sync::{Arc, Mutex};
+        let (f, generation) = pending(LoginMethod::Device);
+        let flow = Arc::new(Mutex::new(f));
+        flow.lock().unwrap().request_close();
+        assert_eq!(
+            flow.lock().unwrap().id.as_deref(),
+            Some("synthetic-session")
+        );
+        let job_flow = flow.clone();
+        let job = tokio::spawn(async move {
+            assert!(job_flow.lock().unwrap().cancel_requested);
+            // Cancel's void acknowledgement and a Pending status cannot release cleanup.
+            assert!(
+                !job_flow
+                    .lock()
+                    .unwrap()
+                    .terminal(generation, LoginState::Pending)
+            );
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            assert!(
+                job_flow
+                    .lock()
+                    .unwrap()
+                    .terminal(generation, LoginState::Completed)
+            );
+        });
+        let wait_flow = flow.clone();
+        let drain = tokio::spawn(async move {
+            retain_cleanup(|| wait_flow.lock().unwrap().leased).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(!drain.is_finished());
+        assert_eq!(flow.lock().unwrap().close_state(), CloseState::Waiting);
+        job.await.unwrap();
+        drain.await.unwrap();
+        let f = flow.lock().unwrap();
+        assert_eq!(f.close_state(), CloseState::Ready);
+        assert!(f.phase == Phase::Completed && f.prompt.is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn close_bounded_no_id_start_reports_unresolved_instead_of_cancelled() {
+        use std::sync::{Arc, Mutex};
+        let mut f = Flow::default();
+        f.chooser(None);
+        let generation = f.begin(LoginMethod::Web).unwrap();
+        f.request_close();
+        let flow = Arc::new(Mutex::new(f));
+        let job_flow = flow.clone();
+        let job = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            job_flow
+                .lock()
+                .unwrap()
+                .start_failed(generation, LoginFailure::Unknown);
+        });
+        let wait_flow = flow.clone();
+        let drain = tokio::spawn(async move {
+            retain_cleanup(|| wait_flow.lock().unwrap().leased).await;
+        });
+        job.await.unwrap();
+        drain.await.unwrap();
+        let mut f = flow.lock().unwrap();
+        assert_eq!(f.close_state(), CloseState::Unresolved);
+        assert!(f.phase == Phase::Unknown);
+        f.abandon_close();
+        assert!(f.visible && !f.close_requested && f.begin(LoginMethod::Device).is_none());
+    }
+}
+
+#[cfg(test)]
+mod completion_identity_tests {
+    use super::*;
+    #[test]
+    fn selected_same_different_and_absent_completion_ids_never_conflate_relogin() {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || {
+                for (actual, expected) in [
+                    (Some("selected"), "로그인이 완료되었습니다."),
+                    (
+                        Some("different"),
+                        "다른 계정의 로그인이 완료되었습니다. 선택한 계정의 재로그인은 확인되지 않았습니다.",
+                    ),
+                    (
+                        None,
+                        "로그인은 완료되었지만 선택한 계정의 결과는 확인하지 못했습니다. 계정 목록을 확인해 주세요.",
+                    ),
+                ] {
+                    let mut flow = Flow::default();
+                    flow.chooser(Some("selected".into()));
+                    let generation = flow.begin(LoginMethod::Device).unwrap();
+                    flow.cancel(false);
+                    assert!(flow.terminal_with_account(
+                        generation,
+                        LoginState::Completed,
+                        actual.map(str::to_owned)
+                    ));
+                    assert_eq!(flow.origin.as_deref(), Some("selected"));
+                    assert_eq!(flow.completed_account.as_deref(), actual);
+                    let card = flow.card(Duration::ZERO);
+                    assert_eq!(card.body, crate::i18n::static_text(expected));
+                    assert!(card.code.is_none());
+                    // Result facts survive without a refreshed row lookup. A
+                    // duplicate terminal event cannot replace the committed ID.
+                    assert!(!flow.terminal_with_account(
+                        generation,
+                        LoginState::Completed,
+                        Some("wrong-late".into())
+                    ));
+                    assert_eq!(flow.completed_account.as_deref(), actual);
+                    // Explicit Change method is distinct from simply reopening
+                    // the truthful completed result after a close/cancel race.
+                    flow.cancel(true);
+                    let _ = flow.begin(LoginMethod::Web).unwrap();
+                    assert!(flow.completed_account.is_none());
+                }
+                let mut add = Flow::default();
+                add.chooser(None);
+                let g = add.begin(LoginMethod::Device).unwrap();
+                assert!(add.terminal_with_account(g, LoginState::Completed, Some("new".into())));
+                assert_eq!(
+                    add.card(Duration::ZERO).body,
+                    crate::i18n::static_text("로그인이 완료되었습니다.")
+                );
+            });
+        }
     }
 }

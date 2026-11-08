@@ -62,6 +62,7 @@ pub(super) struct Worker {
     jobs: AdmissionLane,
     urgent: AdmissionLane,
     admission: Mutex<()>,
+    quiescing: AtomicBool,
     refresh: mpsc::Sender<()>,
     visible: watch::Sender<bool>,
     flyout_visible: AtomicBool,
@@ -138,6 +139,11 @@ impl Worker {
                 // join from WM_DESTROY. Aborting drops all outstanding HTTP futures.
                 while let Ok(job) = urgent_rx.try_recv() { tasks.spawn(job); }
                 while let Ok(job) = job_rx.try_recv() { tasks.spawn(job); }
+                // Retain the already-admitted start/cancel/status job through late IDs
+                // and terminal reconciliation. The ordinary five-second drain is not
+                // evidence that core rolled back a login.
+                qb_tray::v2_session::login_flow::retain_cleanup(super::login_cleanup_pending).await;
+                if super::login_cleanup_unknown() { tracing::warn!(event = "tray_login_cleanup_unresolved"); }
                 let _ = tokio::time::timeout(Duration::from_secs(5), async {
                     while tasks.join_next().await.is_some() {}
                 }).await;
@@ -151,6 +157,7 @@ impl Worker {
             jobs,
             urgent,
             admission: Mutex::new(()),
+            quiescing: AtomicBool::new(false),
             refresh,
             visible,
             flyout_visible: AtomicBool::new(false),
@@ -161,11 +168,13 @@ impl Worker {
     }
     pub(super) fn submit(&self, job: impl Future<Output = ()> + Send + 'static) -> bool {
         let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        !*self.closing.borrow() && self.jobs.submit(job)
+        !self.quiescing.load(Ordering::Acquire) && !*self.closing.borrow() && self.jobs.submit(job)
     }
     pub(super) fn submit_cancel(&self, job: impl Future<Output = ()> + Send + 'static) -> bool {
         let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        !*self.closing.borrow() && self.urgent.submit(job)
+        !self.quiescing.load(Ordering::Acquire)
+            && !*self.closing.borrow()
+            && self.urgent.submit(job)
     }
     pub(super) fn refresh(&self) {
         let _ = self.refresh.try_send(());
@@ -190,7 +199,20 @@ impl Worker {
             let _ = thread.join();
         }
     }
+    /// Stop admitting new work without stopping the runtime holding login cleanup.
+    pub(super) fn quiesce(&self) {
+        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        self.quiescing.store(true, Ordering::Release);
+    }
+    pub(super) fn resume_admission(&self) {
+        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if !*self.closing.borrow() {
+            self.quiescing.store(false, Ordering::Release);
+        }
+    }
     pub(super) fn close(&self) {
+        // Also covers a forced WM_DESTROY / finish path outside normal WM_CLOSE.
+        super::request_login_cleanup();
         let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.disable_supervision();
         self.dashboard.stop();

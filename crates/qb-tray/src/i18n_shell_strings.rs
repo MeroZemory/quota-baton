@@ -9,6 +9,15 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
         "Sign-in expired. Try again or change the sign-in method.",
     ),
     ("Codex 계정 추가", "Add Codex account"),
+    (
+        "다른 계정의 로그인이 완료되었습니다. 선택한 계정의 재로그인은 확인되지 않았습니다.",
+        "Another account signed in. Re-login of the selected account was not confirmed.",
+    ),
+    (
+        "로그인은 완료되었지만 선택한 계정의 결과는 확인하지 못했습니다. 계정 목록을 확인해 주세요.",
+        "Sign-in completed, but the selected account's result could not be confirmed. Check the account list.",
+    ),
+    ("로그인 완료 계정: {0}", "Signed-in account: {0}"),
     ("웹 브라우저로 로그인", "Browser sign-in"),
     (
         "이 PC의 브라우저에서 로그인합니다.",

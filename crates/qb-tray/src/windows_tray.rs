@@ -13,7 +13,8 @@ use qb_proto::admin_login::LoginState;
 use qb_tray::client::login::{LoginFailure, LoginMethod};
 use qb_tray::i18n;
 use qb_tray::v2_session::login_flow::{
-    Action as LoginAction, Flow as CodexLoginFlow, Phase as LoginPhase,
+    Action as LoginAction, CloseState as LoginCloseState, Flow as CodexLoginFlow,
+    Phase as LoginPhase, PointerPress as LoginPointerPress,
 };
 use qb_tray::{
     v2, v2_geometry as geometry,
@@ -112,6 +113,7 @@ mod view_ownership;
 #[path = "windows_takeover.rs"]
 mod windows_takeover;
 const DASHBOARD_HANDOFF: u32 = WM_APP + 0x4c2;
+const LOGIN_CLOSE_DRAIN: u32 = WM_APP + 0x4c3;
 static DOUBLE_CLICK_RELEASE: Mutex<Option<Instant>> = Mutex::new(None);
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -168,6 +170,8 @@ struct Interaction {
     pointer_mode: bool,
     focus_visible: bool,
     pressed: Option<HitTarget>,
+    login_press: Option<LoginPointerPress>,
+    login_pointer_held: bool,
     tooltip: Option<(String, qb_tray::Rect)>,
     since: Option<Instant>,
     popup_offset: f32,
@@ -606,11 +610,23 @@ fn presentation(
     }
     let mut active_overlay = overlay(state);
     if let Overlay::CodexLogin(card) = &mut active_overlay {
-        let origin = codex_login_flow()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .origin
-            .clone();
+        let (origin, completed_account) = {
+            let flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+            (flow.origin.clone(), flow.completed_account.clone())
+        };
+        if let Some(row) = completed_account
+            .as_deref()
+            .and_then(|id| row_view(view, id))
+        {
+            card.body = format!(
+                "{}\n\n{}",
+                i18n::format(
+                    "로그인 완료 계정: {0}",
+                    &[row.raw.email.as_deref().unwrap_or(&row.name).to_owned()]
+                ),
+                card.body
+            );
+        }
         if let Some(row) = origin.as_deref().and_then(|id| row_view(view, id)) {
             card.body = format!(
                 "{}\n\n{}",
@@ -1739,6 +1755,85 @@ fn dispatch_account(hwnd: HWND, id: String, action: MenuAction, ticket: Option<T
     }
 }
 // Codex owns one start/status/cancellation task. Cancel never abandons its lease.
+fn invalidate_login_press() {
+    INPUT.with(|i| {
+        let mut i = i.borrow_mut();
+        if i.login_pointer_held {
+            i.pressed = None;
+            i.login_press = None;
+        }
+    });
+}
+fn request_login_cleanup() {
+    codex_login_flow()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .request_close();
+}
+fn login_cleanup_pending() -> bool {
+    codex_login_flow()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .leased
+}
+fn login_cleanup_unknown() -> bool {
+    codex_login_flow()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .close_state()
+        == LoginCloseState::Unresolved
+}
+/// The HWND and runtime remain alive while the admitted login job cancels/reconciles.
+fn advance_tray_close(hwnd: HWND) {
+    let disposition = {
+        let flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+        if !flow.close_requested {
+            return;
+        }
+        flow.close_state()
+    };
+    match disposition {
+        LoginCloseState::Waiting => {
+            set_view(Some("codex-login".into()));
+            invalidate_model();
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                resize_flyout(hwnd);
+            }
+            redraw_now(hwnd);
+        }
+        LoginCloseState::Unresolved => {
+            // A bounded start with no ID is not cancellation evidence. Decline
+            // this close attempt and leave the existing unresolved guidance visible.
+            codex_login_flow()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .abandon_close();
+            if let Some(worker) = WORKER.get() {
+                worker.resume_admission();
+            }
+            set_view(Some("codex-login".into()));
+            invalidate_model();
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                resize_flyout(hwnd);
+            }
+            redraw_now(hwnd);
+        }
+        LoginCloseState::Ready => {
+            let _ = dashboard_window::close_now_on_ui_thread();
+            sync_login_animation(hwnd, false);
+            disconnect_accessibility();
+            if let Some(worker) = WORKER.get() {
+                worker.close();
+            }
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+}
+
 fn notify_codex_login(hwnd: isize) {
     invalidate_model();
     unsafe {
@@ -1748,9 +1843,16 @@ fn notify_codex_login(hwnd: isize) {
             WPARAM(0),
             LPARAM(0),
         );
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut c_void)),
+            LOGIN_CLOSE_DRAIN,
+            WPARAM(0),
+            LPARAM(0),
+        );
     }
 }
 fn start_codex_login(hwnd: HWND, method: LoginMethod) {
+    invalidate_login_press();
     let generation = {
         let mut flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
         let Some(generation) = flow.begin(method) else {
@@ -1857,7 +1959,7 @@ fn start_codex_login(hwnd: HWND, method: LoginMethod) {
                         let completed = codex_login_flow()
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .terminal(generation, terminal);
+                            .terminal_with_account(generation, terminal, status.account_id.clone());
                         if completed {
                             // Account identity/collision/linked replacement stays entirely in core.
                             // Origin remains attached to this exact flow; no replace_linked field is sent.
@@ -1899,6 +2001,7 @@ fn start_codex_login(hwnd: HWND, method: LoginMethod) {
     }
 }
 fn codex_login_action(hwnd: HWND, action: LoginAction) {
+    invalidate_login_press();
     if view_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2027,6 +2130,7 @@ fn launch_login(hwnd: HWND, provider: String) {
 }
 fn launch_login_for_account(hwnd: HWND, provider: String, origin: Option<String>) {
     if provider == "codex" {
+        invalidate_login_press();
         if !cancel_login() {
             return;
         }
@@ -2480,6 +2584,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
     redraw_now(hwnd);
 }
 fn dismiss_overlay() {
+    invalidate_login_press();
     if view_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3381,25 +3486,66 @@ unsafe extern "system" fn window_proc(
         {
             let (x, y) = point_from_lparam(lparam);
             let target = hit_target(hwnd, x, y);
-            INPUT.with(|i| i.borrow_mut().pressed = target);
+            let ticket = if let Some(HitTarget::CodexLogin(action)) = &target {
+                Some(LoginPointerPress {
+                    action: *action,
+                    generation: codex_login_flow()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .generation,
+                })
+            } else {
+                None
+            };
+            INPUT.with(|i| {
+                let mut i = i.borrow_mut();
+                i.pressed = target;
+                i.login_pointer_held = ticket.is_some();
+                i.login_press = ticket;
+            });
             redraw_now(hwnd);
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_CANCELMODE
         | windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
-            INPUT.with(|i| i.borrow_mut().pressed = None);
+            INPUT.with(|i| {
+                let mut i = i.borrow_mut();
+                i.pressed = None;
+                i.login_press = None;
+            });
             redraw_now(hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP if IsWindowVisible(hwnd).as_bool() => {
-            INPUT.with(|i| {
+            let (login_held, ticket) = INPUT.with(|i| {
                 let mut i = i.borrow_mut();
                 i.pressed = None;
                 i.pointer_mode = true;
                 i.focus_visible = false;
+                let held = i.login_pointer_held;
+                i.login_pointer_held = false;
+                (held, i.login_press.take())
             });
             let (x, y) = point_from_lparam(lparam);
-            if let Some(target) = hit_target(hwnd, x, y) {
+            let target = hit_target(hwnd, x, y);
+            let released_login = match &target {
+                Some(HitTarget::CodexLogin(action)) => Some(*action),
+                _ => None,
+            };
+            if login_held || released_login.is_some() {
+                let generation = codex_login_flow()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .generation;
+                if !ticket
+                    .zip(released_login)
+                    .is_some_and(|(press, action)| press.matches(action, generation))
+                {
+                    redraw_now(hwnd);
+                    return LRESULT(0);
+                }
+            }
+            if let Some(target) = target {
                 activate_hit(hwnd, target);
             } else if painted_frame(hwnd).is_some() {
                 set_view(None);
@@ -3621,6 +3767,7 @@ unsafe extern "system" fn window_proc(
             #[cfg(all(debug_assertions, feature = "testkit"))]
             test_shell(hwnd, "visibility", None);
             if wparam.0 == 0 {
+                invalidate_login_press();
                 codex_login_flow()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3759,10 +3906,17 @@ unsafe extern "system" fn window_proc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CLOSE => {
-            let _ = dashboard_window::close_now_on_ui_thread();
-            sync_login_animation(hwnd, false);
-            disconnect_accessibility();
-            DefWindowProcW(hwnd, message, wparam, lparam)
+            invalidate_login_press();
+            request_login_cleanup();
+            if let Some(worker) = WORKER.get() {
+                worker.quiesce();
+            }
+            advance_tray_close(hwnd);
+            LRESULT(0)
+        }
+        LOGIN_CLOSE_DRAIN => {
+            advance_tray_close(hwnd);
+            LRESULT(0)
         }
         WM_DESTROY => {
             let _ = dashboard_window::close_now_on_ui_thread();
