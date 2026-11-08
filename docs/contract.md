@@ -583,7 +583,7 @@ Inspecting compressed responses:
 - Response headers are always readable.
 - To inspect a compressed SSE stream or error body, the relay decodes a bounded side copy as a stream. Relayed bytes are never changed.
 
-### C9.1 Reset credits (R26, approved design; implementation pending)
+### C9.1 Reset credits (R26, implemented; final integration acceptance pending)
 
 Reset credits are single-use provider entitlements, separate from paid-credit balances, scheduled quota resets and subscription renewals. The initial integration is Codex, for which an earlier usage capture identified `rate_limit_reset_credits`; that observation alone does not establish its current schema or a redemption API. Other providers are unsupported until equivalent evidence exists.
 
