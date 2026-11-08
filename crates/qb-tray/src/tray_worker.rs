@@ -766,6 +766,7 @@ mod tests {
             jobs,
             urgent,
             admission: Mutex::new(()),
+            quiescing: AtomicBool::new(false),
             refresh,
             visible,
             flyout_visible: AtomicBool::new(false),
