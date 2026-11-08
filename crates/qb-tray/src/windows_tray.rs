@@ -4411,17 +4411,16 @@ mod tests {
 
     #[test]
     fn pending_cancel_host_rechecks_owner_view_identity_and_physical_geometry() {
-        let flow = CodexLoginFlow {
-            generation: 41,
-            phase: LoginPhase::Pending,
-            visible: true,
-            leased: true,
-            id: Some("synthetic-session".into()),
-            method: Some(LoginMethod::Device),
-            origin: Some("synthetic-origin".into()),
-            deadline: Some(std::time::Duration::from_secs(1000)),
-            ..CodexLoginFlow::default()
-        };
+        let mut flow = CodexLoginFlow::default();
+        flow.generation = 41;
+        flow.phase = LoginPhase::Pending;
+        flow.visible = true;
+        flow.leased = true;
+        flow.id = Some("synthetic-session".into());
+        flow.method = Some(LoginMethod::Device);
+        flow.origin = Some("synthetic-origin".into());
+        flow.deadline = Some(std::time::Duration::from_secs(1000));
+
         let view = v2::project(r#"{"accounts":[]}"#, SystemTime::now()).unwrap();
         let scene = geometry::Scene::build(
             &view,

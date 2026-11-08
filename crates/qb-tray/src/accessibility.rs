@@ -2938,17 +2938,16 @@ mod tests {
         };
         let mut snapshot = scene();
         snapshot.elements[2].name = "Cancel".into();
-        let flow = Flow {
-            generation: 41,
-            phase: Phase::Pending,
-            visible: true,
-            leased: true,
-            id: Some("synthetic-pending-session".into()),
-            method: Some(LoginMethod::Device),
-            origin: Some("synthetic-origin".into()),
-            deadline: Some(std::time::Duration::from_secs(1000)),
-            ..Flow::default()
-        };
+        let mut flow = Flow::default();
+        flow.generation = 41;
+        flow.phase = Phase::Pending;
+        flow.visible = true;
+        flow.leased = true;
+        flow.id = Some("synthetic-pending-session".into());
+        flow.method = Some(LoginMethod::Device);
+        flow.origin = Some("synthetic-origin".into());
+        flow.deadline = Some(std::time::Duration::from_secs(1000));
+
         let context = PendingCancelContext {
             flow: flow.pending_cancel(std::time::Duration::ZERO).unwrap(),
             owner: 11,
