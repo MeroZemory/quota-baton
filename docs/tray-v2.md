@@ -194,7 +194,7 @@ Overview fixture heights:
 - **Rule.** The chip and the plan never shrink. The name is trimmed first and keeps at least 8 to the chip.
 - **Name.** Use `label` when it is set. Otherwise use the local part of `email`. If two accounts of the same provider share the local part, show the full email for both. If there is no email, show "이름 없는 계정".
 - **Plan labels.**
-  - **Claude**: `pro` → Pro, `max_5x` → Max 5x, `max_20x` → Max 20x, `max` (tier unknown) → Max.
+  - **Claude**: `pro` → Pro, `max_5x` → Max (5×), `max_20x` → Ultra (10×), `max` (tier unknown) → Max. Parenthesized multipliers compare Pro weekly usage; legacy raw keys remain unchanged. Labels do not infer entitlement, remove reported windows, or change routing/forecast capacity.
   - **Codex**: `free` → Free, `plus` → Plus, `pro` → Pro, `team` → Team, `business` → Business, `enterprise` → Enterprise.
   - Anything else, or null: hidden.
 
@@ -366,7 +366,7 @@ A toggle shows "변경 중…" in place of its label while its PATCH is pending 
 | Chip 크레딧 사용 중 | `구독 한도에 도달해 유료 크레딧으로 처리하고 있습니다.` |
 | Chip 일시정지 / 새 대화 안 받음 | `새 대화를 이 계정에 배정하지 않습니다. 사용량은 계속 확인합니다.` / `이미 연결된 대화만 계속 처리합니다.` |
 | Credits line | `크레딧 잔액 19,395.23 · 유료 크레딧 사용 허용: 꺼짐. 켜면 구독 한도에 도달해도 크레딧으로 계속 처리합니다.` |
-| Plan | `요금제: Max 20x` |
+| Plan | `요금제: Ultra (10×)` |
 | Name trimmed with an ellipsis | full email |
 
 The "(요일)" weekday form appears only in tooltips.

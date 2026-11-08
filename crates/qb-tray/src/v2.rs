@@ -595,14 +595,16 @@ pub fn provider_label(provider: &str) -> &str {
         _ => provider,
     }
 }
+/// Display multipliers compare Pro weekly usage; legacy wire keys remain unchanged.
+/// A label does not establish actual windows, eligibility, or routing capacity.
 pub fn plan_label(provider: &str, plan: Option<&str>) -> Option<&'static str> {
     match (provider, plan?) {
         ("claude", "pro") | ("codex", "prolite") => Some("Pro"),
         ("codex", "pro") => Some("Pro (More)"),
         ("codex", "promax") => Some("Pro (Max)"),
         ("claude", "max") => Some("Max"),
-        ("claude", "max_5x") => Some("Max 5x"),
-        ("claude", "max_20x") => Some("Max 20x"),
+        ("claude", "max_5x") => Some("Max (5×)"),
+        ("claude", "max_20x") => Some("Ultra (10×)"),
         ("claude" | "codex", "free") => Some("Free"),
         ("codex", "plus") => Some("Plus"),
         ("codex", "team") => Some("Team"),
@@ -2204,8 +2206,8 @@ mod tests {
         for (provider, raw, label) in [
             ("claude", "pro", "Pro"),
             ("claude", "max", "Max"),
-            ("claude", "max_5x", "Max 5x"),
-            ("claude", "max_20x", "Max 20x"),
+            ("claude", "max_5x", "Max (5×)"),
+            ("claude", "max_20x", "Ultra (10×)"),
             ("codex", "free", "Free"),
             ("codex", "plus", "Plus"),
             ("codex", "pro", "Pro (More)"),
@@ -2218,6 +2220,7 @@ mod tests {
             assert_eq!(plan_label(provider, Some(raw)), Some(label));
         }
         assert_eq!(plan_label("claude", Some("plus")), None);
+        assert_eq!(plan_label("claude", Some("ultra")), None);
         assert_eq!(plan_label("codex", Some("max")), None);
         assert_eq!(plan_label("codex", None), None);
     }

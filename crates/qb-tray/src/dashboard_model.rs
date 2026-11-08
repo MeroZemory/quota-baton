@@ -2923,12 +2923,12 @@ mod r18_plan_ui_tests {
         for (language, label, recovery) in [
             (
                 crate::i18n::UiLanguage::Ko,
-                "요금제 변경: Max 20x → Free",
+                "요금제 변경: Ultra (10×) → Free",
                 "Claude Code를 지원하는 요금제로 변경한 뒤 사용량을 새로고침하세요.",
             ),
             (
                 crate::i18n::UiLanguage::En,
-                "Plan changed: Max 20x → Free",
+                "Plan changed: Ultra (10×) → Free",
                 "Upgrade to a plan with Claude Code access, then refresh usage.",
             ),
         ] {
