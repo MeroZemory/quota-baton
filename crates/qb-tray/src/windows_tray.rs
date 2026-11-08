@@ -855,6 +855,12 @@ fn set_disclosure(provider: &str, expanded: bool) {
 fn drain_intent(view: &v2::View, id: &str) -> Option<bool> {
     row_view(view, id).map(|row| !row.raw.drain)
 }
+// The chooser has no clock-derived content. Its periodic redraw still serves
+// delayed tooltips, but must not retire otherwise unchanged UIA action tickets.
+fn login_timer_invalidates_model(phase: LoginPhase) -> bool {
+    phase != LoginPhase::Chooser
+}
+
 fn login_animation_needed(visible: bool, state: Option<&str>) -> bool {
     visible && state.is_some_and(|state| state.starts_with("login:"))
 }
@@ -3932,7 +3938,13 @@ unsafe extern "system" fn window_proc(
                     .as_deref()
                     == Some("codex-login")
                 {
-                    invalidate_model();
+                    let phase = codex_login_flow()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .phase;
+                    if login_timer_invalidates_model(phase) {
+                        invalidate_model();
+                    }
                 }
                 redraw_now(hwnd);
             }
@@ -4220,6 +4232,89 @@ mod tests {
             let mut changed = repaint.clone();
             change(&mut changed);
             assert!(!same_action_frame(&previous, &changed), "{name}");
+        }
+    }
+
+    #[test]
+    fn chooser_timer_keeps_the_retained_action_frame_domain() {
+        let flow = CodexLoginFlow::default();
+        let before = flow.card(std::time::Duration::ZERO);
+        let after = flow.card(std::time::Duration::from_secs(1));
+        assert_eq!(before, after);
+        let view = v2::project(r#"{"accounts":[]}"#, SystemTime::now()).unwrap();
+        let scene = geometry::Scene::build(
+            &view,
+            geometry::Presentation {
+                overlay: Overlay::CodexLogin(before),
+                ..Default::default()
+            },
+            900.,
+        );
+        assert!(
+            scene
+                .targets
+                .iter()
+                .any(|h| h.enabled && h.target == HitTarget::CodexLogin(LoginAction::Device))
+        );
+        let actions: Vec<_> = scene.targets.iter().map(|h| h.target.clone()).collect();
+        let retained = PaintedFrame {
+            #[cfg(all(debug_assertions, feature = "testkit"))]
+            tooltip_rect: None,
+            view,
+            scene,
+            state: Some("codex-login".into()),
+            owner: 3,
+            revision: 4,
+            epoch: 6,
+            login_generation: flow.generation,
+            pixels: (360, 600),
+            dpi: 96,
+            offset: 0.,
+            elements: actions
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i as i32 + 1, t.clone()))
+                .collect(),
+            actions,
+        };
+        let mut repaint = retained.clone();
+        repaint.scene = geometry::Scene::build(
+            &retained.view,
+            geometry::Presentation {
+                overlay: Overlay::CodexLogin(after),
+                ..Default::default()
+            },
+            900.,
+        );
+        repaint.epoch += 1;
+        // Counterexample: the former unconditional timer invalidation alone
+        // rejects reuse despite the unchanged chooser card and hit geometry.
+        repaint.revision += 1;
+        assert!(!same_action_frame(&retained, &repaint));
+        repaint.revision = retained.revision;
+        if login_timer_invalidates_model(flow.phase) {
+            repaint.revision += 1;
+        }
+        assert!(same_action_frame(&retained, &repaint));
+        // Genuine invalidation still rejects this retained domain.
+        repaint.revision += 1;
+        assert!(!same_action_frame(&retained, &repaint));
+    }
+
+    #[test]
+    fn login_timer_preserves_invalidation_for_every_other_phase() {
+        assert!(!login_timer_invalidates_model(LoginPhase::Chooser));
+        for phase in [
+            LoginPhase::Starting,
+            LoginPhase::Pending,
+            LoginPhase::Cancelling,
+            LoginPhase::Completed,
+            LoginPhase::Failed,
+            LoginPhase::Expired,
+            LoginPhase::Cancelled,
+            LoginPhase::Unknown,
+        ] {
+            assert!(login_timer_invalidates_model(phase));
         }
     }
 
