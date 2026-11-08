@@ -11,7 +11,7 @@ use qb_proto::reset_credits::{
 use std::collections::BTreeMap;
 
 fn text(ko: &'static str) -> String {
-    crate::i18n::static_text(ko).into()
+    qb_tray::i18n::static_text(ko).into()
 }
 
 #[derive(Clone, Debug)]
@@ -53,13 +53,13 @@ pub fn inventory_line(
     let observed = i
         .observed_at
         .as_deref()
-        .unwrap_or(crate::i18n::static_text("확인 전"));
+        .unwrap_or(qb_tray::i18n::static_text("확인 전"));
     let choice = qb_core::reset_credit_display_choice(i, now);
     let reported = i
         .available_count
         .map_or_else(|| "?".into(), |n| n.to_string());
     line.text = if matches!(&choice, Err(ResetCreditRefusal::Stale)) {
-        crate::i18n::format("리셋권 · 오래된 정보 · 제공자 보고 {0}", &[reported])
+        qb_tray::i18n::format("리셋권 · 오래된 정보 · 제공자 보고 {0}", &[reported])
     } else if i.state == ResetCreditState::Unknown {
         text("리셋권 · 확인 전")
     } else if matches!(&choice, Err(ResetCreditRefusal::NoCredits))
@@ -71,12 +71,12 @@ pub fn inventory_line(
         && i.refusal.is_none()
     {
         line.can_use = true;
-        crate::i18n::format(
+        qb_tray::i18n::format(
             "리셋권 {0}개 · 가장 빠른 만료 {1}",
             &[reported, expiry(&grant.expires_at)],
         )
     } else {
-        crate::i18n::format(
+        qb_tray::i18n::format(
             "리셋권 · 제공자 보고 {0} · 상세·만료 확인 필요",
             &[reported],
         )
@@ -89,13 +89,13 @@ pub fn inventory_line(
     line.tooltip = format!(
         "{}\n{}\n{}",
         line.text,
-        crate::i18n::format("확인 시각 {0}", &[observed.into()]),
+        qb_tray::i18n::format("확인 시각 {0}", &[observed.into()]),
         reason
     );
     for grant in &i.grants {
         line.tooltip.push_str(&format!(
             "\n{}",
-            crate::i18n::format("기록된 만료 {0}", &[expiry(&grant.expires_at)])
+            qb_tray::i18n::format("기록된 만료 {0}", &[expiry(&grant.expires_at)])
         ));
     }
     line
@@ -265,7 +265,7 @@ impl AdminClient {
 }
 
 pub fn preview_body(p: &ResetCreditPreview) -> String {
-    crate::i18n::format(
+    qb_tray::i18n::format(
         "{0}\n{1}\n만료 {2}\n영향: 해당되는 Codex 한도\n만료가 가장 빠른 리셋권 1개를 사용합니다.\n확인 유효 시각 {3}",
         &[
             format!("{} ({})", p.label, p.account),
@@ -446,8 +446,8 @@ mod tests {
     }
     #[test]
     fn unknown_unsupported_zero_stale_and_partial_are_distinct_in_both_languages() {
-        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
-            crate::i18n::with_language(language, || {
+        for language in [qb_tray::i18n::UiLanguage::Ko, qb_tray::i18n::UiLanguage::En] {
+            qb_tray::i18n::with_language(language, || {
                 let unknown = inventory_line("codex", None, now());
                 let unsupported = inventory_line("claude", None, now());
                 let mut i = inventory();
@@ -648,8 +648,8 @@ mod tests {
     }
     #[test]
     fn preview_copy_has_identity_exact_expiry_and_only_evidenced_effect_in_both_languages() {
-        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
-            crate::i18n::with_language(language, || {
+        for language in [qb_tray::i18n::UiLanguage::Ko, qb_tray::i18n::UiLanguage::En] {
+            qb_tray::i18n::with_language(language, || {
                 let mut p = preview();
                 p.account = "cx-synthetic-selected".into();
                 let body = preview_body(&p);
@@ -665,7 +665,7 @@ mod tests {
                         && !body.contains("7d")
                         && !body.contains(&p.preview_token)
                 );
-                if language == crate::i18n::UiLanguage::En {
+                if language == qb_tray::i18n::UiLanguage::En {
                     assert!(body.contains("eligible Codex limits"));
                 }
             });

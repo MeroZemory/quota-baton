@@ -863,13 +863,13 @@ async fn r261_existing_status_and_cancel_routes_preserve_typed_terminal_facts() 
 
 #[test]
 fn r261_unresolved_and_invalid_request_copy_is_localized_without_session_material() {
-    for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
-        crate::i18n::with_language(language, || {
+    for language in [qb_tray::i18n::UiLanguage::Ko, qb_tray::i18n::UiLanguage::En] {
+        qb_tray::i18n::with_language(language, || {
             let unknown = ClientError::LoginStartUnresolved {
                 login_id: Some("synthetic-private-session".into()),
             };
             let invalid = ClientError::AccountAction("로그인 요청이 올바르지 않습니다");
-            let (unknown_text, invalid_text) = if language == crate::i18n::UiLanguage::En {
+            let (unknown_text, invalid_text) = if language == qb_tray::i18n::UiLanguage::En {
                 (
                     "Could not confirm the sign-in response",
                     "Invalid sign-in request",
