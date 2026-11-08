@@ -902,15 +902,15 @@ fn sync_login_animation(hwnd: HWND, visible: bool) {
         }
     });
 }
-fn measured_scene(
-    hwnd: HWND,
-) -> Result<(
+type MeasuredScene = (
     Rc<Renderer>,
     v2::View,
     geometry::Scene,
     BTreeSet<String>,
     Option<PendingCancel>,
-)> {
+);
+
+fn measured_scene(hwnd: HWND) -> Result<MeasuredScene> {
     #[cfg(all(debug_assertions, feature = "testkit"))]
     let started = Instant::now();
     let state = view_state()
@@ -4494,7 +4494,12 @@ mod tests {
         starting_frame.pending_cancel = None;
         assert!(flow.pending_cancel(std::time::Duration::ZERO).is_some());
         assert!(
-            pending_cancel_context(&starting_frame, origin, &[context.element.clone()]).is_none()
+            pending_cancel_context(
+                &starting_frame,
+                origin,
+                std::slice::from_ref(&context.element)
+            )
+            .is_none()
         );
         let matches = |f: &PaintedFrame| {
             pending_cancel_host_matches(
