@@ -3330,16 +3330,10 @@ mod tests {
         h.insert("x-codex-plan-type", "prolite".parse().unwrap());
         h.insert("x-codex-primary-window-minutes", "0".parse().unwrap());
         h.insert("x-codex-primary-used-percent", "0".parse().unwrap());
-        h.insert(
-            "x-codex-primary-reset-at",
-            "2000000000".parse().unwrap(),
-        );
+        h.insert("x-codex-primary-reset-at", "2000000000".parse().unwrap());
         h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
         h.insert("x-codex-secondary-used-percent", "1".parse().unwrap());
-        h.insert(
-            "x-codex-secondary-reset-at",
-            "2000000000".parse().unwrap(),
-        );
+        h.insert("x-codex-secondary-reset-at", "2000000000".parse().unwrap());
         let prolite = snapshot(Provider::Codex, &h, now).unwrap();
         assert_eq!(prolite.plan.as_deref(), Some("prolite"));
         assert_eq!(prolite.windows.len(), 1);
