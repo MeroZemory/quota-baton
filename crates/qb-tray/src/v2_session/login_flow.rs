@@ -727,6 +727,39 @@ mod tests {
 mod completion_identity_tests {
     use super::*;
     #[test]
+    fn completed_close_label_and_pending_cancel_are_localized() {
+        for (language, close, cancel) in [
+            (crate::i18n::UiLanguage::Ko, "닫기", "취소"),
+            (crate::i18n::UiLanguage::En, "Close", "Cancel"),
+        ] {
+            crate::i18n::with_language(language, || {
+                for phase in [
+                    Phase::Completed,
+                    Phase::Chooser,
+                    Phase::Pending,
+                    Phase::Expired,
+                ] {
+                    let flow = Flow {
+                        phase,
+                        ..Flow::default()
+                    };
+                    let card = flow.card(Duration::ZERO);
+                    let action = card.actions.iter().find(|a| a.0 == Action::Cancel).unwrap();
+                    assert_eq!(
+                        action.1,
+                        if phase == Phase::Completed {
+                            close
+                        } else {
+                            cancel
+                        }
+                    );
+                    assert!(action.2);
+                }
+            });
+        }
+    }
+
+    #[test]
     fn selected_same_different_and_absent_completion_ids_never_conflate_relogin() {
         for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
             crate::i18n::with_language(language, || {

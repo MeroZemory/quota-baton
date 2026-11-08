@@ -1,5 +1,6 @@
 //! Native shell additions to the shared Korean/English catalog.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
+    ("닫기", "Close"),
     (
         "연결을 확인하며 기존 로그인 상태를 다시 확인하고 있습니다. 새 요청은 만들지 않습니다.",
         "Checking the connection and the existing sign-in request. No new request will be created.",
