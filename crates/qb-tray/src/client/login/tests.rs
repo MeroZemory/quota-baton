@@ -860,3 +860,29 @@ async fn r261_existing_status_and_cancel_routes_preserve_typed_terminal_facts() 
         "/admin/v1/accounts/login/synthetic-status/cancel"
     );
 }
+
+#[test]
+fn r261_unresolved_and_invalid_request_copy_is_localized_without_session_material() {
+    for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+        crate::i18n::with_language(language, || {
+            let unknown = ClientError::LoginStartUnresolved {
+                login_id: Some("synthetic-private-session".into()),
+            };
+            let invalid = ClientError::AccountAction("로그인 요청이 올바르지 않습니다");
+            let (unknown_text, invalid_text) = if language == crate::i18n::UiLanguage::En {
+                (
+                    "Could not confirm the sign-in response",
+                    "Invalid sign-in request",
+                )
+            } else {
+                (
+                    "로그인 응답을 확인할 수 없습니다",
+                    "로그인 요청이 올바르지 않습니다",
+                )
+            };
+            assert_eq!(super::super::error_message(&unknown), unknown_text);
+            assert_eq!(super::super::error_message(&invalid), invalid_text);
+            assert!(!super::super::error_message(&unknown).contains("synthetic-private-session"));
+        });
+    }
+}

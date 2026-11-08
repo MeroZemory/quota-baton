@@ -1,5 +1,10 @@
 //! Client presentation copy only; protocol codes and account metadata stay unchanged.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
+    ("로그인 요청이 올바르지 않습니다", "Invalid sign-in request"),
+    (
+        "로그인 응답을 확인할 수 없습니다",
+        "Could not confirm the sign-in response",
+    ),
     ("먼저 다시 로그인해 주세요.", "Sign in again first."),
     ("계정을 먼저 켜 주세요.", "Enable this account first."),
     (
