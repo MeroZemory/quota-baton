@@ -1,5 +1,67 @@
 //! Native shell additions to the shared Korean/English catalog.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
+    (
+        "연결을 확인하며 기존 로그인 상태를 다시 확인하고 있습니다. 새 요청은 만들지 않습니다.",
+        "Checking the connection and the existing sign-in request. No new request will be created.",
+    ),
+    (
+        "로그인 시간이 만료되었습니다. 다시 시도하거나 로그인 방법을 변경해 주세요.",
+        "Sign-in expired. Try again or change the sign-in method.",
+    ),
+    ("Codex 계정 추가", "Add Codex account"),
+    ("웹 브라우저로 로그인", "Browser sign-in"),
+    (
+        "이 PC의 브라우저에서 로그인합니다.",
+        "Sign in using this PC’s browser.",
+    ),
+    ("디바이스 코드로 로그인", "Device code sign-in"),
+    (
+        "표시된 코드를 브라우저에서 입력합니다. 다른 기기에서도 가능합니다.",
+        "Enter the displayed code in a browser. You can use another device.",
+    ),
+    ("로그인 요청 중…", "Starting sign-in…"),
+    (
+        "이전 로그인 종료를 확인하는 중…",
+        "Confirming the previous sign-in has ended…",
+    ),
+    ("로그인이 완료되었습니다.", "Sign-in completed."),
+    (
+        "로그인 요청 결과를 확인하지 못했습니다. 새 요청을 만들 수 없습니다. 코어 연결과 기존 로그인 요청이 종료되었는지 확인해 주세요.",
+        "Could not confirm the sign-in request. A new request is disabled. Check the core connection and resolve the existing sign-in request.",
+    ),
+    (
+        "브라우저에서 코드를 입력해 주세요.",
+        "Enter the code in your browser.",
+    ),
+    (
+        "브라우저에서 로그인을 완료해 주세요.",
+        "Complete sign-in in your browser.",
+    ),
+    ("남은 시간 {0}초", "Time remaining: {0}s"),
+    ("코드 복사됨", "Code copied"),
+    ("코드 복사", "Copy code"),
+    ("인증 페이지 열기", "Open sign-in page"),
+    ("브라우저 다시 열기", "Reopen browser"),
+    (
+        "브라우저를 열지 못했습니다. 주소를 복사하거나 다시 열어 주세요.",
+        "Could not open the browser. Copy the address or open it again.",
+    ),
+    (
+        "로그인 시간이 만료되었습니다. 새 코드를 명시적으로 요청해 주세요.",
+        "Sign-in expired. Request a new code to continue.",
+    ),
+    ("로그인이 취소되었습니다.", "Sign-in cancelled."),
+    (
+        "로그인 요청을 처리하지 못했습니다. 디바이스 로그인이 허용되어 있는지 Security 설정이나 워크스페이스 관리자에게 확인하세요.",
+        "Could not complete sign-in. For device sign-in, check Security settings or ask your workspace administrator whether device sign-in is allowed.",
+    ),
+    (
+        "로그인 요청이 너무 많습니다. 잠시 후 직접 다시 시도하거나 웹 로그인을 선택해 주세요.",
+        "Too many sign-in requests. Try again later or choose browser sign-in.",
+    ),
+    ("새 코드 요청", "Request new code"),
+    ("로그인 방법 변경", "Change method"),
+    ("선택한 계정: {0}", "Selected account: {0}"),
     ("남은 시간 {}", "Time remaining {}"),
     ("활성 {}{}", "Active {}{}"),
     ("quota-baton 대시보드", "quota-baton dashboard"),

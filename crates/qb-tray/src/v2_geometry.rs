@@ -79,6 +79,7 @@ impl Default for Presentation {
 pub enum Overlay {
     #[default]
     None,
+    CodexLogin(crate::v2_session::login_flow::Card),
     RowMenu(String),
     Settings,
     Quit,
@@ -177,6 +178,7 @@ pub enum Target {
     ConfirmCredits(String),
     ConfirmDelete(String),
     CancelDialog,
+    CodexLogin(crate::v2_session::login_flow::Action),
     LoginCopy,
     LoginCancel,
     /// Modal surface/scrim absorbs clicks, preventing activation underneath.
@@ -312,6 +314,7 @@ pub struct PopupBox {
 }
 #[derive(Debug, Clone)]
 pub struct DialogBox {
+    pub login_card: Option<crate::v2_session::login_flow::Card>,
     pub takeover_body: Option<String>,
     pub body_offset: f32,
     pub body_height: f32,
@@ -525,6 +528,61 @@ impl Scene {
         };
         scene.build_base_targets();
         match &p.overlay {
+            Overlay::CodexLogin(card) => {
+                let mut d = dialog_box(rect, "codex-login", false, &p);
+                let rows = card.actions.len().div_ceil(2);
+                let bar_height = 24. + rows as f32 * 40.;
+                d.button_bar.top = (d.card.bottom - bar_height).max(d.card.top + 48.);
+                d.divider = r(
+                    d.card.left,
+                    d.button_bar.top,
+                    d.card.right,
+                    d.button_bar.top + 1.,
+                );
+                d.body.bottom = (d.button_bar.top - 12.).max(d.body.top);
+                d.login_card = Some(card.clone());
+                d.takeover_body = Some(card.body.clone());
+                d.body_height = p.credits_body_lines as f32 * 20.;
+                d.body_offset = p
+                    .popup_offset
+                    .clamp(0., (d.body_height - h(d.body)).max(0.));
+                d.buttons = card
+                    .actions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (action, label, enabled))| {
+                        let x = 28. + (index % 2) as f32 * 156.;
+                        let y = d.button_bar.top + 12. + (index / 2) as f32 * 40.;
+                        button(
+                            r(x, y, x + 148., y + 32.),
+                            label,
+                            Target::CodexLogin(*action),
+                            *enabled
+                                && (p.core_ok
+                                    || matches!(
+                                        action,
+                                        crate::v2_session::login_flow::Action::Cancel
+                                            | crate::v2_session::login_flow::Action::Change
+                                    )),
+                        )
+                    })
+                    .collect();
+                scene.targets = vec![HitBox {
+                    rect,
+                    target: Target::Blocked,
+                    enabled: true,
+                }];
+                for button in &d.buttons {
+                    push_target(
+                        &mut scene.targets,
+                        button.hit,
+                        d.clip,
+                        button.target.clone(),
+                        button.enabled,
+                    );
+                }
+                scene.dialog = Some(d);
+            }
             Overlay::ResetCredits { id, body, ready } => {
                 let mut d = dialog_box(rect, id, false, &p);
                 d.takeover_body = Some(body.clone());
@@ -1603,6 +1661,12 @@ fn parts_height(parts: &[Part], p: &Presentation) -> f32 {
 }
 fn overlay_min_height(view: &v2::View, p: &Presentation) -> f32 {
     match &p.overlay {
+        Overlay::CodexLogin(card) => {
+            48. + 20. * p.credits_body_lines as f32
+                + 24.
+                + card.actions.len().div_ceil(2) as f32 * 40.
+                + 16.
+        }
         Overlay::TakeoverCard { .. } | Overlay::ResetCredits { .. } => {
             149. + p.credits_body_lines as f32 * 20.
         }
@@ -1751,7 +1815,12 @@ fn credits_dialog_height(p: &Presentation) -> f32 {
     20. + 20. + 8. + 20. * p.credits_body_lines.clamp(1, 12) as f32 + 20. + 1. + 64.
 }
 fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBox {
-    let content_height = if matches!(
+    let content_height = if let Overlay::CodexLogin(card) = &p.overlay {
+        48. + 20. * p.credits_body_lines as f32
+            + 24.
+            + card.actions.len().div_ceil(2) as f32 * 40.
+            + 12.
+    } else if matches!(
         p.overlay,
         Overlay::TakeoverCard { .. } | Overlay::ResetCredits { .. }
     ) {
@@ -1773,6 +1842,7 @@ fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBo
         Target::ConfirmCredits(id.into())
     };
     DialogBox {
+        login_card: None,
         takeover_body: None,
         body_offset: 0.,
         body_height: 0.,
@@ -3269,6 +3339,89 @@ mod r26_geometry_tests {
                             .any(|i| i.tooltip.as_deref() == Some(inventory.tooltip.as_str()))
                     );
                     assert_eq!(format!("{:?}", view.raw), before);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod r261_login_geometry_tests {
+    use super::*;
+    use crate::{
+        client::login::{LoginFailure, LoginMethod},
+        v2_session::login_flow::{Action, Flow},
+    };
+    use std::time::Duration;
+    #[test]
+    fn chooser_loading_pending_expiry_and_unavailable_keep_actions_contained_and_underlay_blocked()
+    {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || {
+                let view =
+                    v2::project("{\"accounts\":[]}", std::time::SystemTime::UNIX_EPOCH).unwrap();
+                let mut flow = Flow::default();
+                flow.chooser(Some("synthetic-long-existing-account".into()));
+                let chooser = flow.card(Duration::ZERO);
+                let generation = flow.begin(LoginMethod::Device).unwrap();
+                let loading = flow.card(Duration::ZERO);
+                flow.started(
+                    generation,
+                    qb_proto::admin_login::LoginStart {
+                        login_id: "synthetic".into(),
+                        auth_url: "https://auth.openai.com/codex/device".into(),
+                        device: Some(qb_proto::admin_login::DevicePrompt {
+                            verification_url: "https://auth.openai.com/codex/device".into(),
+                            user_code: "W".repeat(128),
+                            expires_in: 83,
+                        }),
+                    },
+                    Duration::ZERO,
+                );
+                let pending = flow.card(Duration::from_secs(1));
+                let expired = flow.card(Duration::from_secs(83));
+                flow.terminal(generation, qb_proto::admin_login::LoginState::Expired);
+                let generation = flow.begin(LoginMethod::Device).unwrap();
+                flow.start_failed(generation, LoginFailure::Unavailable);
+                let unavailable = flow.card(Duration::from_secs(83));
+                for card in [chooser, loading, pending, expired, unavailable] {
+                    for cap in [240., 480., 800.] {
+                        let scene = Scene::build(
+                            &view,
+                            Presentation {
+                                overlay: Overlay::CodexLogin(card.clone()),
+                                credits_body_lines: 40,
+                                popup_offset: 100_000.,
+                                ..Default::default()
+                            },
+                            cap,
+                        );
+                        let d = scene.dialog.as_ref().unwrap();
+                        assert!(d.card.left >= scene.rect.left && d.card.right <= scene.rect.right);
+                        assert!(d.card.top >= scene.rect.top && d.card.bottom <= scene.rect.bottom);
+                        for button in &d.buttons {
+                            assert!(
+                                button.visual.left >= d.card.left
+                                    && button.visual.right <= d.card.right
+                            );
+                            assert!(
+                                button.visual.top >= d.button_bar.top
+                                    && button.visual.bottom <= d.card.bottom
+                            );
+                        }
+                        assert!(scene.targets.iter().all(|hit| matches!(
+                            hit.target,
+                            Target::Blocked | Target::CodexLogin(_)
+                        )));
+                        assert!(
+                            scene
+                                .targets
+                                .iter()
+                                .any(|hit| hit.target == Target::CodexLogin(Action::Cancel)
+                                    && hit.enabled)
+                        );
+                        assert!((d.body_offset + h(d.body) - d.body_height).abs() < 0.1);
+                    }
                 }
             });
         }

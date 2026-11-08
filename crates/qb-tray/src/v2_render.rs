@@ -159,20 +159,23 @@ impl Renderer {
     // using the same DirectWrite font metrics. This keeps every identity byte
     // readable through vertical scrolling instead of silently ellipsizing it.
     fn takeover_wrap(&self, text: &str) -> Result<String> {
+        self.wrap_tokens(text, 13, false)
+    }
+    fn wrap_tokens(&self, text: &str, size: u8, bold: bool) -> Result<String> {
         let mut out = String::new();
         for (index, paragraph) in text.split('\n').enumerate() {
             if index > 0 {
                 out.push('\n');
             }
             for token in paragraph.split_inclusive(' ') {
-                if self.width(token, 13, false)? <= 288. {
+                if self.width(token, size, bold)? <= 288. {
                     out.push_str(token);
                     continue;
                 }
                 let mut chunk = String::new();
                 for c in token.chars() {
                     let candidate = format!("{chunk}{c}");
-                    if !chunk.is_empty() && self.width(&candidate, 13, false)? > 288. {
+                    if !chunk.is_empty() && self.width(&candidate, size, bold)? > 288. {
                         out.push_str(&chunk);
                         out.push('\n');
                         chunk.clear();
@@ -185,6 +188,35 @@ impl Renderer {
         Ok(out)
     }
     pub fn measure(&self, view: &v2::View, p: &mut g::Presentation) -> Result<()> {
+        if let g::Overlay::CodexLogin(card) = &p.overlay {
+            let mut body_style = style(13., false, 20.);
+            body_style.wrap = Wrap::KeepAll;
+            let body = self
+                .text
+                .measure(
+                    &self.takeover_wrap(&card.body)?,
+                    bounds(r(0., 0., 288., 65536.)),
+                    body_style,
+                )?
+                .total_lines
+                .max(1);
+            let code = if let Some(code) = &card.code {
+                let mut code_style = style(20., true, 28.);
+                code_style.wrap = Wrap::KeepAll;
+                self.text
+                    .measure(
+                        &self.wrap_tokens(code, 20, true)?,
+                        bounds(r(0., 0., 288., 65536.)),
+                        code_style,
+                    )?
+                    .total_lines
+                    .max(1)
+                    * 2
+            } else {
+                0
+            };
+            p.credits_body_lines = body + code;
+        }
         if let g::Overlay::TakeoverCard { body, .. } | g::Overlay::ResetCredits { body, .. } =
             &p.overlay
         {
@@ -1454,7 +1486,9 @@ impl Renderer {
         let credit = credit_id
             .and_then(|id| account(view, id))
             .and_then(|row| row.menu.credits_enable_confirmation.as_ref());
-        let title = if matches!(d.buttons[0].target, g::Target::ConfirmResetCredit(_)) {
+        let title = if let Some(card) = &d.login_card {
+            card.title.as_str()
+        } else if matches!(d.buttons[0].target, g::Target::ConfirmResetCredit(_)) {
             crate::i18n::static_text("리셋권 1개 사용")
         } else if d.takeover_body.is_some() {
             if d.buttons[0].target == g::Target::TakeoverCommit {
@@ -1467,7 +1501,37 @@ impl Renderer {
         };
         self.text(target, d.title, title, style(14., true, 20.), p.text, 1.)?;
         self.clip(target, d.body, || {
-            if let Some(body) = &d.takeover_body {
+            if let Some(card) = &d.login_card {
+                let mut top = d.body.top - d.body_offset;
+                if let Some(code) = &card.code {
+                    let mut code_style = style(20., true, 28.);
+                    code_style.wrap = Wrap::KeepAll;
+                    let code = self.wrap_tokens(code, 20, true)?;
+                    let metrics =
+                        self.text
+                            .measure(&code, bounds(r(0., 0., 288., 65536.)), code_style)?;
+                    let height = metrics.total_lines.max(1) as f32 * 40.;
+                    self.text(
+                        target,
+                        r(d.body.left, top, 288., height),
+                        &code,
+                        code_style,
+                        p.text,
+                        1.,
+                    )?;
+                    top += height;
+                }
+                let mut body_style = style(13., false, 20.);
+                body_style.wrap = Wrap::KeepAll;
+                self.text(
+                    target,
+                    r(d.body.left, top, 288., d.body_height.max(20.)),
+                    &self.takeover_wrap(&card.body)?,
+                    body_style,
+                    p.text,
+                    1.,
+                )?;
+            } else if let Some(body) = &d.takeover_body {
                 let mut s = style(13., false, 20.);
                 s.wrap = Wrap::KeepAll;
                 self.text(
@@ -2273,6 +2337,79 @@ mod r26_native_metrics_tests {
                             .all(|button| button.visual.top >= d.body.bottom
                                 && button.visual.bottom <= d.card.bottom)
                     );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod r261_login_native_metrics_tests {
+    use super::*;
+    use crate::v2_session::login_flow::{Action, Card};
+    #[test]
+    fn native_login_code_url_and_long_identity_wrap_in_both_themes_and_languages() -> Result<()> {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || -> Result<()> {
+                for dark in [false, true] {
+                    let renderer = Renderer::new(dark)?;
+                    let view = v2::project("{\"accounts\":[]}", std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap();
+                    let card = Card {
+                        title: crate::i18n::static_text("Codex 계정 추가").into(),
+                        body: format!(
+                            "{}\nhttps://auth.openai.com/codex/device\n{}",
+                            "synthetic-long-existing-account@example.invalid ".repeat(20),
+                            crate::i18n::static_text("브라우저에서 코드를 입력해 주세요.")
+                        ),
+                        code: Some("W".repeat(128)),
+                        actions: vec![
+                            (
+                                Action::CopyCode,
+                                crate::i18n::static_text("코드 복사").into(),
+                                true,
+                            ),
+                            (
+                                Action::Open,
+                                crate::i18n::static_text("인증 페이지 열기").into(),
+                                true,
+                            ),
+                            (
+                                Action::Change,
+                                crate::i18n::static_text("로그인 방법 변경").into(),
+                                true,
+                            ),
+                            (
+                                Action::Cancel,
+                                crate::i18n::static_text("취소").into(),
+                                true,
+                            ),
+                        ],
+                    };
+                    for cap in [240., 480., 800.] {
+                        let mut p = g::Presentation {
+                            overlay: g::Overlay::CodexLogin(card.clone()),
+                            ..Default::default()
+                        };
+                        renderer.measure(&view, &mut p)?;
+                        assert!(p.credits_body_lines > 12);
+                        let scene = g::Scene::build(&view, p, cap);
+                        let d = scene.dialog.unwrap();
+                        for button in d.buttons {
+                            assert!(
+                                renderer.width(&button.label, 13, false)?
+                                    <= button.visual.right - button.visual.left - 8.
+                            );
+                        }
+                        for line in renderer
+                            .wrap_tokens(card.code.as_ref().unwrap(), 20, true)?
+                            .split('\n')
+                        {
+                            assert!(renderer.width(line, 20, true)? <= 288.);
+                        }
+                    }
                 }
                 Ok(())
             })?;

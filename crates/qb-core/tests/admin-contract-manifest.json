@@ -702,7 +702,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 230,
+        "line": 231,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\r\n                    \"code\": error.code(), \"message\": error.message()\r\n                }})",
         "field": "",
@@ -716,7 +716,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 262,
+        "line": 263,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\r\n                \"code\":error.code(),\"message\":error.message(),\r\n            }})",
         "field": "",
@@ -730,7 +730,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 289,
+        "line": 290,
         "rule": "serde-default",
         "snippet": "default",
         "field": "inherit",
@@ -744,7 +744,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 364,
+        "line": 365,
         "rule": "serde-default",
         "snippet": "default = \"default_drain_timeout\"",
         "field": "drain_timeout_secs",
@@ -758,7 +758,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 591,
+        "line": 592,
         "rule": "admin-json",
         "snippet": "json!({\"changed\":[],\"removed\":[],\"resync\":true})",
         "field": "",
@@ -772,7 +772,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/admin.rs",
-        "line": 678,
+        "line": 679,
         "rule": "serde-default",
         "snippet": "default",
         "field": "force",

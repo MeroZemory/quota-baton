@@ -12,6 +12,9 @@ use serde::{
     de::{DeserializeOwned, Deserializer},
 };
 
+#[path = "client/login.rs"]
+pub mod login;
+
 #[path = "client/reset_credits.rs"]
 pub mod reset_credits;
 
@@ -459,12 +462,38 @@ impl AdminClient {
     }
 
     pub async fn start_login(&self, provider: &str) -> Result<LoginStart, ClientError> {
-        self.send_json(
-            reqwest::Method::POST,
-            "/admin/v1/accounts/login",
-            &serde_json::json!({"provider": provider}),
+        self.start_login_with_method(provider, login::LoginMethod::Web)
+            .await
+    }
+
+    pub async fn start_login_with_method(
+        &self,
+        provider: &str,
+        method: login::LoginMethod,
+    ) -> Result<LoginStart, ClientError> {
+        let body = login::request_body(provider, method).ok_or(ClientError::AccountAction(
+            "로그인 요청이 올바르지 않습니다",
+        ))?;
+        // Device authorization has a core-side15s request budget. Give this
+        // single request room to return its ID; never retry it at this layer.
+        test_response_delay().await;
+        let mut response = Self::check_response(
+            self.request(reqwest::Method::POST, "/admin/v1/accounts/login")
+                .timeout(Duration::from_secs(20))
+                .json(&body)
+                .send()
+                .await
+                .map_err(ClientError::Transport)?,
         )
-        .await
+        .await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(ClientError::Transport)? {
+            if bytes.len().saturating_add(chunk.len()) > login::MAX_START_BODY {
+                return Err(ClientError::LoginStartUnresolved { login_id: None });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        login::decode_start(provider, method, &bytes)
     }
 
     pub async fn login_status(&self, login_id: &str) -> Result<LoginStatus, ClientError> {
@@ -636,6 +665,8 @@ pub enum ClientError {
     AccountAction(&'static str),
     #[error("admin API returned invalid JSON: {0}")]
     Decode(#[source] reqwest::Error),
+    #[error("login start requires terminal reconciliation")]
+    LoginStartUnresolved { login_id: Option<String> },
 }
 
 fn refresh_result(status: StatusCode, value: &serde_json::Value) -> Result<(), ClientError> {
@@ -684,6 +715,7 @@ pub fn short_error(error: &ClientError) -> &'static str {
         ClientError::Http(StatusCode::NOT_FOUND) => "계정을 찾을 수 없습니다",
         ClientError::Http(_) => "요청을 처리하지 못했습니다",
         ClientError::Decode(_) => "코어 응답을 읽지 못했습니다",
+        ClientError::LoginStartUnresolved { .. } => "로그인 응답을 확인할 수 없습니다",
     })
 }
 

@@ -124,6 +124,7 @@ fn login_error(error_value: crate::oauth::LoginError) -> Response {
     use crate::oauth::LoginError;
     let status = match error_value {
         LoginError::NotFound => StatusCode::NOT_FOUND,
+        LoginError::DeviceRateLimited => StatusCode::TOO_MANY_REQUESTS,
         LoginError::CallbackPortBusy { .. }
         | LoginError::LinkedConflict
         | LoginError::IdentityConflict => StatusCode::CONFLICT,

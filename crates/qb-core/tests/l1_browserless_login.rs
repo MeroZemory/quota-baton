@@ -498,3 +498,54 @@ async fn codex_http_submission_requires_the_exact_localhost_final_url() {
     }
     h.close().await;
 }
+
+#[tokio::test]
+async fn r261_device_rate_limit_and_unavailable_are_single_attempt_admin_failures() {
+    for (provider_status, admin_status) in [
+        (StatusCode::TOO_MANY_REQUESTS, StatusCode::TOO_MANY_REQUESTS),
+        (StatusCode::NOT_FOUND, StatusCode::BAD_REQUEST),
+    ] {
+        let h = Harness::new().await;
+        h.fake
+            .state
+            .push(ScriptedResponse::json(provider_status, "{}"));
+        let response = h
+            .client
+            .post(h.url(""))
+            .bearer_auth(ADMIN)
+            .json(&json!({"provider":"codex","no_browser":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), admin_status);
+        let body = response.text().await.unwrap();
+        if provider_status == StatusCode::TOO_MANY_REQUESTS {
+            assert!(body.contains("rate limited"));
+        } else {
+            assert!(body.contains("Security settings") && body.contains("workspace admin"));
+        }
+        assert_redacted(&body);
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 1, "no implicit retry or fallback");
+        assert_eq!(requests[0].path_and_query, "/device/usercode");
+        assert!(h.store.list().unwrap().is_empty());
+        h.close().await;
+    }
+}
+
+#[tokio::test]
+async fn r261_explicit_web_does_not_request_a_device_code_when_callback_is_occupied() {
+    let h = Harness::new().await;
+    let response = h
+        .client
+        .post(h.url(""))
+        .bearer_auth(ADMIN)
+        .json(&json!({"provider":"codex"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(h.fake.state.requests().is_empty());
+    assert!(h.store.list().unwrap().is_empty());
+    h.close().await;
+}

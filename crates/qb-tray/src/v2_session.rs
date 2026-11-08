@@ -1,4 +1,6 @@
 //! Pure open-lifetime state. Native callbacks own the I/O and overlay ownership.
+pub mod login_flow;
+
 use super::v2;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;

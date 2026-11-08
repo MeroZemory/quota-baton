@@ -272,7 +272,7 @@ The rules below describe one usage line and apply to each line. Each additional 
 - **Background.** surface-footer, with a 1 DIP divider on the top edge and padding 8 left and right.
 - **Buttons.** Each is 32 high, padding 8, radius 4, with no fill at rest. Hover uses the overlay, and an open menu shows the overlay.
   - Content: a 14 DIP icon, a 6 gap, then the label in 13/18.
-  - **[+ 계정 추가]** (U+E710) at the left. It opens the add menu: "Claude 계정 로그인" and "Codex 계정 로그인". These start the old §9 login panel.
+  - **[+ 계정 추가]** (U+E710) at the left. It opens the add menu: "Claude 계정 로그인" and "Codex 계정 로그인". Claude starts its existing login panel; Codex first shows the explicit method chooser (§18.3).
   - **[⚙ 설정]** (U+E713) and **[⏻ 종료]** (U+E7E8) are right-aligned to 352, 2 apart.
 - **Stale notice.** When the last successful `/state` is more than 60 s old, show "N분 전 정보" (12/16 secondary) right-aligned against [설정], 4 gap. Show "1분 전 정보" for anything under 2 min.
 - **Login panel open.** [계정 추가] is disabled (text-disabled).
@@ -518,16 +518,15 @@ This appendix makes the unchanged old-spec references self-contained. V2 tokens,
 
 ### 18.3 Login panel (replaces the list; header and footer stay)
 
-- Padding 16 top, 16 sides, 20 bottom. Total height 176 with a two-line instruction.
-- Title "Codex 로그인" / "Claude 로그인", 15/20 600.
-- 12 below the title, the status block:
-  - Progress ring at x 16, y +2: 16×16, stroke 2, a full track circle plus a 90° accent arc rotating once per second.
-  - Text at x 42, 302 wide: "브라우저에서 로그인을 마치면 자동으로 완료됩니다.", 13/20, wrapped at spaces.
-  - 4 below, at x 42: "남은 시간 M:SS", 12/16 secondary.
-- 16 below the status block, two equal standard buttons, 160 × 32, gap 8:
-  - [주소 복사] with icon U+E8C8 (14 DIP, 8 gap)
-  - [취소]
-- Completed, failed and expired replace the status block text. [다시 시도] replaces [주소 복사].
+R26.1 extends the incumbent native panel; no new framework or visual system. Padding16 top/sides,20 bottom; title15/20 semibold, instructions13/20, secondary/time12/16. Height follows measured wrapping rather than clipping long English text, URLs or codes. Existing native focus rings, theme, keyboard order and hit-region ownership apply in KO/EN, light/dark, narrow/high-DPI.
+
+- Codex entry title `Codex 계정 추가` / `Add Codex account`. Two distinct actions: `웹 브라우저로 로그인` / `Browser sign-in`, with `이 PC의 브라우저에서 로그인합니다.` / `Sign in using this PC's browser.`; and `디바이스 코드로 로그인` / `Device code sign-in`, with `표시된 코드를 브라우저에서 입력합니다. 다른 기기에서도 가능합니다.` / `Enter the displayed code in a browser. You can use another device.` Include Cancel/back. Opening the chooser sends0 starts. Selection is explicit every time, including Codex re-login; selected-account/conflict safeguards remain. Claude's existing flow is preserved.
+- Web pending: `브라우저에서 로그인을 완료해 주세요.` / `Complete sign-in in your browser.` Explicit selection opens the existing validated URL once; offer reopen, link copy, cancel and change method. Browser-launch failure retains those recovery actions rather than inventing provider failure. Never show a device code here.
+- Device loading disables duplicate start. Pending shows `브라우저에서 코드를 입력해 주세요.` / `Enter the code in your browser.`, the trusted returned URL and prominent exact code. Actions: `코드 복사` / `Copy code`, `인증 페이지 열기` / `Open sign-in page`, link copy, cancel, change method. No automatic browser open. Copy feedback stays in place and does not replace the code. Remaining time is based on returned `expires_in`, not a hardcoded600s. Opening/copying never reissues a code.
+- Expiry disables old-code actions and offers explicit `새 코드 요청` / `Request new code` and method choice. Error/unavailable/rate-limit copy includes useful Security/workspace-admin guidance and explicit Web choice, never auto-fallback/reissue. Ambiguous start is reconciled rather than blindly retried.
+- Cancel/Escape/dismiss/method change invalidate the view generation, clear sensitive code and wait for the old core login's cancellation/terminal reconciliation before another start. Late start/status cannot resurrect the old view. Completion wins honestly if already persisted, refreshes accounts once and follows incumbent success behavior. Clipboard cleanup never clears unrelated user data. Each action, deadline and code belongs to one exact current login.
+
+This is a normative implementation target, not a claim of native acceptance: R26 and R26.1 remain incomplete until the required actual core/AdminClient/native fake Windows captures and supervisor gate pass.
 
 ### 18.4 Focus ring geometry
 

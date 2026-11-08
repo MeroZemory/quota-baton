@@ -10,7 +10,11 @@ use crate::{
 use anyhow::Result;
 use geometry::{FooterAction, MenuAction, Overlay, Target as HitTarget};
 use qb_proto::admin_login::LoginState;
+use qb_tray::client::login::{LoginFailure, LoginMethod};
 use qb_tray::i18n;
+use qb_tray::v2_session::login_flow::{
+    Action as LoginAction, Flow as CodexLoginFlow, Phase as LoginPhase,
+};
 use qb_tray::{
     v2, v2_geometry as geometry,
     v2_render::{LoginStatus, RenderOptions, Renderer},
@@ -114,6 +118,10 @@ unsafe extern "system" {
     fn GetDoubleClickTime() -> u32;
 }
 static WORKER: OnceLock<tray_worker::Worker> = OnceLock::new();
+static CODEX_LOGIN_FLOW: OnceLock<Mutex<CodexLoginFlow>> = OnceLock::new();
+fn codex_login_flow() -> &'static Mutex<CodexLoginFlow> {
+    CODEX_LOGIN_FLOW.get_or_init(|| Mutex::new(CodexLoginFlow::default()))
+}
 static LOGIN_GENERATION: Mutex<u64> = Mutex::new(0);
 // The worker spawn gate must also check this while a shutdown is in flight.
 static SHUTDOWN_PENDING: AtomicBool = AtomicBool::new(false);
@@ -551,6 +559,12 @@ fn projected() -> v2::View {
 }
 fn overlay(state: Option<&str>) -> Overlay {
     match state {
+        Some("codex-login") => Overlay::CodexLogin(
+            codex_login_flow()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .card(elapsed()),
+        ),
         Some("settings") => Overlay::Settings,
         Some("quit") => Overlay::Quit,
         Some("add-menu") => Overlay::Add,
@@ -591,6 +605,23 @@ fn presentation(
         session.update(view);
     }
     let mut active_overlay = overlay(state);
+    if let Overlay::CodexLogin(card) = &mut active_overlay {
+        let origin = codex_login_flow()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .origin
+            .clone();
+        if let Some(row) = origin.as_deref().and_then(|id| row_view(view, id)) {
+            card.body = format!(
+                "{}\n\n{}",
+                i18n::format(
+                    "선택한 계정: {0}",
+                    &[row.raw.email.as_deref().unwrap_or(&row.name).to_owned()]
+                ),
+                card.body
+            );
+        }
+    }
     if let Some(id) = state.and_then(|s| s.strip_prefix("reset-credits:")) {
         let consent = &session.reset_credits;
         let body = if consent.busy {
@@ -737,6 +768,13 @@ fn repeated_activation(key: u32, flags: isize) -> bool {
     matches!(key, 0x0d | 0x20 | 0x79 | 0x5d) && (flags as usize & (1usize << 30)) != 0
 }
 fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
+    if scene
+        .targets
+        .iter()
+        .any(|h| h.enabled && h.target == HitTarget::CodexLogin(LoginAction::Cancel))
+    {
+        return Some(HitTarget::CodexLogin(LoginAction::Cancel));
+    }
     if scene.targets.iter().any(|h| {
         h.enabled
             && matches!(
@@ -1537,7 +1575,7 @@ fn dispatch_account(hwnd: HWND, id: String, action: MenuAction, ticket: Option<T
     let row = row_view(&current, &id).expect("checked account");
     if action == MenuAction::Relogin {
         if row.menu.show_relogin {
-            launch_login(hwnd, row.raw.provider.clone());
+            launch_login_for_account(hwnd, row.raw.provider.clone(), Some(row.raw.id.clone()));
         }
         return;
     }
@@ -1700,6 +1738,279 @@ fn dispatch_account(hwnd: HWND, id: String, action: MenuAction, ticket: Option<T
             .complete(&completion, true, elapsed());
     }
 }
+// Codex owns one start/status/cancellation task. Cancel never abandons its lease.
+fn notify_codex_login(hwnd: isize) {
+    invalidate_model();
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut c_void)),
+            STATE_CHANGED,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+fn start_codex_login(hwnd: HWND, method: LoginMethod) {
+    let generation = {
+        let mut flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(generation) = flow.begin(method) else {
+            return;
+        };
+        generation
+    };
+    invalidate_model();
+    INPUT.with(|i| {
+        let mut i = i.borrow_mut();
+        i.popup_offset = 0.;
+        i.focus = Some(HitTarget::CodexLogin(LoginAction::Cancel));
+    });
+    let handle = hwnd.0 as isize;
+    let accepted = WORKER.get().is_some_and(|worker| {
+        worker.submit(async move {
+            let client = match super::client::AdminClient::from_home() {
+                Ok(client) => client,
+                Err(_) => {
+                    codex_login_flow()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .start_failed(generation, LoginFailure::Unavailable);
+                    notify_codex_login(handle);
+                    return;
+                }
+            };
+            let started = client.start_login_with_method("codex", method).await;
+            // Receipt is captured before any shell action; device lifetime has no fallback.
+            let received_at = elapsed();
+            let id = match started {
+                Ok(start) => {
+                    let id = start.login_id.clone();
+                    let auto_open = {
+                        let mut flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+                        flow.started(generation, start, received_at);
+                        flow.auto_open(received_at)
+                    };
+                    if let Some(url) = auto_open {
+                        let result = tokio::task::spawn_blocking(move || {
+                            {
+                                let flow =
+                                    codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+                                if flow.generation != generation || !flow.interactive(elapsed()) {
+                                    return None;
+                                }
+                            }
+                            Some(
+                                !qb_tray::client::login::trusted_url("codex", method, &url)
+                                    || open_login_browser(&url).is_err(),
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(failed) = result {
+                            let mut flow =
+                                codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+                            if flow.generation == generation && flow.interactive(elapsed()) {
+                                flow.browser_failed = failed;
+                            }
+                        }
+                    }
+                    id
+                }
+                Err(error) => {
+                    if let Some(id) = qb_tray::client::login::known_session(&error) {
+                        codex_login_flow()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .invalid_started(generation, id.to_owned());
+                        id.to_owned()
+                    } else {
+                        codex_login_flow()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .start_failed(generation, qb_tray::client::login::start_error(&error));
+                        notify_codex_login(handle);
+                        return;
+                    }
+                }
+            };
+            notify_codex_login(handle);
+            let mut cancellation_sent = false;
+            let mut expired = false;
+            loop {
+                let cancel = {
+                    let mut flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+                    expired |= flow.expire(elapsed());
+                    flow.cancel_requested
+                };
+                if cancel && !cancellation_sent {
+                    cancellation_sent = true;
+                    // Void acknowledgement is not a terminal result. Always read status below.
+                    let _ = client.cancel_login(&id).await;
+                }
+                match client.login_status(&id).await {
+                    Ok(status) if status.status != LoginState::Pending => {
+                        let terminal = if expired && status.status == LoginState::Cancelled {
+                            LoginState::Expired
+                        } else {
+                            status.status
+                        };
+                        let completed = codex_login_flow()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .terminal(generation, terminal);
+                        if completed {
+                            // Account identity/collision/linked replacement stays entirely in core.
+                            // Origin remains attached to this exact flow; no replace_linked field is sent.
+                            if let Ok(read) = client.read().await {
+                                let _ = publish_read(read);
+                            }
+                            update_status(false, None);
+                        }
+                        notify_codex_login(handle);
+                        return;
+                    }
+                    Ok(_) => {
+                        codex_login_flow()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .status_uncertain = false;
+                    }
+                    Err(_) => {
+                        codex_login_flow()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .status_uncertain = true;
+                        // Keep the exact session lease and retry read-only reconciliation.
+                        // Never turn a status transport failure into another start.
+                    }
+                }
+                notify_codex_login(handle);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        })
+    });
+    if !accepted {
+        // No request was admitted, so this failure is safe to retry explicitly.
+        codex_login_flow()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .start_failed(generation, LoginFailure::Unavailable);
+        invalidate_model();
+    }
+}
+fn codex_login_action(hwnd: HWND, action: LoginAction) {
+    if view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        != Some("codex-login")
+    {
+        return;
+    }
+    match action {
+        LoginAction::Web => start_codex_login(hwnd, LoginMethod::Web),
+        LoginAction::Device => start_codex_login(hwnd, LoginMethod::Device),
+        LoginAction::Retry => {
+            let method = codex_login_flow()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .method;
+            if let Some(method) = method {
+                start_codex_login(hwnd, method);
+            }
+        }
+        LoginAction::Change => {
+            codex_login_flow()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel(true);
+            invalidate_model();
+        }
+        LoginAction::Cancel => {
+            codex_login_flow()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel(false);
+            set_view(None);
+            invalidate_model();
+        }
+        LoginAction::Open | LoginAction::CopyLink | LoginAction::CopyCode => {
+            let (generation, method, value) = {
+                let flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+                let Some(value) = flow.value(action, elapsed()) else {
+                    return;
+                };
+                (flow.generation, flow.method, value)
+            };
+            let Some(method) = method else { return };
+            if action != LoginAction::CopyCode
+                && !qb_tray::client::login::trusted_url("codex", method, &value)
+            {
+                return;
+            }
+            let handle = hwnd.0 as isize;
+            submit_job(async move {
+                let work = tokio::task::spawn_blocking(move || {
+                    {
+                        let flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+                        if flow.generation != generation || !flow.interactive(elapsed()) {
+                            return None;
+                        }
+                    }
+                    if action == LoginAction::Open {
+                        return Some(open_login_browser(&value).is_ok());
+                    }
+                    // Sensitive input is stdin, not shell source/arguments. Never schedule clearing.
+                    if std::env::var_os("QB_TRAY_TEST_NO_CLIPBOARD").is_some() {
+                        return Some(true);
+                    }
+                    use std::io::Write;
+                    let child = Command::new("powershell.exe")
+                        .creation_flags(CREATE_NO_WINDOW.0)
+                        .args([
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-Command",
+                            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+                        ])
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    Some(match child {
+                        Ok(mut child) => {
+                            let written = child
+                                .stdin
+                                .take()
+                                .is_some_and(|mut input| input.write_all(value.as_bytes()).is_ok());
+                            let finished = child.wait().is_ok_and(|status| status.success());
+                            written && finished
+                        }
+                        Err(_) => false,
+                    })
+                })
+                .await
+                .ok()
+                .flatten();
+                {
+                    let mut flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+                    if flow.generation == generation
+                        && flow.interactive(elapsed())
+                        && let Some(ok) = work
+                    {
+                        if action == LoginAction::Open {
+                            flow.browser_failed = !ok;
+                        } else if action == LoginAction::CopyCode {
+                            flow.copied = ok;
+                        }
+                    }
+                }
+                notify_codex_login(handle);
+            });
+        }
+    }
+}
+
 // Serialize generation checks with publishing, so cancellation cannot race a
 // late start/status response into restoring a dismissed login dialog.
 fn with_current_login(generation: u64, publish: impl FnOnce()) -> bool {
@@ -1712,6 +2023,29 @@ fn with_current_login(generation: u64, publish: impl FnOnce()) -> bool {
 }
 
 fn launch_login(hwnd: HWND, provider: String) {
+    launch_login_for_account(hwnd, provider, None);
+}
+fn launch_login_for_account(hwnd: HWND, provider: String, origin: Option<String>) {
+    if provider == "codex" {
+        if !cancel_login() {
+            return;
+        }
+        codex_login_flow()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chooser(origin);
+        set_view(Some("codex-login".into()));
+        invalidate_model();
+        return;
+    }
+    let flow = codex_login_flow().lock().unwrap_or_else(|e| e.into_inner());
+    if flow.leased || flow.phase == LoginPhase::Unknown {
+        return;
+    }
+    drop(flow);
+    launch_legacy_login(hwnd, provider);
+}
+fn launch_legacy_login(hwnd: HWND, provider: String) {
     if !cancel_login() {
         return;
     }
@@ -1827,6 +2161,10 @@ fn launch_login(hwnd: HWND, provider: String) {
 // Invalidate the old poller even on rejection, but retain its ID for retry.
 // A start response not yet assigned an ID cancels itself inside its admitted job.
 fn cancel_login() -> bool {
+    codex_login_flow()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .cancel(false);
     let mut generation = LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(all(debug_assertions, feature = "testkit"))]
     let had_login = login_id()
@@ -2078,6 +2416,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
                 set_view(None);
             }
         }
+        HitTarget::CodexLogin(action) => codex_login_action(hwnd, action),
         HitTarget::LoginCopy => {
             let state = view_state()
                 .lock()
@@ -2141,6 +2480,18 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
     redraw_now(hwnd);
 }
 fn dismiss_overlay() {
+    if view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        == Some("codex-login")
+    {
+        codex_login_flow()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel(false);
+        invalidate_model();
+    }
     session()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2668,6 +3019,17 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
             .and_then(|d| d.buttons.iter().find(|b| &b.target == target))
             .map(|b| b.label.clone())
             .unwrap_or_default(),
+        HitTarget::CodexLogin(action) => frame
+            .scene
+            .dialog
+            .as_ref()
+            .and_then(|d| {
+                d.buttons
+                    .iter()
+                    .find(|b| b.target == HitTarget::CodexLogin(*action))
+            })
+            .map(|b| b.label.clone())
+            .unwrap_or_default(),
         HitTarget::ConfirmResetCredit(_) => i18n::text("1개 사용").into_owned(),
         HitTarget::ConfirmCredits(_) => i18n::text("크레딧 사용").into_owned(),
         HitTarget::ConfirmDelete(_) => i18n::text("계정 삭제").into_owned(),
@@ -2719,7 +3081,11 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
         elements.push(Element {
             parent: None,
             id: stable_id("takeover:body".into()),
-            name: body.clone(),
+            name: d
+                .login_card
+                .as_ref()
+                .and_then(|card| card.code.as_ref())
+                .map_or_else(|| body.clone(), |code| format!("{code}\n{body}")),
             kind: Kind::Text,
             bounds: physical(d.body, origin, scale),
             enabled: true,
@@ -2847,6 +3213,35 @@ fn disconnect_accessibility() {
             let _ = root.disconnect_before_destroy();
         }
     });
+}
+
+// Synthetic shell failure is available only in an explicitly isolated native gate.
+#[cfg(all(debug_assertions, feature = "testkit"))]
+mod login_browser_fixture {
+    pub(super) fn fail() -> bool {
+        [
+            "QB_TRAY_TEST_NO_BROWSER",
+            "QB_TRAY_TEST_NO_CLIPBOARD",
+            "QB_TRAY_TEST_BROWSER_FAIL",
+        ]
+        .iter()
+        .all(|name| std::env::var(name).ok().as_deref() == Some("1"))
+    }
+}
+#[cfg(not(all(debug_assertions, feature = "testkit")))]
+mod login_browser_fixture {
+    pub(super) fn fail() -> bool {
+        false
+    }
+}
+fn open_login_browser(url: &str) -> std::io::Result<()> {
+    if login_browser_fixture::fail() {
+        return Err(std::io::Error::other("synthetic browser launch failure"));
+    }
+    if std::env::var_os("QB_TRAY_TEST_NO_BROWSER").is_some() {
+        return Ok(());
+    }
+    open_browser(url)
 }
 
 fn open_browser(url: &str) -> std::io::Result<()> {
@@ -3226,6 +3621,10 @@ unsafe extern "system" fn window_proc(
             #[cfg(all(debug_assertions, feature = "testkit"))]
             test_shell(hwnd, "visibility", None);
             if wparam.0 == 0 {
+                codex_login_flow()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cancel(false);
                 // Release the view guard before set_view takes it again.
                 let takeover_open = view_state()
                     .lock()
@@ -3332,6 +3731,14 @@ unsafe extern "system" fn window_proc(
             }
             if wparam.0 == 3 && IsWindowVisible(hwnd).as_bool() {
                 // Refresh countdowns/error expiry and delayed tooltips without I/O.
+                if view_state()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_deref()
+                    == Some("codex-login")
+                {
+                    invalidate_model();
+                }
                 redraw_now(hwnd);
             }
             if wparam.0 == 1 {
@@ -3953,4 +4360,30 @@ fn r26_reset_credit_modal_always_defaults_to_cancel() {
         );
         assert_eq!(modal_default_focus(&scene), Some(HitTarget::CancelDialog));
     }
+}
+
+#[test]
+fn r261_codex_chooser_and_prompt_default_to_cancel_and_escape_is_a_dismissal() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let mut flow = CodexLoginFlow::default();
+    flow.chooser(Some("synthetic-account".into()));
+    let scene = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::CodexLogin(flow.card(elapsed())),
+            ..Default::default()
+        },
+        480.,
+    );
+    assert_eq!(
+        modal_default_focus(&scene),
+        Some(HitTarget::CodexLogin(LoginAction::Cancel))
+    );
+    // Escape routes modal overlays through dismiss_overlay; hide independently calls cancel(false).
+    assert!(!matches!(
+        Overlay::CodexLogin(flow.card(elapsed())),
+        Overlay::None | Overlay::Login(_)
+    ));
+    flow.cancel(false);
+    assert!(flow.prompt.is_none() && flow.deadline.is_none());
 }
