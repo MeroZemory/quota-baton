@@ -3281,6 +3281,8 @@ mod r26_geometry_tests {
                         &view,
                         Presentation {
                             overlay: Overlay::RowMenu("a".into()),
+                            // Users reveal the excluded row before opening its menu.
+                            expanded: [(v2::EXCLUDED_GROUP_KEY.into(), true)].into(),
                             ..Default::default()
                         },
                         800.,

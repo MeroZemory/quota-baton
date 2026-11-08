@@ -37,7 +37,11 @@ pub fn inventory_line(
 ) -> InventoryLine {
     let mut line = InventoryLine {
         text: text("리셋권 · 확인 전"),
-        tooltip: text("리셋권을 새로고침해 주세요."),
+        tooltip: format!(
+            "{}\n{}",
+            text("리셋권 · 확인 전"),
+            text("리셋권을 새로고침해 주세요.")
+        ),
         can_use: false,
     };
     if provider != "codex" || inventory.is_some_and(|i| i.state == ResetCreditState::Unsupported) {
