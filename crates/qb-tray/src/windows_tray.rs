@@ -157,6 +157,7 @@ struct PaintedFrame {
     owner: usize,
     revision: usize,
     epoch: usize,
+    login_generation: u64,
     pixels: (u32, u32),
     dpi: u32,
     offset: f32,
@@ -1317,6 +1318,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                     owner,
                     revision,
                     epoch,
+                    login_generation: *LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner()),
                     pixels: (pixels.width, pixels.height),
                     dpi,
                     offset,
@@ -3172,6 +3174,31 @@ fn login_copy_ready(state: Option<&str>) -> bool {
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
 }
+// Necessary native-domain checks, before the provider's complete nonfocus
+// snapshot comparison. Never resolve an old ticket against a changed action map.
+fn same_action_frame(previous: &PaintedFrame, next: &PaintedFrame) -> bool {
+    previous.owner == next.owner
+        && previous.state == next.state
+        && previous.revision == next.revision
+        && previous.login_generation == next.login_generation
+        && previous.pixels == next.pixels
+        && previous.dpi == next.dpi
+        && previous.offset == next.offset
+        && previous.actions == next.actions
+        && previous.elements == next.elements
+        && previous.scene.rect == next.scene.rect
+        && previous.scene.list == next.scene.list
+        && previous.scene.offset == next.scene.offset
+        && previous.scene.core_ok == next.scene.core_ok
+        && previous.scene.targets.len() == next.scene.targets.len()
+        && previous
+            .scene
+            .targets
+            .iter()
+            .zip(&next.scene.targets)
+            .all(|(a, b)| a.target == b.target && a.rect == b.rect && a.enabled == b.enabled)
+}
+
 fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
     use accessibility::{Element, Kind, Snapshot};
     let mut origin = POINT::default();
@@ -3302,15 +3329,33 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             *slot = accessibility::create_root_provider(hwnd.0 as isize).ok();
         }
         if let Some(root) = slot.as_ref() {
-            let _ = root.publish(
-                Snapshot {
-                    automation_id: "quota-baton.flyout",
-                    name: "quota-baton".into(),
-                    bounds: physical(frame.scene.rect, origin, scale),
-                    elements,
-                },
-                frame.epoch,
-            );
+            let snapshot = Snapshot {
+                automation_id: "quota-baton.flyout",
+                name: "quota-baton".into(),
+                bounds: physical(frame.scene.rect, origin, scale),
+                elements,
+            };
+            let reused = PAINTED.with(|slot| {
+                let previous = slot.borrow();
+                let previous = previous.as_ref()?;
+                if !same_action_frame(previous, frame) {
+                    return None;
+                }
+                let prepared = accessibility::prepare_snapshot(snapshot.clone()).ok()?;
+                if root
+                    .republish_focus_prepared(&prepared, previous.epoch)
+                    .ok()?
+                {
+                    Some(previous.epoch)
+                } else {
+                    None
+                }
+            });
+            if let Some(epoch) = reused {
+                frame.epoch = epoch;
+            } else {
+                let _ = root.publish(snapshot, frame.epoch);
+            }
         }
     });
 }
@@ -4107,6 +4152,76 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_epoch_reuse_requires_the_exact_native_action_domain() {
+        let view = v2::project(r#"{"version":"test","accounts":[{"id":"focus-account","provider":"codex","user_state":"active","email":"sample@example.invalid","source":{"kind":"oauth"},"health":{"kind":"ready"}}]}"#, SystemTime::now()).unwrap();
+        let scene = geometry::Scene::build(&view, geometry::Presentation::default(), 900.);
+        let actions: Vec<_> = scene.targets.iter().map(|h| h.target.clone()).collect();
+        assert!(actions.len() > 1);
+        let previous = PaintedFrame {
+            #[cfg(all(debug_assertions, feature = "testkit"))]
+            tooltip_rect: None,
+            view,
+            scene,
+            state: None,
+            owner: 3,
+            revision: 4,
+            epoch: 6,
+            login_generation: 8,
+            pixels: (360, 600),
+            dpi: 96,
+            offset: 0.,
+            elements: actions
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i as i32 + 1, t.clone()))
+                .collect(),
+            actions,
+        };
+        let mut repaint = previous.clone();
+        repaint.epoch = 7; // Candidate publication epoch is not domain identity.
+        assert!(same_action_frame(&previous, &repaint));
+        type Change = (&'static str, fn(&mut PaintedFrame));
+        let changes: &[Change] = &[
+            ("owner", |f| f.owner += 1),
+            ("revision", |f| f.revision += 1),
+            ("state", |f| f.state = Some("menu:focus-account:0".into())),
+            ("login generation", |f| f.login_generation += 1),
+            ("pixels", |f| f.pixels.0 += 1),
+            ("dpi", |f| f.dpi = 144),
+            ("scroll", |f| f.offset = 1.),
+            ("action order", |f| f.actions.swap(0, 1)),
+            ("account target", |f| {
+                f.actions[0] = HitTarget::Row("other-account".into())
+            }),
+            ("element identity", |f| f.elements[0].0 += 100),
+            ("element target", |f| {
+                f.elements[0].1 = HitTarget::Row("other-account".into())
+            }),
+            ("element order", |f| f.elements.swap(0, 1)),
+            ("scene bounds", |f| f.scene.rect.bottom += 1.),
+            ("list bounds", |f| f.scene.list.top += 1.),
+            ("scene scroll", |f| f.scene.offset += 1.),
+            ("health", |f| f.scene.core_ok = !f.scene.core_ok),
+            ("hit geometry", |f| f.scene.targets[0].rect.left += 1.),
+            ("hit enabled", |f| {
+                f.scene.targets[0].enabled = !f.scene.targets[0].enabled
+            }),
+            ("hit target", |f| {
+                f.scene.targets[0].target = HitTarget::Row("other-account".into())
+            }),
+            ("hit order", |f| f.scene.targets.swap(0, 1)),
+            ("hit count", |f| {
+                f.scene.targets.pop();
+            }),
+        ];
+        for (name, change) in changes {
+            let mut changed = repaint.clone();
+            change(&mut changed);
+            assert!(!same_action_frame(&previous, &changed), "{name}");
+        }
+    }
 
     #[test]
     fn cancelled_login_generation_cannot_publish_a_late_completion() {

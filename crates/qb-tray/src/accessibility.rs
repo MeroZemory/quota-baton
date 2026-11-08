@@ -64,7 +64,7 @@ pub enum Kind {
     Group,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Element {
     /// Positive, stable, window-scoped identity; never reassign to another entity.
     pub id: i32,
@@ -89,7 +89,7 @@ pub struct Element {
     pub expanded: Option<bool>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     pub automation_id: &'static str,
     pub name: String,
@@ -176,6 +176,38 @@ impl RootProvider {
         cache.epoch = epoch;
         cache.value_requests.clear();
         Ok(())
+    }
+
+    /// Retain admitted action/value tickets only when every snapshot fact except
+    /// focus is identical. The caller must also verify its native action domain.
+    /// Ordinary publish APIs remain strictly monotonic and invalidate requests.
+    pub fn republish_focus_prepared(
+        &self,
+        snapshot: &PreparedSnapshot,
+        expected_epoch: usize,
+    ) -> Result<bool> {
+        let mut cache = self.root.cache.lock().map_err(|_| unavailable())?;
+        if !cache.alive {
+            return Err(unavailable());
+        }
+        if expected_epoch == 0 || cache.epoch != expected_epoch {
+            return Ok(false);
+        }
+        // Whole-value equality includes any future snapshot/element fields.
+        let mut nonfocus = (*snapshot.0).clone();
+        if nonfocus.elements.len() != cache.snapshot.elements.len() {
+            return Ok(false);
+        }
+        for (next, previous) in nonfocus.elements.iter_mut().zip(&cache.snapshot.elements) {
+            next.focused = previous.focused;
+        }
+        if nonfocus != *cache.snapshot {
+            return Ok(false);
+        }
+        cache.snapshot = Arc::clone(&snapshot.0);
+        // Identity, value, enabled state and action mapping are unchanged;
+        // pending value requests still refer to this same epoch and domain.
+        Ok(true)
     }
 
     /// Consume only this owner's admitted WM_UIA_VALUE request, once. Unknown,
@@ -2705,6 +2737,122 @@ mod tests {
         );
         assert!(owner.root.hit_test(0.0, 0.0)?.is_none());
         assert!(first.navigate(NavigateDirection_PreviousSibling)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn focus_republication_keeps_queued_and_retained_invoke_tickets() -> Result<()> {
+        for invoke_before_repaint in [false, true] {
+            let posts = PostCapture::new();
+            let owner = create_root_provider(1)?;
+            owner.publish(scene(), 6)?;
+            let row = owner.root.focus()?.ok_or_else(unavailable)?;
+            row.post_focus()?;
+            if invoke_before_repaint {
+                row.post_invoke()?;
+            }
+            let mut focused = scene();
+            focused.elements[1].focused = false;
+            focused.elements[2].focused = true;
+            let prepared = prepare_snapshot(focused)?;
+            assert!(owner.republish_focus_prepared(&prepared, 6)?);
+            assert_eq!(owner.root.focus()?.unwrap().ticket.unwrap().id, 3);
+            if !invoke_before_repaint {
+                // Exercises Node::read after the focus publication, too.
+                row.post_invoke()?;
+            }
+            assert_eq!(
+                posts.messages(),
+                vec![(1, WM_UIA_FOCUS, 2, 6), (1, WM_UIA_INVOKE, 4, 6),]
+            );
+            let cache = row.read()?;
+            assert_eq!(row.action_ticket(&cache)?, (4, 6));
+            drop(cache);
+            assert!(owner.republish_focus_prepared(&prepared, 6)?);
+            assert!(!owner.republish_focus_prepared(&prepared, 5)?);
+            assert!(!owner.republish_focus_prepared(&prepared, 0)?);
+            assert!(owner.publish_prepared(&prepared, 6).is_err());
+            owner.publish_prepared(&prepared, 7)?;
+            assert_eq!(
+                row.post_invoke().err().map(|e| e.code()),
+                Some(unavailable().code())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn focus_republication_refuses_every_nonfocus_snapshot_field() -> Result<()> {
+        type Change = (&'static str, fn(&mut Snapshot));
+        let changes: &[Change] = &[
+            ("automation_id", |s| s.automation_id = "other"),
+            ("root name", |s| s.name.push('!')),
+            ("root bounds", |s| s.bounds[0] += 1.),
+            ("element count", |s| {
+                s.elements.pop();
+            }),
+            ("element order", |s| s.elements.swap(1, 2)),
+            ("id", |s| s.elements[1].id = 20),
+            ("parent", |s| s.elements[1].parent = Some(1)),
+            ("name", |s| s.elements[1].name.push('!')),
+            ("kind", |s| s.elements[1].kind = Kind::Button),
+            ("bounds", |s| s.elements[1].bounds[0] += 1.),
+            ("enabled", |s| s.elements[2].enabled = false),
+            ("action", |s| s.elements[1].action = Some(5)),
+            ("focusable", |s| s.elements[2].focusable = false),
+            ("value", |s| s.elements[1].value = Some("changed".into())),
+            ("selected", |s| s.elements[1].selected = Some(true)),
+            ("expanded", |s| s.elements[1].expanded = Some(true)),
+        ];
+        let owner = create_root_provider(1)?;
+        owner.publish(scene(), 6)?;
+        for (name, change) in changes {
+            let mut candidate = scene();
+            change(&mut candidate);
+            let prepared = prepare_snapshot(candidate)?;
+            assert!(!owner.republish_focus_prepared(&prepared, 6)?, "{name}");
+            assert_eq!(*owner.root.read()?.snapshot, scene(), "{name}");
+        }
+        owner.deactivate();
+        assert!(
+            owner
+                .republish_focus_prepared(&prepare_snapshot(scene())?, 6)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn focus_republication_preserves_only_same_domain_pending_values() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 6)?;
+        let value = com_pattern::<IValueProvider>(&com_element(&owner, 7)?, UIA_ValuePatternId)?;
+        let input = wide("pending focus search");
+        unsafe { value.SetValue(PCWSTR(input.as_ptr()))? };
+        let (_, _, token, epoch) = posts.messages()[0];
+        let mut next = pattern_scene();
+        next.elements[1].focused = true;
+        assert!(owner.republish_focus_prepared(&prepare_snapshot(next.clone())?, 6)?);
+        assert_eq!(
+            owner.take_value_request(WPARAM(token), LPARAM(epoch))?,
+            Some((7, 6, "pending focus search".into()))
+        );
+        assert!(
+            owner
+                .take_value_request(WPARAM(token), LPARAM(epoch))?
+                .is_none()
+        );
+        unsafe { value.SetValue(PCWSTR(input.as_ptr()))? };
+        next.elements[6].value = Some("changed search".into());
+        let changed = prepare_snapshot(next)?;
+        assert!(!owner.republish_focus_prepared(&changed, 6)?);
+        owner.publish_prepared(&changed, 7)?;
+        assert!(owner.root.read()?.value_requests.is_empty());
+        assert_eq!(
+            unsafe { value.Value() }.err().map(|e| e.code()),
+            Some(unavailable().code())
+        );
         Ok(())
     }
 
