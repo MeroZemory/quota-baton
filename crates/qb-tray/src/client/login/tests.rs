@@ -880,9 +880,9 @@ fn r261_unresolved_and_invalid_request_copy_is_localized_without_session_materia
                     "로그인 요청이 올바르지 않습니다",
                 )
             };
-            assert_eq!(super::super::error_message(&unknown), unknown_text);
-            assert_eq!(super::super::error_message(&invalid), invalid_text);
-            assert!(!super::super::error_message(&unknown).contains("synthetic-private-session"));
+            assert_eq!(super::super::short_error(&unknown), unknown_text);
+            assert_eq!(super::super::short_error(&invalid), invalid_text);
+            assert!(!super::super::short_error(&unknown).contains("synthetic-private-session"));
         });
     }
 }

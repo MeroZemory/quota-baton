@@ -3170,7 +3170,7 @@ mod r26_geometry_tests {
             .insert("a".into(), crate::client::reset_credits::UNKNOWN.into());
         let scene = Scene::build(&view, p.clone(), 800.);
         let popup = scene.popup.unwrap();
-        let action = |kind| {
+        let action = |kind: MenuAction| {
             popup
                 .items
                 .iter()
@@ -3178,7 +3178,7 @@ mod r26_geometry_tests {
                     i.target
                         == Target::Menu {
                             id: Some("a".into()),
-                            action: kind,
+                            action: kind.clone(),
                         }
                 })
                 .unwrap()
