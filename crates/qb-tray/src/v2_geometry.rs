@@ -1509,16 +1509,15 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
                 p.core_ok && !p.pending_ids.contains(id),
             );
             for part in &mut parts {
-                if let Part::Item(_, _, _, _, Target::Menu { action, .. }, enabled) = part {
-                    if (p.reset_busy
+                if let Part::Item(_, _, _, _, Target::Menu { action, .. }, enabled) = part
+                    && ((p.reset_busy
                         && matches!(
                             action,
                             MenuAction::UseResetCredit | MenuAction::RefreshResetCredits
                         ))
-                        || (p.reset_blocked.contains(id) && *action == MenuAction::UseResetCredit)
-                    {
-                        *enabled = false;
-                    }
+                        || (p.reset_blocked.contains(id) && *action == MenuAction::UseResetCredit))
+                {
+                    *enabled = false;
                 }
             }
             if let Some(message) = p.reset_messages.get(id) {
