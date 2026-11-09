@@ -1021,6 +1021,7 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
     let action = row.action.as_ref().map(|a| a.kind);
     44. + subscription_height(row, &Presentation::default())
         + outside_note_height(row, &Presentation::default())
+        + reset_credit_height(row, &Presentation::default())
         + forecast_height(row, &Presentation::default())
         + row
             .usage
@@ -2530,11 +2531,98 @@ mod tests {
         assert!(scene.header.summaries.is_empty());
     }
     #[test]
+    fn r27_codex_reset_line_and_cta_fit_actual_row_list_and_footer() {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || {
+                for used in [50, 100] {
+                    let mut wire = account("reset-card");
+                    wire["plan"] = json!("plus");
+                    wire["windows"] = json!([{
+                        "name":"5h", "used_pct":used, "reset_at":"2099-01-01T00:00:00Z"
+                    }]);
+                    wire["reset_credits"] = json!({
+                        "state":"fresh", "available_count":2, "grants":[]
+                    });
+                    let projected = view(vec![wire], 1);
+                    let model = find_row(&projected, "reset-card").unwrap();
+                    assert!(model.excluded_reason.is_none());
+                    assert!(model.reset_credits.as_ref().unwrap().text.contains('2'));
+                    let scene = Scene::build(&projected, Presentation::default(), 1000.);
+                    assert_eq!(
+                        scene.max_offset, 0.,
+                        "the entire single card must fit naturally"
+                    );
+                    let row = scene.row("reset-card").unwrap();
+                    assert!(!row.disabled_slot);
+                    assert!(inside(row.rect, scene.list));
+                    let line = row
+                        .reset_credits
+                        .expect("actual projected Codex reset line");
+                    assert!(
+                        inside(line, row.rect),
+                        "reset line exceeds its allocated row"
+                    );
+                    assert!(
+                        inside(line, scene.list),
+                        "reset line is clipped by the list"
+                    );
+                    assert!(line.bottom <= scene.footer.rect.top);
+                    assert_eq!(row.reset_credit_action.is_some(), used == 100);
+                    if let Some(button) = &row.reset_credit_action {
+                        assert!(line.bottom <= button.visual.top);
+                        for bounds in [button.visual, button.hit] {
+                            assert!(inside(bounds, row.rect), "CTA exceeds its allocated row");
+                            assert!(inside(bounds, scene.list), "CTA is clipped by the list");
+                            assert!(bounds.bottom <= scene.footer.rect.top);
+                        }
+                        let target = scene
+                            .targets
+                            .iter()
+                            .find(|hit| hit.target == button.target)
+                            .unwrap();
+                        assert_eq!(target.rect, button.hit, "CTA hit area must not be clipped");
+                        let (x, y) = center(button.visual);
+                        assert_eq!(scene.hit_test(x, y), Some(&button.target));
+                    }
+                }
+            });
+        }
+    }
+    #[test]
+    fn r27_claude_reset_inventory_adds_no_geometry_or_height() {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || {
+                let mut wire = account("claude-card");
+                wire["provider"] = json!("claude");
+                wire["plan"] = json!("pro");
+                wire["windows"] = json!([{
+                    "name":"5h", "used_pct":100, "reset_at":"2099-01-01T00:00:00Z"
+                }]);
+                let baseline =
+                    Scene::build(&view(vec![wire.clone()], 1), Presentation::default(), 1000.);
+                wire["reset_credits"] = json!({
+                    "state":"fresh", "available_count":2, "grants":[]
+                });
+                let projected = view(vec![wire], 1);
+                let model = find_row(&projected, "claude-card").unwrap();
+                assert!(model.excluded_reason.is_none());
+                assert!(model.reset_credits.is_none());
+                let scene = Scene::build(&projected, Presentation::default(), 1000.);
+                let row = scene.row("claude-card").unwrap();
+                assert!(row.reset_credits.is_none() && row.reset_credit_action.is_none());
+                assert_eq!(row.rect, baseline.row("claude-card").unwrap().rect);
+                assert_eq!(scene.content_height, baseline.content_height);
+                assert_eq!(scene.rect, baseline.rect);
+                assert!(inside(row.rect, scene.list));
+            });
+        }
+    }
+    #[test]
     fn row_formula_and_visual_coordinates() {
         let v = ready_view();
         let scene = Scene::build(&v, Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 96.);
+        assert_eq!(h(row.rect), 118.);
         assert_eq!(h(row.forecast.unwrap()), 16.);
         assert!(inside(row.forecast.unwrap(), row.rect));
         assert_eq!(row.hover.left, 4.);
@@ -2589,7 +2677,7 @@ mod tests {
         );
         let scene = Scene::build(&v, Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 126.);
+        assert_eq!(h(row.rect), 148.);
         assert_eq!(h(row.button.as_ref().unwrap().visual), 24.);
         assert!(row.credits.is_some());
     }
@@ -2602,7 +2690,7 @@ mod tests {
         ]);
         let scene = Scene::build(&view(vec![a], 1), Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 122.);
+        assert_eq!(h(row.rect), 144.);
         assert_eq!(row.usage_lines.len(), 2);
         assert_eq!(row.usage_lines[0].line.top, row.usage.unwrap().top);
         assert_eq!(
