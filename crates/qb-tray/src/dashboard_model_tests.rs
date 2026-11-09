@@ -195,14 +195,28 @@ fn r27_muted_history_alert_kinds_are_plain_while_global_and_provider_alerts_rema
                 },
                 ..Default::default()
             };
-            let row = event_row(&event, &data.accounts, &clock()).unwrap();
+            let current_health = match kind {
+                "plan_without_claude_code" => {
+                    serde_json::json!({"kind":"plan_without_claude_code"})
+                }
+                "needs_relogin" | "token_refresh" | "linked_reload" => {
+                    serde_json::json!({"kind":"needs_relogin"})
+                }
+                other => {
+                    serde_json::json!({"kind":"cooling","reason":if other == "quota_reached" {"quota"} else {other},"scope":"account","until":"2099-01-01T00:00:00Z"})
+                }
+            };
+            let current = r10_accounts(serde_json::json!([{"id":"a","provider":"codex",
+                "user_state":user,"source":"oauth","health":current_health}]));
+            let alertable = user == "active" && kind != "plan_without_claude_code";
+            let row = event_row(&event, &current.accounts, &clock()).unwrap();
             assert_eq!(
                 row.category == EventFilter::Tasks,
-                user == "active",
+                alertable,
                 "{kind}/{user}"
             );
-            assert_eq!(row.notable, user == "active", "{kind}/{user}");
-            if user != "active" {
+            assert_eq!(row.notable, alertable, "{kind}/{user}");
+            if !alertable {
                 assert_eq!(row.tone, v2::Tone::Off);
                 assert!(!row.relogin);
             }
@@ -594,13 +608,20 @@ fn r7_activity_same_seq_updates_first_placement_hidden_and_filter_counts() {
     assert!(rate.body.contains("2건"));
     assert_eq!(rate.tag, "속도 조절");
     assert_eq!(rate.tone, v2::Tone::Off);
-    assert!(
+    assert_eq!(
         view.event_counts
             .iter()
             .find(|(f, _)| *f == EventFilter::Tasks)
             .unwrap()
-            .1
-            >= 5
+            .1,
+        2,
+        "only the current needs_relogin account and independent global burst are tasks"
+    );
+    assert!(
+        view.events
+            .iter()
+            .filter(|e| e.category == EventFilter::Tasks)
+            .all(|e| matches!(e.kind.as_str(), "needs_relogin" | "burst"))
     );
     let mut first = data
         .activity
@@ -647,6 +668,12 @@ fn r7_all_event_wording_variants_keep_semantic_tags_and_no_raw_errors() {
     quota.data.actionable = false;
     assert_eq!(event_row(&quota, &data.accounts, &c).unwrap().tag, "정보");
     quota.data.actionable = true;
+    assert_eq!(
+        event_row(&quota, &data.accounts, &c).unwrap().tag,
+        "정보",
+        "past payload cannot alert a healthy account"
+    );
+    quota.account = Some("cl-quota".into());
     assert_eq!(event_row(&quota, &data.accounts, &c).unwrap().tag, "할 일");
     for action in [
         "pause",
@@ -1043,6 +1070,11 @@ fn r10_limit_tag_names_known_windows_and_never_leaves_empty_title_slot() {
     e.data.no_eligible = true;
     assert_eq!(event_row(&e, &accounts, &clock()).unwrap().tag, "정보");
     e.data.actionable = true;
+    assert_eq!(
+        event_row(&e, &accounts, &clock()).unwrap().tone,
+        v2::Tone::Off
+    );
+    e.account = Some("cl-quota".into()); // Current native quota hold has no explicit scope.
     assert_eq!(
         event_row(&e, &accounts, &clock()).unwrap().tone,
         v2::Tone::Bad

@@ -1646,7 +1646,8 @@ fn current_account_task(e: &ActivityEvent, account: &v2::Account, clock: &Clock)
             };
             health.kind == "cooling"
                 && health.reason.as_deref() == Some(reason)
-                && (reason == "link_stale" || health.scope.as_deref() == Some("account"))
+                && (matches!(reason, "link_stale" | "quota")
+                    || health.scope.as_deref() == Some("account"))
                 && health
                     .until
                     .as_deref()
@@ -2998,7 +2999,9 @@ mod r18_plan_ui_tests {
                 };
                 let blocked = event_row(&blocked, &accounts, &clock).unwrap();
                 assert_eq!(blocked.body, recovery);
-                assert_eq!(blocked.category, EventFilter::Tasks);
+                assert_eq!(blocked.category, EventFilter::All);
+                assert_eq!(blocked.tone, v2::Tone::Off);
+                assert!(!blocked.notable);
                 assert!(!blocked.relogin);
             });
         }

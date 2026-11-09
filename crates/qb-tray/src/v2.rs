@@ -1082,10 +1082,16 @@ pub use qb_proto::placement_capacity_label;
 fn compact_row(mut row: AccountRow) -> AccountRow {
     if !row.raw.alerts_enabled() {
         row.action = None;
-    }
-    if !row.raw.alerts_enabled() {
+        let text = if row.raw.health.kind == "needs_relogin" {
+            compact_reason(&row).into()
+        } else {
+            row.chip
+                .as_ref()
+                .map(|chip| chip.text.clone())
+                .unwrap_or_else(|| compact_reason(&row).into())
+        };
         row.chip = Some(Chip {
-            text: compact_reason(&row).into(),
+            text,
             tone: Tone::Off,
         });
     }
@@ -2137,12 +2143,12 @@ mod tests {
                 assert_eq!(row.group, Group::NeedsAction);
                 assert_eq!(row.plan.as_deref(), Some("Free"));
                 assert_eq!(row.chip.as_ref().unwrap().text, label);
-                assert_eq!(row.chip.as_ref().unwrap().tone, Tone::Bad);
+                assert_eq!(row.chip.as_ref().unwrap().tone, Tone::Off);
                 assert_eq!(row.reason.as_deref(), Some(recovery));
                 assert!(row.menu.show_refresh_usage);
                 assert!(!row.menu.show_relogin);
                 assert!(row.action.is_none());
-                assert_eq!(view.badge, Badge::Attention);
+                assert_eq!(view.badge, Badge::Normal);
                 assert!(view.tray_tooltip.contains(label));
                 let legacy = crate::parse_state_at(&input, now().into()).unwrap();
                 assert_eq!(legacy[0].health_chip, label);

@@ -117,12 +117,13 @@ fn r27_health_kinds_only_count_active_accounts_and_preserve_unrelated_provider_a
                 fixtures::clock().utc().into(),
             )
             .unwrap();
+            let alertable = user == "active" && health["kind"] != "plan_without_claude_code";
             assert_eq!(
                 view.summaries.iter().map(|s| s.todo).sum::<usize>(),
-                usize::from(user == "active")
+                usize::from(alertable)
             );
-            assert_eq!(view.badge == Badge::Attention, user == "active");
-            if user != "active" {
+            assert_eq!(view.badge == Badge::Attention, alertable);
+            if !alertable {
                 assert!(all_rows(&view).all(|row| row.action.is_none()));
                 assert!(
                     all_rows(&view)
