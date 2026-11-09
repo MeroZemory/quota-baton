@@ -1142,8 +1142,10 @@ mod r27_projection_tests {
             input,
             "any real polled facts beat the pending fallback"
         );
-        let mut refused = ResetCreditInventory::default();
-        refused.refusal = Some(ResetCreditRefusal::Stale);
+        let refused = ResetCreditInventory {
+            refusal: Some(ResetCreditRefusal::Stale),
+            ..Default::default()
+        };
         let input = polled(&refused);
         assert_eq!(
             project(&consent, &input),
