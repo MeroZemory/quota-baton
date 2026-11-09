@@ -583,3 +583,6 @@ Final polish after design approval: Checking retains the last visible reset line
 
 
 R27 delivery: the ordinary KO/EN actual-core/AdminClient/native journeys and the disabled-needs-relogin representative are design-approved. The requested final copy/count-latch/action-label polish is implemented and the fresh KO confirmation captured. Workspace default/all-features each ran once; original nonzero existing out-of-scope failures remain qualified in the R27 gate report. Dev integration preserves the tested tray product tree; installation is the design session's next action.
+
+
+R27.1 makes account to-dos conditional on matching current health; old event flags remain plain history after recovery or removal. Plan-level Not Used exclusions that re-login cannot fix follow the same quiet policy as paused/disabled, including existing notifications and provider alert counts. A muted state line and explicit menu actions remain. Active assignable needs_relogin still alerts, and a recovered assignable plan restores its current alert once. The native placement-exclusion vocabulary is authoritative; missing plan facts alone do not imply exclusion. This correction is regression-tested with both Windows tray profiles, with unchanged coverage reused and original failures preserved in the gate report.
