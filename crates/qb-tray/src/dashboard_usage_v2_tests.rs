@@ -132,16 +132,28 @@ fn r10_usage_header_has_sixty_dip_divider_all_windows_and_limit_chip() {
     let reset = s
         .accessibility
         .iter()
-        .find(|n| n.key == format!("chart:{}:reset-credits", t.id))
-        .unwrap();
+        .find(|n| n.key == format!("chart:{}:reset-credits", t.id));
     let action = s
         .targets
         .iter()
-        .find(|hit| hit.target == Target::OpenTrayAccount(t.id.clone()))
-        .unwrap();
-    assert!(reset.name.contains(&t.reset_credits.text));
-    assert!(reset.rect.top >= 52. && reset.rect.bottom + 4. == action.rect.top);
-    let divider = action.rect.bottom + 8.;
+        .find(|hit| hit.target == Target::OpenTrayResetCredits(t.id.clone()));
+    let divider = if t.provider == "codex" {
+        let reset = reset.expect("Codex quiet reset fact");
+        assert!(reset.name.contains(&t.reset_credits.text));
+        assert!(reset.rect.top >= 52.);
+        if let Some(action) = action {
+            assert_eq!(reset.rect.bottom + 4., action.rect.top);
+            action.rect.bottom + 8.
+        } else {
+            reset.rect.bottom + 8.
+        }
+    } else {
+        assert!(
+            reset.is_none() && action.is_none(),
+            "Claude has no reset content or reserved row"
+        );
+        60.
+    };
     assert!(s.draw.iter().any(|d| matches!(d,
         Draw::Line { from, to, .. } if from == &[0., divider] && to == &[406., divider])));
     assert!(s.charts[0].rect.top >= divider + 20.);
@@ -585,15 +597,24 @@ fn r10_usage_tiles_share_row_height_at_wide_and_narrow_widths() {
                     let reset = component
                         .accessibility
                         .iter()
-                        .find(|n| n.key == format!("chart:{}:reset-credits", tile.id))
-                        .unwrap();
+                        .find(|n| n.key == format!("chart:{}:reset-credits", tile.id));
                     let action = component
                         .targets
                         .iter()
-                        .find(|hit| hit.target == Target::OpenTrayAccount(tile.id.clone()))
-                        .unwrap();
-                    assert!(reset.rect.top >= 52. && reset.rect.bottom + 4. == action.rect.top);
-                    assert!(action.rect.bottom <= component.charts[0].rect.top);
+                        .find(|hit| hit.target == Target::OpenTrayResetCredits(tile.id.clone()));
+                    if tile.provider == "codex" {
+                        let reset = reset.expect("quiet Codex reset line");
+                        assert!(
+                            reset.rect.top >= 52.
+                                && reset.rect.bottom < component.charts[0].rect.top
+                        );
+                        if let Some(action) = action {
+                            assert_eq!(reset.rect.bottom + 4., action.rect.top);
+                            assert!(action.rect.bottom <= component.charts[0].rect.top);
+                        }
+                    } else {
+                        assert!(reset.is_none() && action.is_none());
+                    }
                     let forecast = component
                         .accessibility
                         .iter()

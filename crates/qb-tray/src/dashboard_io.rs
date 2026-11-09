@@ -45,6 +45,7 @@ fn record_data_publication(
 
 pub(super) enum Handoff {
     Account(String),
+    ResetCredits(String),
     Add,
 }
 struct PendingUrgency {
@@ -634,6 +635,10 @@ impl Bridge for Coordinator {
                     }
                     Command::OpenTrayAccount(id) => {
                         c.handoff = Some((owner, Handoff::Account(id)));
+                        handoff = true;
+                    }
+                    Command::OpenTrayResetCredits(id) => {
+                        c.handoff = Some((owner, Handoff::ResetCredits(id)));
                         handoff = true;
                     }
                     Command::OpenTrayAdd => {

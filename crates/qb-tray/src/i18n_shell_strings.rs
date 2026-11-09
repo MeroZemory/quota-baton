@@ -170,4 +170,20 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
         "Choose the account home folder",
     ),
     ("차트", "Chart"),
+    ("리셋권 사용… ({0}개)", "Use a reset credit… ({0})"),
+    ("다시 확인", "Check again"),
+    (
+        "리셋권으로 지금 초기화 ({0}개 남음)",
+        "Reset limits now ({0} credits left)",
+    ),
+    ("리셋권으로 지금 초기화", "Reset limits now"),
+    (
+        "사용 결과를 확인하지 못했습니다. 리셋권이 이미 사용됐을 수 있으니 다시 확인해 주세요.",
+        "The result is unknown. The reset credit may already have been used. Check again.",
+    ),
+    ("리셋권", "Reset credits"),
+    (
+        "리셋권 확인 또는 사용 작업이 진행 중입니다.",
+        "A reset credit check or use is in progress.",
+    ),
 ];

@@ -143,6 +143,7 @@ pub enum Command {
     Activity(u8),
     Usage,
     OpenTrayAccount(String),
+    OpenTrayResetCredits(String),
     OpenTrayAdd,
     FocusSearch,
     FocusEventSearch,
@@ -494,6 +495,7 @@ impl DashboardState {
                 vec![Command::Activity(self.event_days)]
             }
             Target::OpenTrayAccount(id) => vec![Command::OpenTrayAccount(id.clone())],
+            Target::OpenTrayResetCredits(id) => vec![Command::OpenTrayResetCredits(id.clone())],
             Target::OpenTrayAdd => vec![Command::OpenTrayAdd],
             Target::Today => {
                 self.range = Range::Today;

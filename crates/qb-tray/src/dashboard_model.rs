@@ -550,6 +550,8 @@ pub struct AccountGroup {
     pub plan: String,
     pub subscription_lines: Vec<String>,
     pub reset_credits: crate::client::reset_credits::InventoryLine,
+    pub reset_credit_count: Option<u64>,
+    pub reset_credit_allowed: bool,
     pub outside_used: bool,
     pub chip: String,
     pub tone: v2::Tone,
@@ -629,6 +631,8 @@ pub struct UsageTile {
     pub plan: String,
     pub subscription_lines: Vec<String>,
     pub reset_credits: crate::client::reset_credits::InventoryLine,
+    pub reset_credit_count: Option<u64>,
+    pub reset_credit_allowed: bool,
     pub chip: String,
     pub tone: v2::Tone,
     pub windows: Vec<AccountUsageWindow>,
@@ -1332,6 +1336,8 @@ pub fn project(
         };
         groups.push(AccountGroup {
             subscription_lines: v2::subscription_lines(&a.raw, clock.now),
+            reset_credit_count: a.raw.reset_credits.as_ref().and_then(|i| i.available_count),
+            reset_credit_allowed: v2::reset_credit_account_refusal(&a.raw).is_none(),
             reset_credits: crate::client::reset_credits::inventory_line(
                 &a.raw.provider,
                 a.raw.reset_credits.as_ref(),
@@ -2637,6 +2643,8 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 .unwrap_or_default();
             UsageTile {
                 subscription_lines: v2::subscription_lines(&a.raw, clock.now),
+                reset_credit_count: a.raw.reset_credits.as_ref().and_then(|i| i.available_count),
+                reset_credit_allowed: v2::reset_credit_account_refusal(&a.raw).is_none(),
                 reset_credits: crate::client::reset_credits::inventory_line(
                     &a.raw.provider,
                     a.raw.reset_credits.as_ref(),

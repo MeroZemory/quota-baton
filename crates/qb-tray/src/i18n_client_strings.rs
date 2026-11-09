@@ -18,6 +18,52 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
     ("리셋권 · 지원 안 함", "Reset credits · unsupported"),
     ("만료 없음", "Never expires"),
     ("만료 확인 전", "Expiry unknown"),
+    ("리셋권 확인 전", "Reset credits not checked yet"),
+    (
+        "리셋권 사용을 열어 확인해 주세요.",
+        "Open Use reset credit to check.",
+    ),
+    ("리셋권 없음", "No reset credits"),
+    ("리셋권 {0}개", "Reset credits: {0}"),
+    (
+        "리셋권 {0}개 · 만료 없음",
+        "Reset credits: {0} · never expires",
+    ),
+    ("리셋권: {0}", "Reset credit: {0}"),
+    ("{0}일 후", "in {0} days"),
+    ("{0}일 전", "{0} days ago"),
+    ("1일 후", "in 1 day"),
+    ("1일 전", "1 day ago"),
+    ("{0}시간 후", "in {0} hours"),
+    ("1시간 후", "in 1 hour"),
+    ("1시간 전", "1 hour ago"),
+    ("{0}분 후", "in {0} min"),
+    ("1분 이내", "in under 1 min"),
+    ("Codex 계정", "Codex account"),
+    (
+        "만료가 가장 빠른 리셋권({0} 만료)을 사용합니다.",
+        "The reset credit that expires first will be used (expires {0}).",
+    ),
+    (
+        "만료가 없는 리셋권 1개를 사용합니다.",
+        "One reset credit with no expiry will be used.",
+    ),
+    (
+        "이 계정의 Codex 사용 한도가 초기화됩니다.",
+        "This account's Codex usage limits will be reset.",
+    ),
+    (
+        "초기화할 사용 한도를 확인하지 못했습니다.",
+        "Could not verify which usage limits will be reset.",
+    ),
+    (
+        "사용 후 남는 리셋권: {0}개",
+        "Reset credits remaining after use: {0}",
+    ),
+    (
+        "사용 후 남는 리셋권: 확인 전",
+        "Reset credits remaining after use: unknown",
+    ),
     (
         "리셋권 · 오래된 정보 · 제공자 보고 {0}",
         "Reset credits · stale · provider reported {0}",
@@ -93,10 +139,6 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
     ("리셋권 1개 사용", "Use one reset credit"),
     ("1개 사용", "Use one"),
     ("리셋권 · 계정 메뉴…", "Reset credits · account menu…"),
-    (
-        "{0}\n{1}\n만료 {2}\n영향: 해당되는 Codex 한도\n만료가 가장 빠른 리셋권 1개를 사용합니다.\n확인 유효 시각 {3}",
-        "{0}\n{1}\nExpiry {2}\nEffect: eligible Codex limits\nUse one reset credit with the earliest verified expiry.\nConfirmation valid until {3}",
-    ),
     ("세션 번호가 올바르지 않습니다", "Invalid session ID"),
     (
         "대시보드 세션 응답이 요청과 다릅니다",

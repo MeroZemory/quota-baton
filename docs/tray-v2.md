@@ -567,3 +567,9 @@ on the tray worker. Programmatic account reveal does not overwrite that choice.
 The dashboard overview shows the same compact accounts after its main account
 groups. A recovered account returns to the main list immediately, while relative
 ordering within each list remains stable during an open flyout.
+
+### R27 reset-credit interaction
+
+Codex cards show a quiet reset-credit fact; Claude cards omit it. The account menu has one Use reset credit entry (known count appended), enabled for actionable Codex accounts unless count is knownzero. Opening immediately shows Checking and obtains detailed facts inside the flow. Returned inventories update the projected row immediately, without waiting for periodic polling. Expiry/freshness never silently authorizes consumption: retain core300s checks and renewed consent when a preview expired.
+
+Only a reached account quota limit with countnotzero exposes a prominent Reset limits now CTA, opening that same flow. Confirmation uses user label/email/plan, known earliest local expiry, provider-evidenced Codex-limit effect and remainingcreditcount. No internalIDs or validitytimestamp. Dates use local MM/DD HH:mm, yearonlydifferent, relativehints. Results use Close; unknown/retryable read failures use Checkagain/Close. Default remains the non-consuming action. Every disabled reset control has its reason inline and in tooltip. C9.1 uncertainty/once-only fences remain authoritative.

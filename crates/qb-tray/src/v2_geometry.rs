@@ -96,6 +96,11 @@ pub enum Overlay {
         body: String,
         ready: bool,
     },
+    ResetCreditStatus {
+        id: String,
+        body: String,
+        retry: bool,
+    },
     CreditsConfirm(String),
     DeleteConfirm(String),
     /// Replaces the list; provider identifies the caller-owned login flow.
@@ -238,6 +243,7 @@ pub struct RowBox {
     pub bar_fill: Option<Rect>,
     pub credits: Option<Rect>,
     pub reset_credits: Option<Rect>,
+    pub reset_credit_action: Option<ButtonBox>,
     pub reason: Option<Rect>,
     /// One-line compact copy. Main paint must use this instead of the full row path.
     pub compact_reason: Option<InfoLine>,
@@ -314,6 +320,7 @@ pub struct PopupBox {
 }
 #[derive(Debug, Clone)]
 pub struct DialogBox {
+    pub reset_title: bool,
     pub login_card: Option<crate::v2_session::login_flow::Card>,
     pub takeover_body: Option<String>,
     pub body_offset: f32,
@@ -583,6 +590,45 @@ impl Scene {
                 }
                 scene.dialog = Some(d);
             }
+            Overlay::ResetCreditStatus { id, body, retry } => {
+                let mut d = dialog_box(rect, id, false, &p);
+                d.takeover_body = Some(body.clone());
+                d.body_height = p.credits_body_lines as f32 * 20.;
+                d.body_offset = p
+                    .popup_offset
+                    .clamp(0., (d.body_height - h(d.body)).max(0.));
+                d.buttons.remove(0);
+                d.buttons[0].label = crate::i18n::static_text("닫기").into();
+                if *retry {
+                    let mut check = d.buttons[0].clone();
+                    check.visual.left = 36.;
+                    check.visual.right = 176.;
+                    check.hit.left = 36.;
+                    check.hit.right = 176.;
+                    check.label = crate::i18n::static_text("다시 확인").into();
+                    check.target = Target::Menu {
+                        id: Some(id.clone()),
+                        action: MenuAction::UseResetCredit,
+                    };
+                    check.enabled = p.core_ok && !p.reset_busy && !p.pending_ids.contains(id);
+                    d.buttons.insert(0, check);
+                }
+                scene.targets = vec![HitBox {
+                    rect,
+                    target: Target::Blocked,
+                    enabled: true,
+                }];
+                for b in &d.buttons {
+                    push_target(
+                        &mut scene.targets,
+                        b.hit,
+                        d.clip,
+                        b.target.clone(),
+                        b.enabled,
+                    );
+                }
+                scene.dialog = Some(d);
+            }
             Overlay::ResetCredits { id, body, ready } => {
                 let mut d = dialog_box(rect, id, false, &p);
                 d.takeover_body = Some(body.clone());
@@ -740,7 +786,7 @@ impl Scene {
                     Target::Row(row.id.clone()),
                     self.core_ok,
                 );
-                if let Some(b) = &row.button {
+                for b in row.button.iter().chain(row.reset_credit_action.iter()) {
                     push_target(
                         &mut self.targets,
                         b.hit,
@@ -1016,10 +1062,24 @@ fn outside_note_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
         .as_ref()
         .map_or(0., |text| 6. + paragraph_height(p, text, 328.))
 }
+fn reset_credit_cta(row: &v2::AccountRow) -> bool {
+    row.raw.provider == "codex"
+        && v2::reset_credit_account_refusal(&row.raw).is_none()
+        && row
+            .raw
+            .reset_credits
+            .as_ref()
+            .is_none_or(|i| i.available_count != Some(0))
+        && row
+            .windows
+            .iter()
+            .any(|w| w.account_scoped && w.raw.used_pct.is_some_and(|u| u >= 100.))
+}
 fn reset_credit_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
     row.reset_credits
         .as_ref()
         .map_or(0., |line| 6. + paragraph_height(p, &line.text, 328.))
+        + if reset_credit_cta(row) { 38. } else { 0. }
 }
 fn forecast_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
     row.forecast_lines
@@ -1066,6 +1126,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
             bar_fill: None,
             credits: None,
             reset_credits: None,
+            reset_credit_action: None,
             reason: None,
             button: None,
         };
@@ -1159,6 +1220,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
     let mut bar_fill = None;
     let mut credits = None;
     let mut reset_credits = None;
+    let mut reset_credit_action = None;
     let mut reason = None;
     let mut forecast = None;
     if !disabled_slot {
@@ -1267,6 +1329,30 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
             reset_credits = Some(r(16., next, 344., next + height));
             next += height;
         }
+        if reset_credit_cta(row) {
+            let label = row
+                .raw
+                .reset_credits
+                .as_ref()
+                .and_then(|i| i.available_count)
+                .map_or_else(
+                    || crate::i18n::static_text("리셋권으로 지금 초기화").into(),
+                    |n| {
+                        crate::i18n::format("리셋권으로 지금 초기화 ({0}개 남음)", &[n.to_string()])
+                    },
+                );
+            next += 6.;
+            reset_credit_action = Some(button(
+                r(16., next, 344., next + 32.),
+                &label,
+                Target::Menu {
+                    id: Some(row.raw.id.clone()),
+                    action: MenuAction::UseResetCredit,
+                },
+                enabled && !p.reset_busy,
+            ));
+            next += 32.;
+        }
         if row.reason.is_some() {
             next += 8.;
             let has_button = action.is_some_and(|a| {
@@ -1320,6 +1406,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         bar_fill,
         credits,
         reset_credits,
+        reset_credit_action,
         reason,
         button: inline,
         compact_reason: None,
@@ -1359,44 +1446,49 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
     if let Some(s) = &row.menu.credits_line {
         parts.push(Part::Info(s.clone(), false, 16.));
     }
-    let reset = row.reset_credits.clone().unwrap_or_else(|| {
-        crate::client::reset_credits::inventory_line(
-            &row.raw.provider,
-            None,
-            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-        )
-    });
-    parts.push(Part::HintInfo(reset.text, Some(reset.tooltip.clone()), 16.));
     if row.raw.provider == "codex" {
-        let account_refusal = v2::reset_credit_account_refusal(&row.raw);
-        let account_allowed = account_refusal.is_none();
-        if let Some(reason) = account_refusal {
-            parts.push(Part::HintInfo(reason.into(), Some(reason.into()), 16.));
-        }
-        for (action, label, enabled) in [
-            (
-                MenuAction::RefreshResetCredits,
-                "리셋권 새로고침",
-                core_ok && account_allowed,
-            ),
-            (
-                MenuAction::UseResetCredit,
-                "리셋권 사용…",
-                core_ok && account_allowed && reset.can_use,
-            ),
-        ] {
-            parts.push(Part::Item(
-                crate::i18n::static_text(label).into(),
-                None,
-                None,
-                true,
-                Target::Menu {
-                    id: Some(row.raw.id.clone()),
-                    action,
-                },
-                enabled,
+        if let Some(reset) = &row.reset_credits {
+            parts.push(Part::HintInfo(
+                reset.text.clone(),
+                Some(reset.tooltip.clone()),
+                16.,
             ));
         }
+        let reason = if !core_ok {
+            Some(crate::i18n::static_text("코어에 연결할 수 없습니다"))
+        } else {
+            v2::reset_credit_account_refusal(&row.raw)
+        };
+        let zero = row
+            .raw
+            .reset_credits
+            .as_ref()
+            .is_some_and(|i| i.available_count == Some(0));
+        let label = row
+            .raw
+            .reset_credits
+            .as_ref()
+            .and_then(|i| i.available_count)
+            .map_or_else(
+                || crate::i18n::static_text("리셋권 사용…").into(),
+                |n| crate::i18n::format("리셋권 사용… ({0}개)", &[n.to_string()]),
+            );
+        let reason = reason
+            .or_else(|| zero.then(|| crate::i18n::static_text("사용 가능한 리셋권이 없습니다.")));
+        if let Some(reason) = reason {
+            parts.push(Part::HintInfo(reason.into(), Some(reason.into()), 16.));
+        }
+        parts.push(Part::Item(
+            label,
+            None,
+            None,
+            true,
+            Target::Menu {
+                id: Some(row.raw.id.clone()),
+                action: MenuAction::UseResetCredit,
+            },
+            reason.is_none(),
+        ));
     }
     parts.push(Part::Gap(6.));
     parts.push(Part::HintInfo(
@@ -1510,15 +1602,19 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
             );
             for part in &mut parts {
                 if let Part::Item(_, _, _, _, Target::Menu { action, .. }, enabled) = part
-                    && ((p.reset_busy
+                    && (p.reset_busy
                         && matches!(
                             action,
                             MenuAction::UseResetCredit | MenuAction::RefreshResetCredits
                         ))
-                        || (p.reset_blocked.contains(id) && *action == MenuAction::UseResetCredit))
                 {
                     *enabled = false;
                 }
+            }
+            if p.reset_busy {
+                let reason =
+                    crate::i18n::static_text("리셋권 확인 또는 사용 작업이 진행 중입니다.");
+                parts.insert(1, Part::HintInfo(reason.into(), Some(reason.into()), 16.));
             }
             if let Some(message) = p.reset_messages.get(id) {
                 parts.insert(
@@ -1666,9 +1762,9 @@ fn overlay_min_height(view: &v2::View, p: &Presentation) -> f32 {
                 + card.actions.len().div_ceil(2) as f32 * 40.
                 + 16.
         }
-        Overlay::TakeoverCard { .. } | Overlay::ResetCredits { .. } => {
-            149. + p.credits_body_lines as f32 * 20.
-        }
+        Overlay::TakeoverCard { .. }
+        | Overlay::ResetCredits { .. }
+        | Overlay::ResetCreditStatus { .. } => 149. + p.credits_body_lines as f32 * 20.,
         Overlay::DeleteConfirm(id) if find_row(view, id).is_some() => 193. + 16.,
         Overlay::CreditsConfirm(id) if find_row(view, id).is_some() => {
             credits_dialog_height(p) + 16.
@@ -1821,7 +1917,9 @@ fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBo
             + 12.
     } else if matches!(
         p.overlay,
-        Overlay::TakeoverCard { .. } | Overlay::ResetCredits { .. }
+        Overlay::TakeoverCard { .. }
+            | Overlay::ResetCredits { .. }
+            | Overlay::ResetCreditStatus { .. }
     ) {
         // Body starts at +48, ends 20 above the 65-DIP button bar.
         133. + p.credits_body_lines as f32 * 20.
@@ -1841,6 +1939,10 @@ fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBo
         Target::ConfirmCredits(id.into())
     };
     DialogBox {
+        reset_title: matches!(
+            p.overlay,
+            Overlay::ResetCredits { .. } | Overlay::ResetCreditStatus { .. }
+        ),
         login_card: None,
         takeover_body: None,
         body_offset: 0.,
@@ -2115,7 +2217,11 @@ fn shift_row(row: &mut RowBox, dy: f32) {
             shift(fill, dy);
         }
     }
-    if let Some(b) = &mut row.button {
+    for b in row
+        .button
+        .iter_mut()
+        .chain(row.reset_credit_action.iter_mut())
+    {
         shift_button(b, dy);
     }
 }
@@ -3183,8 +3289,17 @@ mod r26_geometry_tests {
                 .unwrap()
                 .enabled
         };
-        assert!(action(MenuAction::RefreshResetCredits));
-        assert!(!action(MenuAction::UseResetCredit));
+        assert!(
+            action(MenuAction::UseResetCredit),
+            "Unknown opens read-only reconciliation, not a new commit"
+        );
+        assert!(!popup.items.iter().any(|i| matches!(
+            i.target,
+            Target::Menu {
+                action: MenuAction::RefreshResetCredits,
+                ..
+            }
+        )));
         assert!(
             popup
                 .info
@@ -3265,11 +3380,10 @@ mod r26_geometry_tests {
                     let view =
                         v2::project(&wire.to_string(), std::time::SystemTime::UNIX_EPOCH).unwrap();
                     let row = find_row(&view, "a").unwrap();
-                    let inventory = row.reset_credits.as_ref().unwrap();
                     assert_eq!(
-                        inventory.can_use,
+                        row.reset_credits.as_ref().is_some_and(|i| i.can_use),
                         provider == "codex",
-                        "account gates must not overwrite known grant facts"
+                        "Claude has no reset display; Codex grant facts survive account gating"
                     );
                     assert_eq!(
                         v2::reset_credit_account_refusal(&row.raw),
@@ -3287,7 +3401,15 @@ mod r26_geometry_tests {
                         800.,
                     );
                     let popup = scene.popup.unwrap();
-                    for kind in [MenuAction::UseResetCredit, MenuAction::RefreshResetCredits] {
+                    assert!(!popup.items.iter().any(|i| matches!(
+                        i.target,
+                        Target::Menu {
+                            action: MenuAction::RefreshResetCredits,
+                            ..
+                        }
+                    )));
+                    {
+                        let kind = MenuAction::UseResetCredit;
                         let item = popup.items.iter().find(|i| {
                             i.target
                                 == Target::Menu {
@@ -3333,12 +3455,22 @@ mod r26_geometry_tests {
                             |i| i.text == localized && i.tooltip.as_deref() == Some(localized)
                         ));
                     }
-                    assert!(
-                        popup
-                            .info
-                            .iter()
-                            .any(|i| i.tooltip.as_deref() == Some(inventory.tooltip.as_str()))
-                    );
+                    if let Some(inventory) = &row.reset_credits {
+                        assert!(
+                            popup
+                                .info
+                                .iter()
+                                .any(|i| i.tooltip.as_deref() == Some(inventory.tooltip.as_str()))
+                        );
+                    } else {
+                        assert!(
+                            !popup
+                                .info
+                                .iter()
+                                .any(|i| i.text.contains("리셋권")
+                                    || i.text.contains("Reset credit"))
+                        );
+                    }
                     assert_eq!(format!("{:?}", view.raw), before);
                 }
             });
@@ -3425,6 +3557,98 @@ mod r261_login_geometry_tests {
                     }
                 }
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod r27_reset_flow_tests {
+    use super::*;
+    fn view(inventory: serde_json::Value, state: &str) -> v2::View {
+        let wire = serde_json::json!({"accounts":[{"id":"cx-synthetic","provider":"codex","label":"User alias","user_state":state,"health":{"kind":"ready"},"reset_credits":inventory}]});
+        v2::project(&wire.to_string(), std::time::SystemTime::UNIX_EPOCH).unwrap()
+    }
+    #[test]
+    fn r27_menu_single_entry_works_with_unknown_count_only_and_stale_details() {
+        for (inventory, enabled) in [
+            (serde_json::Value::Null, true),
+            (
+                serde_json::json!({"state":"fresh","available_count":2,"grants":[]}),
+                true,
+            ),
+            (
+                serde_json::json!({"state":"stale","available_count":2,"grants":[]}),
+                true,
+            ),
+            (
+                serde_json::json!({"state":"fresh","available_count":0,"grants":[]}),
+                false,
+            ),
+        ] {
+            for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+                crate::i18n::with_language(language, || {
+                    let v = view(inventory.clone(), "active");
+                    let scene = Scene::build(
+                        &v,
+                        Presentation {
+                            overlay: Overlay::RowMenu("cx-synthetic".into()),
+                            ..Default::default()
+                        },
+                        800.,
+                    );
+                    let popup = scene.popup.unwrap();
+                    let entries: Vec<_> = popup
+                        .items
+                        .iter()
+                        .filter(|i| {
+                            matches!(
+                                i.target,
+                                Target::Menu {
+                                    action: MenuAction::UseResetCredit
+                                        | MenuAction::RefreshResetCredits,
+                                    ..
+                                }
+                            )
+                        })
+                        .collect();
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].enabled, enabled);
+                    if !enabled {
+                        assert!(popup.info.iter().any(|i| i.tooltip.is_some()));
+                    }
+                });
+            }
+        }
+    }
+    #[test]
+    fn r27_results_have_close_and_optional_read_only_check_never_disabled_use() {
+        let v = view(serde_json::Value::Null, "active");
+        for retry in [false, true] {
+            let scene = Scene::build(
+                &v,
+                Presentation {
+                    overlay: Overlay::ResetCreditStatus {
+                        id: "cx-synthetic".into(),
+                        body: "Result".into(),
+                        retry,
+                    },
+                    ..Default::default()
+                },
+                800.,
+            );
+            let d = scene.dialog.unwrap();
+            assert!(d.reset_title);
+            assert_eq!(d.buttons.len(), if retry { 2 } else { 1 });
+            assert!(
+                d.buttons
+                    .iter()
+                    .all(|b| !matches!(b.target, Target::ConfirmResetCredit(_)))
+            );
+            assert!(
+                d.buttons
+                    .iter()
+                    .any(|b| b.target == Target::CancelDialog && b.enabled)
+            );
         }
     }
 }

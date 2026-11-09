@@ -32,6 +32,7 @@ pub enum Target {
     SessionLink(String),
     AccountLink(String),
     OpenTrayAccount(String),
+    OpenTrayResetCredits(String),
     OpenTrayAdd,
     Today,
     Chart(String),
@@ -717,7 +718,10 @@ impl Builder<'_> {
         tip: Option<String>,
         radius: f32,
     ) {
-        let accent = matches!(&target, Target::OpenTrayAccount(_) | Target::OpenTrayAdd);
+        let accent = matches!(
+            &target,
+            Target::OpenTrayAccount(_) | Target::OpenTrayResetCredits(_) | Target::OpenTrayAdd
+        );
         if !self.enabled {
             self.scene.draw.push(Draw::Alpha(0.5));
         }
@@ -2417,8 +2421,13 @@ fn group_usage_height(g: &m::AccountGroup, available: f32) -> f32 {
 }
 fn group_header_height(b: &mut Builder<'_>, g: &m::AccountGroup, available: f32) -> f32 {
     group_usage_height(g, available)
-        + b.measured_height(&g.reset_credits.text, (available - 46.).max(1.), 12., false)
-        + 32.
+        + reset_credit_height(
+            b,
+            &g.provider,
+            &g.reset_credits.text,
+            (available - 46.).max(1.),
+            group_reset_credit_cta(g).is_some(),
+        )
         + g.subscription_lines
             .iter()
             .map(|line| b.measured_height(line, (available - 46.).max(1.), 12., false) + 4.)
@@ -2430,6 +2439,46 @@ fn group_header_height(b: &mut Builder<'_>, g: &m::AccountGroup, available: f32)
                 b.measured_height(line, (available - 46.).max(1.), 12., g.forecast_warning) + 4.
             })
             .sum::<f32>()
+}
+fn reset_credit_cta(
+    provider: &str,
+    windows: &[m::AccountUsageWindow],
+    count: Option<u64>,
+    allowed: bool,
+) -> Option<String> {
+    if provider != "codex"
+        || !allowed
+        || count == Some(0)
+        || !windows.iter().any(|window| window.remaining_pct == 0)
+    {
+        return None;
+    }
+    Some(match count {
+        Some(count) => {
+            crate::i18n::format("리셋권으로 지금 초기화 ({0}개 남음)", &[count.to_string()])
+        }
+        None => crate::i18n::static_text("리셋권으로 지금 초기화").into(),
+    })
+}
+fn group_reset_credit_cta(g: &m::AccountGroup) -> Option<String> {
+    reset_credit_cta(
+        &g.provider,
+        &g.windows,
+        g.reset_credit_count,
+        g.reset_credit_allowed,
+    )
+}
+fn reset_credit_height(
+    b: &mut Builder<'_>,
+    provider: &str,
+    text: &str,
+    available: f32,
+    has_cta: bool,
+) -> f32 {
+    if provider != "codex" {
+        return 0.;
+    }
+    b.measured_height(text, available, 12., false) + 4. + if has_cta { 28. } else { 0. }
 }
 fn chip(b: &mut Builder<'_>, text: &str, tone: v2::Tone, r: Rect, radius: f32) {
     if text.is_empty() {
@@ -2724,38 +2773,43 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         );
         forecast_y += 20.;
     }
-    let reset_h = b.measured_height(&g.reset_credits.text, (width(r) - 44.).max(1.), 12., false);
-    let reset_rect = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), reset_h);
-    b.text(
-        reset_rect,
-        &g.reset_credits.text,
-        12.,
-        false,
-        Color::Secondary,
-        true,
-    );
-    b.tooltip(reset_rect, g.reset_credits.tooltip.clone());
-    b.semantic(
-        format!("{}:reset-credits:{}", b.scope, g.id),
-        Some(format!("group:{}", g.id)),
-        Role::Text,
-        g.reset_credits.tooltip.clone(),
-        reset_rect,
-        None,
-    );
-    forecast_y += reset_h + 4.;
-    let reset_scope = b.scope.clone();
-    b.scope.push_str(":reset-credits");
-    b.control(
-        rect(r.left + 32., forecast_y, (width(r) - 44.).min(260.), 24.),
-        crate::i18n::static_text("리셋권 · 계정 메뉴…"),
-        Target::OpenTrayAccount(g.id.clone()),
-        Role::Button,
-        false,
-        None,
-    );
-    b.scope = reset_scope;
-    forecast_y += 28.;
+    if g.provider == "codex" {
+        let reset_h =
+            b.measured_height(&g.reset_credits.text, (width(r) - 44.).max(1.), 12., false);
+        let reset_rect = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), reset_h);
+        b.text(
+            reset_rect,
+            &g.reset_credits.text,
+            12.,
+            false,
+            Color::Secondary,
+            true,
+        );
+        b.tooltip(reset_rect, g.reset_credits.tooltip.clone());
+        b.semantic(
+            format!("{}:reset-credits:{}", b.scope, g.id),
+            Some(format!("group:{}", g.id)),
+            Role::Text,
+            g.reset_credits.tooltip.clone(),
+            reset_rect,
+            None,
+        );
+        forecast_y += reset_h + 4.;
+        if let Some(label) = group_reset_credit_cta(g) {
+            let reset_scope = b.scope.clone();
+            b.scope.push_str(":reset-credits");
+            b.control(
+                rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), 24.),
+                &label,
+                Target::OpenTrayResetCredits(g.id.clone()),
+                Role::Button,
+                false,
+                None,
+            );
+            b.scope = reset_scope;
+            forecast_y += 28.;
+        }
+    }
     for (index, line) in g.subscription_lines.iter().enumerate() {
         let h = b.measured_height(line, (width(r) - 44.).max(1.), 12., false);
         let bounds = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), h);

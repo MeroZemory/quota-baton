@@ -1032,11 +1032,9 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         usage,
         windows,
         credits,
-        reset_credits: Some(crate::client::reset_credits::inventory_line(
-            &a.provider,
-            a.reset_credits.as_ref(),
-            now,
-        )),
+        reset_credits: (a.provider == "codex").then(|| {
+            crate::client::reset_credits::inventory_line(&a.provider, a.reset_credits.as_ref(), now)
+        }),
         forecast_lines: vec![forecast_summary.text],
         forecast_tooltip,
         forecast_warning: forecast_summary.warning,

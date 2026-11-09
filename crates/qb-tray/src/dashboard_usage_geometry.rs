@@ -142,8 +142,13 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
 fn tile_height(b: &mut Builder<'_>, tile: &m::UsageTile, w: f32) -> f32 {
     let inner = (w - 24.).max(1.);
     288. + english_window_extra(tile)
-        + b.measured_height(&tile.reset_credits.text, inner, 12., false)
-        + 32.
+        + reset_credit_height(
+            b,
+            &tile.provider,
+            &tile.reset_credits.text,
+            inner,
+            tile_reset_credit_cta(tile).is_some(),
+        )
         + tile
             .subscription_lines
             .iter()
@@ -156,15 +161,26 @@ fn tile_height(b: &mut Builder<'_>, tile: &m::UsageTile, w: f32) -> f32 {
             .sum::<f32>()
 }
 fn additional_account_nodes(tile: &m::UsageTile) -> usize {
-    // Reset status + menu control, subscription/forecast text, and at most one
-    // overflow caption. Full chart series/points are never removed for this budget.
-    2 + tile.subscription_lines.len()
+    // Reserve only the reset status/action nodes actually emitted, plus other
+    // captions. Full chart series/points are never removed for this budget.
+    usize::from(tile.provider == "codex")
+        + usize::from(tile_reset_credit_cta(tile).is_some())
+        + tile.subscription_lines.len()
         + tile.forecast_lines.len()
         + usize::from(
             tile.series
                 .iter()
                 .any(|series| !series.future_resets.is_empty()),
         )
+}
+
+fn tile_reset_credit_cta(tile: &m::UsageTile) -> Option<String> {
+    reset_credit_cta(
+        &tile.provider,
+        &tile.windows,
+        tile.reset_credit_count,
+        tile.reset_credit_allowed,
+    )
 }
 
 fn english_window_extra(tile: &m::UsageTile) -> f32 {
@@ -190,7 +206,13 @@ fn usage_tile(
     }
     b.fill(r, Color::Surface, 6.);
     let reset_h = b.measured_height(&t.reset_credits.text, (width(r) - 24.).max(1.), 12., false);
-    let reset_extra = reset_h + 32.;
+    let reset_extra = reset_credit_height(
+        b,
+        &t.provider,
+        &t.reset_credits.text,
+        (width(r) - 24.).max(1.),
+        tile_reset_credit_cta(t).is_some(),
+    );
     let header_height = 60. + english_window_extra(t) + reset_extra;
     b.fill(
         rect(r.left, r.top, width(r), header_height),
@@ -331,41 +353,45 @@ fn usage_tile(
             left += reset_width + 16.;
         }
     }
-    let reset_rect = rect(
-        r.left + 12.,
-        r.top + 56. + english_window_extra(t),
-        (width(r) - 24.).max(1.),
-        reset_h,
-    );
-    b.text(
-        reset_rect,
-        &t.reset_credits.text,
-        12.,
-        false,
-        Color::Secondary,
-        true,
-    );
-    b.tooltip(reset_rect, t.reset_credits.tooltip.clone());
-    b.semantic(
-        format!("chart:{}:reset-credits", t.id),
-        Some(chartkey.clone()),
-        Role::Text,
-        t.reset_credits.tooltip.clone(),
-        reset_rect,
-        None,
-    );
-    let action_y = reset_rect.bottom + 4.;
-    let prior_scope = b.scope.clone();
-    b.scope.push_str(":reset-credits");
-    b.control(
-        rect(r.left + 12., action_y, (width(r) - 24.).min(260.), 24.),
-        crate::i18n::static_text("리셋권 · 계정 메뉴…"),
-        Target::OpenTrayAccount(t.id.clone()),
-        Role::Button,
-        false,
-        None,
-    );
-    b.scope = prior_scope;
+    if t.provider == "codex" {
+        let reset_rect = rect(
+            r.left + 12.,
+            r.top + 56. + english_window_extra(t),
+            (width(r) - 24.).max(1.),
+            reset_h,
+        );
+        b.text(
+            reset_rect,
+            &t.reset_credits.text,
+            12.,
+            false,
+            Color::Secondary,
+            true,
+        );
+        b.tooltip(reset_rect, t.reset_credits.tooltip.clone());
+        b.semantic(
+            format!("chart:{}:reset-credits", t.id),
+            Some(chartkey.clone()),
+            Role::Text,
+            t.reset_credits.tooltip.clone(),
+            reset_rect,
+            None,
+        );
+        if let Some(label) = tile_reset_credit_cta(t) {
+            let action_y = reset_rect.bottom + 4.;
+            let prior_scope = b.scope.clone();
+            b.scope.push_str(":reset-credits");
+            b.control(
+                rect(r.left + 12., action_y, (width(r) - 24.).max(1.), 24.),
+                &label,
+                Target::OpenTrayResetCredits(t.id.clone()),
+                Role::Button,
+                false,
+                None,
+            );
+            b.scope = prior_scope;
+        }
+    }
     // Move chart annotations below account quota and reset-credit information.
     let r = Rect {
         top: r.top + english_window_extra(t) + reset_extra,

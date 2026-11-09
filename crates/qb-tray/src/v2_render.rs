@@ -217,8 +217,9 @@ impl Renderer {
             };
             p.credits_body_lines = body + code;
         }
-        if let g::Overlay::TakeoverCard { body, .. } | g::Overlay::ResetCredits { body, .. } =
-            &p.overlay
+        if let g::Overlay::TakeoverCard { body, .. }
+        | g::Overlay::ResetCredits { body, .. }
+        | g::Overlay::ResetCreditStatus { body, .. } = &p.overlay
         {
             let mut s = style(13., false, 20.);
             s.wrap = Wrap::KeepAll;
@@ -1130,6 +1131,9 @@ impl Renderer {
                 alpha,
             )?;
         }
+        if let Some(button) = &b.reset_credit_action {
+            self.button(target, button, true, true, o)?;
+        }
         if let Some(button) = &b.button {
             let accent = row.action.as_ref().is_some_and(|a| a.accent);
             self.button(target, button, accent, true, o)?;
@@ -1488,8 +1492,17 @@ impl Renderer {
             .and_then(|row| row.menu.credits_enable_confirmation.as_ref());
         let title = if let Some(card) = &d.login_card {
             card.title.as_str()
-        } else if matches!(d.buttons[0].target, g::Target::ConfirmResetCredit(_)) {
-            crate::i18n::static_text("리셋권 1개 사용")
+        } else if d.reset_title {
+            crate::i18n::static_text(
+                if d.buttons
+                    .iter()
+                    .any(|b| matches!(b.target, g::Target::ConfirmResetCredit(_)))
+                {
+                    "리셋권 1개 사용"
+                } else {
+                    "리셋권"
+                },
+            )
         } else if d.takeover_body.is_some() {
             if d.buttons[0].target == g::Target::TakeoverCommit {
                 crate::i18n::static_text("가져오기 확인")

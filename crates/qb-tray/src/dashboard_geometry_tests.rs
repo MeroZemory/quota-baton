@@ -928,7 +928,7 @@ fn r7_usage_charts_have_table_children_whole_plot_hit_and_remaining_values() {
         ..Default::default()
     };
     let v = view(&mut state);
-    let initial = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    let initial = Scene::build(&v, &state, [1320., 640.], &Metrics::default());
     let chart = initial.charts.iter().find(|c| c.id == "cx-a").unwrap();
     let region = initial
         .content
@@ -936,13 +936,13 @@ fn r7_usage_charts_have_table_children_whole_plot_hit_and_remaining_values() {
         .find(|r| r.region == ScrollRegion::Usage)
         .unwrap();
     let point = (chart.rect.left + 1., chart.rect.top + 1.);
-    // Measured reset content moves this account below the initial viewport. A
-    // retained offscreen chart must not get a hit target through that clip.
+    // Use the supported short viewport to place this retained chart below the clip.
+    // Claude reset rows are absent; offscreen protection must not depend on their old height.
     assert!(point.1 >= region.viewport.bottom);
     assert_eq!(initial.hit_test(point.0, point.1), None);
     state.usage_offset =
         (region.offset + chart.rect.top - region.viewport.top - 8.).clamp(0., region.max_offset);
-    let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    let scene = Scene::build(&v, &state, [1320., 640.], &Metrics::default());
     let chart = scene.charts.iter().find(|c| c.id == "cx-a").unwrap();
     let viewport = scene
         .content
@@ -1781,7 +1781,7 @@ fn r19_empty_guidance_and_global_excluded_rows_have_separate_nonoverlapping_geom
 }
 
 #[test]
-fn r26_inventory_is_near_quota_and_accessible_on_dashboard_with_account_menu_entry() {
+fn r27_inventory_is_quiet_near_quota_and_accessible_on_dashboard() {
     for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
         crate::i18n::with_language(language, || {
             let clock = fixtures::clock();
@@ -1826,12 +1826,236 @@ fn r26_inventory_is_near_quota_and_accessible_on_dashboard_with_account_menu_ent
                             assert!(node.rect.left >= 0. && node.rect.right <= size[0]);
                             assert!(node.name.contains(&v.groups[0].reset_credits.text));
                         }
-                        assert!(scene.accessibility.iter().any(
-                            |node| node.target == Some(Target::OpenTrayAccount("cx-a".into()))
-                        ));
+                        assert!(!scene.accessibility.iter().any(|node| matches!(
+                            node.target,
+                            Some(Target::OpenTrayResetCredits(_))
+                        )));
+                        assert!(
+                            !scene
+                                .accessibility
+                                .iter()
+                                .any(|node| { node.key.contains(":reset-credits:control:") })
+                        );
                     }
                 }
             }
         });
+    }
+}
+
+#[test]
+fn r27_reset_cta_requires_actual_exhaustion_and_actionable_nonzero_or_unknown_count() {
+    for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+        crate::i18n::with_language(language, || {
+            for tab in [Tab::Overview, Tab::Usage] {
+                for (provider, count, allowed, remaining, expected) in [
+                    ("claude", Some(2), true, Some(0), false),
+                    ("codex", Some(2), true, Some(50), false),
+                    ("codex", Some(2), true, None, false),
+                    ("codex", Some(2), true, Some(0), true),
+                    ("codex", None, true, Some(0), true),
+                    ("codex", Some(0), true, Some(0), false),
+                    ("codex", Some(2), false, Some(0), false),
+                    ("codex", None, false, Some(0), false),
+                ] {
+                    let mut state = DashboardState {
+                        tab,
+                        grouped: true,
+                        range: Range::All,
+                        ..Default::default()
+                    };
+                    let mut v = view(&mut state);
+                    let mut group = v
+                        .groups
+                        .iter()
+                        .find(|g| g.provider == "codex")
+                        .unwrap()
+                        .clone();
+                    let mut tile = v.usage.iter().find(|t| t.id == group.id).unwrap().clone();
+                    let id = group.id.clone();
+                    let windows = remaining
+                        .map(|remaining_pct| m::AccountUsageWindow {
+                            label: "synthetic actual window".into(),
+                            remaining: format!("{remaining_pct}%"),
+                            reset: "synthetic reset".into(),
+                            remaining_pct,
+                        })
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    group.provider = provider.into();
+                    tile.provider = provider.into();
+                    group.windows = windows.clone();
+                    tile.windows = windows;
+                    group.reset_credit_count = count;
+                    tile.reset_credit_count = count;
+                    group.reset_credit_allowed = allowed;
+                    tile.reset_credit_allowed = allowed;
+                    // Stale/count-only inventories may enter the refresh flow: the
+                    // old display-only can_use flag must not gate this entry point.
+                    group.reset_credits.can_use = false;
+                    tile.reset_credits.can_use = false;
+                    group.reset_credits.text = "synthetic quiet reset inventory".into();
+                    group.reset_credits.tooltip = group.reset_credits.text.clone();
+                    tile.reset_credits = group.reset_credits.clone();
+                    group.rows.clear();
+                    group.collapsed = false;
+                    v.groups = vec![group];
+                    v.usage = vec![tile];
+                    v.provider_usage.clear();
+                    v.excluded_rows.clear();
+                    for size in [[1024., 960.], [1320., 960.]] {
+                        let scene = Scene::build(&v, &state, size, &Metrics::default());
+                        let actions: Vec<_> = scene
+                            .accessibility
+                            .iter()
+                            .filter(|node| {
+                                node.target == Some(Target::OpenTrayResetCredits(id.clone()))
+                            })
+                            .collect();
+                        assert_eq!(
+                            actions.len(),
+                            usize::from(expected),
+                            "{tab:?} {provider} {count:?} {allowed} {remaining:?}"
+                        );
+                        if let Some(action) = actions.first() {
+                            let label = match count {
+                                Some(count) => crate::i18n::format(
+                                    "리셋권으로 지금 초기화 ({0}개 남음)",
+                                    &[count.to_string()],
+                                ),
+                                None => crate::i18n::static_text("리셋권으로 지금 초기화").into(),
+                            };
+                            assert_eq!(action.name, label);
+                            assert_eq!(action.role, Role::Button);
+                            assert!(action.rect.left >= 0. && action.rect.right <= size[0]);
+                            assert_eq!(
+                                scene
+                                    .targets
+                                    .iter()
+                                    .filter(|hit| hit.target
+                                        == Target::OpenTrayResetCredits(id.clone()))
+                                    .count(),
+                                1
+                            );
+                        }
+                        let reset_lines: Vec<_> = scene
+                            .accessibility
+                            .iter()
+                            .filter(|node| {
+                                node.role == Role::Text && node.key.contains("reset-credits")
+                            })
+                            .collect();
+                        assert_eq!(reset_lines.len(), usize::from(provider == "codex"));
+                        if provider == "claude" {
+                            assert!(!scene.draw.iter().any(|draw| matches!(draw, Draw::Text { measure, .. } if measure.text == "synthetic quiet reset inventory")));
+                        }
+                        assert!(!scene.accessibility.iter().any(|node| {
+                            node.key.contains(":reset-credits:control:OpenTrayAccount")
+                        }));
+                        assert!(scene.accessibility.len() <= history::SCENE_NODE_BUDGET);
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn r27_reset_card_height_and_node_reservation_follow_only_visible_reset_geometry() {
+    for tab in [Tab::Overview, Tab::Usage] {
+        let mut state = DashboardState {
+            tab,
+            grouped: true,
+            range: Range::All,
+            ..Default::default()
+        };
+        let mut v = view(&mut state);
+        let mut group = v
+            .groups
+            .iter()
+            .find(|g| g.provider == "codex")
+            .unwrap()
+            .clone();
+        let mut tile = v.usage.iter().find(|t| t.id == group.id).unwrap().clone();
+        group.rows.clear();
+        group.collapsed = false;
+        group.windows = vec![
+            m::AccountUsageWindow {
+                label: "primary".into(),
+                remaining: "50%".into(),
+                reset: "later".into(),
+                remaining_pct: 50,
+            },
+            m::AccountUsageWindow {
+                label: "secondary".into(),
+                remaining: "50%".into(),
+                reset: "later".into(),
+                remaining_pct: 50,
+            },
+        ];
+        tile.windows = group.windows.clone();
+        group.reset_credits.text = "quiet inventory".into();
+        group.reset_credits.tooltip = group.reset_credits.text.clone();
+        tile.reset_credits = group.reset_credits.clone();
+        group.reset_credit_count = Some(2);
+        tile.reset_credit_count = Some(2);
+        group.reset_credit_allowed = true;
+        tile.reset_credit_allowed = true;
+        v.groups = vec![group];
+        v.usage = vec![tile];
+        v.provider_usage.clear();
+        v.excluded_rows.clear();
+        let metrics = Metrics::default();
+        let build = |v: &m::DashboardView| Scene::build(v, &state, [1320., 1600.], &metrics);
+        let card_height = |scene: &Scene| {
+            scene
+                .draw
+                .iter()
+                .find_map(|draw| match draw {
+                    Draw::Stroke {
+                        rect,
+                        color: Color::GroupBorder,
+                        radius,
+                        ..
+                    } if *radius == 6. => Some(height(*rect)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        v.groups[0].provider = "claude".into();
+        v.usage[0].provider = "claude".into();
+        let claude = build(&v);
+        // Even a nonempty unsupported display model reserves no reset space.
+        v.groups[0].reset_credits.text.clear();
+        v.usage[0].reset_credits.text.clear();
+        let empty_claude = build(&v);
+        assert_eq!(card_height(&claude), card_height(&empty_claude));
+        assert_eq!(claude.accessibility.len(), empty_claude.accessibility.len());
+        v.groups[0].provider = "codex".into();
+        v.usage[0].provider = "codex".into();
+        v.groups[0].reset_credits.text = "quiet inventory".into();
+        v.usage[0].reset_credits.text = "quiet inventory".into();
+        let quiet = build(&v);
+        assert!(card_height(&quiet) > card_height(&claude));
+        assert_eq!(quiet.accessibility.len(), claude.accessibility.len() + 1);
+        // Exhausting a secondary actual window must offer the same single CTA.
+        v.groups[0].windows[1].remaining_pct = 0;
+        v.usage[0].windows[1].remaining_pct = 0;
+        let limited = build(&v);
+        assert_eq!(card_height(&limited), card_height(&quiet) + 28.);
+        assert_eq!(limited.accessibility.len(), quiet.accessibility.len() + 1);
+        assert_eq!(
+            limited
+                .accessibility
+                .iter()
+                .filter(|node| matches!(node.target, Some(Target::OpenTrayResetCredits(_))))
+                .count(),
+            1
+        );
+        v.groups[0].reset_credit_count = Some(0);
+        v.usage[0].reset_credit_count = Some(0);
+        let zero = build(&v);
+        assert_eq!(card_height(&zero), card_height(&quiet));
+        assert_eq!(zero.accessibility.len(), quiet.accessibility.len());
     }
 }

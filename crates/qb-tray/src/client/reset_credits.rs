@@ -1,12 +1,11 @@
 //! Reset-credit transport and pure consent state. No retries, remembered consent or profile I/O.
 use super::{AdminClient, ClientError};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use qb_proto::reset_credit_action::{
     ResetCreditCommitRequest, ResetCreditOutcome, ResetCreditPreview, ResetCreditResult,
 };
 use qb_proto::reset_credits::{
-    ResetCreditExpiry, ResetCreditInventory, ResetCreditRefusal, ResetCreditState,
-    ResetCreditStatus, ResetCreditType,
+    ResetCreditExpiry, ResetCreditInventory, ResetCreditState, ResetCreditStatus, ResetCreditType,
 };
 use std::collections::BTreeMap;
 
@@ -22,8 +21,75 @@ pub struct InventoryLine {
 }
 
 pub fn expiry(value: &ResetCreditExpiry) -> String {
+    expiry_at(value, &Local::now())
+}
+
+/// The explicit clock also supplies the display timezone (FixedOffset in tests).
+fn display_time<Tz: TimeZone>(value: &str, now: &DateTime<Tz>) -> Option<String> {
+    let at = DateTime::parse_from_rfc3339(value).ok()?;
+    let local = at.with_timezone(&now.timezone());
+    let stamp = local
+        .naive_local()
+        .format(if local.year() == now.year() {
+            "%m/%d %H:%M"
+        } else {
+            "%Y/%m/%d %H:%M"
+        })
+        .to_string();
+    let seconds = at
+        .signed_duration_since(now.with_timezone(&Utc))
+        .num_seconds();
+    let magnitude = seconds.unsigned_abs();
+    let hint = if magnitude >= 86_400 {
+        if magnitude < 172_800 {
+            text(if seconds > 0 { "1일 후" } else { "1일 전" })
+        } else {
+            qb_tray::i18n::format(
+                if seconds > 0 {
+                    "{0}일 후"
+                } else {
+                    "{0}일 전"
+                },
+                &[(magnitude / 86_400).to_string()],
+            )
+        }
+    } else if magnitude >= 3_600 {
+        if magnitude < 7_200 {
+            text(if seconds > 0 {
+                "1시간 후"
+            } else {
+                "1시간 전"
+            })
+        } else {
+            qb_tray::i18n::format(
+                if seconds > 0 {
+                    "{0}시간 후"
+                } else {
+                    "{0}시간 전"
+                },
+                &[(magnitude / 3_600).to_string()],
+            )
+        }
+    } else if magnitude >= 60 {
+        qb_tray::i18n::format(
+            if seconds > 0 {
+                "{0}분 후"
+            } else {
+                "{0}분 전"
+            },
+            &[(magnitude / 60).to_string()],
+        )
+    } else {
+        text(if seconds > 0 { "1분 이내" } else { "방금" })
+    };
+    Some(format!("{stamp} ({hint})"))
+}
+
+fn expiry_at<Tz: TimeZone>(value: &ResetCreditExpiry, now: &DateTime<Tz>) -> String {
     match value {
-        ResetCreditExpiry::At { at } => at.clone(),
+        ResetCreditExpiry::At { at } => {
+            display_time(at, now).unwrap_or_else(|| text("만료 확인 전"))
+        }
         ResetCreditExpiry::Never => text("만료 없음"),
         ResetCreditExpiry::Unknown => text("만료 확인 전"),
     }
@@ -35,17 +101,25 @@ pub fn inventory_line(
     inventory: Option<&ResetCreditInventory>,
     now: DateTime<Utc>,
 ) -> InventoryLine {
+    inventory_line_at(provider, inventory, &now.with_timezone(&Local))
+}
+
+fn inventory_line_at<Tz: TimeZone>(
+    provider: &str,
+    inventory: Option<&ResetCreditInventory>,
+    now: &DateTime<Tz>,
+) -> InventoryLine {
     let mut line = InventoryLine {
-        text: text("리셋권 · 확인 전"),
+        text: text("리셋권 확인 전"),
         tooltip: format!(
             "{}\n{}",
-            text("리셋권 · 확인 전"),
-            text("리셋권을 새로고침해 주세요.")
+            text("리셋권 확인 전"),
+            text("리셋권 사용을 열어 확인해 주세요.")
         ),
         can_use: false,
     };
     if provider != "codex" || inventory.is_some_and(|i| i.state == ResetCreditState::Unsupported) {
-        line.text = text("리셋권 · 지원 안 함");
+        line.text.clear();
         line.tooltip = line.text.clone();
         return line;
     }
@@ -53,33 +127,28 @@ pub fn inventory_line(
     let observed = i
         .observed_at
         .as_deref()
-        .unwrap_or(qb_tray::i18n::static_text("확인 전"));
-    let choice = qb_core::reset_credit_display_choice(i, now);
+        .and_then(|at| display_time(at, now))
+        .unwrap_or_else(|| text("확인 전"));
+    let choice = qb_core::reset_credit_display_choice(i, now.with_timezone(&Utc));
     let reported = i
         .available_count
         .map_or_else(|| "?".into(), |n| n.to_string());
-    line.text = if matches!(&choice, Err(ResetCreditRefusal::Stale)) {
-        qb_tray::i18n::format("리셋권 · 오래된 정보 · 제공자 보고 {0}", &[reported])
-    } else if i.state == ResetCreditState::Unknown {
-        text("리셋권 · 확인 전")
-    } else if matches!(&choice, Err(ResetCreditRefusal::NoCredits))
-        && i.available_count == Some(0)
-        && matches!(i.refusal, None | Some(ResetCreditRefusal::NoCredits))
-    {
-        text("리셋권 0개")
-    } else if let Ok(grant) = &choice
-        && i.refusal.is_none()
-    {
-        line.can_use = true;
-        qb_tray::i18n::format(
-            "리셋권 {0}개 · 가장 빠른 만료 {1}",
-            &[reported, expiry(&grant.expires_at)],
-        )
-    } else {
-        qb_tray::i18n::format(
-            "리셋권 · 제공자 보고 {0} · 상세·만료 확인 필요",
-            &[reported],
-        )
+    line.can_use = choice.is_ok() && i.refusal.is_none();
+    line.text = match i.available_count {
+        Some(0) => text("리셋권 없음"),
+        Some(_) if line.can_use => {
+            let grant = choice.as_ref().expect("core proved the complete choice");
+            if grant.expires_at == ResetCreditExpiry::Never {
+                qb_tray::i18n::format("리셋권 {0}개 · 만료 없음", &[reported])
+            } else {
+                qb_tray::i18n::format(
+                    "리셋권 {0}개 · 가장 빠른 만료 {1}",
+                    &[reported, expiry_at(&grant.expires_at, now)],
+                )
+            }
+        }
+        Some(_) => qb_tray::i18n::format("리셋권 {0}개", &[reported]),
+        None => text("리셋권 확인 전"),
     };
     let reason = i
         .refusal
@@ -89,13 +158,13 @@ pub fn inventory_line(
     line.tooltip = format!(
         "{}\n{}\n{}",
         line.text,
-        qb_tray::i18n::format("확인 시각 {0}", &[observed.into()]),
+        qb_tray::i18n::format("확인 시각 {0}", &[observed]),
         reason
     );
     for grant in &i.grants {
         line.tooltip.push_str(&format!(
             "\n{}",
-            qb_tray::i18n::format("기록된 만료 {0}", &[expiry(&grant.expires_at)])
+            qb_tray::i18n::format("리셋권: {0}", &[expiry_at(&grant.expires_at, now)])
         ));
     }
     line
@@ -115,7 +184,8 @@ fn refusal_text(r: qb_proto::reset_credits::ResetCreditRefusal) -> String {
     })
 }
 
-pub const UNKNOWN: &str = "사용 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.";
+pub const UNKNOWN: &str =
+    "사용 결과를 확인하지 못했습니다. 리셋권이 이미 사용됐을 수 있으니 다시 확인해 주세요.";
 pub const STALE: &str = "리셋권 정보가 변경되었거나 만료되었습니다. 새 미리보기를 열어 주세요.";
 #[derive(Debug, thiserror::Error)]
 pub enum ActionError {
@@ -265,15 +335,44 @@ impl AdminClient {
 }
 
 pub fn preview_body(p: &ResetCreditPreview) -> String {
-    qb_tray::i18n::format(
-        "{0}\n{1}\n만료 {2}\n영향: 해당되는 Codex 한도\n만료가 가장 빠른 리셋권 1개를 사용합니다.\n확인 유효 시각 {3}",
-        &[
-            format!("{} ({})", p.label, p.account),
-            p.email.clone(),
-            expiry(&p.grant.expires_at),
-            p.expires_at.clone(),
-        ],
-    )
+    preview_body_at(p, &Local::now())
+}
+
+fn preview_body_at<Tz: TimeZone>(p: &ResetCreditPreview, now: &DateTime<Tz>) -> String {
+    // The host attaches the plan, which is not present in this DTO.
+    let mut lines = Vec::new();
+    for identity in [&p.label, &p.email] {
+        if !identity.trim().is_empty() && identity != &p.account && !lines.contains(identity) {
+            lines.push(identity.clone());
+        }
+    }
+    if lines.is_empty() {
+        lines.push(text("Codex 계정"));
+    }
+    lines.push(match &p.grant.expires_at {
+        ResetCreditExpiry::At { at } if display_time(at, now).is_some() => qb_tray::i18n::format(
+            "만료가 가장 빠른 리셋권({0} 만료)을 사용합니다.",
+            &[expiry_at(&p.grant.expires_at, now)],
+        ),
+        ResetCreditExpiry::Never => text("만료가 없는 리셋권 1개를 사용합니다."),
+        ResetCreditExpiry::At { .. } | ResetCreditExpiry::Unknown => {
+            text("리셋권 만료를 확인하지 못했습니다.")
+        }
+    });
+    lines.push(text(
+        if p.grant.reset_type == ResetCreditType::CodexRateLimits {
+            "이 계정의 Codex 사용 한도가 초기화됩니다."
+        } else {
+            "초기화할 사용 한도를 확인하지 못했습니다."
+        },
+    ));
+    lines.push(
+        match p.inventory.available_count.and_then(|n| n.checked_sub(1)) {
+            Some(n) => qb_tray::i18n::format("사용 후 남는 리셋권: {0}개", &[n.to_string()]),
+            None => text("사용 후 남는 리셋권: 확인 전"),
+        },
+    );
+    lines.join("\n")
 }
 
 /// One open dialog shared by both entry points. A cancelled generation cannot reopen.
@@ -284,11 +383,56 @@ pub struct Consent {
     pub busy: bool,
     pub messages: BTreeMap<String, &'static str>,
     pub unknown: BTreeMap<String, String>,
+    pub inventories: BTreeMap<String, ResetCreditInventory>,
+    pub terminal: bool,
+    pub success_limits: bool,
+    pub sending: bool,
+    pub detail_unavailable: bool,
     generation: u64,
 }
 impl Consent {
-    pub fn begin(&mut self, id: &str, refresh: bool) -> Option<u64> {
-        if self.busy || (!refresh && self.unknown.contains_key(id)) {
+    pub fn project_inventory(&self, input: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) else {
+            return input.into();
+        };
+        if let Some(accounts) = value.get_mut("accounts").and_then(|v| v.as_array_mut()) {
+            for account in accounts {
+                let Some(id) = account.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(inventory) = self.inventories.get(id) else {
+                    continue;
+                };
+                let cached = inventory
+                    .observed_at
+                    .as_deref()
+                    .and_then(|v| DateTime::parse_from_rfc3339(v).ok());
+                let polled = account
+                    .get("reset_credits")
+                    .and_then(|v| v.get("observed_at"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| DateTime::parse_from_rfc3339(v).ok());
+                if cached.is_some() && (polled.is_none() || cached >= polled) {
+                    account["reset_credits"] =
+                        serde_json::to_value(inventory).expect("typed inventory serializes");
+                }
+            }
+        }
+        value.to_string()
+    }
+    pub fn operation(&self) -> u64 {
+        self.generation
+    }
+    pub fn publish_limits(&mut self, id: &str, operation: u64, successful: bool) -> bool {
+        if self.account.as_deref() == Some(id) && self.generation == operation && self.terminal {
+            self.success_limits = successful;
+            true
+        } else {
+            false
+        }
+    }
+    pub fn begin(&mut self, id: &str, _refresh: bool) -> Option<u64> {
+        if self.busy {
             return None;
         }
         self.generation = self.generation.checked_add(1)?;
@@ -296,6 +440,10 @@ impl Consent {
         self.preview = None;
         self.busy = true;
         self.messages.remove(id);
+        self.terminal = false;
+        self.success_limits = false;
+        self.sending = false;
+        self.detail_unavailable = false;
         Some(self.generation)
     }
     pub fn ready(&mut self, generation: u64, p: ResetCreditPreview, now: DateTime<Utc>) -> bool {
@@ -321,6 +469,8 @@ impl Consent {
             self.messages.insert(p.account, STALE);
             return false;
         }
+        self.inventories
+            .insert(p.account.clone(), p.inventory.clone());
         self.preview = Some(p);
         true
     }
@@ -339,6 +489,7 @@ impl Consent {
             return None;
         }
         self.busy = true;
+        self.sending = true;
         // Fence immediately, including if the worker fails after dispatch.
         self.unknown.insert(id.into(), p.grant.id);
         Some(ResetCreditCommitRequest {
@@ -355,6 +506,7 @@ impl Consent {
         }
     }
     pub fn reconciled(&mut self, id: &str, inventory: &ResetCreditInventory) {
+        self.inventories.insert(id.into(), inventory.clone());
         // Core's durable fence remains authoritative; no UI inference can bypass it.
         if inventory.state == ResetCreditState::Fresh
             && matches!(
@@ -378,6 +530,12 @@ impl Consent {
     pub fn result(&mut self, id: &str, result: &Result<ResetCreditResult, ActionError>) {
         self.busy = false;
         self.preview = None;
+        self.terminal = true;
+        self.sending = false;
+        self.success_limits = false; // Result DTO has inventory, not refreshed usage windows.
+        if let Ok(r) = result {
+            self.inventories.insert(id.into(), r.inventory.clone());
+        }
         let message = match result {
             Ok(r) if r.outcome == ResetCreditOutcome::Unknown => UNKNOWN,
             Err(ActionError::Stale) => {
@@ -445,7 +603,7 @@ mod tests {
         }
     }
     #[test]
-    fn unknown_unsupported_zero_stale_and_partial_are_distinct_in_both_languages() {
+    fn quiet_counts_zero_unknown_and_hidden_unsupported_in_both_languages() {
         for language in [qb_tray::i18n::UiLanguage::Ko, qb_tray::i18n::UiLanguage::En] {
             qb_tray::i18n::with_language(language, || {
                 let unknown = inventory_line("codex", None, now());
@@ -456,20 +614,30 @@ mod tests {
                 i.refusal = Some(ResetCreditRefusal::NoCredits);
                 let zero = inventory_line("codex", Some(&i), now());
                 i.state = ResetCreditState::Stale;
+                i.refusal = None;
                 let stale = inventory_line("codex", Some(&i), now());
                 i.state = ResetCreditState::Fresh;
                 i.available_count = Some(7);
                 i.refusal = Some(ResetCreditRefusal::Incomplete);
                 let partial = inventory_line("codex", Some(&i), now());
-                let lines = [&unknown, &unsupported, &zero, &stale, &partial];
-                for (a, line) in lines.iter().enumerate() {
+                for line in [&unknown, &unsupported, &zero, &stale, &partial] {
                     assert!(!line.can_use);
-                    for other in lines.iter().skip(a + 1) {
-                        assert_ne!(line.text, other.text);
-                    }
                 }
-                assert!(partial.text.contains('7'));
-                assert!(!partial.text.contains("earliest") && !partial.text.contains("가장 빠른"));
+                assert_eq!(unknown.text, text("리셋권 확인 전"));
+                assert!(unsupported.text.is_empty() && unsupported.tooltip.is_empty());
+                assert_eq!(zero.text, text("리셋권 없음"));
+                assert_eq!(stale.text, zero.text);
+                assert_ne!(stale.tooltip, zero.tooltip);
+                assert_eq!(
+                    partial.text,
+                    qb_tray::i18n::format("리셋권 {0}개", &["7".into()])
+                );
+                i.refusal = None;
+                let count_only = inventory_line("codex", Some(&i), now());
+                assert_eq!(count_only.text, partial.text);
+                assert!(!count_only.can_use);
+                i.available_count = None;
+                assert_eq!(inventory_line("codex", Some(&i), now()).text, unknown.text);
             });
         }
     }
@@ -550,10 +718,136 @@ mod tests {
                 },
             ),
         ]);
-        let line = inventory_line("codex", Some(&i), now());
+        let local_now = now().with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap());
+        let line = inventory_line_at("codex", Some(&i), &local_now);
         assert!(line.can_use);
-        assert!(line.text.contains("2026-11-09T00:00:00+09:00"));
-        assert!(line.tooltip.contains("2026-11-07T10:00:00+00:00"));
+        assert!(line.text.contains("11/09 00:00"));
+        assert!(line.tooltip.contains("11/07 19:00"));
+        assert!(!line.text.contains("2026") && !line.tooltip.contains("T10:00"));
+    }
+    #[test]
+    fn fixed_offset_clock_formats_local_dates_relative_hints_and_local_years() {
+        let clock = DateTime::parse_from_rfc3339("2026-11-07T19:00:00+09:00").unwrap();
+        for language in [qb_tray::i18n::UiLanguage::Ko, qb_tray::i18n::UiLanguage::En] {
+            qb_tray::i18n::with_language(language, || {
+                for (raw, stamp, ko_hint, en_hint) in [
+                    (
+                        "2026-11-28T10:00:00Z",
+                        "11/28 19:00",
+                        "21일 후",
+                        "in 21 days",
+                    ),
+                    (
+                        "2026-11-07T13:00:00.1234567Z",
+                        "11/07 22:00",
+                        "3시간 후",
+                        "in 3 hours",
+                    ),
+                    (
+                        "2026-11-07T09:00:00Z",
+                        "11/07 18:00",
+                        "1시간 전",
+                        "1 hour ago",
+                    ),
+                    ("2026-11-08T10:00:00Z", "11/08 19:00", "1일 후", "in 1 day"),
+                    (
+                        "2026-11-07T10:17:00Z",
+                        "11/07 19:17",
+                        "17분 후",
+                        "in 17 min",
+                    ),
+                    (
+                        "2026-11-07T10:00:30Z",
+                        "11/07 19:00",
+                        "1분 이내",
+                        "in under 1 min",
+                    ),
+                    ("2026-11-07T10:00:00Z", "11/07 19:00", "방금", "Just now"),
+                ] {
+                    let hint = if language == qb_tray::i18n::UiLanguage::Ko {
+                        ko_hint
+                    } else {
+                        en_hint
+                    };
+                    assert_eq!(
+                        display_time(raw, &clock).unwrap(),
+                        format!("{stamp} ({hint})")
+                    );
+                }
+                assert!(
+                    display_time("2027-01-01T00:00:00Z", &clock)
+                        .unwrap()
+                        .starts_with("2027/01/01 09:00")
+                );
+                let west = DateTime::parse_from_rfc3339("2026-12-31T18:00:00-05:00").unwrap();
+                let stamp = display_time("2027-01-01T01:00:00Z", &west).unwrap();
+                assert!(stamp.starts_with("12/31 20:00"));
+                assert!(!stamp.contains("2027"));
+                let east = DateTime::parse_from_rfc3339("2027-01-01T01:00:00+09:00").unwrap();
+                assert!(
+                    display_time("2026-12-31T10:00:00Z", &east)
+                        .unwrap()
+                        .starts_with("2026/12/31 19:00")
+                );
+                assert!(display_time("bad-provider-date", &clock).is_none());
+                assert_eq!(
+                    expiry_at(
+                        &ResetCreditExpiry::At {
+                            at: "bad-provider-date".into()
+                        },
+                        &clock
+                    ),
+                    text("만료 확인 전")
+                );
+            });
+        }
+    }
+    #[test]
+    fn rendered_reset_credit_copy_never_exposes_wire_dates_or_identifiers() {
+        let clock = DateTime::parse_from_rfc3339("2026-11-07T19:00:00+09:00").unwrap();
+        for language in [qb_tray::i18n::UiLanguage::Ko, qb_tray::i18n::UiLanguage::En] {
+            qb_tray::i18n::with_language(language, || {
+                for value in [
+                    ResetCreditExpiry::Never,
+                    ResetCreditExpiry::Unknown,
+                    ResetCreditExpiry::At {
+                        at: "2026-11-08T10:00:00.123456700+00:00".into(),
+                    },
+                    ResetCreditExpiry::At {
+                        at: "invalid-wire-date".into(),
+                    },
+                ] {
+                    let mut p = preview();
+                    p.account = "cx-internal-account".into();
+                    p.grant.id = "grant-internal-secret".into();
+                    p.grant.expires_at = value.clone();
+                    p.inventory.grants[0] = p.grant.clone();
+                    let line = inventory_line_at("codex", Some(&p.inventory), &clock);
+                    for rendered in [
+                        line.text,
+                        line.tooltip,
+                        preview_body_at(&p, &clock),
+                        expiry_at(&value, &clock),
+                    ] {
+                        assert!(!rendered.contains(&p.account));
+                        assert!(!rendered.contains(&p.grant.id));
+                        assert!(!rendered.contains(&p.expires_at));
+                        assert!(!rendered.contains("invalid-wire-date"));
+                        assert!(!rendered.contains("+00:00") && !rendered.contains("+09:00"));
+                        assert!(!rendered.contains(".1234567"));
+                        assert!(!rendered.as_bytes().windows(11).any(|w| {
+                            w[0..4].iter().all(u8::is_ascii_digit)
+                                && w[4] == b'-'
+                                && w[7] == b'-'
+                                && w[10] == b'T'
+                        }));
+                        assert!(
+                            !rendered.contains("만료 만료") && !rendered.contains("expiry Never")
+                        );
+                    }
+                }
+            });
+        }
     }
     #[test]
     fn cancellation_late_preview_wrong_account_and_every_new_confirmation_send_zero() {
@@ -586,7 +880,14 @@ mod tests {
         assert!(c.begin("a", false).is_none());
         c.result("a", &Err(ActionError::Unknown));
         assert_eq!(c.messages.get("a"), Some(&UNKNOWN));
-        assert!(c.begin("a", false).is_none());
+        let read_generation = c
+            .begin("a", false)
+            .expect("Unknown permits read-only checking");
+        assert!(
+            c.confirm("a", now()).is_none(),
+            "read-only entry keeps the Unknown fence"
+        );
+        c.finish_read("a", read_generation, None);
         assert!(c.begin("a", true).is_some());
         c.reconciled("a", &ResetCreditInventory::default());
         assert!(c.unknown.contains_key("a"));
@@ -647,28 +948,103 @@ mod tests {
         ));
     }
     #[test]
-    fn preview_copy_has_identity_exact_expiry_and_only_evidenced_effect_in_both_languages() {
+    fn preview_copy_has_user_identity_plain_effect_remaining_count_and_no_internal_metadata() {
         for language in [qb_tray::i18n::UiLanguage::Ko, qb_tray::i18n::UiLanguage::En] {
             qb_tray::i18n::with_language(language, || {
                 let mut p = preview();
                 p.account = "cx-synthetic-selected".into();
-                let body = preview_body(&p);
-                assert!(
-                    body.contains(&p.label)
-                        && body.contains(&p.account)
-                        && body.contains(&p.email)
-                        && body.contains(&p.expires_at)
-                );
-                assert!(body.contains(&expiry(&p.grant.expires_at)));
+                p.grant.expires_at = ResetCreditExpiry::At {
+                    at: "2026-11-08T10:00:00.1234567Z".into(),
+                };
+                p.inventory.available_count = Some(2);
+                let local_now =
+                    now().with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap());
+                let body = preview_body_at(&p, &local_now);
+                assert!(body.contains(&p.label) && body.contains(&p.email));
+                assert!(body.contains("11/08 19:00"));
+                assert!(body.contains(&text("이 계정의 Codex 사용 한도가 초기화됩니다.")));
+                assert!(body.contains(&qb_tray::i18n::format(
+                    "사용 후 남는 리셋권: {0}개",
+                    &["1".into()]
+                )));
                 assert!(
                     !body.contains("5h")
                         && !body.contains("7d")
                         && !body.contains(&p.preview_token)
+                        && !body.contains(&p.account)
+                        && !body.contains(&p.expires_at)
+                        && !body.contains("2026-")
+                        && !body.contains("valid until")
+                        && !body.contains("유효 시각")
                 );
-                if language == qb_tray::i18n::UiLanguage::En {
-                    assert!(body.contains("eligible Codex limits"));
-                }
+                p.grant.reset_type = ResetCreditType::Unknown;
+                p.inventory.available_count = None;
+                let body = preview_body_at(&p, &local_now);
+                assert!(!body.contains(&text("이 계정의 Codex 사용 한도가 초기화됩니다.")));
+                assert!(body.contains(&text("사용 후 남는 리셋권: 확인 전")));
+                p.label = p.account.clone();
+                p.email.clear();
+                p.inventory.available_count = Some(0);
+                let body = preview_body_at(&p, &local_now);
+                assert!(!body.contains(&p.account));
+                assert!(body.starts_with(&text("Codex 계정")));
+                assert!(body.contains(&text("사용 후 남는 리셋권: 확인 전")));
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod r27_projection_tests {
+    use super::*;
+    use qb_proto::reset_credits::ResetCreditRefusal;
+    #[test]
+    fn r27_result_limits_wait_for_same_operation_dashboard_publication() {
+        let mut consent = Consent::default();
+        let operation = consent.begin("cx-a", false).unwrap();
+        consent.result(
+            "cx-a",
+            &Ok(ResetCreditResult {
+                account: "cx-a".into(),
+                outcome: ResetCreditOutcome::Reset,
+                inventory: ResetCreditInventory::default(),
+                refresh_failed: false,
+            }),
+        );
+        assert!(
+            !consent.success_limits,
+            "commit DTO contains no usage windows"
+        );
+        assert!(!consent.publish_limits("cx-b", operation, true));
+        assert!(consent.publish_limits("cx-a", operation, true));
+        assert!(consent.success_limits);
+        let replacement = consent.begin("cx-a", true).unwrap();
+        assert_ne!(operation, replacement);
+        assert!(!consent.publish_limits("cx-a", operation, true));
+        assert!(!consent.success_limits);
+        consent.cancel();
+        assert!(!consent.publish_limits("cx-a", replacement, true));
+    }
+    #[test]
+    fn r27_refresh_inventory_immediately_reprojects_menu_and_preserves_other_accounts() {
+        let inventory = ResetCreditInventory {
+            state: ResetCreditState::Fresh,
+            observed_at: Some("2026-11-09T00:00:01Z".into()),
+            available_count: Some(2),
+            grants: vec![],
+            refusal: Some(ResetCreditRefusal::Incomplete),
+        };
+        let mut consent = Consent::default();
+        consent.reconciled("cx-a", &inventory);
+        let input = r#"{"accounts":[{"id":"cx-a","provider":"codex","reset_credits":{"state":"stale","observed_at":"2026-11-09T00:00:00Z","available_count":1,"grants":[],"refusal":"stale"}},{"id":"cx-b","provider":"codex"}]}"#;
+        let output: serde_json::Value =
+            serde_json::from_str(&consent.project_inventory(input)).unwrap();
+        assert_eq!(output["accounts"][0]["reset_credits"]["available_count"], 2);
+        assert_eq!(output["accounts"][0]["reset_credits"]["state"], "fresh");
+        assert!(output["accounts"][1].get("reset_credits").is_none());
+        let newer = input.replace("00:00:00Z", "00:00:02Z");
+        let output: serde_json::Value =
+            serde_json::from_str(&consent.project_inventory(&newer)).unwrap();
+        assert_eq!(output["accounts"][0]["reset_credits"]["available_count"], 1);
     }
 }

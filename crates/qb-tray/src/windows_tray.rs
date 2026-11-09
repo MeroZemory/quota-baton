@@ -556,14 +556,18 @@ fn admission_error() {
 
 fn projected() -> v2::View {
     let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
-    v2::project(
-        rows.first()
-            .and_then(|r| r.view_input.as_deref())
-            .unwrap_or("{\"accounts\":[]}"),
-        SystemTime::now(),
-    )
-    .expect("published state was parsed before publication")
+    let input = rows
+        .first()
+        .and_then(|r| r.view_input.as_deref())
+        .unwrap_or("{\"accounts\":[]}");
+    let input = session()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reset_credits
+        .project_inventory(input);
+    v2::project(&input, SystemTime::now()).expect("published state was parsed before publication")
 }
+
 fn overlay(state: Option<&str>) -> Overlay {
     match state {
         Some("codex-login") => Overlay::CodexLogin(
@@ -655,17 +659,50 @@ fn presentation(
     }
     if let Some(id) = state.and_then(|s| s.strip_prefix("reset-credits:")) {
         let consent = &session.reset_credits;
-        let body = if consent.busy {
-            i18n::static_text(if consent.unknown.contains_key(id) {
+        let mut body = if consent.busy {
+            i18n::static_text(if consent.sending {
                 "리셋권 사용 중…"
             } else {
                 "리셋권 확인 중…"
             })
             .into()
         } else if let Some(preview) = &consent.preview {
-            qb_tray::client::reset_credits::preview_body(preview)
+            let body = qb_tray::client::reset_credits::preview_body(preview);
+            row_view(view, id)
+                .and_then(|row| row.plan.as_deref())
+                .map_or(body.clone(), |plan| format!("{plan}\n{body}"))
+        } else if consent.detail_unavailable {
+            row_view(view, id)
+                .map(|row| {
+                    qb_tray::client::reset_credits::inventory_line(
+                        &row.raw.provider,
+                        row.raw.reset_credits.as_ref(),
+                        chrono::Utc::now(),
+                    )
+                    .tooltip
+                })
+                .unwrap_or_default()
         } else if let Some(message) = consent.messages.get(id) {
-            i18n::static_text(message).into()
+            let mut text = i18n::static_text(message).to_owned();
+            if consent.success_limits
+                && let Some(row) = row_view(view, id)
+            {
+                let limits: Vec<_> = row
+                    .windows
+                    .iter()
+                    .filter(|w| w.account_scoped)
+                    .filter_map(|w| {
+                        w.remaining.map(|n| {
+                            i18n::format("{0} {1}% 남음", &[w.label.clone(), n.to_string()])
+                        })
+                    })
+                    .collect();
+                if !limits.is_empty() {
+                    text.push('\n');
+                    text.push_str(&limits.join(" · "));
+                }
+            }
+            text
         } else {
             row_view(view, id).map_or_else(String::new, |row| {
                 qb_tray::client::reset_credits::inventory_line(
@@ -676,14 +713,32 @@ fn presentation(
                 .tooltip
             })
         };
-        active_overlay = Overlay::ResetCredits {
-            id: id.into(),
-            body,
-            ready: row_view(view, id)
-                .is_some_and(|row| v2::reset_credit_account_refusal(&row.raw).is_none())
-                && consent.preview.as_ref().is_some_and(|p| p.account == id)
-                && !consent.busy
-                && !consent.unknown.contains_key(id),
+        let refusal = if !core_ok {
+            Some(i18n::static_text("코어에 연결할 수 없습니다"))
+        } else {
+            row_view(view, id).and_then(|row| v2::reset_credit_account_refusal(&row.raw))
+        };
+        if let Some(reason) = refusal {
+            body.push('\n');
+            body.push_str(reason);
+        }
+        let ready = row_view(view, id)
+            .is_some_and(|row| v2::reset_credit_account_refusal(&row.raw).is_none())
+            && consent.preview.as_ref().is_some_and(|p| p.account == id)
+            && !consent.busy
+            && !consent.unknown.contains_key(id);
+        active_overlay = if consent.preview.is_some() && !consent.terminal && refusal.is_none() {
+            Overlay::ResetCredits {
+                id: id.into(),
+                body,
+                ready,
+            }
+        } else {
+            Overlay::ResetCreditStatus {
+                id: id.into(),
+                body,
+                retry: !consent.busy && (!consent.terminal || consent.unknown.contains_key(id)),
+            }
         };
     }
     let mut p = geometry::Presentation {
@@ -703,6 +758,13 @@ fn presentation(
         popup_offset: INPUT.with(|i| i.borrow().popup_offset),
         ..Default::default()
     };
+    if let Some(id) = state.and_then(|s| s.strip_prefix("reset-credits:"))
+        && (!core_ok
+            || row_view(view, id)
+                .is_some_and(|row| v2::reset_credit_account_refusal(&row.raw).is_some()))
+    {
+        p.pending_ids.insert(id.into());
+    }
     if session.reset_credits.busy
         && let Some(id) = &session.reset_credits.account
     {
@@ -805,6 +867,14 @@ fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
         .any(|h| h.enabled && h.target == HitTarget::CodexLogin(LoginAction::Cancel))
     {
         return Some(HitTarget::CodexLogin(LoginAction::Cancel));
+    }
+    if scene.dialog.as_ref().is_some_and(|d| d.reset_title)
+        && scene
+            .targets
+            .iter()
+            .any(|h| h.enabled && h.target == HitTarget::CancelDialog)
+    {
+        return Some(HitTarget::CancelDialog);
     }
     if scene.targets.iter().any(|h| {
         h.enabled
@@ -1439,6 +1509,17 @@ fn ask_credits(id: &str, origin: ReturnTo) {
         set_view(Some(format!("confirm-credits:{id}")));
     }
 }
+fn reset_facts_changed(handle: isize) {
+    invalidate_model();
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(handle as *mut c_void)),
+            STATE_CHANGED,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
 fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
     let view = projected();
     let Some(row) = row_view(&view, &id) else {
@@ -1466,41 +1547,71 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
         worker.submit(async move {
             use qb_tray::client::reset_credits::ActionError;
             let client = super::client::AdminClient::from_home();
-            if refresh {
-                let result = match &client {
-                    Ok(client) => client.refresh_reset_credits(&id).await,
-                    Err(_) => Err(ActionError::Read(
-                        super::client::ClientError::AccountAction(
-                            "리셋권을 확인하지 못했습니다. 새로고침하세요.",
-                        ),
-                    )),
-                };
+            // One entry always obtains details inside the flow. This is read-only;
+            // an old Unknown fence must be reconciled by core, never by UI inference.
+            let inventory = match &client {
+                Ok(client) => client.refresh_reset_credits(&id).await,
+                Err(_) => Err(ActionError::Read(
+                    super::client::ClientError::AccountAction(
+                        "리셋권을 확인하지 못했습니다. 새로고침하세요.",
+                    ),
+                )),
+            };
+            {
                 let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
-                state
-                    .reset_credits
-                    .finish_read(&id, generation, result.as_ref().err());
-                if let Ok(inventory) = &result {
+                if let Ok(inventory) = &inventory {
                     state.reset_credits.reconciled(&id, inventory);
                 }
-            } else {
-                let result = match &client {
-                    Ok(client) => client.preview_reset_credit(&id).await,
-                    Err(_) => Err(ActionError::Read(
-                        super::client::ClientError::AccountAction(
-                            "리셋권을 확인하지 못했습니다. 새로고침하세요.",
-                        ),
-                    )),
-                };
+            }
+            reset_facts_changed(handle);
+            let result = match (&client, &inventory) {
+                (Ok(client), Ok(inventory))
+                    if qb_tray::client::reset_credits::inventory_line(
+                        "codex",
+                        Some(inventory),
+                        chrono::Utc::now(),
+                    )
+                    .can_use =>
+                {
+                    Some(client.preview_reset_credit(&id).await)
+                }
+                _ => None,
+            };
+            {
                 let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
-                state
-                    .reset_credits
-                    .finish_read(&id, generation, result.as_ref().err());
-                if let Ok(preview) = result {
+                let error = inventory
+                    .as_ref()
+                    .err()
+                    .or_else(|| result.as_ref().and_then(|r| r.as_ref().err()));
+                state.reset_credits.finish_read(&id, generation, error);
+                if inventory
+                    .as_ref()
+                    .is_ok_and(|i| i.available_count == Some(0))
+                {
+                    state
+                        .reset_credits
+                        .messages
+                        .insert(id.clone(), "사용 가능한 리셋권이 없습니다.");
+                    state.reset_credits.terminal = true;
+                }
+                if let Ok(inventory) = &inventory
+                    && inventory.available_count != Some(0)
+                    && !qb_tray::client::reset_credits::inventory_line(
+                        "codex",
+                        Some(inventory),
+                        chrono::Utc::now(),
+                    )
+                    .can_use
+                {
+                    state.reset_credits.detail_unavailable = true;
+                }
+                if let Some(Ok(preview)) = result {
                     state
                         .reset_credits
                         .ready(generation, preview, chrono::Utc::now());
                 }
             }
+            reset_facts_changed(handle);
             if let Ok(client) = client
                 && let Ok(read) = client.read().await
             {
@@ -1540,12 +1651,23 @@ fn confirm_reset_credit(hwnd: HWND, id: String) {
     {
         return;
     }
-    let request = session()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .reset_credits
-        .confirm(&id, chrono::Utc::now());
+    let (request, operation) = {
+        let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
+        let request = state.reset_credits.confirm(&id, chrono::Utc::now());
+        (request, state.reset_credits.operation())
+    };
     let Some(request) = request else {
+        let stale = session()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset_credits
+            .messages
+            .get(&id)
+            .copied()
+            == Some(qb_tray::client::reset_credits::STALE);
+        if stale {
+            dispatch_reset_credit(hwnd, id, true);
+        }
         invalidate_model();
         return;
     };
@@ -1563,11 +1685,29 @@ fn confirm_reset_credit(hwnd: HWND, id: String) {
                 .unwrap_or_else(|e| e.into_inner())
                 .reset_credits
                 .result(&id, &result);
-            if let Ok(client) = client
-                && let Ok(read) = client.read().await
-            {
-                let _ = publish_read(read);
-            }
+            reset_facts_changed(handle);
+            let published = if let Ok(client) = client {
+                if let Ok(read) = client.read().await {
+                    publish_read(read).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let limits_known = published
+                && result.as_ref().is_ok_and(|r| {
+                    matches!(
+                        r.outcome,
+                        qb_proto::reset_credit_action::ResetCreditOutcome::Reset
+                            | qb_proto::reset_credit_action::ResetCreditOutcome::AlreadyRedeemed
+                    ) && !r.refresh_failed
+                });
+            session()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset_credits
+                .publish_limits(&id, operation, limits_known);
             invalidate_model();
             unsafe {
                 let _ = PostMessageW(
@@ -2431,7 +2571,8 @@ fn dashboard_handoff(hwnd: HWND) {
         } else {
             s.show(&view);
         }
-        if let dashboard_io::Handoff::Account(id) = &action
+        if let dashboard_io::Handoff::Account(id) | dashboard_io::Handoff::ResetCredits(id) =
+            &action
             && let Some(provider) = s
                 .slots
                 .iter()
@@ -2445,6 +2586,9 @@ fn dashboard_handoff(hwnd: HWND) {
         dashboard_io::Handoff::Account(id) => {
             set_view(None);
             INPUT.with(|i| i.borrow_mut().reveal = Some(id));
+        }
+        dashboard_io::Handoff::ResetCredits(id) => {
+            dispatch_reset_credit(hwnd, id, true);
         }
         dashboard_io::Handoff::Add => {
             set_view(Some("add".into()));
@@ -2511,10 +2655,11 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         HitTarget::TakeoverCommit => windows_takeover::commit(hwnd),
         HitTarget::ConfirmResetCredit(id) => confirm_reset_credit(hwnd, id),
         HitTarget::ConfirmCredits(id) => {
+            let current = projected();
             let confirmed = session()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .confirm_credits(&projected());
+                .confirm_credits(&current);
             if let Some((dialog, ticket)) = confirmed {
                 if dialog.id == id {
                     restore_origin(dialog.return_to, &dialog.id);
@@ -2751,10 +2896,51 @@ fn tooltip_content(
     x: f32,
     y: f32,
 ) -> Option<(String, qb_tray::Rect)> {
-    if scene.dialog.is_some() {
-        return None;
+    if let Some(dialog) = &scene.dialog {
+        return dialog
+            .reset_title
+            .then(|| {
+                dialog
+                    .buttons
+                    .iter()
+                    .find(|b| !b.enabled && contains(b.visual, x, y))
+            })
+            .flatten()
+            .and_then(|b| {
+                dialog
+                    .takeover_body
+                    .as_ref()
+                    .map(|reason| (reason.clone(), b.visual))
+            });
     }
     if let Some(popup) = &scene.popup {
+        if let Some(item) = popup
+            .items
+            .iter()
+            .find(|i| !i.enabled && contains(i.rect, x, y))
+            && let HitTarget::Menu {
+                id: Some(id),
+                action: MenuAction::UseResetCredit,
+            } = &item.target
+        {
+            let reason = if !scene.core_ok {
+                i18n::static_text("코어에 연결할 수 없습니다")
+            } else if let Some(reason) =
+                row_view(view, id).and_then(|r| v2::reset_credit_account_refusal(&r.raw))
+            {
+                reason
+            } else if row_view(view, id).is_some_and(|r| {
+                r.raw
+                    .reset_credits
+                    .as_ref()
+                    .is_some_and(|i| i.available_count == Some(0))
+            }) {
+                i18n::static_text("사용 가능한 리셋권이 없습니다.")
+            } else {
+                i18n::static_text("리셋권 확인 또는 사용 작업이 진행 중입니다.")
+            };
+            return Some((reason.into(), item.rect));
+        }
         if !contains(popup.clip, x, y) {
             return None;
         }
@@ -3128,25 +3314,43 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
         HitTarget::AddProvider(p) => {
             i18n::format("{} 계정 추가", &[v2::provider_label(p).to_owned()])
         }
-        HitTarget::Menu { .. } => frame
-            .scene
-            .popup
-            .as_ref()
-            .and_then(|p| p.items.iter().find(|i| &i.target == target))
-            .map(|i| {
+        HitTarget::Menu { .. } => {
+            if let Some(item) = frame
+                .scene
+                .popup
+                .as_ref()
+                .and_then(|p| p.items.iter().find(|i| &i.target == target))
+            {
                 format!(
                     "{}{}{}",
-                    i.text,
-                    i.checked
+                    item.text,
+                    item.checked
                         .map(|b| i18n::text(if b { " · 켜짐" } else { " · 꺼짐" }))
                         .unwrap_or_default(),
-                    i.detail
+                    item.detail
                         .as_ref()
                         .map(|s| format!(" · {s}"))
                         .unwrap_or_default()
                 )
-            })
-            .unwrap_or_default(),
+            } else if let Some(button) = frame
+                .scene
+                .dialog
+                .as_ref()
+                .and_then(|d| d.buttons.iter().find(|b| &b.target == target))
+            {
+                button.label.clone()
+            } else {
+                frame
+                    .scene
+                    .sections
+                    .iter()
+                    .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                    .filter_map(|r| r.reset_credit_action.as_ref())
+                    .find(|b| &b.target == target)
+                    .map(|b| b.label.clone())
+                    .unwrap_or_default()
+            }
+        }
         HitTarget::TakeoverNext | HitTarget::TakeoverCommit => frame
             .scene
             .dialog
@@ -3168,7 +3372,12 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
         HitTarget::ConfirmResetCredit(_) => i18n::text("1개 사용").into_owned(),
         HitTarget::ConfirmCredits(_) => i18n::text("크레딧 사용").into_owned(),
         HitTarget::ConfirmDelete(_) => i18n::text("계정 삭제").into_owned(),
-        HitTarget::CancelDialog | HitTarget::LoginCancel => i18n::text("취소").into_owned(),
+        HitTarget::CancelDialog | HitTarget::LoginCancel => frame
+            .scene
+            .dialog
+            .as_ref()
+            .and_then(|d| d.buttons.iter().find(|b| &b.target == target))
+            .map_or_else(|| i18n::text("취소").into_owned(), |b| b.label.clone()),
         HitTarget::LoginCopy => i18n::text("주소 복사").into_owned(),
         _ => String::new(),
     }
