@@ -314,7 +314,7 @@ impl Controller {
             // Only the core's resolved context may turn it into an exhausted toast.
             let unresolved_quota = snapshot.accounts.iter().any(|a| {
                 a.provider == provider
-                    && a.user_state == "active"
+                    && account_alerts_allowed(a)
                     && a.health["kind"] == "cooling"
                     && a.health["reason"] == "quota"
             });
@@ -378,7 +378,7 @@ impl Controller {
                     || current.contains(&(notice.target.clone(), notice.kind)))
         });
         if self.active.as_ref().is_some_and(|(_, notice)| {
-            matches!(notice.target, Target::Account(_))
+            notice.target != Target::Core
                 && !current.contains(&(notice.target.clone(), notice.kind))
         }) {
             self.active = None;
@@ -901,6 +901,7 @@ mod tests {
                     },
                     Duration::from_secs(2),
                 );
+                assert!(c.next(Duration::from_secs(2)).is_some());
                 observe(&mut c, &muted, 2);
                 assert!(
                     c.pending.is_empty() && c.active.is_none(),
@@ -913,6 +914,34 @@ mod tests {
             observe(&mut c, &active, 4);
             assert!(c.next(Duration::from_secs(4)).is_none());
         }
+        // A quiet Free account's retained quota hold must not hide the legitimate
+        // provider alert for a different, assignable account needing re-login.
+        let mixed: TraySnapshot = serde_json::from_value(json!({"accounts":[
+            {"id":"cl-free","provider":"claude","plan":"free","user_state":"active",
+             "source":"oauth","health":{"kind":"cooling","reason":"quota","scope":"account","until":"2099-01-01T00:00:00Z"}},
+            {"id":"cl-paid","provider":"claude","plan":"pro","user_state":"active",
+             "source":"oauth","health":{"kind":"needs_relogin"}}],
+             "pools":{"claude":{"eligible":0}}})).unwrap();
+        let mut controller = Controller::default();
+        observe(&mut controller, &mixed, 0);
+        assert!(
+            controller
+                .pending
+                .iter()
+                .any(|n| n.kind == Kind::ProviderExhausted)
+        );
+        assert!(
+            controller
+                .pending
+                .iter()
+                .any(|n| n.target == Target::Account("cl-paid".into()) && n.kind == Kind::Relogin)
+        );
+        assert!(
+            !controller
+                .pending
+                .iter()
+                .any(|n| n.target == Target::Account("cl-free".into()))
+        );
     }
 
     #[test]
