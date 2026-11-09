@@ -45,6 +45,10 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
         "The reset credit that expires first will be used (expires {0}).",
     ),
     (
+        "만료가 가장 빠른 리셋권({0} 만료, {1})을 사용합니다.",
+        "The reset credit that expires first will be used (expires {0} ({1})).",
+    ),
+    (
         "만료가 없는 리셋권 1개를 사용합니다.",
         "One reset credit with no expiry will be used.",
     ),

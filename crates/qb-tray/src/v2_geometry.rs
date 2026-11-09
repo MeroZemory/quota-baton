@@ -1545,7 +1545,13 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
     if row.raw.user_state == "active" {
         groups[2].push((
             MenuAction::Pause,
-            crate::i18n::static_text("일시정지"),
+            // The shared Korean word also names a state; keep that state's
+            // English "Paused" while this unchecked menu item is an action.
+            if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                "Pause"
+            } else {
+                crate::i18n::static_text("일시정지")
+            },
             None,
         ));
     }
@@ -3655,6 +3661,57 @@ mod r27_reset_flow_tests {
     fn view(inventory: serde_json::Value, state: &str) -> v2::View {
         let wire = serde_json::json!({"accounts":[{"id":"cx-synthetic","provider":"codex","label":"User alias","user_state":state,"health":{"kind":"ready"},"reset_credits":inventory}]});
         v2::project(&wire.to_string(), std::time::SystemTime::UNIX_EPOCH).unwrap()
+    }
+    #[test]
+    fn r27_menu_pause_and_resume_are_actions_without_changing_paused_state_copy() {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || {
+                for state in ["active", "paused"] {
+                    let view = view(serde_json::Value::Null, state);
+                    let mut presentation = Presentation {
+                        overlay: Overlay::RowMenu("cx-synthetic".into()),
+                        ..Default::default()
+                    };
+                    presentation
+                        .expanded
+                        .insert(v2::EXCLUDED_GROUP_KEY.into(), true);
+                    let scene = Scene::build(&view, presentation, 800.);
+                    let menu = scene.popup.unwrap();
+                    let actions: Vec<_> = menu
+                        .items
+                        .iter()
+                        .filter(|item| {
+                            matches!(
+                                item.target,
+                                Target::Menu {
+                                    action: MenuAction::Pause | MenuAction::Resume,
+                                    ..
+                                }
+                            )
+                        })
+                        .collect();
+                    assert_eq!(actions.len(), 1);
+                    assert!(actions[0].enabled && actions[0].checked.is_none());
+                    assert_eq!(
+                        actions[0].text,
+                        match (language, state) {
+                            (crate::i18n::UiLanguage::En, "active") => "Pause",
+                            (crate::i18n::UiLanguage::En, _) => "Resume",
+                            (_, "active") => "일시정지",
+                            _ => "재개",
+                        }
+                    );
+                    assert_eq!(
+                        crate::i18n::static_text("일시정지"),
+                        if language == crate::i18n::UiLanguage::En {
+                            "Paused"
+                        } else {
+                            "일시정지"
+                        }
+                    );
+                }
+            });
+        }
     }
     #[test]
     fn r27_menu_single_entry_works_with_unknown_count_only_and_stale_details() {

@@ -1544,7 +1544,11 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
         if state.pending(&id) {
             return;
         }
-        let Some(generation) = state.reset_credits.begin(&id, refresh) else {
+        let Some(generation) =
+            state
+                .reset_credits
+                .begin_with_inventory(&id, refresh, row.raw.reset_credits.as_ref())
+        else {
             return;
         };
         generation

@@ -26,6 +26,11 @@ pub fn expiry(value: &ResetCreditExpiry) -> String {
 
 /// The explicit clock also supplies the display timezone (FixedOffset in tests).
 fn display_time<Tz: TimeZone>(value: &str, now: &DateTime<Tz>) -> Option<String> {
+    let (stamp, hint) = display_time_parts(value, now)?;
+    Some(format!("{stamp} ({hint})"))
+}
+
+fn display_time_parts<Tz: TimeZone>(value: &str, now: &DateTime<Tz>) -> Option<(String, String)> {
     let at = DateTime::parse_from_rfc3339(value).ok()?;
     let local = at.with_timezone(&now.timezone());
     let stamp = local
@@ -82,7 +87,7 @@ fn display_time<Tz: TimeZone>(value: &str, now: &DateTime<Tz>) -> Option<String>
     } else {
         text(if seconds > 0 { "1분 이내" } else { "방금" })
     };
-    Some(format!("{stamp} ({hint})"))
+    Some((stamp, hint))
 }
 
 fn expiry_at<Tz: TimeZone>(value: &ResetCreditExpiry, now: &DateTime<Tz>) -> String {
@@ -350,14 +355,24 @@ fn preview_body_at<Tz: TimeZone>(p: &ResetCreditPreview, now: &DateTime<Tz>) -> 
         lines.push(text("Codex 계정"));
     }
     lines.push(match &p.grant.expires_at {
-        ResetCreditExpiry::At { at } if display_time(at, now).is_some() => qb_tray::i18n::format(
-            "만료가 가장 빠른 리셋권({0} 만료)을 사용합니다.",
-            &[expiry_at(&p.grant.expires_at, now)],
-        ),
+        ResetCreditExpiry::At { at } => match display_time_parts(at, now) {
+            Some((stamp, hint)) => {
+                if qb_tray::i18n::language() == qb_tray::i18n::UiLanguage::Ko {
+                    qb_tray::i18n::format(
+                        "만료가 가장 빠른 리셋권({0} 만료, {1})을 사용합니다.",
+                        &[stamp, hint],
+                    )
+                } else {
+                    qb_tray::i18n::format(
+                        "만료가 가장 빠른 리셋권({0} 만료)을 사용합니다.",
+                        &[format!("{stamp} ({hint})")],
+                    )
+                }
+            }
+            None => text("리셋권 만료를 확인하지 못했습니다."),
+        },
         ResetCreditExpiry::Never => text("만료가 없는 리셋권 1개를 사용합니다."),
-        ResetCreditExpiry::At { .. } | ResetCreditExpiry::Unknown => {
-            text("리셋권 만료를 확인하지 못했습니다.")
-        }
+        ResetCreditExpiry::Unknown => text("리셋권 만료를 확인하지 못했습니다."),
     });
     lines.push(text(
         if p.grant.reset_type == ResetCreditType::CodexRateLimits {
@@ -388,6 +403,8 @@ pub struct Consent {
     pub success_limits: bool,
     pub sending: bool,
     pub detail_unavailable: bool,
+    // Display seed only: never enters inventory choice or confirmation authority.
+    read_inventory: Option<ResetCreditInventory>,
     generation: u64,
 }
 impl Consent {
@@ -395,11 +412,23 @@ impl Consent {
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) else {
             return input.into();
         };
+        let placeholder = serde_json::to_value(ResetCreditInventory::default())
+            .expect("typed inventory serializes");
         if let Some(accounts) = value.get_mut("accounts").and_then(|v| v.as_array_mut()) {
             for account in accounts {
                 let Some(id) = account.get("id").and_then(|v| v.as_str()) else {
                     continue;
                 };
+                if self.busy
+                    && !self.sending
+                    && self.account.as_deref() == Some(id)
+                    && account.get("reset_credits") == Some(&placeholder)
+                    && let Some(inventory) = &self.read_inventory
+                {
+                    account["reset_credits"] =
+                        serde_json::to_value(inventory).expect("typed inventory serializes");
+                    continue;
+                }
                 let Some(inventory) = self.inventories.get(id) else {
                     continue;
                 };
@@ -444,13 +473,25 @@ impl Consent {
         self.success_limits = false;
         self.sending = false;
         self.detail_unavailable = false;
+        self.read_inventory = None;
         Some(self.generation)
+    }
+    pub fn begin_with_inventory(
+        &mut self,
+        id: &str,
+        refresh: bool,
+        inventory: Option<&ResetCreditInventory>,
+    ) -> Option<u64> {
+        let generation = self.begin(id, refresh)?;
+        self.read_inventory = inventory.cloned();
+        Some(generation)
     }
     pub fn ready(&mut self, generation: u64, p: ResetCreditPreview, now: DateTime<Utc>) -> bool {
         if self.generation != generation || self.account.as_deref() != Some(&p.account) {
             return false;
         }
         self.busy = false;
+        self.read_inventory = None;
         if p.preview_token.is_empty()
             || !p.inventory.grants.contains(&p.grant)
             || p.grant.status != ResetCreditStatus::Available
@@ -478,6 +519,7 @@ impl Consent {
         self.generation = self.generation.saturating_add(1);
         self.preview = None;
         self.account = None; /* in-flight dispatch remains disabled until completion */
+        self.read_inventory = None;
     }
     pub fn confirm(&mut self, id: &str, now: DateTime<Utc>) -> Option<ResetCreditCommitRequest> {
         if self.busy || self.account.as_deref() != Some(id) || self.unknown.contains_key(id) {
@@ -499,6 +541,7 @@ impl Consent {
     }
     pub fn finish_read(&mut self, id: &str, generation: u64, error: Option<&ActionError>) {
         self.busy = false;
+        self.read_inventory = None;
         if self.generation == generation
             && let Some(e) = error
         {
@@ -507,6 +550,9 @@ impl Consent {
     }
     pub fn reconciled(&mut self, id: &str, inventory: &ResetCreditInventory) {
         self.inventories.insert(id.into(), inventory.clone());
+        if self.account.as_deref() == Some(id) {
+            self.read_inventory = None;
+        }
         // Core's durable fence remains authoritative; no UI inference can bypass it.
         if inventory.state == ResetCreditState::Fresh
             && matches!(
@@ -529,6 +575,7 @@ impl Consent {
     }
     pub fn result(&mut self, id: &str, result: &Result<ResetCreditResult, ActionError>) {
         self.busy = false;
+        self.read_inventory = None;
         self.preview = None;
         self.terminal = true;
         self.sending = false;
@@ -725,6 +772,31 @@ mod tests {
         assert!(line.tooltip.contains("11/07 19:00"));
         assert!(!line.text.contains("2026") && !line.tooltip.contains("T10:00"));
     }
+    #[test]
+    fn r27_korean_confirmation_uses_one_expiry_clause_and_english_bytes_stay_the_same() {
+        let clock = DateTime::parse_from_rfc3339("2026-11-10T20:57:00+09:00").unwrap();
+        let mut p = preview();
+        p.grant.expires_at = ResetCreditExpiry::At {
+            at: "2026-11-11T15:57:00Z".into(),
+        };
+        qb_tray::i18n::with_language(qb_tray::i18n::UiLanguage::Ko, || {
+            let body = preview_body_at(&p, &clock);
+            assert_eq!(
+                body.lines().nth(2).unwrap(),
+                "만료가 가장 빠른 리셋권(11/12 00:57 만료, 1일 후)을 사용합니다."
+            );
+            assert_eq!(body.matches('(').count(), 1);
+            assert_eq!(body.matches(')').count(), 1);
+        });
+        qb_tray::i18n::with_language(qb_tray::i18n::UiLanguage::En, || {
+            let expected = format!(
+                "{}\n{}\nThe reset credit that expires first will be used (expires 11/12 00:57 (in 1 day)).\nThis account's Codex usage limits will be reset.\nReset credits remaining after use: 0",
+                p.label, p.email
+            );
+            assert_eq!(preview_body_at(&p, &clock).as_bytes(), expected.as_bytes());
+        });
+    }
+
     #[test]
     fn fixed_offset_clock_formats_local_dates_relative_hints_and_local_years() {
         let clock = DateTime::parse_from_rfc3339("2026-11-07T19:00:00+09:00").unwrap();
@@ -998,6 +1070,175 @@ mod tests {
 mod r27_projection_tests {
     use super::*;
     use qb_proto::reset_credits::ResetCreditRefusal;
+
+    fn count_only(observed_at: Option<&str>, count: u64) -> ResetCreditInventory {
+        ResetCreditInventory {
+            state: ResetCreditState::Fresh,
+            observed_at: observed_at.map(str::to_owned),
+            available_count: Some(count),
+            grants: vec![],
+            refusal: Some(ResetCreditRefusal::Incomplete),
+        }
+    }
+
+    fn polled(a: &ResetCreditInventory) -> serde_json::Value {
+        serde_json::json!({"accounts":[
+            {"id":"cx-a","provider":"codex","label":"same label","reset_credits":a},
+            {"id":"cx-b","provider":"codex","reset_credits":ResetCreditInventory::default()}
+        ]})
+    }
+
+    fn project(consent: &Consent, input: &serde_json::Value) -> serde_json::Value {
+        serde_json::from_str(&consent.project_inventory(&input.to_string())).unwrap()
+    }
+
+    #[test]
+    fn r27_pending_read_preserves_only_the_owned_core_placeholder() {
+        // reset_credit_cached returns this exact Default on entry.try_lock failure.
+        let input = polled(&ResetCreditInventory::default());
+        for observed in [None, Some("2026-11-09T00:00:01Z")] {
+            let seed = count_only(observed, 2);
+            let mut consent = Consent::default();
+            assert_eq!(project(&consent, &input), input);
+            consent
+                .begin_with_inventory("cx-a", true, Some(&seed))
+                .unwrap();
+            let output = project(&consent, &input);
+            assert_eq!(
+                output["accounts"][0]["reset_credits"],
+                serde_json::to_value(&seed).unwrap()
+            );
+            assert_eq!(
+                output["accounts"][0]["label"],
+                input["accounts"][0]["label"]
+            );
+            assert_eq!(output["accounts"][1], input["accounts"][1]);
+            assert!(
+                consent.inventories.is_empty(),
+                "display seed is not a result cache"
+            );
+            assert!(consent.begin_with_inventory("cx-b", true, None).is_none());
+            assert_eq!(consent.read_inventory.as_ref(), Some(&seed));
+            let mut absent = input.clone();
+            absent["accounts"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("reset_credits");
+            assert_eq!(project(&consent, &absent), absent);
+        }
+    }
+
+    #[test]
+    fn r27_new_inventory_and_newer_polled_facts_replace_the_read_seed() {
+        let seed = count_only(None, 2);
+        let mut consent = Consent::default();
+        consent
+            .begin_with_inventory("cx-a", true, Some(&seed))
+            .unwrap();
+        let newer = count_only(Some("2026-11-09T00:00:02Z"), 3);
+        let input = polled(&newer);
+        assert_eq!(
+            project(&consent, &input),
+            input,
+            "any real polled facts beat the pending fallback"
+        );
+        let mut refused = ResetCreditInventory::default();
+        refused.refusal = Some(ResetCreditRefusal::Stale);
+        let input = polled(&refused);
+        assert_eq!(
+            project(&consent, &input),
+            input,
+            "only the exact Default placeholder qualifies"
+        );
+        let result = count_only(Some("2026-11-09T00:00:01Z"), 1);
+        consent.reconciled("cx-a", &result);
+        assert!(consent.read_inventory.is_none());
+        let output = project(&consent, &polled(&ResetCreditInventory::default()));
+        assert_eq!(output["accounts"][0]["reset_credits"]["available_count"], 1);
+        assert_eq!(
+            project(&consent, &polled(&newer)),
+            polled(&newer),
+            "newer observed poll still beats cached result"
+        );
+        // Even a timestamp-free Unknown response is a new result, not a lock placeholder.
+        consent.reconciled("cx-a", &ResetCreditInventory::default());
+        let input = polled(&ResetCreditInventory::default());
+        assert_eq!(project(&consent, &input), input);
+    }
+
+    #[test]
+    fn r27_read_seed_never_grants_send_authority_and_cancel_releases_it() {
+        let now = DateTime::parse_from_rfc3339("2026-11-09T00:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let seed = count_only(None, 2);
+        let input = polled(&ResetCreditInventory::default());
+        let mut consent = Consent::default();
+        consent
+            .unknown
+            .insert("cx-a".into(), "uncertain-grant".into());
+        let generation = consent
+            .begin_with_inventory("cx-a", true, Some(&seed))
+            .unwrap();
+        assert!(consent.confirm("cx-a", now).is_none());
+        assert!(!inventory_line("codex", Some(&seed), now).can_use);
+        assert_eq!(consent.unknown["cx-a"], "uncertain-grant");
+        consent.cancel();
+        assert!(consent.busy && consent.read_inventory.is_none());
+        assert_eq!(project(&consent, &input), input);
+        consent.finish_read("cx-a", generation, None);
+        let other = consent
+            .begin_with_inventory("cx-b", true, Some(&seed))
+            .unwrap();
+        let output = project(&consent, &input);
+        assert_eq!(output["accounts"][0], input["accounts"][0]);
+        assert_eq!(output["accounts"][1]["reset_credits"]["available_count"], 2);
+        consent.finish_read("cx-b", other, None);
+        assert_eq!(project(&consent, &input), input);
+
+        let generation = consent
+            .begin_with_inventory("cx-b", true, Some(&seed))
+            .unwrap();
+        let grant = qb_proto::reset_credits::ResetCreditGrant {
+            id: "fresh-grant".into(),
+            status: ResetCreditStatus::Available,
+            reset_type: ResetCreditType::CodexRateLimits,
+            expires_at: ResetCreditExpiry::Never,
+        };
+        let preview = ResetCreditPreview {
+            account: "cx-b".into(),
+            label: "B".into(),
+            email: "b@example.invalid".into(),
+            preview_token: "fresh-token".into(),
+            expires_at: (now + chrono::Duration::seconds(60)).to_rfc3339(),
+            grant: grant.clone(),
+            effect: "eligible_codex_limits".into(),
+            inventory: ResetCreditInventory {
+                state: ResetCreditState::Fresh,
+                observed_at: Some(now.to_rfc3339()),
+                available_count: Some(1),
+                grants: vec![grant],
+                refusal: None,
+            },
+        };
+        assert!(consent.ready(generation, preview.clone(), now));
+        assert!(consent.read_inventory.is_none());
+        assert!(consent.confirm("cx-a", now).is_none());
+        assert!(consent.confirm("cx-b", now).unwrap().confirm);
+        assert!(consent.sending && consent.busy);
+        assert!(consent.confirm("cx-b", now).is_none());
+        assert_eq!(consent.unknown["cx-b"], "fresh-grant");
+        consent.inventories.clear();
+        assert_eq!(
+            project(&consent, &input),
+            input,
+            "send does not reuse a read seed"
+        );
+        consent.cancel();
+        assert_eq!(consent.unknown["cx-b"], "fresh-grant");
+        assert!(!consent.ready(generation, preview, now));
+    }
+
     #[test]
     fn r27_result_limits_wait_for_same_operation_dashboard_publication() {
         let mut consent = Consent::default();
