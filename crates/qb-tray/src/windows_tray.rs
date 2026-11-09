@@ -1509,6 +1509,15 @@ fn ask_credits(id: &str, origin: ReturnTo) {
         set_view(Some(format!("confirm-credits:{id}")));
     }
 }
+fn reset_inventory_no_credits(inventory: &qb_proto::reset_credits::ResetCreditInventory) -> bool {
+    use qb_proto::reset_credits::{ResetCreditRefusal, ResetCreditState};
+    inventory.state == ResetCreditState::Fresh
+        && inventory.available_count == Some(0)
+        && matches!(
+            inventory.refusal,
+            None | Some(ResetCreditRefusal::NoCredits)
+        )
+}
 fn reset_facts_changed(handle: isize) {
     invalidate_model();
     unsafe {
@@ -1584,10 +1593,7 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                     .err()
                     .or_else(|| result.as_ref().and_then(|r| r.as_ref().err()));
                 state.reset_credits.finish_read(&id, generation, error);
-                if inventory
-                    .as_ref()
-                    .is_ok_and(|i| i.available_count == Some(0))
-                {
+                if inventory.as_ref().is_ok_and(reset_inventory_no_credits) {
                     state
                         .reset_credits
                         .messages
@@ -1595,7 +1601,7 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                     state.reset_credits.terminal = true;
                 }
                 if let Ok(inventory) = &inventory
-                    && inventory.available_count != Some(0)
+                    && !reset_inventory_no_credits(inventory)
                     && !qb_tray::client::reset_credits::inventory_line(
                         "codex",
                         Some(inventory),
@@ -5364,4 +5370,26 @@ fn r261_codex_chooser_and_prompt_default_to_cancel_and_escape_is_a_dismissal() {
     ));
     flow.cancel(false);
     assert!(flow.prompt.is_none() && flow.deadline.is_none());
+}
+
+#[test]
+fn r27_zero_with_refusal_is_not_a_confirmed_no_credit_result() {
+    use qb_proto::reset_credits::{ResetCreditInventory, ResetCreditRefusal, ResetCreditState};
+    let mut inventory = ResetCreditInventory {
+        state: ResetCreditState::Fresh,
+        available_count: Some(0),
+        refusal: None,
+        ..Default::default()
+    };
+    assert!(reset_inventory_no_credits(&inventory));
+    inventory.refusal = Some(ResetCreditRefusal::NoCredits);
+    assert!(reset_inventory_no_credits(&inventory));
+    inventory.refusal = Some(ResetCreditRefusal::Incomplete);
+    assert!(
+        !reset_inventory_no_credits(&inventory),
+        "zero reported count does not erase refusal evidence"
+    );
+    inventory.refusal = None;
+    inventory.state = ResetCreditState::Stale;
+    assert!(!reset_inventory_no_credits(&inventory));
 }
