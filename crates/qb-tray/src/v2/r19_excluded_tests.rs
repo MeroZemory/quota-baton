@@ -82,11 +82,11 @@ fn r27_muted_relogin_keeps_combined_state_and_recovery_menu_without_attention() 
                     assert!(scene.row("muted").unwrap().button.is_none());
                     let popup = scene.popup.unwrap();
                     for action in [
-                        crate::actions::MenuAction::Relogin,
+                        g::MenuAction::Relogin,
                         if user == "disabled" {
-                            crate::actions::MenuAction::Enable
+                            g::MenuAction::Enable
                         } else {
-                            crate::actions::MenuAction::Resume
+                            g::MenuAction::Resume
                         },
                     ] {
                         assert!(popup.items.iter().any(|item| item.enabled && matches!(&item.target, g::Target::Menu { id: Some(id), action: current } if id == "muted" && *current == action)));
