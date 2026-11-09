@@ -99,6 +99,7 @@ pub struct Account<'a> {
     pub provider: &'a str,
     pub id: &'a str,
     pub user_state: &'a str,
+    pub plan: Option<&'a str>,
     /// Credential maintenance does not opt a paused/disabled account into alerts.
     pub maintains_tokens: bool,
     pub health_kind: &'a str,
@@ -111,7 +112,12 @@ pub struct Account<'a> {
 pub fn account_signal<'a>(account: &Account<'a>) -> Option<Signal<'a>> {
     if account.id.is_empty()
         || account.provider.is_empty()
-        || !account_alerts_enabled(account.user_state)
+        || !account_alerts_allowed(
+            account.provider,
+            account.user_state,
+            account.plan,
+            account.health_kind,
+        )
     {
         return None;
     }
@@ -143,6 +149,22 @@ pub fn account_signal<'a>(account: &Account<'a>) -> Option<Signal<'a>> {
 
 pub fn account_alerts_enabled(user_state: &str) -> bool {
     user_state == "active"
+}
+
+/// Placement exclusions that authentication cannot repair stay quiet. Re-login
+/// itself remains actionable; use the shared raw exclusion policy, not UI text.
+pub fn account_alerts_allowed(
+    provider: &str,
+    user_state: &str,
+    plan: Option<&str>,
+    health_kind: &str,
+) -> bool {
+    use qb_proto::admin_account::{PlacementExclusion, placement_exclusion};
+    account_alerts_enabled(user_state)
+        && matches!(
+            placement_exclusion(provider, user_state, plan, health_kind),
+            None | Some(PlacementExclusion::NeedsRelogin)
+        )
 }
 
 /// Core-derived provider pool status, not a count guessed from display rows.
@@ -244,6 +266,7 @@ mod tests {
             provider: "codex",
             id: "synthetic",
             user_state: "active",
+            plan: None,
             maintains_tokens: true,
             health_kind: "ready",
             health_reason: None,

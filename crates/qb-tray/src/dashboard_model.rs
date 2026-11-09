@@ -1374,7 +1374,7 @@ pub fn project(
             forecast_lines: a.forecast_lines.clone(),
             forecast_tooltip: a.forecast_tooltip.clone(),
             forecast_warning: a.forecast_warning,
-            relogin: crate::tray_icon::signals::account_alerts_enabled(&a.raw.user_state)
+            relogin: a.raw.alerts_enabled()
                 && a.raw.health.kind == "needs_relogin"
                 && a.menu.show_relogin,
             relogin_reason: if a.state == v2::DisplayState::Relogin {
@@ -1632,6 +1632,31 @@ fn enriched_event(
     }
     event
 }
+/// Past event payloads describe history, never current account authority.
+fn current_account_task(e: &ActivityEvent, account: &v2::Account, clock: &Clock) -> bool {
+    let health = &account.health;
+    match e.kind.as_str() {
+        "needs_relogin" | "token_refresh" | "linked_reload" => health.kind == "needs_relogin",
+        "plan_without_claude_code" => false,
+        "link_stale" | "payment" | "permission" | "store_error" | "quota_reached" => {
+            let reason = if e.kind == "quota_reached" {
+                "quota"
+            } else {
+                &e.kind
+            };
+            health.kind == "cooling"
+                && health.reason.as_deref() == Some(reason)
+                && (reason == "link_stale" || health.scope.as_deref() == Some("account"))
+                && health
+                    .until
+                    .as_deref()
+                    .and_then(v2::timestamp)
+                    .is_some_and(|until| until > clock.utc())
+        }
+        _ => false,
+    }
+}
+
 fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<EventRow> {
     let d = &e.data;
     let p = v2::provider_label(&e.provider);
@@ -2076,13 +2101,18 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
         }
         _ => return None,
     };
-    // Retain past account alerts only as plain history while the account is off.
-    // Global burst warnings remain global even when their payload names an account.
+    // An account event is a task only while its matching current condition exists.
+    // Retain resolved/removed/plan-excluded alerts as plain history, not to-dos.
+    // Global burst and provider events keep their independent semantics.
     let muted_alert = e.kind != "burst"
         && (category == EventFilter::Tasks || e.kind == "quota_reached")
-        && account_rows(accounts).iter().any(|a| {
-            Some(&a.raw.id) == e.account.as_ref()
-                && !crate::tray_icon::signals::account_alerts_enabled(&a.raw.user_state)
+        && e.account.as_ref().is_some_and(|id| {
+            !account_rows(accounts).iter().any(|a| {
+                a.raw.id == *id
+                    && a.raw.provider == e.provider
+                    && a.raw.alerts_enabled()
+                    && (category != EventFilter::Tasks || current_account_task(e, &a.raw, clock))
+            })
         });
     if muted_alert {
         tag = crate::i18n::static_text("정보");
@@ -2093,7 +2123,7 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
         && e.kind == "needs_relogin"
         && account_rows(accounts).iter().any(|a| {
             Some(&a.raw.id) == e.account.as_ref()
-                && crate::tray_icon::signals::account_alerts_enabled(&a.raw.user_state)
+                && a.raw.alerts_enabled()
                 && a.raw.health.kind == "needs_relogin"
                 && a.menu.show_relogin
         });

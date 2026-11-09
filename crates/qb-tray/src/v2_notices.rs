@@ -32,7 +32,7 @@ pub fn quota_message(
         return None;
     }
     let row = account_row(view, provider, account_id)?;
-    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state) {
+    if !row.raw.alerts_enabled() {
         return None;
     }
     let name = &row.name;
@@ -187,7 +187,7 @@ pub fn account_message(
     now: SystemTime,
 ) -> Option<(String, String)> {
     let row = account_row(view, provider, id)?;
-    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state) {
+    if !row.raw.alerts_enabled() {
         return None;
     }
     let title = |reason| crate::account_notice_title(&row.name, provider, reason);

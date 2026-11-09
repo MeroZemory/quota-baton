@@ -3,6 +3,103 @@ use crate::dashboard_fixtures as fixtures;
 use fixtures::*;
 
 #[test]
+fn r271_old_account_tasks_clear_when_current_health_changes() {
+    let mut raw = serde_json::json!({"id":"current","provider":"claude","plan":"pro",
+        "user_state":"active","source":"oauth","health":{"kind":"needs_relogin"}});
+    let event = ActivityEvent {
+        seq: 17,
+        ts: Some(clock().utc()),
+        kind: "needs_relogin".into(),
+        provider: "claude".into(),
+        account: Some("current".into()),
+        notable: true,
+        ..Default::default()
+    };
+    let mut state = DashboardState {
+        event_filter: EventFilter::Tasks,
+        ..Default::default()
+    };
+    let mut data = r10_accounts(serde_json::json!([raw.clone()]));
+    data.activity = vec![event];
+    assert_eq!(project(&data, &mut state, &clock()).events.len(), 1);
+    for health in ["ready", "plan_without_claude_code"] {
+        raw["health"] = serde_json::json!({"kind":health});
+        data.accounts = r10_accounts(serde_json::json!([raw.clone()])).accounts;
+        let view = project(&data, &mut state, &clock());
+        assert_eq!(view.todo, 0);
+        assert!(view.events.is_empty() && view.recent.is_empty());
+        assert_eq!(
+            view.event_counts
+                .iter()
+                .find(|(f, _)| *f == EventFilter::Tasks)
+                .unwrap()
+                .1,
+            0
+        );
+        state.event_filter = EventFilter::All;
+        let history = project(&data, &mut state, &clock());
+        assert_eq!(history.events.len(), 1);
+        assert_eq!(history.events[0].seq, 17);
+        assert_eq!(history.events[0].category, EventFilter::All);
+        assert!(!history.events[0].notable && !history.events[0].relogin);
+        state.event_filter = EventFilter::Tasks;
+    }
+    // The same rule covers legacy token events carrying old needs_relogin flags.
+    raw["health"] = serde_json::json!({"kind":"ready"});
+    data.accounts = r10_accounts(serde_json::json!([raw])).accounts;
+    for kind in [
+        "token_refresh",
+        "linked_reload",
+        "payment",
+        "permission",
+        "store_error",
+        "link_stale",
+    ] {
+        data.activity[0].kind = kind.into();
+        data.activity[0].data.needs_relogin = true;
+        assert!(
+            project(&data, &mut state, &clock()).events.is_empty(),
+            "{kind}"
+        );
+    }
+    data.accounts = r10_accounts(serde_json::json!([])).accounts;
+    assert!(project(&data, &mut state, &clock()).events.is_empty());
+    assert_eq!(data.activity.len(), 1, "history is retained, not rewritten");
+}
+
+#[test]
+fn r271_active_assignable_relogin_remains_a_current_task() {
+    for (provider, plan) in [("claude", "pro"), ("codex", "plus")] {
+        let data = {
+            let mut data = r10_accounts(serde_json::json!([{"id":"current","provider":provider,
+                "plan":plan,"user_state":"active","source":"oauth",
+                "health":{"kind":"needs_relogin"}}]));
+            data.activity = vec![ActivityEvent {
+                seq: 4,
+                ts: Some(clock().utc()),
+                kind: "needs_relogin".into(),
+                provider: provider.into(),
+                account: Some("current".into()),
+                notable: true,
+                ..Default::default()
+            }];
+            data
+        };
+        let mut state = DashboardState {
+            event_filter: EventFilter::Tasks,
+            ..Default::default()
+        };
+        let view = project(&data, &mut state, &clock());
+        assert_eq!(view.todo, 1);
+        assert_eq!(view.events.len(), 1);
+        assert!(view.events[0].relogin && view.events[0].notable);
+        assert_eq!(data.accounts.badge, v2::Badge::Attention);
+        let row = account_rows(&data.accounts).into_iter().next().unwrap();
+        assert!(row.raw.alerts_enabled() && row.menu.show_relogin);
+    }
+}
+
+#[test]
 fn r27_disabling_removes_existing_todo_cards_and_counts_but_keeps_plain_history() {
     let mut raw = serde_json::json!({"id":"muted","provider":"codex","label":"Muted",
         "user_state":"active","source":{"kind":"cpa","mode":"adopted"},

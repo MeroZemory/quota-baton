@@ -110,6 +110,17 @@ pub struct Account {
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
+impl Account {
+    pub fn alerts_enabled(&self) -> bool {
+        crate::tray_icon::signals::account_alerts_allowed(
+            &self.provider,
+            &self.user_state,
+            self.plan.as_deref(),
+            &self.health.kind,
+        )
+    }
+}
+
 /// Explicit reset actions preserve pause/drain placement controls; grants supply plan eligibility.
 pub fn reset_credit_account_refusal(account: &Account) -> Option<&'static str> {
     let reason = if account.provider != "codex" {
@@ -544,7 +555,13 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
         });
     }
     let empty = raw.accounts.is_empty();
-    let blocked = summaries.iter().any(|s| s.verdict == Verdict::Unavailable);
+    let blocked = summaries.iter().any(|s| {
+        s.verdict == Verdict::Unavailable
+            && raw
+                .accounts
+                .iter()
+                .any(|a| a.provider == s.provider && a.alerts_enabled())
+    });
     let badge = if blocked || summaries.iter().any(|s| s.todo > 0) {
         Badge::Attention
     } else {
@@ -1063,12 +1080,10 @@ pub use qb_proto::placement_capacity_label;
 /// the tray and CLI. Hidden or missing estimates remain cold, never inferred.
 /// Remove card-only content, keeping the full native facts exclusively for menus.
 fn compact_row(mut row: AccountRow) -> AccountRow {
-    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state) {
+    if !row.raw.alerts_enabled() {
         row.action = None;
     }
-    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state)
-        && row.raw.health.kind == "needs_relogin"
-    {
+    if !row.raw.alerts_enabled() {
         row.chip = Some(Chip {
             text: compact_reason(&row).into(),
             tone: Tone::Off,
@@ -1082,9 +1097,7 @@ fn compact_row(mut row: AccountRow) -> AccountRow {
     row.forecast_tooltip.clear();
     row.forecast_warning = false;
     row.credits = None;
-    let reason = if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state)
-        && row.raw.health.kind == "needs_relogin"
-    {
+    let reason = if !row.raw.alerts_enabled() && row.raw.health.kind == "needs_relogin" {
         compact_reason(&row)
     } else {
         row.excluded_reason.unwrap_or_default()
@@ -1268,7 +1281,10 @@ fn summarize(
                 )
             })
             .unwrap_or_else(|| {
-                if active.iter().any(|r| r.state == DisplayState::Relogin) {
+                if active
+                    .iter()
+                    .any(|r| r.raw.alerts_enabled() && r.state == DisplayState::Relogin)
+                {
                     crate::i18n::static_text("다시 로그인 필요")
                 } else {
                     crate::i18n::static_text("사용할 수 있는 계정 없음")
@@ -1278,10 +1294,7 @@ fn summarize(
     };
     let todo = rows
         .iter()
-        .filter(|r| {
-            crate::tray_icon::signals::account_alerts_enabled(&r.raw.user_state)
-                && r.group == Group::NeedsAction
-        })
+        .filter(|r| r.raw.alerts_enabled() && r.group == Group::NeedsAction)
         .count();
     let provider_name = provider_label(provider);
     let mut tooltip = crate::i18n::format(

@@ -134,6 +134,15 @@ fn account_message(
     )
 }
 
+fn account_alerts_allowed(account: &crate::client::PresentationAccount) -> bool {
+    signals::account_alerts_allowed(
+        &account.provider,
+        &account.user_state,
+        account.plan.as_deref(),
+        account.health["kind"].as_str().unwrap_or("unknown"),
+    )
+}
+
 impl Controller {
     pub fn presentation(&self) -> Presentation {
         self.presentation.clone()
@@ -153,7 +162,7 @@ impl Controller {
         elapsed: Duration,
     ) {
         for account in &snapshot.accounts {
-            if !signals::account_alerts_enabled(&account.user_state) {
+            if !account_alerts_allowed(account) {
                 self.debounce.forget_account(&account.provider, &account.id);
                 self.pending
                     .retain(|n| n.target != Target::Account(account.id.clone()));
@@ -252,6 +261,7 @@ impl Controller {
                 provider: &account.provider,
                 id: &account.id,
                 user_state: &account.user_state,
+                plan: account.plan.as_deref(),
                 maintains_tokens: matches!(account.source.as_str(), "oauth" | "owned" | "adopted"),
                 health_kind: health["kind"].as_str().unwrap_or("unknown"),
                 health_reason: health["reason"].as_str(),
@@ -311,7 +321,7 @@ impl Controller {
             let active = snapshot
                 .accounts
                 .iter()
-                .filter(|a| a.provider == provider && a.user_state == "active")
+                .filter(|a| a.provider == provider && account_alerts_allowed(a))
                 .count() as u64;
             if !exhausted_providers.contains(provider)
                 && !unresolved_quota
@@ -343,11 +353,10 @@ impl Controller {
         }
         // Final subject guard also covers manually constructed and future kinds.
         found.retain(|(signal, _)| match signal.subject {
-            Subject::Account { provider, id } => snapshot.accounts.iter().any(|a| {
-                a.provider == provider
-                    && a.id == id
-                    && signal.for_user_state(&a.user_state).is_some()
-            }),
+            Subject::Account { provider, id } => snapshot
+                .accounts
+                .iter()
+                .any(|a| a.provider == provider && a.id == id && account_alerts_allowed(a)),
             _ => true,
         });
         self.presentation = Presentation {
@@ -368,6 +377,12 @@ impl Controller {
                 && (notice.target == Target::Core
                     || current.contains(&(notice.target.clone(), notice.kind)))
         });
+        if self.active.as_ref().is_some_and(|(_, notice)| {
+            matches!(notice.target, Target::Account(_))
+                && !current.contains(&(notice.target.clone(), notice.kind))
+        }) {
+            self.active = None;
+        }
         for (signal, message) in found {
             self.enqueue_message(signal, message, elapsed);
         }
@@ -816,6 +831,87 @@ mod tests {
             let mut fresh = Controller::default();
             observe(&mut fresh, &s, 0);
             assert!(fresh.next(Duration::ZERO).is_none());
+        }
+    }
+
+    #[test]
+    fn r271_plan_exclusions_mute_all_surfaces_and_restore_assignable_relogin_once() {
+        for (plan, health) in [
+            ("free", "ready"),
+            ("free", "needs_relogin"),
+            ("pro", "plan_without_claude_code"),
+        ] {
+            let active: TraySnapshot = serde_json::from_value(json!({"accounts":[{
+                "id":"cl-synthetic","provider":"claude","plan":"pro","user_state":"active",
+                "source":{"kind":"cpa","mode":"adopted"},"health":{"kind":"needs_relogin"}}],
+                "pools":{"claude":{"eligible":1}}}))
+            .unwrap();
+            let mut muted = active.clone();
+            muted.accounts[0].plan = Some(plan.into());
+            muted.accounts[0].health = json!({"kind":health});
+            muted
+                .pools
+                .as_mut()
+                .unwrap()
+                .claude
+                .as_mut()
+                .unwrap()
+                .eligible = Some(0);
+            let mut c = Controller::default();
+            observe(&mut c, &active, 0);
+            assert_eq!(c.next(Duration::ZERO).unwrap().kind, Kind::Relogin);
+            observe(&mut c, &muted, 1);
+            assert!(c.active.is_none() && c.pending.is_empty());
+            assert_eq!(c.presentation().badge, Badge::Normal);
+            assert!(c.next(Duration::from_secs(1)).is_none(), "{plan}/{health}");
+            let view = projection(&muted, SystemTime::now()).unwrap();
+            assert_eq!(view.summaries.iter().map(|s| s.todo).sum::<usize>(), 0);
+            let row = qb_tray::v2_notices::account_row(&view, "claude", "cl-synthetic").unwrap();
+            assert!(row.action.is_none());
+            assert_eq!(row.chip.as_ref().unwrap().tone, qb_tray::v2::Tone::Off);
+            assert!(
+                qb_tray::v2_notices::account_message(
+                    &view,
+                    "claude",
+                    "cl-synthetic",
+                    qb_tray::v2_notices::AccountKind::Relogin,
+                    false,
+                    SystemTime::now()
+                )
+                .is_none()
+            );
+            for kind in [
+                Kind::Relogin,
+                Kind::LinkStale,
+                Kind::Limit,
+                Kind::QuotaCredits,
+                Kind::QuotaFailover,
+                Kind::QuotaExhausted,
+                Kind::Billing,
+                Kind::StoreError,
+                Kind::OrganisationDenied,
+            ] {
+                c.enqueue(
+                    Signal {
+                        subject: Subject::Account {
+                            provider: "claude",
+                            id: "cl-synthetic",
+                        },
+                        kind,
+                    },
+                    Duration::from_secs(2),
+                );
+                observe(&mut c, &muted, 2);
+                assert!(
+                    c.pending.is_empty() && c.active.is_none(),
+                    "{kind:?}/{plan}/{health}"
+                );
+            }
+            observe(&mut c, &active, 3);
+            assert_eq!(c.next(Duration::from_secs(3)).unwrap().kind, Kind::Relogin);
+            c.finish();
+            observe(&mut c, &active, 4);
+            assert!(c.next(Duration::from_secs(4)).is_none());
         }
     }
 
