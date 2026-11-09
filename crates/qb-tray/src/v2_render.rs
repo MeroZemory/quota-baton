@@ -1862,7 +1862,7 @@ mod n10_outside_note_render_tests {
                         .expanded
                         .insert(v2::EXCLUDED_GROUP_KEY.into(), true);
                     renderer.measure(&view, &mut presentation)?;
-                    let scene = g::Scene::build(&view, presentation, 800.);
+                    let scene = g::Scene::build(&view, presentation.clone(), 800.);
                     let boxes = scene
                         .sections
                         .iter()
@@ -1886,10 +1886,15 @@ mod n10_outside_note_render_tests {
                     );
                     if user_state == "disabled" {
                         assert!(row.excluded_reason.is_some());
-                        assert_eq!(
-                            row.action.as_ref().map(|a| a.kind),
-                            Some(v2::ActionKind::Enable)
-                        );
+                        assert!(row.action.is_none(), "off accounts keep only menu actions");
+                        presentation.overlay = g::Overlay::RowMenu(row.raw.id.clone());
+                        let menu_scene = g::Scene::build(&view, presentation.clone(), 800.);
+                        assert!(menu_scene.popup.as_ref().unwrap().items.iter().any(|item| {
+                            item.enabled
+                                && matches!(&item.target,
+                                g::Target::Menu { id: Some(id), action: g::MenuAction::Enable }
+                                if id == &row.raw.id)
+                        }));
                         assert_eq!(boxes.rect.bottom - boxes.rect.top, 44.);
                         assert!(boxes.compact_reason.is_some());
                         assert!(boxes.button.is_none());

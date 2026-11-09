@@ -2155,7 +2155,8 @@ mod tests {
         assert_eq!(row_height(&rows[5]), 92.0);
         // R19 keeps the four main accounts and hides one re-login plus two
         // disabled accounts behind one 28-DIP disclosure. Legacy Row geometry
-        // above remains unchanged; the measured native fixture is now 793 DIPs.
+        // above remains unchanged. R27 adds three 22-DIP Codex reset lines,
+        // taking the measured native fixture from 793 to 859 DIPs.
         let collapsed = native_render::content_height(&rows, false);
         let view = v2::project(FIXTURE, SystemTime::now()).unwrap();
         let group = view
@@ -2165,7 +2166,7 @@ mod tests {
             .unwrap();
         assert_eq!(group.disabled_rows.len(), 3);
         assert!(!group.auto_expand_recommended);
-        assert_eq!(collapsed, 793.0);
+        assert_eq!(collapsed, 859.0);
         assert_eq!(
             native_render::content_height(&rows, true) - collapsed,
             3. * 44.
