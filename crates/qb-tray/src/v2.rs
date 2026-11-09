@@ -30,6 +30,13 @@ pub fn exclusion_reason(account: &Account) -> Option<&'static str> {
 
 /// Single-line copy; the plan and accessible name retain the full Free explanation.
 pub fn compact_reason(row: &AccountRow) -> &'static str {
+    if row.raw.health.kind == "needs_relogin" {
+        match row.raw.user_state.as_str() {
+            "disabled" => return crate::i18n::static_text("사용 안 함 · 다시 로그인 필요"),
+            "paused" => return crate::i18n::static_text("일시 중지 · 다시 로그인 필요"),
+            _ => {}
+        }
+    }
     let reason = row.excluded_reason.unwrap_or_default();
     if reason == crate::i18n::static_text("Free 요금제 · Claude Code 사용 불가") {
         crate::i18n::static_text("Claude Code 사용 불가")
@@ -560,7 +567,7 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
                     .iter()
                     .any(|a| {
                         a.provider == s.provider
-                            && a.user_state != "disabled"
+                            && crate::tray_icon::signals::account_alerts_enabled(&a.user_state)
                             && a.health.kind == "plan_without_claude_code"
                     })
                     .then(|| crate::i18n::static_text("Free 요금제 · Claude Code 사용 불가"));
@@ -673,6 +680,9 @@ fn display_state(a: &Account) -> DisplayState {
     if a.user_state == "disabled" {
         return DisplayState::Disabled;
     }
+    if a.user_state == "paused" {
+        return DisplayState::Paused;
+    }
     if a.health.kind == "needs_relogin" {
         return DisplayState::Relogin;
     }
@@ -690,8 +700,6 @@ fn display_state(a: &Account) -> DisplayState {
     }
     if actual_credits(a) {
         DisplayState::Credits
-    } else if a.user_state == "paused" {
-        DisplayState::Paused
     } else if quota(a) {
         DisplayState::Quota
     } else if account_cooling(a) && a.health.reason.as_deref() == Some("auth") {
@@ -1055,6 +1063,17 @@ pub use qb_proto::placement_capacity_label;
 /// the tray and CLI. Hidden or missing estimates remain cold, never inferred.
 /// Remove card-only content, keeping the full native facts exclusively for menus.
 fn compact_row(mut row: AccountRow) -> AccountRow {
+    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state) {
+        row.action = None;
+    }
+    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state)
+        && row.raw.health.kind == "needs_relogin"
+    {
+        row.chip = Some(Chip {
+            text: compact_reason(&row).into(),
+            tone: Tone::Off,
+        });
+    }
     row.usage = None;
     row.windows.clear();
     row.subscription_lines.clear();
@@ -1063,10 +1082,17 @@ fn compact_row(mut row: AccountRow) -> AccountRow {
     row.forecast_tooltip.clear();
     row.forecast_warning = false;
     row.credits = None;
+    let reason = if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state)
+        && row.raw.health.kind == "needs_relogin"
+    {
+        compact_reason(&row)
+    } else {
+        row.excluded_reason.unwrap_or_default()
+    };
     row.accessible_name = [
         row.name.as_str(),
         row.plan.as_deref().unwrap_or_default(),
-        row.excluded_reason.unwrap_or_default(),
+        reason,
     ]
     .into_iter()
     .filter(|part| !part.is_empty())
@@ -1242,7 +1268,7 @@ fn summarize(
                 )
             })
             .unwrap_or_else(|| {
-                if rows.iter().any(|r| r.state == DisplayState::Relogin) {
+                if active.iter().any(|r| r.state == DisplayState::Relogin) {
                     crate::i18n::static_text("다시 로그인 필요")
                 } else {
                     crate::i18n::static_text("사용할 수 있는 계정 없음")
@@ -1252,7 +1278,10 @@ fn summarize(
     };
     let todo = rows
         .iter()
-        .filter(|r| r.group == Group::NeedsAction)
+        .filter(|r| {
+            crate::tray_icon::signals::account_alerts_enabled(&r.raw.user_state)
+                && r.group == Group::NeedsAction
+        })
         .count();
     let provider_name = provider_label(provider);
     let mut tooltip = crate::i18n::format(
@@ -2408,7 +2437,6 @@ mod tests {
             ("permission", DisplayState::Permission, Tone::Bad, None),
         ] {
             let mut a = base("a");
-            a["user_state"] = json!("paused");
             a["credits_in_use"] = json!(true);
             a["health"] = json!({"kind":"cooling","reason":reason,"scope":"account"});
             let v = view(vec![a], 0);
@@ -2424,9 +2452,12 @@ mod tests {
         a["user_state"] = json!("paused");
         let v = view(vec![a.clone()], 0);
         let r = actual_row(&v, "a");
-        assert_eq!(r.state, DisplayState::Relogin);
+        assert_eq!(r.state, DisplayState::Paused);
         assert!(r.usage.is_none());
-        assert_eq!(r.action.as_ref().unwrap().kind, ActionKind::Relogin);
+        assert!(r.action.is_none());
+        assert_eq!(r.chip.as_ref().unwrap().tone, Tone::Off);
+        assert_eq!(summary(&v).todo, 0);
+        a["user_state"] = json!("active");
         a["source"] = json!({"kind":"cpa","mode":"linked"});
         let v = view(vec![a], 0);
         assert!(actual_row(&v, "a").action.is_none());
@@ -2437,8 +2468,8 @@ mod tests {
                 "quota",
                 4,
                 true,
-                DisplayState::Credits,
-                Some(Tone::Warn),
+                DisplayState::Paused,
+                Some(Tone::Off),
             ),
             (
                 "paused",
@@ -2683,7 +2714,8 @@ mod tests {
             assert!(row.forecast_lines.is_empty() && row.subscription_lines.is_empty());
             assert_eq!(row.raw.windows.len(), 1);
             assert!(row.excluded_reason.is_some());
-            assert_eq!(summary(&v).todo, if user == "disabled" { 0 } else { 1 });
+            assert_eq!(summary(&v).todo, 0);
+            assert_eq!(v.badge, Badge::Normal);
         }
     }
     #[test]

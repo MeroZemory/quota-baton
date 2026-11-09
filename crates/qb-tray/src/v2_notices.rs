@@ -32,6 +32,9 @@ pub fn quota_message(
         return None;
     }
     let row = account_row(view, provider, account_id)?;
+    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state) {
+        return None;
+    }
     let name = &row.name;
     let provider_name = v2::provider_label(provider);
     let window = match notice.window.as_deref() {
@@ -184,6 +187,9 @@ pub fn account_message(
     now: SystemTime,
 ) -> Option<(String, String)> {
     let row = account_row(view, provider, id)?;
+    if !crate::tray_icon::signals::account_alerts_enabled(&row.raw.user_state) {
+        return None;
+    }
     let title = |reason| crate::account_notice_title(&row.name, provider, reason);
     let serving = view
         .sections
@@ -261,6 +267,38 @@ mod tests {
             observed_at: "2026-10-18T11:00:00Z".parse().unwrap(),
         }
     }
+    #[test]
+    fn r27_direct_account_and_quota_copy_only_alerts_for_active_accounts() {
+        for user in ["active", "paused", "disabled"] {
+            let mut raw = account("a");
+            raw["user_state"] = json!(user);
+            raw["health"] = json!({"kind":"needs_relogin"});
+            let v = view(vec![raw]);
+            for kind in [
+                AccountKind::Relogin,
+                AccountKind::LinkStale,
+                AccountKind::Billing,
+                AccountKind::OrganisationDenied,
+                AccountKind::StoreError,
+            ] {
+                assert_eq!(
+                    account_message(&v, "codex", "a", kind, false, now()).is_some(),
+                    user == "active"
+                );
+            }
+            for action in [
+                QuotaAction::Credits,
+                QuotaAction::Failover,
+                QuotaAction::Exhausted,
+            ] {
+                assert_eq!(
+                    quota_message(&v, "codex", "a", &context(action), now()).is_some(),
+                    user == "active"
+                );
+            }
+        }
+    }
+
     #[test]
     fn r19_excluded_group_keeps_exact_provider_notice_lookup_and_disabled_recovery() {
         let mut login = account("sample-login");

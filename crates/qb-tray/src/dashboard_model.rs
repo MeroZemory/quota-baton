@@ -1374,7 +1374,9 @@ pub fn project(
             forecast_lines: a.forecast_lines.clone(),
             forecast_tooltip: a.forecast_tooltip.clone(),
             forecast_warning: a.forecast_warning,
-            relogin: a.raw.health.kind == "needs_relogin" && a.menu.show_relogin,
+            relogin: crate::tray_icon::signals::account_alerts_enabled(&a.raw.user_state)
+                && a.raw.health.kind == "needs_relogin"
+                && a.menu.show_relogin,
             relogin_reason: if a.state == v2::DisplayState::Relogin {
                 a.reason
                     .clone()
@@ -2074,9 +2076,24 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
         }
         _ => return None,
     };
-    let relogin = e.kind == "needs_relogin"
+    // Retain past account alerts only as plain history while the account is off.
+    // Global burst warnings remain global even when their payload names an account.
+    let muted_alert = e.kind != "burst"
+        && (category == EventFilter::Tasks || e.kind == "quota_reached")
         && account_rows(accounts).iter().any(|a| {
             Some(&a.raw.id) == e.account.as_ref()
+                && !crate::tray_icon::signals::account_alerts_enabled(&a.raw.user_state)
+        });
+    if muted_alert {
+        tag = crate::i18n::static_text("정보");
+        tone = v2::Tone::Off;
+        category = EventFilter::All;
+    }
+    let relogin = !muted_alert
+        && e.kind == "needs_relogin"
+        && account_rows(accounts).iter().any(|a| {
+            Some(&a.raw.id) == e.account.as_ref()
+                && crate::tray_icon::signals::account_alerts_enabled(&a.raw.user_state)
                 && a.raw.health.kind == "needs_relogin"
                 && a.menu.show_relogin
         });
@@ -2099,7 +2116,7 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
         session: d.session.as_deref().and_then(hash),
         session_label: d.label.as_deref().map(folder),
         relogin,
-        notable: e.notable,
+        notable: e.notable && !muted_alert,
         category,
         at: e.ts,
     })

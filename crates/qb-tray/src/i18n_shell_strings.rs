@@ -1,5 +1,10 @@
 //! Native shell additions to the shared Korean/English catalog.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
+    (
+        "사용 안 함 · 다시 로그인 필요",
+        "Disabled · Sign-in required",
+    ),
+    ("일시 중지 · 다시 로그인 필요", "Paused · Sign-in required"),
     ("닫기", "Close"),
     (
         "연결을 확인하며 기존 로그인 상태를 다시 확인하고 있습니다. 새 요청은 만들지 않습니다.",

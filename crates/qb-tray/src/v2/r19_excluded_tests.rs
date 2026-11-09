@@ -30,6 +30,127 @@ fn all_rows(view: &View) -> impl Iterator<Item = &AccountRow> {
         .iter()
         .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
 }
+
+#[test]
+fn r27_muted_relogin_keeps_combined_state_and_recovery_menu_without_attention() {
+    for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+        crate::i18n::with_language(language, || {
+            for user in ["disabled", "paused"] {
+                for source in [
+                    json!({"kind":"oauth"}),
+                    json!({"kind":"cpa","mode":"adopted"}),
+                ] {
+                    let mut raw = account("muted", "codex");
+                    raw["source"] = source;
+                    raw["user_state"] = json!(user);
+                    raw["health"] = json!({"kind":"needs_relogin"});
+                    raw["pool_eligible"] = json!(false);
+                    let view = project_accounts(vec![raw]);
+                    assert_eq!(view.badge, Badge::Normal);
+                    assert!(view.summaries.iter().all(|s| s.todo == 0));
+                    let row = all_rows(&view).next().unwrap();
+                    let expected = crate::i18n::static_text(if user == "disabled" {
+                        "사용 안 함 · 다시 로그인 필요"
+                    } else {
+                        "일시 중지 · 다시 로그인 필요"
+                    });
+                    assert_eq!(compact_reason(row), expected);
+                    assert!(row.accessible_name.contains(expected));
+                    assert_eq!(row.chip.as_ref().unwrap().tone, Tone::Off);
+                    assert!(row.action.is_none());
+                    assert!(row.menu.show_relogin);
+                    let scene = g::Scene::build(
+                        &view,
+                        g::Presentation {
+                            core_ok: true,
+                            expanded: [(EXCLUDED_GROUP_KEY.into(), true)].into_iter().collect(),
+                            overlay: g::Overlay::RowMenu("muted".into()),
+                            ..Default::default()
+                        },
+                        700.,
+                    );
+                    assert_eq!(
+                        scene
+                            .row("muted")
+                            .unwrap()
+                            .compact_reason
+                            .as_ref()
+                            .unwrap()
+                            .text,
+                        expected
+                    );
+                    assert!(scene.row("muted").unwrap().button.is_none());
+                    let popup = scene.popup.unwrap();
+                    for action in [
+                        crate::actions::MenuAction::Relogin,
+                        if user == "disabled" {
+                            crate::actions::MenuAction::Enable
+                        } else {
+                            crate::actions::MenuAction::Resume
+                        },
+                    ] {
+                        assert!(popup.items.iter().any(|item| item.enabled && matches!(&item.target, g::Target::Menu { id: Some(id), action: current } if id == "muted" && *current == action)));
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn r27_health_kinds_only_count_active_accounts_and_preserve_unrelated_provider_attention() {
+    for health in [
+        json!({"kind":"needs_relogin"}),
+        json!({"kind":"plan_without_claude_code"}),
+        json!({"kind":"cooling","reason":"link_stale","scope":"account"}),
+        json!({"kind":"cooling","reason":"store_error","scope":"account"}),
+        json!({"kind":"cooling","reason":"permission","scope":"account"}),
+        json!({"kind":"cooling","reason":"payment","scope":"account"}),
+    ] {
+        for user in ["active", "paused", "disabled"] {
+            let mut raw = account("subject", "codex");
+            raw["user_state"] = json!(user);
+            raw["health"] = health.clone();
+            raw["pool_eligible"] = json!(false);
+            let view = project(
+                &json!({"accounts":[raw],"pools":{"codex":{"eligible":0}}}).to_string(),
+                fixtures::clock().utc().into(),
+            )
+            .unwrap();
+            assert_eq!(
+                view.summaries.iter().map(|s| s.todo).sum::<usize>(),
+                usize::from(user == "active")
+            );
+            assert_eq!(view.badge == Badge::Attention, user == "active");
+            if user != "active" {
+                assert!(all_rows(&view).all(|row| row.action.is_none()));
+                assert!(
+                    all_rows(&view)
+                        .all(|row| row.chip.as_ref().is_none_or(|chip| chip.tone == Tone::Off))
+                );
+            }
+        }
+    }
+    let mut off = account("off", "codex");
+    off["user_state"] = json!("disabled");
+    off["health"] = json!({"kind":"needs_relogin"});
+    let ready = account("ready", "codex");
+    let view = project(
+        &json!({"accounts":[off,ready],"pools":{"codex":{"eligible":0}}}).to_string(),
+        fixtures::clock().utc().into(),
+    )
+    .unwrap();
+    assert_eq!(view.badge, Badge::Attention);
+    assert_eq!(
+        view.summaries
+            .iter()
+            .find(|s| s.provider == "codex")
+            .unwrap()
+            .verdict,
+        Verdict::Unavailable
+    );
+    assert!(view.summaries.iter().all(|s| s.todo == 0));
+}
 fn excluded(view: &View) -> &Section {
     view.sections
         .iter()

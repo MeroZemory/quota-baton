@@ -41,6 +41,12 @@ pub struct Signal<'a> {
 }
 
 impl Signal<'_> {
+    /// Account opt-out applies before kind selection, including future kinds.
+    pub fn for_user_state(self, user_state: &str) -> Option<Self> {
+        (!matches!(self.subject, Subject::Account { .. }) || account_alerts_enabled(user_state))
+            .then_some(self)
+    }
+
     /// Generic fallback; account context is formatted by the typed adapter.
     pub fn message(self) -> (&'static str, &'static str) {
         match self.kind {
@@ -93,7 +99,7 @@ pub struct Account<'a> {
     pub provider: &'a str,
     pub id: &'a str,
     pub user_state: &'a str,
-    /// D17 keeps owned/adopted credentials alive even while sessions are disabled.
+    /// Credential maintenance does not opt a paused/disabled account into alerts.
     pub maintains_tokens: bool,
     pub health_kind: &'a str,
     pub health_reason: Option<&'a str>,
@@ -105,12 +111,8 @@ pub struct Account<'a> {
 pub fn account_signal<'a>(account: &Account<'a>) -> Option<Signal<'a>> {
     if account.id.is_empty()
         || account.provider.is_empty()
-        || !matches!(account.user_state, "active" | "paused" | "disabled")
+        || !account_alerts_enabled(account.user_state)
     {
-        return None;
-    }
-    let maintained_relogin = account.maintains_tokens && account.health_kind == "needs_relogin";
-    if account.user_state != "active" && !maintained_relogin {
         return None;
     }
     let kind = match (
@@ -137,6 +139,10 @@ pub fn account_signal<'a>(account: &Account<'a>) -> Option<Signal<'a>> {
         },
         kind,
     })
+}
+
+pub fn account_alerts_enabled(user_state: &str) -> bool {
+    user_state == "active"
 }
 
 /// Core-derived provider pool status, not a count guessed from display rows.
@@ -203,6 +209,13 @@ enum OwnedSubject {
 }
 
 impl Debouncer {
+    /// Re-enabling starts from current conditions, without an old account throttle.
+    pub fn forget_account(&mut self, provider: &str, id: &str) {
+        self.entries.retain(|(subject, _), _| {
+            !matches!(subject, OwnedSubject::Account(p, a) if p == provider && a == id)
+        });
+    }
+
     pub fn allow(&mut self, signal: Signal<'_>, now: Duration) -> bool {
         const WINDOW: Duration = Duration::from_secs(30 * 60);
         // Expired entries can go; a backwards tick fails closed, not spam-open.
@@ -266,13 +279,120 @@ mod tests {
         a.health_kind = "needs_relogin";
         for state in ["paused", "disabled"] {
             a.user_state = state;
-            assert_eq!(account_signal(&a).unwrap().kind, Kind::Relogin);
+            assert!(account_signal(&a).is_none());
             a.maintains_tokens = false;
             assert!(account_signal(&a).is_none());
             a.maintains_tokens = true;
         }
         a.user_state = "unknown";
         assert!(account_signal(&a).is_none());
+    }
+
+    #[test]
+    fn r27_every_kind_obeys_account_state_without_silencing_other_subjects() {
+        for kind in [
+            Kind::Relogin,
+            Kind::LinkStale,
+            Kind::Limit,
+            Kind::QuotaCredits,
+            Kind::QuotaFailover,
+            Kind::QuotaExhausted,
+            Kind::Billing,
+            Kind::StoreError,
+            Kind::ProviderExhausted,
+            Kind::OrganisationDenied,
+            Kind::Burst,
+            Kind::CoreRestart,
+            Kind::MoveBreaker,
+            Kind::MoveReread,
+        ] {
+            for state in ["active", "paused", "disabled"] {
+                for subject in [
+                    Subject::Account {
+                        provider: "codex",
+                        id: "a",
+                    },
+                    Subject::Provider("codex"),
+                    Subject::Core,
+                ] {
+                    let signal = Signal { subject, kind };
+                    assert_eq!(
+                        signal.for_user_state(state).is_some(),
+                        !matches!(subject, Subject::Account { .. }) || state == "active",
+                        "{kind:?}/{state}/{subject:?}"
+                    );
+                }
+            }
+        }
+        for (health, reason, expected) in [
+            ("needs_relogin", None, Kind::Relogin),
+            ("cooling", Some("link_stale"), Kind::LinkStale),
+            ("cooling", Some("quota"), Kind::Limit),
+            ("cooling", Some("permission"), Kind::OrganisationDenied),
+            ("cooling", Some("payment"), Kind::Billing),
+            ("cooling", Some("store_error"), Kind::StoreError),
+        ] {
+            for state in ["active", "paused", "disabled"] {
+                for maintained in [false, true] {
+                    let mut a = account();
+                    a.user_state = state;
+                    a.maintains_tokens = maintained;
+                    a.health_kind = health;
+                    a.health_reason = reason;
+                    assert_eq!(
+                        account_signal(&a).map(|s| s.kind),
+                        (state == "active").then_some(expected)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r27_forgetting_muted_account_resets_every_kind_but_no_other_subject() {
+        let mut debounce = Debouncer::default();
+        let subjects = [
+            Subject::Account {
+                provider: "codex",
+                id: "a",
+            },
+            Subject::Account {
+                provider: "codex",
+                id: "b",
+            },
+            Subject::Provider("codex"),
+            Subject::Core,
+        ];
+        let kinds = [
+            Kind::Relogin,
+            Kind::LinkStale,
+            Kind::Limit,
+            Kind::QuotaCredits,
+            Kind::QuotaFailover,
+            Kind::QuotaExhausted,
+            Kind::Billing,
+            Kind::StoreError,
+            Kind::ProviderExhausted,
+            Kind::OrganisationDenied,
+            Kind::Burst,
+            Kind::CoreRestart,
+            Kind::MoveBreaker,
+            Kind::MoveReread,
+        ];
+        for subject in subjects {
+            for kind in kinds {
+                assert!(debounce.allow(Signal { subject, kind }, Duration::ZERO));
+            }
+        }
+        debounce.forget_account("codex", "a");
+        for (index, subject) in subjects.into_iter().enumerate() {
+            for kind in kinds {
+                assert_eq!(
+                    debounce.allow(Signal { subject, kind }, Duration::from_secs(1)),
+                    index == 0
+                );
+            }
+        }
     }
 
     #[test]

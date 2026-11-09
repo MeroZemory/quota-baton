@@ -152,6 +152,20 @@ impl Controller {
         wall: SystemTime,
         elapsed: Duration,
     ) {
+        for account in &snapshot.accounts {
+            if !signals::account_alerts_enabled(&account.user_state) {
+                self.debounce.forget_account(&account.provider, &account.id);
+                self.pending
+                    .retain(|n| n.target != Target::Account(account.id.clone()));
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|(_, n)| n.target == Target::Account(account.id.clone()))
+                {
+                    self.active = None;
+                }
+            }
+        }
         if !core_ok {
             self.unavailable(account_count);
             return;
@@ -327,6 +341,15 @@ impl Controller {
                 ));
             }
         }
+        // Final subject guard also covers manually constructed and future kinds.
+        found.retain(|(signal, _)| match signal.subject {
+            Subject::Account { provider, id } => snapshot.accounts.iter().any(|a| {
+                a.provider == provider
+                    && a.id == id
+                    && signal.for_user_state(&a.user_state).is_some()
+            }),
+            _ => true,
+        });
         self.presentation = Presentation {
             badge: match view.badge {
                 qb_tray::v2::Badge::Normal => Badge::Normal,
@@ -797,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_disabled_relogin_is_actionable_but_missing_pools_do_not_invent_exhaustion() {
+    fn owned_disabled_relogin_is_quiet_and_missing_pools_do_not_invent_exhaustion() {
         let mut c = Controller::default();
         observe(
             &mut c,
@@ -805,10 +828,107 @@ mod tests {
             0,
         );
         assert_eq!(c.presentation().badge, Badge::Normal);
-        assert_eq!(c.next(Duration::ZERO).unwrap().kind, Kind::Relogin);
-        c.finish();
         assert!(c.next(Duration::ZERO).is_none());
     }
+    #[test]
+    fn r27_health_and_quota_notices_mute_and_reenable_once_without_old_throttle() {
+        let mut cases = Vec::new();
+        for (health, expected) in [
+            (json!({"kind":"needs_relogin"}), Kind::Relogin),
+            (
+                json!({"kind":"cooling","reason":"link_stale","scope":"account","until":"2099-01-01T00:00:00Z"}),
+                Kind::LinkStale,
+            ),
+            (
+                json!({"kind":"cooling","reason":"permission","scope":"account","until":"2099-01-01T00:00:00Z"}),
+                Kind::OrganisationDenied,
+            ),
+            (
+                json!({"kind":"cooling","reason":"payment","scope":"account","until":"2099-01-01T00:00:00Z"}),
+                Kind::Billing,
+            ),
+            (
+                json!({"kind":"cooling","reason":"store_error","scope":"account","until":"2099-01-01T00:00:00Z"}),
+                Kind::StoreError,
+            ),
+        ] {
+            cases.push((snapshot(health, "active", None), expected));
+        }
+        for (action, expected) in [
+            ("credits", Kind::QuotaCredits),
+            ("failover", Kind::QuotaFailover),
+            ("exhausted", Kind::QuotaExhausted),
+        ] {
+            let mut s = quota_snapshot(action);
+            s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(1);
+            cases.push((s, expected));
+        }
+        for (active, expected) in cases {
+            for state in ["paused", "disabled"] {
+                let mut muted = active.clone();
+                muted.accounts[0].user_state = state.into();
+                let mut c = Controller::default();
+                observe(&mut c, &active, 0);
+                assert_eq!(c.next(Duration::ZERO).unwrap().kind, expected);
+                c.finish();
+                observe(&mut c, &muted, 1);
+                assert!(c.pending.is_empty(), "{expected:?}/{state}");
+                assert!(c.next(Duration::from_secs(1)).is_none());
+                observe(&mut c, &active, 2);
+                assert_eq!(c.next(Duration::from_secs(2)).unwrap().kind, expected);
+                c.finish();
+                observe(&mut c, &active, 3);
+                assert!(c.next(Duration::from_secs(3)).is_none());
+                let mut queued = Controller::default();
+                observe(&mut queued, &active, 0);
+                observe(&mut queued, &muted, 1);
+                assert!(queued.next(Duration::from_secs(1)).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn r27_muting_does_not_replay_recovered_health_or_silence_global_provider_alerts() {
+        for state in ["paused", "disabled"] {
+            let mut c = Controller::default();
+            let mut s = snapshot(json!({"kind":"needs_relogin"}), "active", Some(1));
+            observe(&mut c, &s, 0);
+            assert_eq!(c.next(Duration::ZERO).unwrap().kind, Kind::Relogin);
+            s.accounts[0].user_state = state.into();
+            observe(&mut c, &s, 1);
+            assert!(c.active.is_none() && c.pending.is_empty());
+            assert_eq!(c.presentation().badge, Badge::Normal);
+            s.accounts[0].user_state = "active".into();
+            s.accounts[0].health = json!({"kind":"ready"});
+            observe(&mut c, &s, 2);
+            assert!(c.next(Duration::from_secs(2)).is_none());
+            s.accounts[0].user_state = state.into();
+            s.pools.as_mut().unwrap().codex.as_mut().unwrap().eligible = Some(0);
+            observe(&mut c, &s, 3);
+            assert!(
+                c.next(Duration::from_secs(3)).is_none(),
+                "off-only pool is not exhausted"
+            );
+            let other = snapshot(json!({"kind":"ready"}), "active", None)
+                .accounts
+                .remove(0);
+            let mut other = other;
+            other.id = "another-active-account".into();
+            s.accounts.push(other);
+            c.restarted(Duration::from_secs(4));
+            observe(&mut c, &s, 4);
+            assert_eq!(
+                c.next(Duration::from_secs(4)).unwrap().kind,
+                Kind::CoreRestart
+            );
+            c.finish();
+            assert_eq!(
+                c.next(Duration::from_secs(4)).unwrap().kind,
+                Kind::ProviderExhausted
+            );
+        }
+    }
+
     #[test]
     fn pending_recovery_is_pruned_and_stale_or_model_cooling_is_not_a_notice() {
         let mut c = Controller::default();

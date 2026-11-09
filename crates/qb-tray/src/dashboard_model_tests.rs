@@ -3,6 +3,135 @@ use crate::dashboard_fixtures as fixtures;
 use fixtures::*;
 
 #[test]
+fn r27_disabling_removes_existing_todo_cards_and_counts_but_keeps_plain_history() {
+    let mut raw = serde_json::json!({"id":"muted","provider":"codex","label":"Muted",
+        "user_state":"active","source":{"kind":"cpa","mode":"adopted"},
+        "health":{"kind":"needs_relogin"},"pool_eligible":false});
+    let login = ActivityEvent {
+        seq: 1,
+        ts: Some(clock().utc()),
+        kind: "needs_relogin".into(),
+        provider: "codex".into(),
+        account: Some("muted".into()),
+        notable: true,
+        ..Default::default()
+    };
+    let mut state = DashboardState {
+        event_filter: EventFilter::Tasks,
+        ..Default::default()
+    };
+    let mut data = r10_accounts(serde_json::json!([raw.clone()]));
+    data.activity = vec![login.clone()];
+    let before = project(&data, &mut state, &clock());
+    assert_eq!(before.todo, 1);
+    assert_eq!(before.events.len(), 1);
+    assert_eq!(before.recent.len(), 1);
+    assert!(before.events[0].relogin);
+    for user in ["disabled", "paused"] {
+        raw["user_state"] = serde_json::json!(user);
+        data.accounts = r10_accounts(serde_json::json!([raw.clone()])).accounts;
+        let muted = project(&data, &mut state, &clock());
+        assert_eq!(muted.todo, 0);
+        assert!(muted.events.is_empty() && muted.recent.is_empty());
+        assert_eq!(
+            muted
+                .event_counts
+                .iter()
+                .find(|(f, _)| *f == EventFilter::Tasks)
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(muted.excluded_rows.len(), 1);
+        assert!(muted.groups.iter().all(|g| !g.relogin));
+        state.event_filter = EventFilter::All;
+        let history = project(&data, &mut state, &clock());
+        assert_eq!(history.events.len(), 1);
+        assert_eq!(history.events[0].seq, login.seq);
+        assert_eq!(history.events[0].category, EventFilter::All);
+        assert_eq!(history.events[0].tone, v2::Tone::Off);
+        assert!(!history.events[0].notable && !history.events[0].relogin);
+        state.event_filter = EventFilter::Tasks;
+    }
+    raw["user_state"] = serde_json::json!("active");
+    data.accounts = r10_accounts(serde_json::json!([raw])).accounts;
+    let enabled = project(&data, &mut state, &clock());
+    assert_eq!(enabled.todo, 1);
+    assert_eq!(enabled.events.len(), 1);
+    assert_eq!(
+        data.activity.len(),
+        1,
+        "projection never replays or creates history"
+    );
+}
+
+#[test]
+fn r27_muted_history_alert_kinds_are_plain_while_global_and_provider_alerts_remain() {
+    for user in ["active", "paused", "disabled"] {
+        let data = r10_accounts(
+            serde_json::json!([{"id":"a","provider":"codex","user_state":user,
+            "source":"oauth","health":{"kind":"needs_relogin"}}]),
+        );
+        for kind in [
+            "plan_without_claude_code",
+            "needs_relogin",
+            "link_stale",
+            "payment",
+            "permission",
+            "store_error",
+            "quota_reached",
+            "token_refresh",
+            "linked_reload",
+        ] {
+            let mut event = ActivityEvent {
+                seq: 1,
+                ts: Some(clock().utc()),
+                provider: "codex".into(),
+                account: Some("a".into()),
+                kind: kind.into(),
+                notable: true,
+                data: ActivityData {
+                    actionable: true,
+                    no_eligible: true,
+                    needs_relogin: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let row = event_row(&event, &data.accounts, &clock()).unwrap();
+            assert_eq!(
+                row.category == EventFilter::Tasks,
+                user == "active",
+                "{kind}/{user}"
+            );
+            assert_eq!(row.notable, user == "active", "{kind}/{user}");
+            if user != "active" {
+                assert_eq!(row.tone, v2::Tone::Off);
+                assert!(!row.relogin);
+            }
+            event.account = None;
+            assert_eq!(
+                event_row(&event, &data.accounts, &clock())
+                    .unwrap()
+                    .category,
+                EventFilter::Tasks,
+                "provider event survives {kind}/{user}"
+            );
+        }
+        let burst = ActivityEvent {
+            kind: "burst".into(),
+            account: Some("a".into()),
+            notable: true,
+            ..Default::default()
+        };
+        let global = event_row(&burst, &data.accounts, &clock()).unwrap();
+        assert_eq!(global.category, EventFilter::Tasks);
+        assert_eq!(global.tone, v2::Tone::Bad);
+        assert!(global.notable);
+    }
+}
+
+#[test]
 fn r10_retained_data_timestamp_does_not_follow_later_offline_or_polling_clocks() {
     let mut data = snapshot();
     data.data_at = None; // Exercise the explicitly unknown publication time first.
