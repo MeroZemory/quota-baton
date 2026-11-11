@@ -684,6 +684,10 @@ fn presentation(
                 .unwrap_or_default()
         } else if let Some(message) = consent.messages.get(id) {
             let mut text = i18n::static_text(message).to_owned();
+            if let Some(detail) = &consent.result_detail {
+                text.push('\n');
+                text.push_str(detail);
+            }
             if consent.success_limits
                 && let Some(row) = row_view(view, id)
             {
@@ -727,7 +731,41 @@ fn presentation(
             && consent.preview.as_ref().is_some_and(|p| p.account == id)
             && !consent.busy
             && !consent.unknown.contains_key(id);
-        active_overlay = if consent.preview.is_some() && !consent.terminal && refusal.is_none() {
+        active_overlay = if let Some(inventory) = &consent.choices
+            && let Some(i) = &inventory.claude
+            && !consent.busy
+            && refusal.is_none()
+        {
+            let recommendation = qb_tray::client::reset_credits::claude_recommendation(
+                inventory,
+                chrono::Utc::now(),
+            );
+            Overlay::ResetCreditChoices {
+                id: id.into(),
+                rows: i
+                    .grants
+                    .iter()
+                    .map(|g| {
+                        let mut detail =
+                            qb_tray::client::reset_credits::claude_choice_detail(inventory, g);
+                        if consent.unknown.contains_key(id) {
+                            detail.push('\n');
+                            detail.push_str(i18n::static_text(
+                                qb_tray::client::reset_credits::UNKNOWN,
+                            ));
+                        }
+                        geometry::ResetCreditChoice {
+                            id: g.id.clone(),
+                            label: qb_tray::client::reset_credits::claude_label(g),
+                            detail,
+                            recommended: recommendation.as_deref() == Some(g.id.as_str())
+                                && consent.can_select(id, &g.id),
+                            enabled: consent.can_select(id, &g.id),
+                        }
+                    })
+                    .collect(),
+            }
+        } else if consent.preview.is_some() && !consent.terminal && refusal.is_none() {
             Overlay::ResetCredits {
                 id: id.into(),
                 body,
@@ -744,6 +782,11 @@ fn presentation(
     let mut p = geometry::Presentation {
         expanded: session.expansion.clone(),
         pending_ids: session.pending_ids(),
+        reset_confirmation_title: session
+            .reset_credits
+            .preview
+            .as_ref()
+            .and_then(qb_tray::client::reset_credits::claude_preview_title),
         reset_busy: session.reset_credits.busy,
         reset_blocked: session.reset_credits.unknown.keys().cloned().collect(),
         reset_messages: session
@@ -861,6 +904,13 @@ fn repeated_activation(key: u32, flags: isize) -> bool {
     matches!(key, 0x0d | 0x20 | 0x79 | 0x5d) && (flags as usize & (1usize << 30)) != 0
 }
 fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
+    if let Some(target) = scene
+        .popup
+        .as_ref()
+        .and_then(|popup| popup.preferred_focus.as_ref())
+    {
+        return Some(target.clone());
+    }
     if scene
         .targets
         .iter()
@@ -898,6 +948,56 @@ fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
         .find(|h| h.enabled && !matches!(h.target, HitTarget::Blocked | HitTarget::DismissOverlay))
         .map(|h| h.target.clone())
 }
+// Previous pixels are consulted only to initialize presentation focus, never to authorize an action.
+fn reset_choice_focus_context_changed(
+    previous: Option<&geometry::Scene>,
+    next: &geometry::Scene,
+) -> bool {
+    let Some(next) = next
+        .popup
+        .as_ref()
+        .filter(|popup| popup.preferred_focus.is_some())
+    else {
+        return false;
+    };
+    let Some(previous) = previous
+        .and_then(|scene| scene.popup.as_ref())
+        .filter(|popup| popup.preferred_focus.is_some())
+    else {
+        return true;
+    };
+    previous.preferred_focus != next.preferred_focus
+        || previous
+            .items
+            .iter()
+            .filter(|item| matches!(item.target, HitTarget::SelectResetCredit { .. }))
+            .map(|item| (&item.target, item.enabled))
+            .ne(next
+                .items
+                .iter()
+                .filter(|item| matches!(item.target, HitTarget::SelectResetCredit { .. }))
+                .map(|item| (&item.target, item.enabled)))
+}
+
+fn modal_focus_after_scene_change(
+    previous: Option<&geometry::Scene>,
+    next: &geometry::Scene,
+    current: Option<&HitTarget>,
+) -> Option<HitTarget> {
+    if reset_choice_focus_context_changed(previous, next)
+        || ((next.popup.is_some() || next.dialog.is_some())
+            && !current.is_some_and(|target| {
+                next.targets
+                    .iter()
+                    .any(|hit| hit.enabled && &hit.target == target)
+            }))
+    {
+        modal_default_focus(next)
+    } else {
+        current.cloned()
+    }
+}
+
 fn disclosure_intent(scene: &geometry::Scene, provider: &str) -> Option<bool> {
     scene
         .sections
@@ -1289,16 +1389,18 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         flyout_perf::phase("target_us", perf_target);
         let offset = scene.offset;
         target.SetTransform(&Matrix3x2::identity());
-        INPUT.with(|i| {
-            let mut i = i.borrow_mut();
-            if (scene.popup.is_some() || scene.dialog.is_some())
-                && !i
-                    .focus
-                    .as_ref()
-                    .is_some_and(|t| scene.targets.iter().any(|h| h.enabled && &h.target == t))
-            {
-                i.focus = modal_default_focus(&scene);
-            }
+        // A valid Cancel target can survive Checking -> choices. Compare the previous
+        // raw painted scene for focus initialization only; action freshness still uses painted_frame.
+        PAINTED.with(|previous| {
+            let previous = previous.borrow();
+            let previous_scene = previous
+                .as_ref()
+                .filter(|frame| frame.owner == owner)
+                .map(|frame| &frame.scene);
+            INPUT.with(|i| {
+                let mut i = i.borrow_mut();
+                i.focus = modal_focus_after_scene_change(previous_scene, &scene, i.focus.as_ref());
+            });
         });
         let pointer = if INPUT.with(|i| i.borrow().pointer_mode) {
             let mut point = POINT::default();
@@ -1530,6 +1632,9 @@ fn reset_facts_changed(handle: isize) {
     }
 }
 fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
+    dispatch_reset_credit_grant(hwnd, id, refresh, None);
+}
+fn dispatch_reset_credit_grant(hwnd: HWND, id: String, refresh: bool, grant_id: Option<String>) {
     let view = projected();
     let Some(row) = row_view(&view, &id) else {
         return;
@@ -1541,6 +1646,11 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
     }
     let generation = {
         let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(grant) = &grant_id
+            && !state.reset_credits.can_select(&id, grant)
+        {
+            return;
+        }
         if state.pending(&id) {
             return;
         }
@@ -1556,6 +1666,7 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
     set_view(Some(format!("reset-credits:{id}")));
     let handle = hwnd.0 as isize;
     let failed_id = id.clone();
+    let provider = row.raw.provider.clone();
     let accepted = WORKER.get().is_some_and(|worker| {
         worker.submit(async move {
             use qb_tray::client::reset_credits::ActionError;
@@ -1573,18 +1684,37 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
             {
                 let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(inventory) = &inventory {
-                    state.reset_credits.reconciled(&id, inventory);
+                    state.reset_credits.refreshed(&id, &provider, inventory);
                 }
             }
             reset_facts_changed(handle);
             let result = match (&client, &inventory) {
+                (Ok(client), Ok(_inventory)) if provider == "claude" && grant_id.is_some() => Some(
+                    client
+                        .preview_reset_credit_grant(&id, grant_id.as_deref())
+                        .await,
+                ),
                 (Ok(client), Ok(inventory))
-                    if qb_tray::client::reset_credits::inventory_line(
-                        "codex",
-                        Some(inventory),
-                        chrono::Utc::now(),
+                    if provider == "claude"
+                        && inventory.claude.as_ref().is_some_and(|i| {
+                            i.eligible && i.grants.len() == 1 && i.grants[0].usable_now
+                        }) =>
+                {
+                    let grant = &inventory.claude.as_ref().expect("checked above").grants[0];
+                    Some(
+                        client
+                            .preview_reset_credit_grant(&id, Some(&grant.id))
+                            .await,
                     )
-                    .can_use =>
+                }
+                (Ok(client), Ok(inventory))
+                    if provider == "codex"
+                        && qb_tray::client::reset_credits::inventory_line(
+                            "codex",
+                            Some(inventory),
+                            chrono::Utc::now(),
+                        )
+                        .can_use =>
                 {
                     Some(client.preview_reset_credit(&id).await)
                 }
@@ -1597,6 +1727,13 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                     .err()
                     .or_else(|| result.as_ref().and_then(|r| r.as_ref().err()));
                 state.reset_credits.finish_read(&id, generation, error);
+                if grant_id.is_none()
+                    && let Ok(inventory) = &inventory
+                {
+                    state
+                        .reset_credits
+                        .offer_choices(&id, generation, inventory);
+                }
                 if inventory.as_ref().is_ok_and(reset_inventory_no_credits) {
                     state
                         .reset_credits
@@ -1607,7 +1744,7 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                 if let Ok(inventory) = &inventory
                     && !reset_inventory_no_credits(inventory)
                     && !qb_tray::client::reset_credits::inventory_line(
-                        "codex",
+                        &provider,
                         Some(inventory),
                         chrono::Utc::now(),
                     )
@@ -1616,9 +1753,26 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                     state.reset_credits.detail_unavailable = true;
                 }
                 if let Some(Ok(preview)) = result {
-                    state
-                        .reset_credits
-                        .ready(generation, preview, chrono::Utc::now());
+                    let provider_matches = matches!(
+                        (provider.as_str(), preview.grant.reset_type),
+                        (
+                            "codex",
+                            qb_proto::reset_credits::ResetCreditType::CodexRateLimits
+                        ) | (
+                            "claude",
+                            qb_proto::reset_credits::ResetCreditType::ClaudeRateLimits
+                        )
+                    );
+                    if provider_matches {
+                        state
+                            .reset_credits
+                            .ready(generation, preview, chrono::Utc::now());
+                    } else {
+                        state
+                            .reset_credits
+                            .messages
+                            .insert(id.clone(), qb_tray::client::reset_credits::STALE);
+                    }
                 }
             }
             reset_facts_changed(handle);
@@ -2664,6 +2818,9 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         HitTarget::TakeoverNext => windows_takeover::next(),
         HitTarget::TakeoverCommit => windows_takeover::commit(hwnd),
         HitTarget::ConfirmResetCredit(id) => confirm_reset_credit(hwnd, id),
+        HitTarget::SelectResetCredit { id, grant_id } => {
+            dispatch_reset_credit_grant(hwnd, id, false, Some(grant_id))
+        }
         HitTarget::ConfirmCredits(id) => {
             let current = projected();
             let confirmed = session()
@@ -2928,6 +3085,14 @@ fn tooltip_content(
             .items
             .iter()
             .find(|i| !i.enabled && contains(i.rect, x, y))
+            && matches!(item.target, HitTarget::SelectResetCredit { .. })
+        {
+            return item.detail.clone().map(|text| (text, item.rect));
+        }
+        if let Some(item) = popup
+            .items
+            .iter()
+            .find(|i| !i.enabled && contains(i.rect, x, y))
             && let HitTarget::Menu {
                 id: Some(id),
                 action: MenuAction::UseResetCredit,
@@ -2940,10 +3105,11 @@ fn tooltip_content(
             {
                 reason
             } else if row_view(view, id).is_some_and(|r| {
-                r.raw
-                    .reset_credits
-                    .as_ref()
-                    .is_some_and(|i| i.available_count == Some(0))
+                r.raw.provider == "codex"
+                    && r.raw
+                        .reset_credits
+                        .as_ref()
+                        .is_some_and(|i| i.available_count == Some(0))
             }) {
                 i18n::static_text("사용 가능한 리셋권이 없습니다.")
             } else {
@@ -3380,6 +3546,13 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
             .map(|b| b.label.clone())
             .unwrap_or_default(),
         HitTarget::ConfirmResetCredit(_) => i18n::text("1개 사용").into_owned(),
+        HitTarget::SelectResetCredit { .. } => frame
+            .scene
+            .popup
+            .as_ref()
+            .and_then(|p| p.items.iter().find(|i| &i.target == target))
+            .map(|i| format!("{} {}", i.text, i.detail.as_deref().unwrap_or_default()))
+            .unwrap_or_default(),
         HitTarget::ConfirmCredits(_) => i18n::text("크레딧 사용").into_owned(),
         HitTarget::ConfirmDelete(_) => i18n::text("계정 삭제").into_owned(),
         HitTarget::CancelDialog | HitTarget::LoginCancel => frame
@@ -5396,4 +5569,256 @@ fn r27_zero_with_refusal_is_not_a_confirmed_no_credit_result() {
     inventory.refusal = None;
     inventory.state = ResetCreditState::Stale;
     assert!(!reset_inventory_no_credits(&inventory));
+}
+
+#[test]
+fn r28_copy_polish_grant_list_focuses_recommended_choice_without_confirming() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    for language in [i18n::UiLanguage::Ko, i18n::UiLanguage::En] {
+        i18n::with_language(language, || {
+            let scene = geometry::Scene::build(
+                &view,
+                geometry::Presentation {
+                    overlay: Overlay::ResetCreditChoices {
+                        id: "synthetic-account".into(),
+                        rows: vec![geometry::ResetCreditChoice {
+                            id: "hidden-grant".into(),
+                            label: "Full".into(),
+                            detail: "2".into(),
+                            recommended: true,
+                            enabled: true,
+                        }],
+                    },
+                    ..Default::default()
+                },
+                480.,
+            );
+            assert_eq!(
+                modal_default_focus(&scene),
+                Some(HitTarget::SelectResetCredit {
+                    id: "synthetic-account".into(),
+                    grant_id: "hidden-grant".into(),
+                })
+            );
+            assert!(
+                scene
+                    .targets
+                    .iter()
+                    .all(|h| !matches!(h.target, HitTarget::ConfirmResetCredit(_)))
+            );
+        });
+    }
+}
+
+#[test]
+fn r28_copy_polish_grant_list_focus_falls_back_to_cancel_without_usable_recommendation() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let scene = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCreditChoices {
+                id: "synthetic-account".into(),
+                rows: vec![geometry::ResetCreditChoice {
+                    id: "hidden-grant".into(),
+                    label: "Full".into(),
+                    detail: "Unavailable".into(),
+                    recommended: true,
+                    enabled: false,
+                }],
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    assert_eq!(modal_default_focus(&scene), Some(HitTarget::CancelDialog));
+}
+
+#[test]
+fn r28_copy_polish_checking_cancel_transitions_to_nonfirst_recommended_choice() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let checking = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCreditStatus {
+                id: "account-a".into(),
+                body: "Checking".into(),
+                retry: false,
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    let choices = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCreditChoices {
+                id: "account-a".into(),
+                rows: vec![
+                    geometry::ResetCreditChoice {
+                        id: "full".into(),
+                        label: "Full".into(),
+                        detail: "Full scope".into(),
+                        recommended: false,
+                        enabled: true,
+                    },
+                    geometry::ResetCreditChoice {
+                        id: "fable".into(),
+                        label: "Fable".into(),
+                        detail: "Model weekly".into(),
+                        recommended: true,
+                        enabled: true,
+                    },
+                ],
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    let cancel = HitTarget::CancelDialog;
+    assert_eq!(modal_default_focus(&checking), Some(cancel.clone()));
+    assert!(
+        choices
+            .targets
+            .iter()
+            .any(|hit| hit.enabled && hit.target == cancel),
+        "old Cancel is still valid; invalid-focus repair alone cannot handle this transition"
+    );
+    assert!(
+        matches!(&choices.popup.as_ref().unwrap().items[0].target, HitTarget::SelectResetCredit { grant_id, .. } if grant_id == "full")
+    );
+    assert_eq!(
+        modal_focus_after_scene_change(Some(&checking), &choices, Some(&cancel)),
+        Some(HitTarget::SelectResetCredit {
+            id: "account-a".into(),
+            grant_id: "fable".into()
+        })
+    );
+}
+
+#[test]
+fn r28_copy_polish_unchanged_choices_keep_user_cancel_and_other_choice_focus() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let mut p = geometry::Presentation {
+        overlay: Overlay::ResetCreditChoices {
+            id: "account-a".into(),
+            rows: vec![
+                geometry::ResetCreditChoice {
+                    id: "full".into(),
+                    label: "Full".into(),
+                    detail: "Full scope".into(),
+                    recommended: false,
+                    enabled: true,
+                },
+                geometry::ResetCreditChoice {
+                    id: "fable".into(),
+                    label: "Fable".into(),
+                    detail: "Model weekly".into(),
+                    recommended: true,
+                    enabled: true,
+                },
+            ],
+        },
+        ..Default::default()
+    };
+    let previous = geometry::Scene::build(&view, p.clone(), 480.);
+    if let Overlay::ResetCreditChoices { rows, .. } = &mut p.overlay {
+        rows[1].detail = "A newer local expiry description".into();
+    }
+    let next = geometry::Scene::build(&view, p, 480.);
+    assert!(!reset_choice_focus_context_changed(Some(&previous), &next));
+    for current in [
+        HitTarget::CancelDialog,
+        HitTarget::SelectResetCredit {
+            id: "account-a".into(),
+            grant_id: "full".into(),
+        },
+    ] {
+        assert_eq!(
+            modal_focus_after_scene_change(Some(&previous), &next, Some(&current)),
+            Some(current)
+        );
+    }
+    let confirmation = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCredits {
+                id: "account-a".into(),
+                body: "Confirm".into(),
+                ready: true,
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    assert!(!reset_choice_focus_context_changed(
+        Some(&next),
+        &confirmation
+    ));
+    assert_eq!(
+        modal_focus_after_scene_change(
+            Some(&next),
+            &confirmation,
+            next.popup.as_ref().unwrap().preferred_focus.as_ref()
+        ),
+        Some(HitTarget::CancelDialog)
+    );
+}
+
+#[test]
+fn r28_copy_polish_new_account_or_choice_context_initializes_recommendation_once() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let p = geometry::Presentation {
+        overlay: Overlay::ResetCreditChoices {
+            id: "account-a".into(),
+            rows: vec![
+                geometry::ResetCreditChoice {
+                    id: "full".into(),
+                    label: "Full".into(),
+                    detail: "Full scope".into(),
+                    recommended: false,
+                    enabled: true,
+                },
+                geometry::ResetCreditChoice {
+                    id: "fable".into(),
+                    label: "Fable".into(),
+                    detail: "Model weekly".into(),
+                    recommended: true,
+                    enabled: true,
+                },
+            ],
+        },
+        ..Default::default()
+    };
+    let previous = geometry::Scene::build(&view, p.clone(), 480.);
+    for change in ["account", "grant", "enabled", "recommendation"] {
+        let mut next_p = p.clone();
+        if let Overlay::ResetCreditChoices { id, rows } = &mut next_p.overlay {
+            match change {
+                "account" => *id = "account-b".into(),
+                "grant" => rows[0].id = "different-full".into(),
+                "enabled" => rows[0].enabled = false,
+                "recommendation" => {
+                    rows[0].recommended = true;
+                    rows[1].recommended = false;
+                }
+                _ => unreachable!(),
+            }
+        }
+        let next = geometry::Scene::build(&view, next_p, 480.);
+        assert!(
+            reset_choice_focus_context_changed(Some(&previous), &next),
+            "{change}"
+        );
+        let expected = next.popup.as_ref().unwrap().preferred_focus.clone();
+        assert_eq!(
+            modal_focus_after_scene_change(Some(&previous), &next, Some(&HitTarget::CancelDialog)),
+            expected,
+            "{change}"
+        );
+        assert_eq!(
+            modal_focus_after_scene_change(Some(&next), &next, Some(&HitTarget::CancelDialog)),
+            Some(HitTarget::CancelDialog),
+            "unchanged follow-up paint: {change}"
+        );
+    }
 }

@@ -243,6 +243,22 @@ impl Renderer {
                 .total_lines;
             p.subtitle_lines.insert(detail.into(), lines);
         }
+        if let g::Overlay::ResetCreditChoices { rows, .. } = &p.overlay {
+            for row in rows {
+                let mut s = style(12., false, 16.);
+                s.wrap = Wrap::KeepAll;
+                let detail = &row.detail;
+                let lines = self
+                    .text
+                    .measure(
+                        &self.wrap_tokens(detail, 12, false)?,
+                        bounds(r(0., 0., 294., 65536.)),
+                        s,
+                    )?
+                    .total_lines;
+                p.subtitle_lines.insert(detail.clone(), lines.max(1));
+            }
+        }
         for summary in &view.summaries {
             let mut s = style(12., false, 16.);
             s.wrap = Wrap::KeepAll;
@@ -1348,6 +1364,13 @@ impl Renderer {
                 if let (Some(detail), Some(rect)) = (&item.detail, item.subtitle) {
                     let mut s = style(12., false, 16.);
                     s.wrap = Wrap::KeepAll;
+                    let wrapped;
+                    let detail = if matches!(item.target, g::Target::SelectResetCredit { .. }) {
+                        wrapped = self.wrap_tokens(detail, 12, false)?;
+                        &wrapped
+                    } else {
+                        detail
+                    };
                     self.text(target, rect, detail, s, p.secondary, alpha)?;
                 }
             }
@@ -1492,6 +1515,8 @@ impl Renderer {
             .and_then(|row| row.menu.credits_enable_confirmation.as_ref());
         let title = if let Some(card) = &d.login_card {
             card.title.as_str()
+        } else if let Some(title) = &d.title_text {
+            title.as_str()
         } else if d.reset_title {
             crate::i18n::static_text(
                 if d.buttons

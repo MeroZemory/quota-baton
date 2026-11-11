@@ -4,6 +4,8 @@ mod admin_view;
 pub(crate) use admin_view::pools as account_pools;
 mod outside_owner;
 mod outside_usage;
+mod reset_recovery;
+pub(crate) use reset_recovery::ResetQuotaObservation;
 mod selection;
 pub(crate) use selection::RuntimeUnavailableEvidence;
 mod wait_admission;
@@ -2680,6 +2682,7 @@ impl AccountRuntime {
                 (origin, publication),
                 None,
                 None,
+                None,
             )
             .await
             .ok();
@@ -2817,6 +2820,7 @@ impl AccountRuntime {
             (origin, wait_owner::ReportPublication::Immediate),
             None,
             None,
+            None,
         )
         .await
         .map(|(account, _, _, _)| account)
@@ -2850,6 +2854,7 @@ impl AccountRuntime {
                 origin: outside_origin,
             }),
             Some(report),
+            None,
         )
         .await
         .map(|(account, receipt, snapshot, quota_applied)| {
@@ -2898,6 +2903,7 @@ impl AccountRuntime {
         publication: (Option<ReportOrigin>, wait_owner::ReportPublication),
         outside: Option<outside_owner::PollApplication>,
         poll: Option<PollUsageReport>,
+        reset: Option<reset_recovery::ResetRecovery>,
     ) -> Result<(Account, Option<wait_owner::ReportReceipt>, Value, bool), ()> {
         let (origin, publication) = publication;
         let reported = reported.clone();
@@ -3041,30 +3047,78 @@ impl AccountRuntime {
                 // partial or nonqualifying raw report. Never capture on receipt.
                 let mut application =
                     origin.and_then(|origin| wait_owner.accept(&account_id, origin));
+                // Reset observations arrive RAW. Neither Claude's ordinary
+                // complete flag nor a cache merged before Store proves coverage.
+                let mut recover_reset = false;
+                let mut reset_published = reset.is_none();
+                if let Some(reset) = &reset {
+                    let current = store.read_account_unlocked(&account_id).map_err(|_| ())?;
+                    let live = obs.quota_snapshot(&account_id);
+                    let covered = reset.complete() && Observability::reset_window_coverage(
+                        &reported, live.as_ref(), reset.started_at(), Utc::now());
+                    if application.is_some() && covered && reset.can_recover(&current, &reported, Utc::now()) {
+                        if let Some(merged) = obs.observe_poll_after_reset(
+                            &account_id, snapshot.clone(), reset.cleared(), reset.started_at()) {
+                            snapshot = merged;
+                            reset_published = true;
+                            recover_reset = true;
+                        } else {
+                            // A newer header/expanded live inventory won the
+                            // cache lock. Never retry retirement with old facts.
+                            snapshot = obs.quota_snapshot(&account_id).ok_or(())?;
+                        }
+                    } else if let Some(merged) = obs.observe_reset_poll(&account_id, snapshot, covered, reset.started_at()) {
+                        snapshot = merged;
+                        reset_published = true;
+                    } else {
+                        snapshot = obs.quota_snapshot(&account_id).ok_or(())?;
+                    }
+                }
                 let report_model = model.clone();
                 let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
                 let mut model = model;
-                if let Some(current) = obs.quota_snapshot(&account_id)
-                    && let Some((new, incoming)) =
-                        time(&current["observed_at"]).zip(time(&snapshot["observed_at"]))
-                    && new >= incoming
-                {
-                    if new > incoming {
+                if let Some(current) = obs.quota_snapshot(&account_id) {
+                    if reset.is_some() && current != snapshot {
+                        // A cache change after the successful insert can only
+                        // veto publication; equality never grants authority.
+                        reset_published = false;
                         model = None;
+                        snapshot = current;
+                    } else if let Some((new, incoming)) =
+                        time(&current["observed_at"]).zip(time(&snapshot["observed_at"]))
+                        && new >= incoming
+                    {
+                        if new > incoming {
+                            model = None;
+                        }
+                        snapshot = current;
                     }
-                    snapshot = current;
                 }
-                if let Ok(mut released) = released_quota.lock()
+                if !reset_published {
+                    recover_reset = false;
+                    drop(application.take());
+                }
+                if reset_published && let Ok(mut released) = released_quota.lock()
                     && let Some(release) = released.get_mut(&account_id)
                 {
                     release.observe(&reported, &snapshot);
                 }
+                if recover_reset {
+                    // Release is not reproducible by the ordinary UsageSnapshot
+                    // reducer. Its native hook revokes the old origin; never
+                    // own-rotate or mint a quota/readiness proof for this change.
+                    drop(application.take());
+                }
                 let attributed = application.is_some();
-                let cause = match application.as_mut() {
-                    Some(report) => crate::accounts::MetadataCause::UsageReport(report),
-                    None => crate::accounts::MetadataCause::Mutation(
-                        crate::accounts::MetadataMutation::Ordinary,
-                    ),
+                let cause = if recover_reset {
+                    crate::accounts::MetadataCause::Mutation(crate::accounts::MetadataMutation::Release)
+                } else {
+                    match application.as_mut() {
+                        Some(report) => crate::accounts::MetadataCause::UsageReport(report),
+                        None => crate::accounts::MetadataCause::Mutation(
+                            crate::accounts::MetadataMutation::Ordinary,
+                        ),
+                    }
                 };
                 let mut ran = false;
                 let mut candidate = None;
@@ -3120,6 +3174,11 @@ impl AccountRuntime {
                             account.quota_cooling = None;
                             account.quota_credit_releasable = false;
                             removed_quota_hold = true;
+                        }
+                        if recover_reset {
+                            account.health = Health::Ready;
+                            account.quota_cooling = None;
+                            account.quota_credit_releasable = false;
                         }
                         account.apply_health_signal(
                             crate::accounts::HealthSignal::UsageSnapshot {
@@ -3218,7 +3277,7 @@ impl AccountRuntime {
                     &snapshot,
                     model.as_deref(),
                 );
-                let publish_outside = ran && !store.writes_stopped() && outside.is_some();
+                let publish_outside = ran && !store.writes_stopped() && outside.is_some() && reset_published;
                 if publish_outside
                     && let Some(outside_owner::PollApplication {
                         origin: Some(origin),
@@ -3245,7 +3304,7 @@ impl AccountRuntime {
                 if publish_outside {
                     outside_owner.publish();
                 }
-                Ok((account, snapshot, pending, true))
+                Ok((account, snapshot, pending, reset_published))
             })
             .await
             .map_err(|_| ())??;

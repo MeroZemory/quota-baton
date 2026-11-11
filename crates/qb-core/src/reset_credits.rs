@@ -82,5 +82,6 @@ pub(crate) fn inventory(state: ResetCreditState) -> ResetCreditInventory {
             ResetCreditState::Unsupported => ResetCreditRefusal::Unsupported,
             _ => ResetCreditRefusal::Unknown,
         }),
+        claude: None,
     }
 }

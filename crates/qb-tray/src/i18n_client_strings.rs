@@ -209,4 +209,107 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
         "가져오면 quota-baton이 이 계정의 토큰을 관리합니다. 원래 앱({})은 로그아웃되며, 다시 쓰려면 그 앱에서 새로 로그인해야 합니다. 원래 앱이 켜져 있으면 먼저 종료하세요.",
         "Importing lets quota-baton manage this account's tokens. The original app ({}) will be signed out. To use it again, sign in there. Close the original app before continuing.",
     ),
+    ("추가 사용 포함 주간", "Weekly including extra usage"),
+    ("Cowork 주간", "Cowork weekly"),
+    ("모델별 주간", "Model weekly"),
+    ("연결 앱 주간", "Connected apps weekly"),
+    ("사용 한도", "Usage limits"),
+    (
+        "이 계정에서는 리셋권을 사용할 수 없습니다.",
+        "This account is not eligible for reset credits.",
+    ),
+    (
+        "이 리셋권은 지금 사용할 수 없습니다.",
+        "This reset credit cannot be used now.",
+    ),
+    ("잠시 후 다시 시도해 주세요.", "Try again shortly."),
+    ("다시 사용할 수 있는 시각: {0}", "Available again: {0}"),
+    (
+        "한도에 도달했을 때만 사용할 수 있습니다.",
+        "Can only be used when a limit is reached.",
+    ),
+    (
+        "이 리셋권은 일시 중지되어 있습니다.",
+        "This reset credit is paused.",
+    ),
+    (
+        "이 리셋권은 만료되었습니다.",
+        "This reset credit has expired.",
+    ),
+    (
+        "5시간 한도 때문에 지금 사용할 수 없습니다.",
+        "The 5-hour limit prevents use right now.",
+    ),
+    (
+        "주간 한도 때문에 지금 사용할 수 없습니다.",
+        "The weekly limit prevents use right now.",
+    ),
+    (
+        "Opus 한도 때문에 지금 사용할 수 없습니다.",
+        "The Opus limit prevents use right now.",
+    ),
+    (
+        "Sonnet 한도 때문에 지금 사용할 수 없습니다.",
+        "The Sonnet limit prevents use right now.",
+    ),
+    (
+        "현재 도달한 한도를 초기화할 수 없습니다.",
+        "Cannot clear the limit currently reached.",
+    ),
+    (
+        "현재 연결 방식에서는 리셋권을 사용할 수 없습니다.",
+        "Reset credits are unavailable through this connection.",
+    ),
+    (
+        "Claude Code를 업데이트한 후 다시 확인해 주세요.",
+        "Update Claude Code, then check again.",
+    ),
+    (
+        "리셋권 정보가 변경되었습니다. 다시 확인해 주세요.",
+        "Reset credit details changed. Check again.",
+    ),
+    (
+        "초기화: {0} · {1}회 남음 · {2}",
+        "Clears: {0} · {1} uses left · {2}",
+    ),
+    ("{0} {1}개", "{0}: {1}"),
+    ("리셋권 · {0}", "Reset credits · {0}"),
+    (" · 가장 빠른 만료 {0}", " · Earliest expiry {0}"),
+    ("Claude 계정", "Claude account"),
+    ("{0} 리셋권 1개 사용", "Use one {0} reset credit"),
+    (
+        "이 계정의 {0} 사용 한도가 초기화됩니다.",
+        "This account’s {0} usage limits will be reset.",
+    ),
+    ("사용 후 남는 횟수: {0}", "Uses left after reset: {0}"),
+    ("초기화했습니다: {0}", "Reset: {0}"),
+    ("남은 횟수: {0}", "Uses left: {0}"),
+    ("주간 초기화 시각: {0}", "Weekly reset: {0}"),
+    ("사용할 리셋권을 선택하세요.", "Choose a reset credit."),
+    (
+        "Claude Code 사용 자격이 필요합니다.",
+        "Claude Code access is required.",
+    ),
+    (
+        "계정 인증이 거절되었습니다. 갱신 상태를 확인해 주세요.",
+        "Account authentication was refused. Check its refresh status.",
+    ),
+    (
+        "요청이 많습니다. 잠시 후 다시 확인해 주세요.",
+        "Too many requests. Check again shortly.",
+    ),
+    ("{0} · 오래된 정보", "{0} · stale"),
+    ("{0} · 추천", "{0} · Recommended"),
+    (
+        "모든 사용 한도 (5시간 · 주간 · 모델별)",
+        "All usage limits (5-hour, weekly, per-model)",
+    ),
+    (
+        "이 계정의 {0}가 초기화됩니다.",
+        "{0} on this account will be reset.",
+    ),
+    ("초기화: {0} · {1} · {2}", "Clears: {0} · {1} · {2}"),
+    ("1회 남음", "1 use left"),
+    ("{0}회 남음", "{0} uses left"),
+    ("만료: {0}", "Expires: {0}"),
 ];

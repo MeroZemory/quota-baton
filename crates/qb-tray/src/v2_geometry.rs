@@ -44,6 +44,7 @@ pub struct Presentation {
     pub core_ok: bool,
     pub pending_ids: BTreeSet<String>,
     pub reset_busy: bool,
+    pub reset_confirmation_title: Option<String>,
     pub reset_blocked: BTreeSet<String>,
     pub reset_messages: BTreeMap<String, String>,
     /// Actual text advance in DIPs, keyed by `text_key`. Missing keys use an
@@ -66,6 +67,7 @@ impl Default for Presentation {
             core_ok: true,
             pending_ids: BTreeSet::new(),
             reset_busy: false,
+            reset_confirmation_title: None,
             reset_blocked: BTreeSet::new(),
             reset_messages: BTreeMap::new(),
             text_widths: BTreeMap::new(),
@@ -101,10 +103,22 @@ pub enum Overlay {
         body: String,
         retry: bool,
     },
+    ResetCreditChoices {
+        id: String,
+        rows: Vec<ResetCreditChoice>,
+    },
     CreditsConfirm(String),
     DeleteConfirm(String),
     /// Replaces the list; provider identifies the caller-owned login flow.
     Login(String),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetCreditChoice {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+    pub recommended: bool,
+    pub enabled: bool,
 }
 /// Measurement cache keys distinguish font size/weight. Values exclude padding.
 pub fn text_key(text: &str, size: u8, bold: bool) -> String {
@@ -180,6 +194,10 @@ pub enum Target {
     TakeoverNext,
     TakeoverCommit,
     ConfirmResetCredit(String),
+    SelectResetCredit {
+        id: String,
+        grant_id: String,
+    },
     ConfirmCredits(String),
     ConfirmDelete(String),
     CancelDialog,
@@ -310,6 +328,7 @@ pub struct MenuItemBox {
 }
 #[derive(Debug, Clone)]
 pub struct PopupBox {
+    pub preferred_focus: Option<Target>,
     pub rect: Rect,
     pub clip: Rect,
     pub content_height: f32,
@@ -321,6 +340,7 @@ pub struct PopupBox {
 #[derive(Debug, Clone)]
 pub struct DialogBox {
     pub reset_title: bool,
+    pub title_text: Option<String>,
     pub login_card: Option<crate::v2_session::login_flow::Card>,
     pub takeover_body: Option<String>,
     pub body_offset: f32,
@@ -631,6 +651,7 @@ impl Scene {
             }
             Overlay::ResetCredits { id, body, ready } => {
                 let mut d = dialog_box(rect, id, false, &p);
+                d.title_text = p.reset_confirmation_title.clone();
                 d.takeover_body = Some(body.clone());
                 d.body_height = p.credits_body_lines as f32 * 20.;
                 d.body_offset = p
@@ -1064,6 +1085,20 @@ fn outside_note_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
         .map_or(0., |text| 6. + paragraph_height(p, text, 328.))
 }
 fn reset_credit_cta(row: &v2::AccountRow) -> bool {
+    if row.raw.provider == "claude" {
+        return v2::reset_credit_account_refusal(&row.raw).is_none()
+            && row.reset_credits.as_ref().is_some_and(|i| i.can_use)
+            && (row
+                .raw
+                .reset_credits
+                .as_ref()
+                .and_then(|i| i.claude.as_ref())
+                .is_some_and(|i| i.at_limit == Some(true))
+                || row
+                    .windows
+                    .iter()
+                    .any(|w| w.raw.used_pct.is_some_and(|u| u >= 100.)));
+    }
     row.raw.provider == "codex"
         && v2::reset_credit_account_refusal(&row.raw).is_none()
         && row
@@ -1447,7 +1482,7 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
     if let Some(s) = &row.menu.credits_line {
         parts.push(Part::Info(s.clone(), false, 16.));
     }
-    if row.raw.provider == "codex" {
+    if matches!(row.raw.provider.as_str(), "codex" | "claude") {
         if let Some(reset) = &row.reset_credits {
             parts.push(Part::HintInfo(
                 reset.text.clone(),
@@ -1460,11 +1495,14 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
         } else {
             v2::reset_credit_account_refusal(&row.raw)
         };
-        let zero = row
-            .raw
-            .reset_credits
-            .as_ref()
-            .is_some_and(|i| i.available_count == Some(0));
+        // Claude details are explicit-read only; a cached zero must not prevent
+        // checking for newly offered grants. This entry never authorizes a POST.
+        let zero = row.raw.provider == "codex"
+            && row
+                .raw
+                .reset_credits
+                .as_ref()
+                .is_some_and(|i| i.available_count == Some(0));
         let label = row
             .raw
             .reset_credits
@@ -1602,6 +1640,43 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
         )
     };
     Some(match &p.overlay {
+        Overlay::ResetCreditChoices { id, rows } => {
+            let mut parts = vec![
+                Part::Info(
+                    crate::i18n::static_text("사용할 리셋권을 선택하세요.").into(),
+                    true,
+                    24.,
+                ),
+                Part::Gap(4.),
+            ];
+            for row in rows {
+                parts.push(Part::Item(
+                    if row.recommended {
+                        crate::i18n::format("{0} · 추천", std::slice::from_ref(&row.label))
+                    } else {
+                        row.label.clone()
+                    },
+                    Some(row.detail.clone()),
+                    None,
+                    false,
+                    Target::SelectResetCredit {
+                        id: id.clone(),
+                        grant_id: row.id.clone(),
+                    },
+                    row.enabled && p.core_ok && !p.reset_busy && !p.pending_ids.contains(id),
+                ));
+            }
+            parts.push(Part::Separator);
+            parts.push(Part::Item(
+                crate::i18n::static_text("취소").into(),
+                None,
+                None,
+                false,
+                Target::CancelDialog,
+                true,
+            ));
+            (328., parts)
+        }
         Overlay::RowMenu(id) => {
             let mut parts = row_parts(
                 find_row(view, id)?,
@@ -1745,15 +1820,28 @@ fn subtitle_height(detail: &str, p: &Presentation) -> f32 {
         .unwrap_or(1)
         .clamp(1, 8) as f32
 }
+fn item_subtitle_height(detail: &str, target: &Target, p: &Presentation) -> f32 {
+    if matches!(target, Target::SelectResetCredit { .. }) {
+        let lines = p.subtitle_lines.get(detail).copied().unwrap_or_else(|| {
+            detail
+                .lines()
+                .map(|s| s.chars().count().div_ceil(42).max(1))
+                .sum()
+        });
+        16. * lines.max(1) as f32
+    } else {
+        subtitle_height(detail, p)
+    }
+}
 fn parts_height(parts: &[Part], p: &Presentation) -> f32 {
     8. + parts
         .iter()
         .map(|part| match part {
             Part::Info(_, _, height) | Part::HintInfo(_, _, height) | Part::Gap(height) => *height,
             Part::Separator => 9.,
-            Part::Item(_, subtitle, _, _, _, _) => {
+            Part::Item(_, subtitle, _, _, target, _) => {
                 if let Some(detail) = subtitle {
-                    36. + subtitle_height(detail, p)
+                    36. + item_subtitle_height(detail, target, p)
                 } else {
                     32.
                 }
@@ -1790,6 +1878,7 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
     }
     let height = content_height.min(available);
     let (right, top) = match &p.overlay {
+        Overlay::ResetCreditChoices { .. } => (344., 8.),
         Overlay::RowMenu(id) => {
             let row = scene.row(id)?;
             let below = row.more.bottom + 4.;
@@ -1869,7 +1958,7 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
             Part::Item(text, detail, checked, lead, target, enabled) => {
                 let height = detail
                     .as_deref()
-                    .map_or(32., |detail| 36. + subtitle_height(detail, p));
+                    .map_or(32., |detail| 36. + item_subtitle_height(detail, &target, p));
                 let item = r(rect.left + 5., y, rect.right - 5., y + height);
                 let lead_rect = lead.then(|| {
                     r(
@@ -1890,7 +1979,7 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
                             text_left,
                             ty + 20.,
                             item.right - 12.,
-                            ty + 20. + subtitle_height(detail, p),
+                            ty + 20. + item_subtitle_height(detail, &target, p),
                         )
                     }),
                     text,
@@ -1903,7 +1992,30 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
             }
         }
     }
+    let preferred_focus = if let Overlay::ResetCreditChoices { rows, .. } = &p.overlay {
+        rows.iter()
+            .filter(|row| row.recommended)
+            .find_map(|row| {
+                items
+                    .iter()
+                    .find(|item| {
+                        item.enabled
+                            && matches!(&item.target,
+                Target::SelectResetCredit { grant_id, .. } if grant_id == &row.id)
+                    })
+                    .map(|item| item.target.clone())
+            })
+            .or_else(|| {
+                items
+                    .iter()
+                    .find(|item| item.enabled && item.target == Target::CancelDialog)
+                    .map(|item| item.target.clone())
+            })
+    } else {
+        None
+    };
     Some(PopupBox {
+        preferred_focus,
         rect,
         clip,
         content_height,
@@ -1946,6 +2058,7 @@ fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBo
         Target::ConfirmCredits(id.into())
     };
     DialogBox {
+        title_text: None,
         reset_title: matches!(
             p.overlay,
             Overlay::ResetCredits { .. } | Overlay::ResetCreditStatus { .. }
@@ -3462,13 +3575,7 @@ mod r26_geometry_tests {
                         "ready",
                         Some("계정 상태를 먼저 확인해 주세요."),
                     ),
-                    (
-                        "claude",
-                        "active",
-                        false,
-                        "ready",
-                        Some("리셋권 · 지원 안 함"),
-                    ),
+                    ("claude", "active", false, "ready", None),
                 ] {
                     let wire = serde_json::json!({"accounts":[{"id":"a","provider":provider,"user_state":state,"drain":drain,"health":{"kind":health},"reset_credits":{"state":"fresh","observed_at":"1970-01-01T00:00:00Z","available_count":1,"grants":[{"id":"credit","expires_at":{"type":"never"},"status":"available","reset_type":"codex_rate_limits"}],"refusal":null}}]});
                     let view =
@@ -3511,13 +3618,9 @@ mod r26_geometry_tests {
                                     action: kind.clone(),
                                 }
                         });
-                        if provider == "codex" {
-                            assert_eq!(item.unwrap().enabled, reason.is_none());
-                        } else {
-                            assert!(item.is_none());
-                        }
+                        assert_eq!(item.unwrap().enabled, reason.is_none());
                     }
-                    if reason.is_none() {
+                    if reason.is_none() && provider == "codex" {
                         let now = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
                         let facts = row.raw.reset_credits.as_ref().unwrap();
                         let mut consent = crate::client::reset_credits::Consent::default();

@@ -9,6 +9,8 @@ use qb_proto::reset_credits::{
 use serde_json::Value;
 use std::collections::HashSet;
 
+pub(crate) mod claude;
+
 pub(crate) type Error = ResetCreditRefusal;
 
 /// At the boundary a new read is required. Preview validity is enforced separately.
@@ -128,6 +130,7 @@ pub(crate) fn parse_details(
         available_count: count,
         grants,
         refusal: None,
+        claude: None,
     };
     inventory.refusal = choose(&inventory, now).err();
     Ok(inventory)
@@ -140,6 +143,9 @@ pub(crate) fn choose(
     inventory: &ResetCreditInventory,
     now: DateTime<Utc>,
 ) -> Result<&ResetCreditGrant, Error> {
+    if inventory.claude.is_some() {
+        return claude::choose(inventory, None, now);
+    }
     match inventory.state {
         ResetCreditState::Unknown => return Err(Error::Unknown),
         ResetCreditState::Unsupported => return Err(Error::Unsupported),

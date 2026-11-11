@@ -1477,6 +1477,7 @@ mod tests {
 
     include!("quota/profile_tests.rs");
     include!("quota/tests/reset_credit_tests.rs");
+    include!("quota/tests/claude_reset_credit_tests.rs");
     include!("quota/tests/reset_credit_admin_tests.rs");
     mod r18_profile_tests;
     mod r18_relay_tests;
