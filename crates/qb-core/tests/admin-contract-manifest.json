@@ -338,6 +338,12 @@
       "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
     },
     {
+      "file": "crates/qb-core/src/quota/reset_credits/claude.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R28 Claude reset-credit adapter, entire production child file: typed result construction, selected-grant checks and durable settlement witness. Both production cfg branches are scanned; no JSON/default occurrences approved."
+    },
+    {
       "file": "crates/qb-core/src/reset_credits.rs",
       "json": true,
       "defaults": true,
@@ -348,6 +354,12 @@
       "json": true,
       "defaults": true,
       "coverage": "R26 reset-credit typed facts and explicit confirmation graph, entire production file; test-only items excluded. No native markers or blanket JSON/default exemptions."
+    },
+    {
+      "file": "crates/qb-core/src/reset_credits/model/claude.rs",
+      "json": true,
+      "defaults": true,
+      "coverage": "R28 Claude native facts parser and shared grant-selection model, entire production child file; direct cfg(test) items excluded. Typed inventory/result projection only; no JSON/default occurrences approved."
     },
     {
       "file": "crates/qb-proto/src/reset_credits.rs",
@@ -1864,7 +1876,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/quota/reset_credits.rs",
-        "line": 622,
+        "line": 784,
         "rule": "serde-default",
         "snippet": "default",
         "field": "_windows_reset",
@@ -1878,7 +1890,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/reset_credits/model.rs",
-        "line": 47,
+        "line": 49,
         "rule": "admin-json",
         "snippet": "json!({\"available_count\": summary.get(\"available_count\")})",
         "field": "",
@@ -1888,6 +1900,62 @@
       },
       "count": 1,
       "reason": "R26 incoming usage-summary normalization only: copies the allowlisted available_count into the strict details parser with no grant rows, so unexpected summary details cannot authorize use. Not an admin reply or arbitrary native subtree."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/quota/reset_credits.rs",
+        "line": 24,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "claude",
+        "field_type": "Option<claude::Witness>",
+        "owner": "struct:Fence",
+        "attribute": "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+      },
+      "count": 1,
+      "reason": "R28 legacy durable reset checkpoint compatibility: an absent Claude settlement witness remains None for pre-R28/Codex fences. Absence cannot prove a Claude reset settled or authorize replay; witness members stay required."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/reset_credits.rs",
+        "line": 14,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "claude",
+        "field_type": "Option<ClaudeResetInventory>",
+        "owner": "struct:ResetCreditInventory",
+        "attribute": "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+      },
+      "count": 1,
+      "reason": "R28 additive optional Claude inventory metadata: old replies and Codex inventories omit this member and retain None, never an empty/zero Claude inventory or usable-grant authority. Inner Claude fields receive no default allowance."
+    },
+    {
+      "key": {
+        "file": "crates/qb-proto/src/reset_credit_action.rs",
+        "line": 49,
+        "rule": "serde-default",
+        "snippet": "default",
+        "field": "claude",
+        "field_type": "Option<ClaudeResetResult>",
+        "owner": "struct:ResetCreditResult",
+        "attribute": "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+      },
+      "count": 1,
+      "reason": "R28 additive optional Claude outcome details: old replies and Codex results omit the member and retain None, never fabricated cleared windows, remaining uses or settlement proof. The existing outcome and inner Claude fields remain required."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/quota/reset_credits.rs",
+        "line": 513,
+        "rule": "admin-json",
+        "snippet": "json!({\"program\":\"cedar_ember\",\"grant_id\":fence.grant,\"request_id\":fence.request})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "R28 outbound Claude redemption POST body only, not an admin reply: exactly the pinned program plus the explicitly selected grant and durably fenced request ID. No provider response/body subtree or arbitrary fields are copied into this allowlisted request envelope."
     }
   ]
 }
