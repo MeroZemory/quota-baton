@@ -84,7 +84,34 @@ mod r28_claude_reset_tests {
     }
 
     fn assert_requests(f: &Fixture, posts: usize) {
+        assert_requests_with_profiles(f, posts, 0);
+    }
+
+    fn profile_reply(f: &Fixture) -> ScriptedResponse {
+        let account = f.account(0);
+        let Identity::Claude {
+            account_uuid,
+            organization_uuid: Some(organization_uuid),
+            ..
+        } = &account.identity
+        else {
+            panic!("synthetic Claude account and organization identity");
+        };
+        reply(json!({
+            "account":{"uuid":account_uuid,"has_claude_max":true},
+            "organization":{"uuid":organization_uuid,"rate_limit_tier":"default_claude_max_5x"}
+        }))
+    }
+
+    fn assert_requests_with_profiles(f: &Fixture, posts: usize, profiles: usize) {
         let requests = f.fake.state.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path_and_query == "/api/oauth/profile")
+                .count(),
+            profiles
+        );
         assert_eq!(
             requests
                 .iter()
@@ -96,7 +123,8 @@ mod r28_claude_reset_tests {
             assert!(
                 match request.method {
                     reqwest::Method::GET =>
-                        matches!(request.path_and_query.as_str(), DETAILS | USAGE),
+                        matches!(request.path_and_query.as_str(), DETAILS | USAGE)
+                            || (profiles == 1 && request.path_and_query == "/api/oauth/profile"),
                     reqwest::Method::POST => request.path_and_query == CONSUME,
                     _ => false,
                 },
@@ -201,22 +229,11 @@ mod r28_claude_reset_tests {
     async fn explicit_detail_read_uses_existing_claude_auth_and_ordinary_poll_stays_plain() {
         let f = fixture().await;
         let before = f.account(0);
-        let Identity::Claude {
-            account_uuid,
-            organization_uuid: Some(organization_uuid),
-            ..
-        } = &before.identity
-        else {
-            panic!("synthetic Claude account and organization identity");
-        };
         f.fake.state.push(reply(usage(83)));
         // Ordinary Claude polling also refreshes the existing profile lane.
         // Return this exact fixture identity, rather than letting an unscripted
         // failure mask a profile/credential regression.
-        f.fake.state.push(reply(json!({
-            "account":{"uuid":account_uuid,"has_claude_max":true},
-            "organization":{"uuid":organization_uuid,"rate_limit_tier":"default_claude_max_5x"}
-        })));
+        f.fake.state.push(profile_reply(&f));
         f.relay.quota.poll(&f.ids[0]).await.unwrap();
         assert_eq!(f.account(0).identity, before.identity);
         assert_eq!(f.account(0).plan.as_deref(), Some("max_5x"));
@@ -244,24 +261,12 @@ mod r28_claude_reset_tests {
                 requests[2].headers.get(header)
             );
         }
-        // Profile is permitted only in this explicitly scripted three-request
-        // journey. Keep assert_requests strict for every other reset-credit case.
+        // Both ordinary-poll journeys permit exactly one scripted profile GET.
+        // Other reset-credit cases retain assert_requests' zero-profile default.
+        assert_requests_with_profiles(&f, 0, 1);
         for request in &requests {
             assert_eq!(request.method, reqwest::Method::GET);
             assert!(request.body.is_empty());
-            assert_eq!(
-                request.headers["authorization"],
-                "Bearer synthetic-usage-access"
-            );
-            assert_eq!(request.headers["accept"], "application/json");
-            assert_eq!(request.headers["anthropic-beta"], "oauth-2025-04-20");
-            assert_eq!(
-                request.headers["user-agent"],
-                concat!("quota-baton/", env!("CARGO_PKG_VERSION"))
-            );
-            assert!(!request.headers.contains_key("chatgpt-account-id"));
-            assert!(!request.headers.contains_key("x-app"));
-            assert!(!request.headers.contains_key("anthropic-client-platform"));
         }
     }
 
@@ -491,7 +496,13 @@ mod r28_claude_reset_tests {
         for selected in ["full", "fable"] {
             let f = fixture().await;
             f.fake.state.push(reply(usage(94)));
+            f.fake.state.push(profile_reply(&f));
             f.relay.quota.poll(&f.ids[0]).await.unwrap();
+            let priming_requests = f.fake.state.requests();
+            assert_eq!(priming_requests.len(), 2);
+            assert_eq!(priming_requests[0].path_and_query, USAGE);
+            assert_eq!(priming_requests[1].path_and_query, "/api/oauth/profile");
+            assert_requests_with_profiles(&f, 0, 1);
             assert!(matches!(
                 f.relay.quota.poll(&f.ids[0]).await,
                 Err(PollError::TooSoon { .. })
@@ -577,7 +588,7 @@ mod r28_claude_reset_tests {
                 Err(ResetError::Stale)
             );
             assert_eq!(f.fake.state.requests().len(), count);
-            assert_requests(&f, 1);
+            assert_requests_with_profiles(&f, 1, 1);
         }
     }
 
