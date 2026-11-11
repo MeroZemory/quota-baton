@@ -21,10 +21,12 @@ fn claude_extensions_preserve_old_wire_defaults_and_request_strictness() {
     }))
     .unwrap();
     assert_eq!(result.claude, None);
-    assert!(serde_json::to_value(result)
-        .unwrap()
-        .get("claude")
-        .is_none());
+    assert!(
+        serde_json::to_value(result)
+            .unwrap()
+            .get("claude")
+            .is_none()
+    );
 }
 
 fn now() -> DateTime<Utc> {
