@@ -533,3 +533,47 @@ fn codex_wire_bytes_and_confirmation_copy_remain_unchanged() {
         );
     });
 }
+
+#[test]
+fn transport_refusals_explain_recovery_in_both_languages_without_generic_duplication() {
+    for language in [UiLanguage::Ko, UiLanguage::En] {
+        with_language(language, || {
+            for (reason, wanted) in [
+                (
+                    "authentication_required",
+                    "계정 인증이 거절되었습니다. 갱신 상태를 확인해 주세요.",
+                ),
+                (
+                    "rate_limited",
+                    "요청이 많습니다. 잠시 후 다시 확인해 주세요.",
+                ),
+            ] {
+                let mut c = Consent::default();
+                let mut r = ResetCreditResult {
+                    account: "cl-secret".into(),
+                    outcome: ResetCreditOutcome::Refused,
+                    inventory: inventory(vec![grant("one-secret", "Full", false)]),
+                    refresh_failed: false,
+                    claude: Some(qb_proto::reset_credit_action::ClaudeResetResult {
+                        result: "unavailable".into(),
+                        reason: Some(reason.into()),
+                        resets_left: None,
+                        cleared: vec![],
+                        weekly_resets_at: None,
+                        cooldown_until: None,
+                    }),
+                };
+                c.result("cl-secret", &Ok(r.clone()));
+                assert_eq!(c.result_detail.as_deref(), Some(text(wanted).as_str()));
+                assert!(!c.sending && c.terminal);
+                r.claude.as_mut().unwrap().reason = None;
+                c.result("cl-secret", &Ok(r));
+                assert!(c.result_detail.is_none());
+                assert_eq!(
+                    c.messages.get("cl-secret"),
+                    Some(&"이 리셋권은 지금 사용할 수 없습니다.")
+                );
+            }
+        });
+    }
+}

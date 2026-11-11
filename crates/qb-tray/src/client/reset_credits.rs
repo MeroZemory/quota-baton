@@ -256,6 +256,8 @@ fn claude_reason_at<Tz: TimeZone>(
         "cli_version" => "Claude Code를 업데이트한 후 다시 확인해 주세요.",
         "tier" | "seat" | "ineligible" => "이 계정에서는 리셋권을 사용할 수 없습니다.",
         "no_grant" => "사용 가능한 리셋권이 없습니다.",
+        "authentication_required" => "계정 인증이 거절되었습니다. 갱신 상태를 확인해 주세요.",
+        "rate_limited" => "요청이 많습니다. 잠시 후 다시 확인해 주세요.",
         "grant_id_required" | "not_next_grant" | "unknown_grant" => {
             "리셋권 정보가 변경되었습니다. 다시 확인해 주세요."
         }
@@ -991,7 +993,8 @@ impl Consent {
             .ok()
             .filter(|r| r.outcome != ResetCreditOutcome::Unknown)
             .and_then(|r| r.claude.as_ref())
-            .map(claude_result_body);
+            .map(claude_result_body)
+            .filter(|detail| detail != &text("이 리셋권은 지금 사용할 수 없습니다."));
         self.terminal = true;
         self.sending = false;
         self.success_limits = false; // Result DTO has inventory, not refreshed usage windows.

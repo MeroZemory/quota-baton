@@ -295,5 +295,13 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
         "Claude Code 사용 자격이 필요합니다.",
         "Claude Code access is required.",
     ),
+    (
+        "계정 인증이 거절되었습니다. 갱신 상태를 확인해 주세요.",
+        "Account authentication was refused. Check its refresh status.",
+    ),
+    (
+        "요청이 많습니다. 잠시 후 다시 확인해 주세요.",
+        "Too many requests. Check again shortly.",
+    ),
     ("{0} · 추천", "{0} · Recommended"),
 ];
