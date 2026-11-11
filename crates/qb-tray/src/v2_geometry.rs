@@ -328,6 +328,7 @@ pub struct MenuItemBox {
 }
 #[derive(Debug, Clone)]
 pub struct PopupBox {
+    pub preferred_focus: Option<Target>,
     pub rect: Rect,
     pub clip: Rect,
     pub content_height: f32,
@@ -1647,15 +1648,6 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
                     24.,
                 ),
                 Part::Gap(4.),
-                Part::Item(
-                    crate::i18n::static_text("취소").into(),
-                    None,
-                    None,
-                    false,
-                    Target::CancelDialog,
-                    true,
-                ),
-                Part::Separator,
             ];
             for row in rows {
                 parts.push(Part::Item(
@@ -1664,7 +1656,7 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
                     } else {
                         row.label.clone()
                     },
-                    Some(format!("{}\n{}", row.label, row.detail)),
+                    Some(row.detail.clone()),
                     None,
                     false,
                     Target::SelectResetCredit {
@@ -1674,6 +1666,15 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
                     row.enabled && p.core_ok && !p.reset_busy && !p.pending_ids.contains(id),
                 ));
             }
+            parts.push(Part::Separator);
+            parts.push(Part::Item(
+                crate::i18n::static_text("취소").into(),
+                None,
+                None,
+                false,
+                Target::CancelDialog,
+                true,
+            ));
             (328., parts)
         }
         Overlay::RowMenu(id) => {
@@ -1991,7 +1992,30 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
             }
         }
     }
+    let preferred_focus = if let Overlay::ResetCreditChoices { rows, .. } = &p.overlay {
+        rows.iter()
+            .filter(|row| row.recommended)
+            .find_map(|row| {
+                items
+                    .iter()
+                    .find(|item| {
+                        item.enabled
+                            && matches!(&item.target,
+                Target::SelectResetCredit { grant_id, .. } if grant_id == &row.id)
+                    })
+                    .map(|item| item.target.clone())
+            })
+            .or_else(|| {
+                items
+                    .iter()
+                    .find(|item| item.enabled && item.target == Target::CancelDialog)
+                    .map(|item| item.target.clone())
+            })
+    } else {
+        None
+    };
     Some(PopupBox {
+        preferred_focus,
         rect,
         clip,
         content_height,

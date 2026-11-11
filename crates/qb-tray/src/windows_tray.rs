@@ -746,14 +746,8 @@ fn presentation(
                     .grants
                     .iter()
                     .map(|g| {
-                        let mut detail = qb_tray::client::reset_credits::claude_grant_detail(i, g);
-                        if !consent.can_select(id, &g.id)
-                            && g.usable_now
-                            && let Some(reason) = inventory.refusal
-                        {
-                            detail.push('\n');
-                            detail.push_str(&qb_tray::client::reset_credits::refusal_text(reason));
-                        }
+                        let mut detail =
+                            qb_tray::client::reset_credits::claude_choice_detail(inventory, g);
                         if consent.unknown.contains_key(id) {
                             detail.push('\n');
                             detail.push_str(i18n::static_text(
@@ -910,12 +904,12 @@ fn repeated_activation(key: u32, flags: isize) -> bool {
     matches!(key, 0x0d | 0x20 | 0x79 | 0x5d) && (flags as usize & (1usize << 30)) != 0
 }
 fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
-    if scene
-        .targets
-        .iter()
-        .any(|h| matches!(h.target, HitTarget::SelectResetCredit { .. }))
+    if let Some(target) = scene
+        .popup
+        .as_ref()
+        .and_then(|popup| popup.preferred_focus.as_ref())
     {
-        return Some(HitTarget::CancelDialog);
+        return Some(target.clone());
     }
     if scene
         .targets
@@ -954,6 +948,56 @@ fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
         .find(|h| h.enabled && !matches!(h.target, HitTarget::Blocked | HitTarget::DismissOverlay))
         .map(|h| h.target.clone())
 }
+// Previous pixels are consulted only to initialize presentation focus, never to authorize an action.
+fn reset_choice_focus_context_changed(
+    previous: Option<&geometry::Scene>,
+    next: &geometry::Scene,
+) -> bool {
+    let Some(next) = next
+        .popup
+        .as_ref()
+        .filter(|popup| popup.preferred_focus.is_some())
+    else {
+        return false;
+    };
+    let Some(previous) = previous
+        .and_then(|scene| scene.popup.as_ref())
+        .filter(|popup| popup.preferred_focus.is_some())
+    else {
+        return true;
+    };
+    previous.preferred_focus != next.preferred_focus
+        || previous
+            .items
+            .iter()
+            .filter(|item| matches!(item.target, HitTarget::SelectResetCredit { .. }))
+            .map(|item| (&item.target, item.enabled))
+            .ne(next
+                .items
+                .iter()
+                .filter(|item| matches!(item.target, HitTarget::SelectResetCredit { .. }))
+                .map(|item| (&item.target, item.enabled)))
+}
+
+fn modal_focus_after_scene_change(
+    previous: Option<&geometry::Scene>,
+    next: &geometry::Scene,
+    current: Option<&HitTarget>,
+) -> Option<HitTarget> {
+    if reset_choice_focus_context_changed(previous, next)
+        || ((next.popup.is_some() || next.dialog.is_some())
+            && !current.is_some_and(|target| {
+                next.targets
+                    .iter()
+                    .any(|hit| hit.enabled && &hit.target == target)
+            }))
+    {
+        modal_default_focus(next)
+    } else {
+        current.cloned()
+    }
+}
+
 fn disclosure_intent(scene: &geometry::Scene, provider: &str) -> Option<bool> {
     scene
         .sections
@@ -1345,16 +1389,18 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         flyout_perf::phase("target_us", perf_target);
         let offset = scene.offset;
         target.SetTransform(&Matrix3x2::identity());
-        INPUT.with(|i| {
-            let mut i = i.borrow_mut();
-            if (scene.popup.is_some() || scene.dialog.is_some())
-                && !i
-                    .focus
-                    .as_ref()
-                    .is_some_and(|t| scene.targets.iter().any(|h| h.enabled && &h.target == t))
-            {
-                i.focus = modal_default_focus(&scene);
-            }
+        // A valid Cancel target can survive Checking -> choices. Compare the previous
+        // raw painted scene for focus initialization only; action freshness still uses painted_frame.
+        PAINTED.with(|previous| {
+            let previous = previous.borrow();
+            let previous_scene = previous
+                .as_ref()
+                .filter(|frame| frame.owner == owner)
+                .map(|frame| &frame.scene);
+            INPUT.with(|i| {
+                let mut i = i.borrow_mut();
+                i.focus = modal_focus_after_scene_change(previous_scene, &scene, i.focus.as_ref());
+            });
         });
         let pointer = if INPUT.with(|i| i.borrow().pointer_mode) {
             let mut point = POINT::default();
@@ -5526,7 +5572,7 @@ fn r27_zero_with_refusal_is_not_a_confirmed_no_credit_result() {
 }
 
 #[test]
-fn r28_grant_list_defaults_to_cancel_even_when_a_recommendation_is_usable() {
+fn r28_copy_polish_grant_list_focuses_recommended_choice_without_confirming() {
     let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
     for language in [i18n::UiLanguage::Ko, i18n::UiLanguage::En] {
         i18n::with_language(language, || {
@@ -5547,7 +5593,13 @@ fn r28_grant_list_defaults_to_cancel_even_when_a_recommendation_is_usable() {
                 },
                 480.,
             );
-            assert_eq!(modal_default_focus(&scene), Some(HitTarget::CancelDialog));
+            assert_eq!(
+                modal_default_focus(&scene),
+                Some(HitTarget::SelectResetCredit {
+                    id: "synthetic-account".into(),
+                    grant_id: "hidden-grant".into(),
+                })
+            );
             assert!(
                 scene
                     .targets
@@ -5555,5 +5607,218 @@ fn r28_grant_list_defaults_to_cancel_even_when_a_recommendation_is_usable() {
                     .all(|h| !matches!(h.target, HitTarget::ConfirmResetCredit(_)))
             );
         });
+    }
+}
+
+#[test]
+fn r28_copy_polish_grant_list_focus_falls_back_to_cancel_without_usable_recommendation() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let scene = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCreditChoices {
+                id: "synthetic-account".into(),
+                rows: vec![geometry::ResetCreditChoice {
+                    id: "hidden-grant".into(),
+                    label: "Full".into(),
+                    detail: "Unavailable".into(),
+                    recommended: true,
+                    enabled: false,
+                }],
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    assert_eq!(modal_default_focus(&scene), Some(HitTarget::CancelDialog));
+}
+
+#[test]
+fn r28_copy_polish_checking_cancel_transitions_to_nonfirst_recommended_choice() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let checking = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCreditStatus {
+                id: "account-a".into(),
+                body: "Checking".into(),
+                retry: false,
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    let choices = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCreditChoices {
+                id: "account-a".into(),
+                rows: vec![
+                    geometry::ResetCreditChoice {
+                        id: "full".into(),
+                        label: "Full".into(),
+                        detail: "Full scope".into(),
+                        recommended: false,
+                        enabled: true,
+                    },
+                    geometry::ResetCreditChoice {
+                        id: "fable".into(),
+                        label: "Fable".into(),
+                        detail: "Model weekly".into(),
+                        recommended: true,
+                        enabled: true,
+                    },
+                ],
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    let cancel = HitTarget::CancelDialog;
+    assert_eq!(modal_default_focus(&checking), Some(cancel.clone()));
+    assert!(
+        choices
+            .targets
+            .iter()
+            .any(|hit| hit.enabled && hit.target == cancel),
+        "old Cancel is still valid; invalid-focus repair alone cannot handle this transition"
+    );
+    assert!(
+        matches!(&choices.popup.as_ref().unwrap().items[0].target, HitTarget::SelectResetCredit { grant_id, .. } if grant_id == "full")
+    );
+    assert_eq!(
+        modal_focus_after_scene_change(Some(&checking), &choices, Some(&cancel)),
+        Some(HitTarget::SelectResetCredit {
+            id: "account-a".into(),
+            grant_id: "fable".into()
+        })
+    );
+}
+
+#[test]
+fn r28_copy_polish_unchanged_choices_keep_user_cancel_and_other_choice_focus() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let mut p = geometry::Presentation {
+        overlay: Overlay::ResetCreditChoices {
+            id: "account-a".into(),
+            rows: vec![
+                geometry::ResetCreditChoice {
+                    id: "full".into(),
+                    label: "Full".into(),
+                    detail: "Full scope".into(),
+                    recommended: false,
+                    enabled: true,
+                },
+                geometry::ResetCreditChoice {
+                    id: "fable".into(),
+                    label: "Fable".into(),
+                    detail: "Model weekly".into(),
+                    recommended: true,
+                    enabled: true,
+                },
+            ],
+        },
+        ..Default::default()
+    };
+    let previous = geometry::Scene::build(&view, p.clone(), 480.);
+    if let Overlay::ResetCreditChoices { rows, .. } = &mut p.overlay {
+        rows[1].detail = "A newer local expiry description".into();
+    }
+    let next = geometry::Scene::build(&view, p, 480.);
+    assert!(!reset_choice_focus_context_changed(Some(&previous), &next));
+    for current in [
+        HitTarget::CancelDialog,
+        HitTarget::SelectResetCredit {
+            id: "account-a".into(),
+            grant_id: "full".into(),
+        },
+    ] {
+        assert_eq!(
+            modal_focus_after_scene_change(Some(&previous), &next, Some(&current)),
+            Some(current)
+        );
+    }
+    let confirmation = geometry::Scene::build(
+        &view,
+        geometry::Presentation {
+            overlay: Overlay::ResetCredits {
+                id: "account-a".into(),
+                body: "Confirm".into(),
+                ready: true,
+            },
+            ..Default::default()
+        },
+        480.,
+    );
+    assert!(!reset_choice_focus_context_changed(
+        Some(&next),
+        &confirmation
+    ));
+    assert_eq!(
+        modal_focus_after_scene_change(
+            Some(&next),
+            &confirmation,
+            next.popup.as_ref().unwrap().preferred_focus.as_ref()
+        ),
+        Some(HitTarget::CancelDialog)
+    );
+}
+
+#[test]
+fn r28_copy_polish_new_account_or_choice_context_initializes_recommendation_once() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    let p = geometry::Presentation {
+        overlay: Overlay::ResetCreditChoices {
+            id: "account-a".into(),
+            rows: vec![
+                geometry::ResetCreditChoice {
+                    id: "full".into(),
+                    label: "Full".into(),
+                    detail: "Full scope".into(),
+                    recommended: false,
+                    enabled: true,
+                },
+                geometry::ResetCreditChoice {
+                    id: "fable".into(),
+                    label: "Fable".into(),
+                    detail: "Model weekly".into(),
+                    recommended: true,
+                    enabled: true,
+                },
+            ],
+        },
+        ..Default::default()
+    };
+    let previous = geometry::Scene::build(&view, p.clone(), 480.);
+    for change in ["account", "grant", "enabled", "recommendation"] {
+        let mut next_p = p.clone();
+        if let Overlay::ResetCreditChoices { id, rows } = &mut next_p.overlay {
+            match change {
+                "account" => *id = "account-b".into(),
+                "grant" => rows[0].id = "different-full".into(),
+                "enabled" => rows[0].enabled = false,
+                "recommendation" => {
+                    rows[0].recommended = true;
+                    rows[1].recommended = false;
+                }
+                _ => unreachable!(),
+            }
+        }
+        let next = geometry::Scene::build(&view, next_p, 480.);
+        assert!(
+            reset_choice_focus_context_changed(Some(&previous), &next),
+            "{change}"
+        );
+        let expected = next.popup.as_ref().unwrap().preferred_focus.clone();
+        assert_eq!(
+            modal_focus_after_scene_change(Some(&previous), &next, Some(&HitTarget::CancelDialog)),
+            expected,
+            "{change}"
+        );
+        assert_eq!(
+            modal_focus_after_scene_change(Some(&next), &next, Some(&HitTarget::CancelDialog)),
+            Some(HitTarget::CancelDialog),
+            "unchanged follow-up paint: {change}"
+        );
     }
 }

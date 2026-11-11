@@ -300,4 +300,16 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
     ),
     ("{0} · 오래된 정보", "{0} · stale"),
     ("{0} · 추천", "{0} · Recommended"),
+    (
+        "모든 사용 한도 (5시간 · 주간 · 모델별)",
+        "All usage limits (5-hour, weekly, per-model)",
+    ),
+    (
+        "이 계정의 {0}가 초기화됩니다.",
+        "{0} on this account will be reset.",
+    ),
+    ("초기화: {0} · {1} · {2}", "Clears: {0} · {1} · {2}"),
+    ("1회 남음", "1 use left"),
+    ("{0}회 남음", "{0} uses left"),
+    ("만료: {0}", "Expires: {0}"),
 ];

@@ -247,16 +247,16 @@ impl Renderer {
             for row in rows {
                 let mut s = style(12., false, 16.);
                 s.wrap = Wrap::KeepAll;
-                let detail = format!("{}\n{}", row.label, row.detail);
+                let detail = &row.detail;
                 let lines = self
                     .text
                     .measure(
-                        &self.wrap_tokens(&detail, 12, false)?,
+                        &self.wrap_tokens(detail, 12, false)?,
                         bounds(r(0., 0., 294., 65536.)),
                         s,
                     )?
                     .total_lines;
-                p.subtitle_lines.insert(detail, lines.max(1));
+                p.subtitle_lines.insert(detail.clone(), lines.max(1));
             }
         }
         for summary in &view.summaries {

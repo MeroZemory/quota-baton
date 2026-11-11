@@ -268,7 +268,7 @@ fn localized_names_expiry_effect_count_and_reasons_never_show_identifiers_or_ali
             let line = inventory_line_at("claude", Some(&i), &clock);
             assert!(line.text.contains("Full") && line.text.contains("Fable"));
             assert!(line.text.contains("11/30 19:00"));
-            assert!(body.contains("Fable") && body.contains("11/30 19:00"));
+            assert!(!body.contains("Fable") && body.contains("11/30 19:00"));
             assert!(body.contains(&text("모델별 주간")));
             assert!(
                 !body.contains(&text("5시간")),
@@ -375,10 +375,13 @@ fn multiple_grants_use_bounded_scrolling_native_menu_and_keep_disabled_reasons()
         let popup = scene.popup.unwrap();
         assert!(popup.rect.bottom <= cap);
         assert!(popup.content_height > popup.clip.bottom - popup.clip.top);
-        assert!(popup.items[0].target == g::Target::CancelDialog && popup.items[0].enabled);
-        assert!(!popup.items[1].enabled);
         assert!(
-            popup.items[1]
+            popup.items.last().unwrap().target == g::Target::CancelDialog
+                && popup.items.last().unwrap().enabled
+        );
+        assert!(!popup.items[0].enabled);
+        assert!(
+            popup.items[0]
                 .detail
                 .as_ref()
                 .unwrap()
@@ -436,9 +439,9 @@ fn success_and_refusal_show_native_windows_counts_and_finite_reasons() {
                 weekly_resets_at: None,
                 cooldown_until: None,
             };
-            let body = claude_result_body(&r);
+            let body = claude_result_body(&r, false);
             assert!(body.contains(&text("5시간")) && body.contains(&text("Sonnet 주간")));
-            assert!(body.contains(&qb_tray::i18n::format("남은 횟수: {0}", &["1".into()])));
+            assert!(body.contains(&claude_uses_left(1)));
             let mut c = Consent::default();
             c.result(
                 "cl-secret",
@@ -682,4 +685,216 @@ fn claude_cached_zero_can_check_for_new_grants_without_cached_consumption_author
                 ..
             }
         )));
+}
+
+#[test]
+fn r28_copy_polish_full_scope_summary_is_shared_by_list_confirm_and_selected_result() {
+    for language in [UiLanguage::Ko, UiLanguage::En] {
+        with_language(language, || {
+            let g = grant("hidden-full", "Full", true);
+            let i = inventory(vec![g.clone()]);
+            let p = preview(i.clone(), "hidden-full");
+            let summary = text("모든 사용 한도 (5시간 · 주간 · 모델별)");
+            assert!(
+                claude_grant_detail_at(i.claude.as_ref().unwrap(), &g, &now()).contains(&summary)
+            );
+            assert!(preview_body_at(&p, &now()).contains(&summary));
+            let mut c = Consent::default();
+            let generation = c.begin("cl-secret", false).unwrap();
+            c.finish_read("cl-secret", generation, None);
+            assert!(c.ready(generation, p, now()));
+            assert!(c.confirm("cl-secret", now()).unwrap().confirm);
+            assert!(c.preview.is_none());
+            c.result(
+                "cl-secret",
+                &Ok(ResetCreditResult {
+                    account: "cl-secret".into(),
+                    outcome: ResetCreditOutcome::Reset,
+                    inventory: i,
+                    refresh_failed: false,
+                    claude: Some(qb_proto::reset_credit_action::ClaudeResetResult {
+                        result: "reset".into(),
+                        reason: None,
+                        resets_left: Some(1),
+                        cleared: g.clears,
+                        weekly_resets_at: None,
+                        cooldown_until: None,
+                    }),
+                }),
+            );
+            let detail = c.result_detail.unwrap();
+            assert!(detail.contains(&summary));
+            assert!(!detail.contains("hidden-full"));
+            assert!(c.unknown.is_empty());
+        });
+    }
+}
+
+#[test]
+fn r28_copy_polish_full_result_requires_selected_type_not_window_shape() {
+    let mut full = grant("hidden-full", "Full", true);
+    full.clears = vec![
+        "five_hour".into(),
+        "seven_day".into(),
+        "seven_day_omelette".into(),
+    ];
+    let r = qb_proto::reset_credit_action::ClaudeResetResult {
+        result: "reset".into(),
+        reason: None,
+        resets_left: Some(1),
+        cleared: full.clears.clone(),
+        weekly_resets_at: None,
+        cooldown_until: None,
+    };
+    let without_selected_context = claude_result_body(&r, false);
+    assert!(!without_selected_context.contains(&text("모든 사용 한도 (5시간 · 주간 · 모델별)")));
+    assert!(without_selected_context.contains(&text("모델별 주간")));
+    full.grant_type = Some("weekly".into());
+    assert!(
+        !claude_grant_detail_at(
+            inventory(vec![full.clone()]).claude.as_ref().unwrap(),
+            &full,
+            &now()
+        )
+        .contains(&text("모든 사용 한도 (5시간 · 주간 · 모델별)"))
+    );
+}
+
+#[test]
+fn r28_copy_polish_confirmation_keeps_identity_one_effect_remaining_and_expiry_only() {
+    for language in [UiLanguage::Ko, UiLanguage::En] {
+        with_language(language, || {
+            for label in ["Full", "Fable"] {
+                let i = inventory(vec![grant("hidden-selected", label, true)]);
+                let p = preview(i, "hidden-selected");
+                let clock = now().with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap());
+                let body = preview_body_at(&p, &clock);
+                assert_eq!(
+                    body.lines().count(),
+                    5,
+                    "identity, email, effect, remaining, expiry; plan is attached by host"
+                );
+                assert!(body.starts_with("Chosen account\nsample@example.invalid\n"));
+                assert!(!body.contains(&claude_preview_title(&p).unwrap()));
+                assert!(!body.contains(&text("초기화:")) && !body.contains("Clears:"));
+                assert_eq!(body.matches("11/30 19:00").count(), 1);
+                assert!(body.contains(&qb_tray::i18n::format(
+                    "사용 후 남는 횟수: {0}",
+                    &["1".into()]
+                )));
+                if label == "Fable" {
+                    assert!(body.contains(&text("모델별 주간")));
+                    assert!(!body.contains("Fable") && !body.contains("omelette"));
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn r28_copy_polish_uses_left_agrees_for_one_zero_and_many() {
+    with_language(UiLanguage::En, || {
+        for (count, expected) in [(0, "0 uses left"), (1, "1 use left"), (2, "2 uses left")] {
+            assert_eq!(claude_uses_left(count), expected);
+            let mut g = grant("hidden", "Fable", true);
+            g.resets_left = count;
+            let i = inventory(vec![g.clone()]);
+            assert!(
+                claude_grant_detail_at(i.claude.as_ref().unwrap(), &g, &now()).contains(expected)
+            );
+            let r = qb_proto::reset_credit_action::ClaudeResetResult {
+                result: "reset".into(),
+                reason: None,
+                resets_left: Some(count),
+                cleared: g.clears,
+                weekly_resets_at: None,
+                cooldown_until: None,
+            };
+            assert!(claude_result_body(&r, false).contains(expected));
+        }
+    });
+}
+
+#[test]
+fn r28_copy_polish_ineligible_choice_keeps_only_the_specific_provider_reason() {
+    for language in [UiLanguage::Ko, UiLanguage::En] {
+        with_language(language, || {
+            let mut i = inventory(vec![grant("hidden", "Full", true)]);
+            i.refusal = Some(qb_proto::reset_credits::ResetCreditRefusal::Ineligible);
+            let facts = i.claude.as_mut().unwrap();
+            facts.eligible = false;
+            facts.ineligible_reason = Some("surface".into());
+            let detail = claude_choice_detail(&i, &i.claude.as_ref().unwrap().grants[0]);
+            assert_eq!(
+                detail
+                    .matches(&text("현재 연결 방식에서는 리셋권을 사용할 수 없습니다."))
+                    .count(),
+                1
+            );
+            assert!(!detail.contains(&text("이 계정에서는 리셋권을 사용할 수 없습니다.")));
+        });
+    }
+}
+
+#[test]
+fn r28_copy_polish_choice_names_once_cancel_last_and_enabled_recommendation_only() {
+    let v = view(None, "active", "ready", "pro");
+    let rows = vec![
+        g::ResetCreditChoice {
+            id: "hidden-full".into(),
+            label: "Full".into(),
+            detail: "All usage limits".into(),
+            recommended: false,
+            enabled: true,
+        },
+        g::ResetCreditChoice {
+            id: "hidden-fable".into(),
+            label: "Fable".into(),
+            detail: "Model weekly".into(),
+            recommended: true,
+            enabled: true,
+        },
+    ];
+    for available in [true, false] {
+        let mut rows = rows.clone();
+        if !available {
+            for row in &mut rows {
+                row.enabled = false;
+            }
+        }
+        let scene = g::Scene::build(
+            &v,
+            g::Presentation {
+                overlay: g::Overlay::ResetCreditChoices {
+                    id: "cl-secret".into(),
+                    rows,
+                },
+                ..Default::default()
+            },
+            480.,
+        );
+        let popup = scene.popup.unwrap();
+        assert_eq!(popup.items.last().unwrap().target, g::Target::CancelDialog);
+        for (name, item) in ["Full", "Fable"].iter().zip(&popup.items) {
+            assert_eq!(item.text.matches(*name).count(), 1);
+            assert!(!item.detail.as_ref().unwrap().contains(*name));
+        }
+        assert_eq!(
+            popup.preferred_focus,
+            Some(if available {
+                g::Target::SelectResetCredit {
+                    id: "cl-secret".into(),
+                    grant_id: "hidden-fable".into(),
+                }
+            } else {
+                g::Target::CancelDialog
+            })
+        );
+        assert!(
+            scene
+                .targets
+                .iter()
+                .all(|t| !matches!(t.target, g::Target::ConfirmResetCredit(_)))
+        );
+    }
 }

@@ -312,6 +312,46 @@ fn claude_grant_reason<Tz: TimeZone>(
     }
 }
 
+// Full is an authoritative provider grant type, never inferred from a window list.
+fn claude_effect_summary(windows: &[String], full: bool) -> String {
+    if full {
+        text("모든 사용 한도 (5시간 · 주간 · 모델별)")
+    } else {
+        claude_windows(windows)
+    }
+}
+
+fn claude_uses_left(count: u64) -> String {
+    if count == 1 {
+        text("1회 남음")
+    } else {
+        qb_tray::i18n::format("{0}회 남음", &[count.to_string()])
+    }
+}
+
+fn claude_expiry_at<Tz: TimeZone>(g: &ClaudeResetGrant, now: &DateTime<Tz>) -> String {
+    g.ends_at
+        .as_deref()
+        .and_then(|v| display_time(v, now))
+        .unwrap_or_else(|| text("만료 확인 전"))
+}
+
+pub fn claude_choice_detail(common: &ResetCreditInventory, g: &ClaudeResetGrant) -> String {
+    let Some(i) = &common.claude else {
+        return text(STALE);
+    };
+    let mut detail = claude_grant_detail(i, g);
+    // An ineligible account already has its specific provider reason below the row.
+    if i.eligible
+        && g.usable_now
+        && let Some(reason) = common.refusal
+    {
+        detail.push('\n');
+        detail.push_str(&refusal_text(reason));
+    }
+    detail
+}
+
 pub fn claude_grant_detail(i: &ClaudeResetInventory, g: &ClaudeResetGrant) -> String {
     claude_grant_detail_at(i, g, &Local::now())
 }
@@ -321,14 +361,14 @@ fn claude_grant_detail_at<Tz: TimeZone>(
     g: &ClaudeResetGrant,
     now: &DateTime<Tz>,
 ) -> String {
-    let expiry = g
-        .ends_at
-        .as_deref()
-        .and_then(|v| display_time(v, now))
-        .unwrap_or_else(|| text("만료 확인 전"));
+    let expiry = claude_expiry_at(g, now);
     let mut detail = qb_tray::i18n::format(
-        "초기화: {0} · {1}회 남음 · {2}",
-        &[claude_windows(&g.clears), g.resets_left.to_string(), expiry],
+        "초기화: {0} · {1} · {2}",
+        &[
+            claude_effect_summary(&g.clears, g.grant_type.as_deref() == Some("full")),
+            claude_uses_left(g.resets_left),
+            expiry,
+        ],
     );
     if !i.eligible || !g.usable_now {
         detail.push('\n');
@@ -448,11 +488,11 @@ fn claude_inventory_line<Tz: TimeZone>(
 }
 
 fn claude_preview_body<Tz: TimeZone>(p: &ResetCreditPreview, now: &DateTime<Tz>) -> String {
-    let Some((i, g)) = p
+    let Some(g) = p
         .inventory
         .claude
         .as_ref()
-        .and_then(|i| i.grants.iter().find(|g| g.id == p.grant.id).map(|g| (i, g)))
+        .and_then(|i| i.grants.iter().find(|g| g.id == p.grant.id))
     else {
         return text(STALE);
     };
@@ -464,26 +504,36 @@ fn claude_preview_body<Tz: TimeZone>(p: &ResetCreditPreview, now: &DateTime<Tz>)
     if lines.is_empty() {
         lines.push(text("Claude 계정"));
     }
+    let full = g.grant_type.as_deref() == Some("full");
     lines.push(qb_tray::i18n::format(
-        "{0} 리셋권 1개 사용",
-        &[claude_label(g)],
-    ));
-    lines.push(qb_tray::i18n::format(
-        "이 계정의 {0} 사용 한도가 초기화됩니다.",
-        &[claude_windows(&g.clears)],
+        if full {
+            "이 계정의 {0}가 초기화됩니다."
+        } else {
+            "이 계정의 {0} 사용 한도가 초기화됩니다."
+        },
+        &[claude_effect_summary(&g.clears, full)],
     ));
     lines.push(qb_tray::i18n::format(
         "사용 후 남는 횟수: {0}",
         &[g.resets_left.saturating_sub(1).to_string()],
     ));
-    lines.push(claude_grant_detail_at(i, g, now));
+    lines.push(qb_tray::i18n::format(
+        "만료: {0}",
+        &[claude_expiry_at(g, now)],
+    ));
     lines.join("\n")
 }
 
-fn claude_result_body(r: &qb_proto::reset_credit_action::ClaudeResetResult) -> String {
+fn claude_result_body(
+    r: &qb_proto::reset_credit_action::ClaudeResetResult,
+    selected_full: bool,
+) -> String {
     let now = Local::now();
     let mut lines = vec![if r.result == "reset" {
-        qb_tray::i18n::format("초기화했습니다: {0}", &[claude_windows(&r.cleared)])
+        qb_tray::i18n::format(
+            "초기화했습니다: {0}",
+            &[claude_effect_summary(&r.cleared, selected_full)],
+        )
     } else {
         claude_reason_at(
             r.reason.as_deref().or(Some(&r.result)),
@@ -492,7 +542,7 @@ fn claude_result_body(r: &qb_proto::reset_credit_action::ClaudeResetResult) -> S
         )
     }];
     if let Some(left) = r.resets_left {
-        lines.push(qb_tray::i18n::format("남은 횟수: {0}", &[left.to_string()]));
+        lines.push(claude_uses_left(left));
     }
     for (key, value) in [
         ("주간 초기화 시각: {0}", &r.weekly_resets_at),
@@ -747,6 +797,9 @@ pub struct Consent {
     pub detail_unavailable: bool,
     pub choices: Option<ResetCreditInventory>,
     pub result_detail: Option<String>,
+    // Presentation only: captured from the selected Claude preview before confirm consumes it.
+    // Never used by selection, commit, generation checks or Unknown settlement.
+    claude_selected_full: Option<bool>,
     // Display seed only: never enters inventory choice or confirmation authority.
     read_inventory: Option<ResetCreditInventory>,
     generation: u64,
@@ -857,6 +910,7 @@ impl Consent {
         self.detail_unavailable = false;
         self.choices = None;
         self.result_detail = None;
+        self.claude_selected_full = None;
         self.read_inventory = None;
         Some(self.generation)
     }
@@ -932,6 +986,14 @@ impl Consent {
             self.messages.insert(id.into(), STALE);
             return None;
         }
+        self.claude_selected_full =
+            (p.grant.reset_type == ResetCreditType::ClaudeRateLimits).then(|| {
+                p.inventory
+                    .claude
+                    .as_ref()
+                    .and_then(|i| i.grants.iter().find(|g| g.id == p.grant.id))
+                    .is_some_and(|g| g.grant_type.as_deref() == Some("full"))
+            });
         self.busy = true;
         self.sending = true;
         // Fence immediately, including if the worker fails after dispatch.
@@ -986,6 +1048,7 @@ impl Consent {
         }
     }
     pub fn result(&mut self, id: &str, result: &Result<ResetCreditResult, ActionError>) {
+        let selected_full = self.claude_selected_full.take().unwrap_or(false);
         self.busy = false;
         self.detail_unavailable = false;
         self.read_inventory = None;
@@ -996,7 +1059,7 @@ impl Consent {
             .ok()
             .filter(|r| r.outcome != ResetCreditOutcome::Unknown)
             .and_then(|r| r.claude.as_ref())
-            .map(claude_result_body)
+            .map(|r| claude_result_body(r, selected_full))
             .filter(|detail| detail != &text("이 리셋권은 지금 사용할 수 없습니다."));
         self.terminal = true;
         self.sending = false;
