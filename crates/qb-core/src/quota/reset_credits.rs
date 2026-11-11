@@ -629,6 +629,44 @@ impl UsagePoller {
         let snapshot = super::parse::snapshot(account.provider, &bytes, Utc::now())
             .ok_or(Error::Unavailable)?;
         let complete = super::parse::is_complete_snapshot(account.provider, &bytes);
+        if account.provider == Provider::Claude {
+            // The descriptive PollUsageReport lane is deliberately Codex-only.
+            // Follow the incumbent Claude observer + native reducer path instead
+            // of weakening that lane's provider/generation fences.
+            let current = self
+                .load(&account.id)
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            if !same_confirmation_account(&current, account)
+                || current.token_meta != account.token_meta
+            {
+                return Err(Error::Unavailable);
+            }
+            if let (Some(table), Some(asof)) = (table, asof) {
+                if complete {
+                    table.replace_usage_windows_asof_token(&account.id, &snapshot, asof);
+                } else {
+                    table.note_usage_observation_asof_token(&account.id, &snapshot, asof);
+                }
+            }
+            let reported = snapshot.clone();
+            let snapshot = self
+                .obs
+                .observe_poll(&account.id, snapshot, complete)
+                .ok_or(Error::Unavailable)?;
+            self.runtime
+                .apply_polled_quota_snapshot(
+                    &account.id,
+                    snapshot,
+                    &reported,
+                    wait,
+                    outside,
+                    Some((started_at, complete)),
+                )
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            return Ok(());
+        }
         let (_, _, reconciled) = self
             .runtime
             .apply_polled_usage_report(

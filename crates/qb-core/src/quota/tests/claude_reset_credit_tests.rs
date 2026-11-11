@@ -200,8 +200,26 @@ mod r28_claude_reset_tests {
     #[tokio::test]
     async fn explicit_detail_read_uses_existing_claude_auth_and_ordinary_poll_stays_plain() {
         let f = fixture().await;
+        let before = f.account(0);
+        let Identity::Claude {
+            account_uuid,
+            organization_uuid: Some(organization_uuid),
+            ..
+        } = &before.identity
+        else {
+            panic!("synthetic Claude account and organization identity");
+        };
         f.fake.state.push(reply(usage(83)));
+        // Ordinary Claude polling also refreshes the existing profile lane.
+        // Return this exact fixture identity, rather than letting an unscripted
+        // failure mask a profile/credential regression.
+        f.fake.state.push(reply(json!({
+            "account":{"uuid":account_uuid,"has_claude_max":true},
+            "organization":{"uuid":organization_uuid,"rate_limit_tier":"default_claude_max_5x"}
+        })));
         f.relay.quota.poll(&f.ids[0]).await.unwrap();
+        assert_eq!(f.account(0).identity, before.identity);
+        assert_eq!(f.account(0).plan.as_deref(), Some("max_5x"));
         f.fake.state.push(reply(details(2)));
         let inventory = f
             .relay
@@ -216,16 +234,35 @@ mod r28_claude_reset_tests {
         assert_eq!(facts.next_grant_id.as_deref(), Some("fable"));
         assert_eq!(facts.grants[1].label, "Fable reset");
         let requests = f.fake.state.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].path_and_query, USAGE);
-        assert_eq!(requests[1].path_and_query, DETAILS);
+        assert_eq!(requests[1].path_and_query, "/api/oauth/profile");
+        assert_eq!(requests[2].path_and_query, DETAILS);
         for header in ["authorization", "accept", "user-agent", "anthropic-beta"] {
             assert_eq!(
                 requests[0].headers.get(header),
-                requests[1].headers.get(header)
+                requests[2].headers.get(header)
             );
         }
-        assert_requests(&f, 0);
+        // Profile is permitted only in this explicitly scripted three-request
+        // journey. Keep assert_requests strict for every other reset-credit case.
+        for request in &requests {
+            assert_eq!(request.method, reqwest::Method::GET);
+            assert!(request.body.is_empty());
+            assert_eq!(
+                request.headers["authorization"],
+                "Bearer synthetic-usage-access"
+            );
+            assert_eq!(request.headers["accept"], "application/json");
+            assert_eq!(request.headers["anthropic-beta"], "oauth-2025-04-20");
+            assert_eq!(
+                request.headers["user-agent"],
+                concat!("quota-baton/", env!("CARGO_PKG_VERSION"))
+            );
+            assert!(!request.headers.contains_key("chatgpt-account-id"));
+            assert!(!request.headers.contains_key("x-app"));
+            assert!(!request.headers.contains_key("anthropic-client-platform"));
+        }
     }
 
     #[tokio::test]
