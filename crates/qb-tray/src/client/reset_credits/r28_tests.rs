@@ -1,5 +1,5 @@
 use super::*;
-use qb_proto::reset_credits::ResetCreditGrant;
+use qb_proto::reset_credits::{ResetCreditGrant, ResetCreditRefusal};
 use qb_tray::{
     i18n::{UiLanguage, with_language},
     v2, v2_geometry as g,

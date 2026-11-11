@@ -1327,16 +1327,6 @@ impl Observability {
     ) -> Option<serde_json::Value> {
         use crate::dashboard::history::*;
         let merged = self.merge_snapshot(id, next, preserve_missing_windows, mode)?;
-        if matches!(mode, Some(QuotaMerge::ResetFacts { .. }))
-            && merged["observed_at"]
-                .as_str()
-                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-                != Some(next.observed_at)
-        {
-            // Header overlap returned prior facts, not publication of this GET.
-            // Do not replay its raw numbers into forecast/history measurements.
-            return Some(merged);
-        }
         if let Some(balance) = next.credits.as_ref().and_then(|c| c.balance) {
             self.dashboard
                 .observe_credit_forecast(id, balance, next.observed_at);
@@ -1427,11 +1417,9 @@ impl Observability {
                         .and_then(|s| s.parse::<DateTime<Utc>>().ok())
                         .is_none_or(|at| at >= fence)
                 }) {
-                    return if matches!(mode, Some(QuotaMerge::ResetFacts { .. })) {
-                        Some(old.clone())
-                    } else {
-                        None
-                    };
+                    // Refusal is explicit: even H == R cannot turn the prior
+                    // cache into a successful GET publication or measurement.
+                    return None;
                 }
                 if let (Some(new), Some(previous)) =
                     (value["windows"].as_array_mut(), old["windows"].as_array())
@@ -3839,7 +3827,7 @@ mod tests {
 
     #[test]
     fn r28_reset_cache_clock_preserves_header_published_after_the_get() {
-        for overlap in [false, true] {
+        for timing in ["after_read", "overlap", "equal_clock"] {
             let dir = directory();
             let obs = Observability::new(dir.path(), None).unwrap();
             let now = Utc::now();
@@ -3861,16 +3849,25 @@ mod tests {
             let (before, _) = obs
                 .observe_headers_reported("cl-r28-race", Provider::Claude, &headers)
                 .unwrap();
-            if overlap {
-                let read_at = Utc::now();
+            if timing != "after_read" {
                 let header_at = before["observed_at"]
                     .as_str()
                     .unwrap()
                     .parse::<DateTime<Utc>>()
                     .unwrap();
+                let read_at = if timing == "equal_clock" {
+                    header_at
+                } else {
+                    Utc::now()
+                };
                 assert!(
-                    now - Duration::seconds(2) < header_at && header_at < read_at,
-                    "S < H < R"
+                    now - Duration::seconds(2) < header_at
+                        && if timing == "equal_clock" {
+                            header_at == read_at
+                        } else {
+                            header_at < read_at
+                        },
+                    "{timing}: S < H <= R"
                 );
                 fresh["observed_at"] = json!(read_at);
                 for window in fresh["windows"].as_array_mut().unwrap() {
@@ -3887,12 +3884,15 @@ mod tests {
                 .is_none()
             );
             assert_eq!(obs.quota_snapshot("cl-r28-race").unwrap(), before);
-            let retained = obs
-                .observe_reset_poll("cl-r28-race", fresh, true, now - Duration::seconds(2))
-                .unwrap();
+            assert!(
+                obs.observe_reset_poll("cl-r28-race", fresh, true, now - Duration::seconds(2))
+                    .is_none(),
+                "{timing}: facts-only refusal is not publication"
+            );
             assert_eq!(
-                retained, before,
-                "ordinary reset facts also respect GET start (overlap={overlap})"
+                obs.quota_snapshot("cl-r28-race").unwrap(),
+                before,
+                "{timing}"
             );
         }
     }

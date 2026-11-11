@@ -3050,6 +3050,7 @@ impl AccountRuntime {
                 // Reset observations arrive RAW. Neither Claude's ordinary
                 // complete flag nor a cache merged before Store proves coverage.
                 let mut recover_reset = false;
+                let mut reset_published = reset.is_none();
                 if let Some(reset) = &reset {
                     let current = store.read_account_unlocked(&account_id).map_err(|_| ())?;
                     let live = obs.quota_snapshot(&account_id);
@@ -3059,34 +3060,40 @@ impl AccountRuntime {
                         if let Some(merged) = obs.observe_poll_after_reset(
                             &account_id, snapshot.clone(), reset.cleared(), reset.started_at()) {
                             snapshot = merged;
+                            reset_published = true;
                             recover_reset = true;
                         } else {
                             // A newer header/expanded live inventory won the
                             // cache lock. Never retry retirement with old facts.
                             snapshot = obs.quota_snapshot(&account_id).ok_or(())?;
                         }
+                    } else if let Some(merged) = obs.observe_reset_poll(&account_id, snapshot, covered, reset.started_at()) {
+                        snapshot = merged;
+                        reset_published = true;
                     } else {
-                        snapshot = obs.observe_reset_poll(&account_id, snapshot, covered, reset.started_at()).ok_or(())?;
+                        snapshot = obs.quota_snapshot(&account_id).ok_or(())?;
                     }
                 }
                 let report_model = model.clone();
                 let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
                 let mut model = model;
-                if let Some(current) = obs.quota_snapshot(&account_id)
-                    && let Some((new, incoming)) =
-                        time(&current["observed_at"]).zip(time(&snapshot["observed_at"]))
-                    && new >= incoming
-                {
-                    if new > incoming {
+                if let Some(current) = obs.quota_snapshot(&account_id) {
+                    if reset.is_some() && current != snapshot {
+                        // A cache change after the successful insert can only
+                        // veto publication; equality never grants authority.
+                        reset_published = false;
                         model = None;
+                        snapshot = current;
+                    } else if let Some((new, incoming)) =
+                        time(&current["observed_at"]).zip(time(&snapshot["observed_at"]))
+                        && new >= incoming
+                    {
+                        if new > incoming {
+                            model = None;
+                        }
+                        snapshot = current;
                     }
-                    snapshot = current;
                 }
-                // An overlapping header may win even though H < parse time R.
-                // Reusing that prior canonical cache is not publication of R.
-                let reset_published = reset.is_none()
-                    || time(&snapshot["observed_at"]).zip(time(&reported["observed_at"]))
-                        .is_some_and(|(canonical, raw)| canonical == raw);
                 if !reset_published {
                     recover_reset = false;
                     drop(application.take());

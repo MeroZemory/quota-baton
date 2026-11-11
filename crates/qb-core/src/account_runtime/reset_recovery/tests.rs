@@ -592,9 +592,14 @@ async fn newer_or_unrelated_rejections_and_facts_only_refresh_keep_the_native_ho
         "facts_only",
         "overlap",
         "overlap_facts",
+        "equal_clock",
+        "equal_clock_facts",
     ] {
         let f = Fixture::new(Provider::Claude);
-        let overlap = matches!(variant, "overlap" | "overlap_facts");
+        let overlap = matches!(
+            variant,
+            "overlap" | "overlap_facts" | "equal_clock" | "equal_clock_facts"
+        );
         let observation = if overlap {
             let mut observation = f.observation().await;
             // Publish H through the actual header cache path, deliberately
@@ -606,10 +611,16 @@ async fn newer_or_unrelated_rejections_and_facts_only_refresh_keep_the_native_ho
                 .unwrap()
                 .parse::<DateTime<Utc>>()
                 .unwrap();
-            let read_at = Utc::now();
+            let equal_clock = matches!(variant, "equal_clock" | "equal_clock_facts");
+            let read_at = if equal_clock { header_at } else { Utc::now() };
             assert!(
-                observation.started_at < header_at && header_at < read_at,
-                "{variant}: S < H < R"
+                observation.started_at < header_at
+                    && if equal_clock {
+                        header_at == read_at
+                    } else {
+                        header_at < read_at
+                    },
+                "{variant}: S < H <= R"
             );
             assert_eq!(
                 f.account(),
@@ -621,7 +632,7 @@ async fn newer_or_unrelated_rejections_and_facts_only_refresh_keep_the_native_ho
                 window["observed_at"] = json!(read_at);
             }
             observation.snapshot = observation.reported.clone();
-            if variant == "overlap_facts" {
+            if matches!(variant, "overlap_facts" | "equal_clock_facts") {
                 observation.cleared.clear();
             }
             observation
