@@ -3082,7 +3082,16 @@ impl AccountRuntime {
                     }
                     snapshot = current;
                 }
-                if let Ok(mut released) = released_quota.lock()
+                // An overlapping header may win even though H < parse time R.
+                // Reusing that prior canonical cache is not publication of R.
+                let reset_published = reset.is_none()
+                    || time(&snapshot["observed_at"]).zip(time(&reported["observed_at"]))
+                        .is_some_and(|(canonical, raw)| canonical == raw);
+                if !reset_published {
+                    recover_reset = false;
+                    drop(application.take());
+                }
+                if reset_published && let Ok(mut released) = released_quota.lock()
                     && let Some(release) = released.get_mut(&account_id)
                 {
                     release.observe(&reported, &snapshot);
@@ -3261,7 +3270,7 @@ impl AccountRuntime {
                     &snapshot,
                     model.as_deref(),
                 );
-                let publish_outside = ran && !store.writes_stopped() && outside.is_some();
+                let publish_outside = ran && !store.writes_stopped() && outside.is_some() && reset_published;
                 if publish_outside
                     && let Some(outside_owner::PollApplication {
                         origin: Some(origin),
@@ -3288,7 +3297,7 @@ impl AccountRuntime {
                 if publish_outside {
                     outside_owner.publish();
                 }
-                Ok((account, snapshot, pending, true))
+                Ok((account, snapshot, pending, reset_published))
             })
             .await
             .map_err(|_| ())??;

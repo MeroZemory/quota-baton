@@ -1327,6 +1327,16 @@ impl Observability {
     ) -> Option<serde_json::Value> {
         use crate::dashboard::history::*;
         let merged = self.merge_snapshot(id, next, preserve_missing_windows, mode)?;
+        if matches!(mode, Some(QuotaMerge::ResetFacts { .. }))
+            && merged["observed_at"]
+                .as_str()
+                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                != Some(next.observed_at)
+        {
+            // Header overlap returned prior facts, not publication of this GET.
+            // Do not replay its raw numbers into forecast/history measurements.
+            return Some(merged);
+        }
         if let Some(balance) = next.credits.as_ref().and_then(|c| c.balance) {
             self.dashboard
                 .observe_credit_forecast(id, balance, next.observed_at);
@@ -1403,10 +1413,20 @@ impl Observability {
             if let Some(old) = snapshots.get(id) {
                 // Headers publish before taking Store. Check and merge under
                 // this one lock, or a late poll could erase their rejection.
-                if mode.is_some()
-                    && old["observed_at"].as_str()?.parse::<DateTime<Utc>>().ok()?
-                        >= next.observed_at
-                {
+                let fence = match mode {
+                    Some(
+                        QuotaMerge::Reset { started_at, .. }
+                        | QuotaMerge::ResetFacts { started_at, .. },
+                    ) => Some(started_at),
+                    Some(QuotaMerge::Removed(_)) => Some(next.observed_at),
+                    None => None,
+                };
+                if fence.is_some_and(|fence| {
+                    old["observed_at"]
+                        .as_str()
+                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                        .is_none_or(|at| at >= fence)
+                }) {
                     return if matches!(mode, Some(QuotaMerge::ResetFacts { .. })) {
                         Some(old.clone())
                     } else {
@@ -3819,44 +3839,62 @@ mod tests {
 
     #[test]
     fn r28_reset_cache_clock_preserves_header_published_after_the_get() {
-        let dir = directory();
-        let obs = Observability::new(dir.path(), None).unwrap();
-        let now = Utc::now();
-        let reset = now + Duration::hours(1);
-        let fresh = r28_reset_cache_body(now - Duration::seconds(1), reset, 0.0);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "anthropic-ratelimit-unified-status",
-            "rejected".parse().unwrap(),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-5h-status",
-            "rejected".parse().unwrap(),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-5h-reset",
-            reset.timestamp().to_string().parse().unwrap(),
-        );
-        let (before, _) = obs
-            .observe_headers_reported("cl-r28-race", Provider::Claude, &headers)
-            .unwrap();
-        assert!(
-            obs.observe_poll_after_reset(
-                "cl-r28-race",
-                fresh.clone(),
-                &BTreeSet::from(["5h".into()]),
-                now - Duration::seconds(2)
-            )
-            .is_none()
-        );
-        assert_eq!(obs.quota_snapshot("cl-r28-race").unwrap(), before);
-        let retained = obs
-            .observe_reset_poll("cl-r28-race", fresh, true, now - Duration::seconds(2))
-            .unwrap();
-        assert_eq!(
-            retained, before,
-            "ordinary reset facts also respect the cache clock"
-        );
+        for overlap in [false, true] {
+            let dir = directory();
+            let obs = Observability::new(dir.path(), None).unwrap();
+            let now = Utc::now();
+            let reset = now + Duration::hours(1);
+            let mut fresh = r28_reset_cache_body(now - Duration::seconds(1), reset, 0.0);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "anthropic-ratelimit-unified-status",
+                "rejected".parse().unwrap(),
+            );
+            headers.insert(
+                "anthropic-ratelimit-unified-5h-status",
+                "rejected".parse().unwrap(),
+            );
+            headers.insert(
+                "anthropic-ratelimit-unified-5h-reset",
+                reset.timestamp().to_string().parse().unwrap(),
+            );
+            let (before, _) = obs
+                .observe_headers_reported("cl-r28-race", Provider::Claude, &headers)
+                .unwrap();
+            if overlap {
+                let read_at = Utc::now();
+                let header_at = before["observed_at"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<DateTime<Utc>>()
+                    .unwrap();
+                assert!(
+                    now - Duration::seconds(2) < header_at && header_at < read_at,
+                    "S < H < R"
+                );
+                fresh["observed_at"] = json!(read_at);
+                for window in fresh["windows"].as_array_mut().unwrap() {
+                    window["observed_at"] = json!(read_at);
+                }
+            }
+            assert!(
+                obs.observe_poll_after_reset(
+                    "cl-r28-race",
+                    fresh.clone(),
+                    &BTreeSet::from(["5h".into()]),
+                    now - Duration::seconds(2)
+                )
+                .is_none()
+            );
+            assert_eq!(obs.quota_snapshot("cl-r28-race").unwrap(), before);
+            let retained = obs
+                .observe_reset_poll("cl-r28-race", fresh, true, now - Duration::seconds(2))
+                .unwrap();
+            assert_eq!(
+                retained, before,
+                "ordinary reset facts also respect GET start (overlap={overlap})"
+            );
+        }
     }
 
     #[cfg(windows)]
