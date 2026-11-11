@@ -56,11 +56,45 @@ pub(super) async fn refresh(State(state): State<RuntimeAdmin>, Path(id): Path<St
     }
 }
 
-pub(super) async fn preview(State(state): State<RuntimeAdmin>, Path(id): Path<String>) -> Response {
+pub(super) async fn preview(
+    State(state): State<RuntimeAdmin>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
     if state.relay.is_draining() {
         return refused(Error::Unavailable);
     }
-    match state.relay.quota.preview_reset_credit(&id).await {
+    if body.len() > 1024 {
+        return refused(Error::Stale);
+    }
+    let request = if body.is_empty() {
+        qb_proto::reset_credit_action::ResetCreditPreviewRequest::default()
+    } else {
+        let Ok(request) = serde_json::from_slice::<
+            qb_proto::reset_credit_action::ResetCreditPreviewRequest,
+        >(&body) else {
+            return refused(Error::Stale);
+        };
+        request
+    };
+    if request
+        .grant_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control))
+    {
+        return refused(Error::Stale);
+    }
+    let result = match request.grant_id {
+        Some(grant) => {
+            state
+                .relay
+                .quota
+                .preview_reset_credit_grant(&id, Some(grant))
+                .await
+        }
+        None => state.relay.quota.preview_reset_credit(&id).await,
+    };
+    match result {
         Ok(value) => Json(value).into_response(),
         Err(value) => refused(value),
     }

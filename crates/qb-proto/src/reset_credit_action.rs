@@ -2,6 +2,12 @@
 use crate::reset_credits::{ResetCreditGrant, ResetCreditInventory};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetCreditPreviewRequest {
+    pub grant_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResetCreditPreview {
@@ -30,6 +36,7 @@ pub enum ResetCreditOutcome {
     NothingToReset,
     NoCredit,
     Unknown,
+    Refused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +46,18 @@ pub struct ResetCreditResult {
     pub outcome: ResetCreditOutcome,
     pub inventory: ResetCreditInventory,
     pub refresh_failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ClaudeResetResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeResetResult {
+    pub result: String,
+    pub reason: Option<String>,
+    pub resets_left: Option<u64>,
+    pub cleared: Vec<String>,
+    pub weekly_resets_at: Option<String>,
+    pub cooldown_until: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

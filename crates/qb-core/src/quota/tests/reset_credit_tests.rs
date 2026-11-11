@@ -728,21 +728,29 @@ mod r26_reset_credit_tests {
     }
 
     #[tokio::test]
-    async fn unsupported_provider_never_reaches_fake_or_claims_zero() {
+    async fn claude_absent_programme_is_unknown_and_cannot_authorize_use() {
         let f = Fixture::with_provider(1, Provider::Claude).await;
         assert_loopback(&f);
         let cached = f
             .relay
             .quota
             .reset_credit_cached(&f.ids[0], Provider::Claude);
-        assert_eq!(cached.state, ResetCreditState::Unsupported);
+        assert_eq!(cached.state, ResetCreditState::Unknown);
         assert_eq!(cached.available_count, None);
+        f.fake
+            .state
+            .push(reply(json!({"five_hour":{"utilization":0}})));
         assert_eq!(
             f.relay.quota.preview_reset_credit(&f.ids[0]).await,
-            Err(ResetError::Unsupported)
+            Err(ResetError::Ineligible)
         );
-        assert!(f.fake.state.requests().is_empty());
-        assert_requests(&f, 0);
+        let requests = f.fake.state.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, reqwest::Method::GET);
+        assert_eq!(
+            requests[0].path_and_query,
+            "/api/oauth/usage?cedar_ember=1&skip_spend=1"
+        );
     }
 
     #[tokio::test]

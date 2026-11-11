@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod claude;
+
 const DETAILS: &str = "/backend-api/wham/rate-limit-reset-credits";
 const PREVIEW_SECONDS: i64 = 60;
 
@@ -19,6 +21,8 @@ struct Fence {
     grant: String,
     request: String,
     outcome: ResetCreditOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude: Option<claude::Witness>,
 }
 
 #[derive(Serialize)]
@@ -31,17 +35,21 @@ impl UsagePoller {
     pub(crate) async fn close_reset_credits(&self) {
         self.reset_credits.close().await;
     }
-    pub(crate) fn reset_credit_cached(&self, id: &str, provider: Provider) -> ResetCreditInventory {
-        if provider != Provider::Codex {
-            return reset::inventory(ResetCreditState::Unsupported);
-        }
+    pub(crate) fn reset_credit_cached(
+        &self,
+        id: &str,
+        _provider: Provider,
+    ) -> ResetCreditInventory {
         let Ok(entry) = self.reset_credits.entry(id) else {
             return ResetCreditInventory::default();
         };
         let Ok(entry) = entry.try_lock() else {
             return ResetCreditInventory::default();
         };
-        let mut value = entry.inventory.clone().unwrap_or_default();
+        let mut value = entry
+            .inventory
+            .clone()
+            .unwrap_or_else(|| reset::inventory(ResetCreditState::Unknown));
         let fresh = value
             .observed_at
             .as_deref()
@@ -106,7 +114,10 @@ impl UsagePoller {
             return Err(Error::Unavailable);
         }
         let original = self.load(id).await.map_err(|_| Error::Unavailable)?;
-        if original.provider != Provider::Codex {
+        if !matches!(
+            (&original.provider, &original.identity),
+            (Provider::Codex, Identity::Codex { .. }) | (Provider::Claude, Identity::Claude { .. })
+        ) {
             return Err(Error::Unsupported);
         }
         if !reset_account_allowed(&original) {
@@ -141,16 +152,20 @@ impl UsagePoller {
         method: reqwest::Method,
         path: &str,
     ) -> Result<reqwest::RequestBuilder, Error> {
-        let endpoint = format!("{}{path}", self.bases[1]);
+        let endpoint = format!(
+            "{}{path}",
+            self.bases[usize::from(account.provider == Provider::Codex)]
+        );
         let url = reqwest::Url::parse(&endpoint).map_err(|_| Error::Unavailable)?;
         // Test builds cannot reach a production redemption host, even with an
         // accidentally loaded real config. The shared HTTP client never redirects.
-        if !reset_endpoint_allowed(&url) {
+        if !(if account.provider == Provider::Claude {
+            claude::endpoint_allowed(&url)
+        } else {
+            reset_endpoint_allowed(&url)
+        }) {
             return Err(Error::Unavailable);
         }
-        let Identity::Codex { account_id, .. } = &account.identity else {
-            return Err(Error::Unsupported);
-        };
         // Only the mutating transport overrides reqwest's default protocol-NACK
         // policy. Ordinary relay/poll traffic keeps its incumbent client.
         let client = if method == reqwest::Method::POST {
@@ -158,16 +173,34 @@ impl UsagePoller {
         } else {
             self.client.clone()
         };
-        Ok(client
+        let seconds = if account.provider == Provider::Claude {
+            if method == reqwest::Method::POST {
+                25
+            } else {
+                5
+            }
+        } else {
+            20
+        };
+        let mut request = client
             .request(method, url)
             .bearer_auth(&tokens.access_token)
-            .header("ChatGPT-Account-Id", account_id)
             .header("Accept", "application/json")
             .header(
                 "User-Agent",
                 concat!("quota-baton/", env!("CARGO_PKG_VERSION")),
             )
-            .timeout(Duration::from_secs(20)))
+            .timeout(Duration::from_secs(seconds));
+        match &account.identity {
+            Identity::Codex { account_id, .. } if account.provider == Provider::Codex => {
+                request = request.header("ChatGPT-Account-Id", account_id);
+            }
+            Identity::Claude { .. } if account.provider == Provider::Claude => {
+                request = request.header("anthropic-beta", "oauth-2025-04-20");
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        Ok(request)
     }
 
     async fn reset_details(
@@ -176,13 +209,26 @@ impl UsagePoller {
         tokens: &crate::accounts::Tokens,
     ) -> Result<ResetCreditInventory, Error> {
         let response = self
-            .reset_request(account, tokens, reqwest::Method::GET, DETAILS)?
+            .reset_request(
+                account,
+                tokens,
+                reqwest::Method::GET,
+                if account.provider == Provider::Claude {
+                    claude::DETAILS
+                } else {
+                    DETAILS
+                },
+            )?
             .send()
             .await
             .map_err(|_| Error::Unavailable)?;
         let value = reset_body(response).await?;
-        let mut inventory =
-            model::parse_details(&value, Utc::now()).map_err(|_| Error::Unavailable)?;
+        let mut inventory = if account.provider == Provider::Claude {
+            model::claude::parse_details(&value, Utc::now())
+        } else {
+            model::parse_details(&value, Utc::now())
+        }
+        .map_err(|_| Error::Unavailable)?;
         inventory.grants.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(inventory)
     }
@@ -197,14 +243,14 @@ impl UsagePoller {
                 account,
                 tokens,
                 reqwest::Method::GET,
-                "/backend-api/wham/usage",
+                claude::usage_path(account.provider),
             )?
             .send()
             .await
             .map_err(|_| Error::Unavailable)?;
         let body = reset_body(response).await?;
         let bytes = serde_json::to_vec(&body).map_err(|_| Error::Unavailable)?;
-        let snapshot = super::parse::snapshot(Provider::Codex, &bytes, Utc::now())
+        let snapshot = super::parse::snapshot(account.provider, &bytes, Utc::now())
             .ok_or(Error::Unavailable)?;
         // Bind the affected window set, not utilization/receipt timestamps:
         // ordinary traffic cannot change what the user agreed to reset.
@@ -249,13 +295,22 @@ impl UsagePoller {
                 if fence.outcome == ResetCreditOutcome::Unknown {
                     // Available/absent is not proof that an uncertain request did
                     // not apply. Only this exact grant's redeemed status resolves it.
-                    if inventory
-                        .grants
-                        .iter()
-                        .any(|g| g.id == fence.grant && g.status == ResetCreditStatus::Redeemed)
-                    {
+                    if if fence.claude.is_some() {
+                        claude::settled(&fence, &inventory)
+                    } else {
+                        inventory
+                            .grants
+                            .iter()
+                            .any(|g| g.id == fence.grant && g.status == ResetCreditStatus::Redeemed)
+                    } {
+                        let claude_settlement = fence.claude.is_some();
                         fence.outcome = ResetCreditOutcome::AlreadyRedeemed;
                         self.reset_fence(id, Some(fence)).await?;
+                        if claude_settlement {
+                            // Positive read-only proof may release old native quota
+                            // holds only through another real usage observation.
+                            let _ = self.reset_success_usage(&account).await;
+                        }
                     } else {
                         entry.inventory = Some(inventory);
                         return Err(Error::Unknown);
@@ -284,18 +339,32 @@ impl UsagePoller {
         self: &Arc<Self>,
         id: &str,
     ) -> Result<ResetCreditPreview, Error> {
+        self.preview_reset_credit_grant(id, None).await
+    }
+
+    pub(crate) async fn preview_reset_credit_grant(
+        self: &Arc<Self>,
+        id: &str,
+        grant_id: Option<String>,
+    ) -> Result<ResetCreditPreview, Error> {
         let admitted = self.reset_credits.admit()?;
         let poller = self.clone();
         let id = id.to_owned();
         crate::boxes::spawn(async move {
             let _admitted = admitted;
-            poller.preview_reset_credit_inner(&id).await
+            poller
+                .preview_reset_credit_inner(&id, grant_id.as_deref())
+                .await
         })
         .await
         .map_err(|_| Error::Unavailable)?
     }
 
-    async fn preview_reset_credit_inner(&self, id: &str) -> Result<ResetCreditPreview, Error> {
+    async fn preview_reset_credit_inner(
+        &self,
+        id: &str,
+        grant_id: Option<&str>,
+    ) -> Result<ResetCreditPreview, Error> {
         let entry = self.reset_credits.entry(id)?;
         let mut entry = entry.try_lock().map_err(|_| Error::Busy)?;
         let _process_lock = self.reset_process_lock(id).await?;
@@ -318,7 +387,20 @@ impl UsagePoller {
             }
         };
         entry.inventory = Some(inventory.clone());
-        let grant = model::choose(&inventory, Utc::now())
+        // Several usable Claude grants have different effects: a recommendation
+        // is a highlight, never the user's selection or consumption consent.
+        if account.provider == Provider::Claude
+            && grant_id.is_none()
+            && inventory
+                .grants
+                .iter()
+                .filter(|g| model::claude::choose(&inventory, Some(&g.id), Utc::now()).is_ok())
+                .count()
+                > 1
+        {
+            return Err(Error::Ineligible);
+        }
+        let grant = claude::choose(&inventory, grant_id, Utc::now())
             .map_err(|_| Error::Ineligible)?
             .clone();
         let windows = self.reset_windows(&account, &tokens).await?;
@@ -334,7 +416,12 @@ impl UsagePoller {
             expires_at: (Utc::now() + chrono::Duration::seconds(PREVIEW_SECONDS)).to_rfc3339(),
             grant,
             inventory,
-            effect: "eligible_codex_limits".into(),
+            effect: if account.provider == Provider::Claude {
+                "claude_rate_limits"
+            } else {
+                "eligible_codex_limits"
+            }
+            .into(),
         };
         entry.preview = Some(Preview {
             wire: wire.clone(),
@@ -394,10 +481,12 @@ impl UsagePoller {
             return Err(Error::Unknown);
         }
         let inventory = self.reset_details(&account, &tokens).await?;
-        let grant = model::choose(&inventory, Utc::now()).map_err(|_| Error::Stale)?;
+        let grant = claude::choose(&inventory, Some(&preview.wire.grant.id), Utc::now())
+            .map_err(|_| Error::Stale)?;
         if grant != &preview.wire.grant
             || inventory.available_count != preview.wire.inventory.available_count
             || inventory.grants != preview.wire.inventory.grants
+            || !claude::same_grant(&inventory, &preview.wire.inventory, &grant.id)
             || self.reset_windows(&account, &tokens).await? != preview.windows
             || Utc::now() >= valid_until
             || !same_confirmation_account(
@@ -414,9 +503,14 @@ impl UsagePoller {
             grant: grant.id.clone(),
             request: format!("{:032x}", rand::random::<u128>()),
             outcome: ResetCreditOutcome::Unknown,
+            claude: claude::witness(&inventory, &grant.id),
         };
-        let request = self
-            .reset_request(
+        let request = if account.provider == Provider::Claude {
+            let path = claude::redeem_path(&account)?;
+            self.reset_request(&account, &tokens, reqwest::Method::POST, &path)?
+                .json(&serde_json::json!({"program":"cedar_ember","grant_id":fence.grant,"request_id":fence.request}))
+        } else {
+            self.reset_request(
                 &account,
                 &tokens,
                 reqwest::Method::POST,
@@ -425,7 +519,8 @@ impl UsagePoller {
             .json(&RedemptionRequest {
                 redeem_request_id: &fence.request,
                 credit_id: &fence.grant,
-            });
+            })
+        };
         self.reset_fence(&id, Some(fence.clone())).await?;
         // If takeover stopped this store while the durable write ran, leave
         // Unknown and refuse to send. The process lock spans both boundaries.
@@ -436,27 +531,52 @@ impl UsagePoller {
         if !same_confirmation_account(&current, &account)
             || !reset_account_allowed(&current)
             || Utc::now() >= valid_until
-            || model::choose(&inventory, Utc::now()).ok() != Some(&preview.wire.grant)
+            || claude::choose(&inventory, Some(&preview.wire.grant.id), Utc::now()).ok()
+                != Some(&preview.wire.grant)
         {
             fence.outcome = ResetCreditOutcome::NothingToReset;
             self.reset_fence(&id, Some(fence)).await?;
             return Err(Error::Stale);
         }
-        let outcome = match request.send().await {
-            Ok(response) => match reset_body(response).await {
-                Ok(value) => serde_json::from_value::<Redemption>(value)
-                    .map(|reply| reply.code)
-                    .unwrap_or(ResetCreditOutcome::Unknown),
+        let (outcome, claude_result) = if account.provider == Provider::Claude {
+            match request.send().await {
+                Ok(response) => {
+                    self.claude_reset_response(&account, &tokens, response)
+                        .await
+                }
+                Err(_) => (ResetCreditOutcome::Unknown, None),
+            }
+        } else {
+            let outcome = match request.send().await {
+                Ok(response) => match reset_body(response).await {
+                    Ok(value) => serde_json::from_value::<Redemption>(value)
+                        .map(|reply| {
+                            if reply.code == ResetCreditOutcome::Refused {
+                                ResetCreditOutcome::Unknown
+                            } else {
+                                reply.code
+                            }
+                        })
+                        .unwrap_or(ResetCreditOutcome::Unknown),
+                    Err(_) => ResetCreditOutcome::Unknown,
+                },
                 Err(_) => ResetCreditOutcome::Unknown,
-            },
-            Err(_) => ResetCreditOutcome::Unknown,
+            };
+            (outcome, None)
         };
         fence.outcome = outcome;
         // If terminal persistence fails the durable pre-send Unknown remains.
         if self.reset_fence(&id, Some(fence)).await.is_err() {
             return Err(Error::Unknown);
         }
-        let refreshed = self.reset_details(&account, &tokens).await;
+        let refreshed = if claude_result
+            .as_ref()
+            .is_some_and(|r| r.reason.as_deref() == Some("authentication_required"))
+        {
+            Err(Error::Unavailable)
+        } else {
+            self.reset_details(&account, &tokens).await
+        };
         let mut refresh_failed = refreshed.is_err();
         let mut inventory = refreshed.unwrap_or(inventory);
         if outcome == ResetCreditOutcome::Unknown || refresh_failed {
@@ -475,6 +595,7 @@ impl UsagePoller {
             outcome,
             inventory,
             refresh_failed,
+            claude: claude_result,
         })
     }
 
@@ -498,16 +619,16 @@ impl UsagePoller {
                 account,
                 &tokens,
                 reqwest::Method::GET,
-                "/backend-api/wham/usage",
+                claude::usage_path(account.provider),
             )?
             .send()
             .await
             .map_err(|_| Error::Unavailable)?;
         let body = reset_body(response).await?;
         let bytes = serde_json::to_vec(&body).map_err(|_| Error::Unavailable)?;
-        let snapshot = super::parse::snapshot(Provider::Codex, &bytes, Utc::now())
+        let snapshot = super::parse::snapshot(account.provider, &bytes, Utc::now())
             .ok_or(Error::Unavailable)?;
-        let complete = super::parse::is_complete_snapshot(Provider::Codex, &bytes);
+        let complete = super::parse::is_complete_snapshot(account.provider, &bytes);
         let (_, _, reconciled) = self
             .runtime
             .apply_polled_usage_report(
@@ -641,7 +762,8 @@ fn same_confirmation_account(a: &Account, b: &Account) -> bool {
 }
 
 fn reset_account_allowed(account: &Account) -> bool {
-    account.provider == Provider::Codex
+    (account.provider == Provider::Codex
+        || (account.provider == Provider::Claude && account.plan.as_deref() != Some("free")))
         && matches!(account.user_state, UserState::Active | UserState::Paused)
         && matches!(account.health, Health::Ready | Health::Cooling { .. })
 }

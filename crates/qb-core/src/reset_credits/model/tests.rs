@@ -1,6 +1,32 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn claude_extensions_preserve_old_wire_defaults_and_request_strictness() {
+    use qb_proto::reset_credit_action::{ResetCreditPreviewRequest, ResetCreditResult};
+    let inventory = ResetCreditInventory::default();
+    let wire = serde_json::to_value(&inventory).unwrap();
+    assert!(wire.get("claude").is_none());
+    assert_eq!(
+        serde_json::from_value::<ResetCreditInventory>(wire.clone())
+            .unwrap()
+            .claude,
+        None
+    );
+    let request: ResetCreditPreviewRequest = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(request, ResetCreditPreviewRequest::default());
+    assert!(serde_json::from_value::<ResetCreditPreviewRequest>(json!({"other":true})).is_err());
+    let result: ResetCreditResult = serde_json::from_value(json!({
+        "account":"test", "outcome":"refused", "inventory":wire, "refresh_failed":false
+    }))
+    .unwrap();
+    assert_eq!(result.claude, None);
+    assert!(serde_json::to_value(result)
+        .unwrap()
+        .get("claude")
+        .is_none());
+}
+
 fn now() -> DateTime<Utc> {
     parse_timestamp("2026-11-07T10:00:00Z").unwrap()
 }
