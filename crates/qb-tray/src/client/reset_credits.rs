@@ -760,10 +760,10 @@ impl Consent {
         {
             return false;
         }
-        if !inventory
+        if inventory
             .claude
             .as_ref()
-            .is_some_and(|i| i.grants.len() > 1)
+            .is_none_or(|i| i.grants.len() <= 1)
         {
             return false;
         }

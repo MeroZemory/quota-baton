@@ -1657,7 +1657,7 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
             for row in rows {
                 parts.push(Part::Item(
                     if row.recommended {
-                        crate::i18n::format("{0} · 추천", &[row.label.clone()])
+                        crate::i18n::format("{0} · 추천", std::slice::from_ref(&row.label))
                     } else {
                         row.label.clone()
                     },
