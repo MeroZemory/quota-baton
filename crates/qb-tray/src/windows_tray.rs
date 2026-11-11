@@ -3059,10 +3059,11 @@ fn tooltip_content(
             {
                 reason
             } else if row_view(view, id).is_some_and(|r| {
-                r.raw
-                    .reset_credits
-                    .as_ref()
-                    .is_some_and(|i| i.available_count == Some(0))
+                r.raw.provider == "codex"
+                    && r.raw
+                        .reset_credits
+                        .as_ref()
+                        .is_some_and(|i| i.available_count == Some(0))
             }) {
                 i18n::static_text("사용 가능한 리셋권이 없습니다.")
             } else {

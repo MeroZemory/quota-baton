@@ -195,6 +195,67 @@ struct Snapshot {
     #[serde(default)]
     signals: Signals,
 }
+
+#[derive(Clone, Copy)]
+enum QuotaMerge<'a> {
+    Removed(&'a crate::accounts::QuotaCooling),
+    Reset {
+        cleared: &'a BTreeSet<String>,
+        started_at: DateTime<Utc>,
+    },
+    // Same facts-only merge as an ordinary poll, but recheck reset coverage and
+    // the header clock while holding the cache mutex. No rejection retirement.
+    ResetFacts {
+        complete: bool,
+        started_at: DateTime<Utc>,
+    },
+}
+
+fn reset_window_name(name: &str) -> Option<&'static str> {
+    match name {
+        "5h" | "primary" | "five_hour" => Some("5h"),
+        "7d" | "secondary" | "seven_day" => Some("7d"),
+        "7d_oi" | "seven_day_opus" => Some("7d_oi"),
+        "7d_sonnet" | "seven_day_sonnet" => Some("7d_sonnet"),
+        _ => None,
+    }
+}
+
+fn fresh_reset_number(
+    window: &serde_json::Value,
+    started_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    window["observed_at"]
+        .as_str()
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .is_some_and(|at| at > started_at && at <= now && now - at < Duration::seconds(300))
+        && window["used_pct"]
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && (0.0..=100.0).contains(&n))
+}
+
+fn reset_healthy_windows(
+    value: &serde_json::Value,
+    cleared: &BTreeSet<String>,
+    started_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> BTreeSet<String> {
+    value["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|window| {
+            let name = window["name"].as_str()?;
+            (matches!(name, "5h" | "7d" | "7d_oi" | "7d_sonnet")
+                && cleared.contains(name)
+                && fresh_reset_number(window, started_at, now)
+                && window["used_pct"].as_f64()? < 100.0
+                && window["status"] != "rejected")
+                .then(|| name.to_owned())
+        })
+        .collect()
+}
 #[derive(Default, Serialize, Deserialize)]
 struct Signals {
     unified_status: Option<String>,
@@ -887,6 +948,101 @@ impl Observability {
         self.remember(id, &next, !replace_windows, None)
     }
 
+    /// Reset GETs must cover the LIVE known inventory, not an invented fixed
+    /// four-slot schema. Numeric freshness also gates placement measurements.
+    pub(crate) fn reset_window_coverage(
+        reported: &serde_json::Value,
+        known: Option<&serde_json::Value>,
+        started_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some(windows) = reported["windows"]
+            .as_array()
+            .filter(|rows| !rows.is_empty())
+        else {
+            return false;
+        };
+        let mut names = BTreeSet::new();
+        for window in windows {
+            let Some(name) = window["name"]
+                .as_str()
+                .filter(|name| matches!(*name, "5h" | "7d" | "7d_oi" | "7d_sonnet"))
+            else {
+                return false;
+            };
+            if !names.insert(name) || !fresh_reset_number(window, started_at, now) {
+                return false;
+            }
+        }
+        let time = |value: &serde_json::Value| value.as_str()?.parse::<DateTime<Utc>>().ok();
+        if let Some(old) = known {
+            if time(&old["observed_at"])
+                .zip(time(&reported["observed_at"]))
+                .is_some_and(|(old, new)| old > new)
+            {
+                return false;
+            }
+            let Some(previous) = old["windows"].as_array() else {
+                return false;
+            };
+            for old_window in previous {
+                let Some(new) = windows.iter().find(|new| new["name"] == old_window["name"]) else {
+                    return false;
+                };
+                if time(&old_window["observed_at"])
+                    .zip(time(&new["observed_at"]))
+                    .is_some_and(|(old, new)| old > new)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Ordinary reset facts only: preserve missing/malformed known windows and
+    /// headers that raced the GET. This confers no release authority.
+    pub(crate) fn observe_reset_poll(
+        &self,
+        id: &str,
+        value: serde_json::Value,
+        complete: bool,
+        started_at: DateTime<Utc>,
+    ) -> Option<serde_json::Value> {
+        let next: Snapshot = serde_json::from_value(value).ok()?;
+        self.remember(
+            id,
+            &next,
+            !complete,
+            Some(QuotaMerge::ResetFacts {
+                complete,
+                started_at,
+            }),
+        )
+    }
+
+    /// Called only after native pre-POST origin/account/cause proof under Store.
+    /// The cache independently rechecks live coverage and clocks before retiring
+    /// only older rejection evidence on acknowledged, freshly healthy scopes.
+    pub(crate) fn observe_poll_after_reset(
+        &self,
+        id: &str,
+        value: serde_json::Value,
+        cleared: &BTreeSet<String>,
+        started_at: DateTime<Utc>,
+    ) -> Option<serde_json::Value> {
+        let next: Snapshot = serde_json::from_value(value).ok()?;
+        self.remember(
+            id,
+            &next,
+            false,
+            Some(QuotaMerge::Reset {
+                cleared,
+                started_at,
+            }),
+        )
+    }
+
     /// The runtime has proved complete inventory removal of this durable cause.
     /// The cache owner must still fence any header published since that proof.
     pub(crate) fn observe_poll_after_window_removal(
@@ -904,7 +1060,7 @@ impl Observability {
         {
             return None;
         }
-        self.remember(id, &next, false, Some(cause))
+        self.remember(id, &next, false, Some(QuotaMerge::Removed(cause)))
     }
 
     pub(crate) fn capture_poll(&self, provider: Provider, body: &[u8]) {
@@ -1167,10 +1323,10 @@ impl Observability {
         id: &str,
         next: &Snapshot,
         preserve_missing_windows: bool,
-        removed_cause: Option<&crate::accounts::QuotaCooling>,
+        mode: Option<QuotaMerge<'_>>,
     ) -> Option<serde_json::Value> {
         use crate::dashboard::history::*;
-        let merged = self.merge_snapshot(id, next, preserve_missing_windows, removed_cause)?;
+        let merged = self.merge_snapshot(id, next, preserve_missing_windows, mode)?;
         if let Some(balance) = next.credits.as_ref().and_then(|c| c.balance) {
             self.dashboard
                 .observe_credit_forecast(id, balance, next.observed_at);
@@ -1216,21 +1372,46 @@ impl Observability {
         &self,
         id: &str,
         next: &Snapshot,
-        preserve_missing_windows: bool,
-        removed_cause: Option<&crate::accounts::QuotaCooling>,
+        mut preserve_missing_windows: bool,
+        mode: Option<QuotaMerge<'_>>,
     ) -> Option<serde_json::Value> {
         if let Ok(mut snapshots) = self.snapshots.lock()
             && let Ok(mut value) = serde_json::to_value(next)
         {
+            let now = Utc::now();
+            let reset_scopes = match mode {
+                Some(QuotaMerge::Reset {
+                    cleared,
+                    started_at,
+                }) => {
+                    if !Self::reset_window_coverage(&value, snapshots.get(id), started_at, now) {
+                        return None;
+                    }
+                    reset_healthy_windows(&value, cleared, started_at, now)
+                }
+                Some(QuotaMerge::ResetFacts {
+                    complete,
+                    started_at,
+                }) => {
+                    preserve_missing_windows = !(complete
+                        && Self::reset_window_coverage(&value, snapshots.get(id), started_at, now));
+                    BTreeSet::new()
+                }
+                _ => BTreeSet::new(),
+            };
             // 부분 헤더 응답은 기존 창 정보를 지우지 않는다.
             if let Some(old) = snapshots.get(id) {
                 // Headers publish before taking Store. Check and merge under
                 // this one lock, or a late poll could erase their rejection.
-                if removed_cause.is_some()
+                if mode.is_some()
                     && old["observed_at"].as_str()?.parse::<DateTime<Utc>>().ok()?
                         >= next.observed_at
                 {
-                    return None;
+                    return if matches!(mode, Some(QuotaMerge::ResetFacts { .. })) {
+                        Some(old.clone())
+                    } else {
+                        None
+                    };
                 }
                 if let (Some(new), Some(previous)) =
                     (value["windows"].as_array_mut(), old["windows"].as_array())
@@ -1242,7 +1423,14 @@ impl Observability {
                                 && !window["reset_at"].is_null()
                                 && reset_moved(&updated["reset_at"], &window["reset_at"]);
                             for key in ["used_pct", "reset_at", "observed_at", "status"] {
-                                if updated[key].is_null() && !(key == "status" && reset_changed) {
+                                let reset_status = key == "status"
+                                    && window["name"]
+                                        .as_str()
+                                        .is_some_and(|name| reset_scopes.contains(name));
+                                if updated[key].is_null()
+                                    && !(key == "status" && reset_changed)
+                                    && !reset_status
+                                {
                                     updated[key] = window[key].clone();
                                 }
                             }
@@ -1266,13 +1454,13 @@ impl Observability {
                     serde_json::from_value::<Signals>(value["signals"].clone()),
                     serde_json::from_value::<Signals>(old["signals"].clone()),
                 ) {
-                    if fresh_reset {
+                    if fresh_reset && !matches!(mode, Some(QuotaMerge::Reset { .. })) {
                         prior_signals.unified_status = None;
                         prior_signals.limit_reached = None;
                         prior_signals.serving_from_credits = None;
                         prior_signals.active_limit = None;
                     }
-                    if let Some(cause) = removed_cause {
+                    if let Some(QuotaMerge::Removed(cause)) = mode {
                         // Retire inherited evidence to unknown, not acceptance.
                         // Explicit incoming fields are merged afterwards.
                         prior_signals.unified_status = None;
@@ -1301,6 +1489,48 @@ impl Observability {
                             prior_signals.representative_claim = None;
                         }
                     }
+                    if matches!(mode, Some(QuotaMerge::Reset { .. })) {
+                        let claims: Vec<_> = [
+                            prior_signals.active_limit.as_deref(),
+                            prior_signals.representative_claim.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        let scoped = !claims.is_empty()
+                            && claims.iter().all(|claim| {
+                                reset_window_name(claim)
+                                    .is_some_and(|name| reset_scopes.contains(name))
+                            });
+                        let all_known = old["windows"].as_array().is_some_and(|windows| {
+                            !windows.is_empty()
+                                && windows.iter().all(|window| {
+                                    window["name"]
+                                        .as_str()
+                                        .is_some_and(|name| reset_scopes.contains(name))
+                                })
+                        });
+                        let unrelated_rejection =
+                            old["windows"].as_array().is_some_and(|windows| {
+                                windows.iter().any(|window| {
+                                    window["status"] == "rejected"
+                                        && !window["name"]
+                                            .as_str()
+                                            .is_some_and(|name| reset_scopes.contains(name))
+                                })
+                            });
+                        if !unrelated_rejection && (scoped || (claims.is_empty() && all_known)) {
+                            if prior_signals.unified_status.as_deref() == Some("rejected") {
+                                prior_signals.unified_status = None;
+                            }
+                            if prior_signals.limit_reached == Some(true) {
+                                prior_signals.limit_reached = None;
+                            }
+                            prior_signals.unified_reset_at = None;
+                            prior_signals.active_limit = None;
+                            prior_signals.representative_claim = None;
+                        }
+                    }
                     next_signals.merge(prior_signals);
                     value["signals"] = serde_json::to_value(next_signals).unwrap_or_default();
                 }
@@ -1314,7 +1544,9 @@ impl Observability {
                             && w["used_pct"].as_f64().is_some_and(|p| p >= 99.0)
                     })
                 });
-                if (!fresh_reset || subscription_still_full)
+                if (matches!(mode, Some(QuotaMerge::Reset { .. }))
+                    || !fresh_reset
+                    || subscription_still_full)
                     && !crate::credits::serving_ended(&value)
                     && old["paid_serving_observed_at"].as_str().is_some()
                 {
@@ -3485,6 +3717,148 @@ mod tests {
         }
         assert_eq!(body[0], b'{');
     }
+    fn r28_reset_cache_body(at: DateTime<Utc>, reset: DateTime<Utc>, used: f64) -> Value {
+        json!({"source":"poll","observed_at":at,"windows":[
+            {"name":"5h","used_pct":used,"reset_at":reset,"observed_at":at,"status":null},
+            {"name":"7d","used_pct":12.0,"reset_at":reset + Duration::days(1),"observed_at":at,"status":null}
+        ]})
+    }
+
+    #[test]
+    fn r28_reset_cache_retirement_preserves_unscoped_mixed_unknown_and_paid_claims() {
+        for kind in ["scoped", "unscoped", "mixed", "unknown", "paid"] {
+            let dir = directory();
+            let obs = Observability::new(dir.path(), None).unwrap();
+            let now = Utc::now();
+            let reset = now + Duration::hours(1);
+            let mut old = r28_reset_cache_body(now - Duration::seconds(5), reset, 100.0);
+            old["windows"][0]["status"] = json!("rejected");
+            old["credits"] = json!({"has_credits":true,"balance":42.0,"unlimited":false});
+            old["signals"] =
+                json!({"unified_status":"rejected","unified_reset_at":reset,"limit_reached":true});
+            match kind {
+                "scoped" => old["signals"]["representative_claim"] = json!("five_hour"),
+                "mixed" => {
+                    old["signals"]["active_limit"] = json!("5h");
+                    old["signals"]["representative_claim"] = json!("seven_day");
+                }
+                "unknown" => old["signals"]["representative_claim"] = json!("seven_day_omelette"),
+                "paid" => {
+                    old["signals"]["active_limit"] = json!("credits");
+                    old["signals"]["serving_from_credits"] = json!(true);
+                }
+                _ => {}
+            }
+            obs.observe_poll("cl-r28-cache", old.clone(), true).unwrap();
+            let fresh = r28_reset_cache_body(now - Duration::seconds(1), reset, 0.0);
+            let merged = obs
+                .observe_poll_after_reset(
+                    "cl-r28-cache",
+                    fresh,
+                    &BTreeSet::from(["5h".into()]),
+                    now - Duration::seconds(2),
+                )
+                .unwrap();
+            assert!(
+                merged["windows"][0]["status"].is_null(),
+                "no invented allowed status"
+            );
+            assert_eq!(merged["windows"][0]["used_pct"], 0.0);
+            assert_eq!(merged["windows"][1]["used_pct"], 12.0);
+            assert_eq!(merged["credits"]["balance"], 42.0);
+            if kind == "scoped" {
+                assert!(merged["signals"]["unified_status"].is_null());
+                assert!(merged["signals"]["limit_reached"].is_null());
+            } else {
+                assert_eq!(merged["signals"]["unified_status"], "rejected", "{kind}");
+                assert_eq!(merged["signals"]["limit_reached"], true, "{kind}");
+            }
+            if kind == "paid" {
+                assert_eq!(merged["signals"]["active_limit"], "credits");
+                assert_eq!(merged["signals"]["serving_from_credits"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn r28_reset_cache_unscoped_retirement_requires_all_known_scopes_and_keeps_explicit_rejection()
+    {
+        for explicit in [false, true] {
+            let dir = directory();
+            let obs = Observability::new(dir.path(), None).unwrap();
+            let now = Utc::now();
+            let reset = now + Duration::hours(1);
+            let mut old = r28_reset_cache_body(now - Duration::seconds(5), reset, 100.0);
+            old["signals"] = json!({"unified_status":"rejected","limit_reached":true});
+            obs.observe_poll("cl-r28-all", old, true).unwrap();
+            let mut fresh = r28_reset_cache_body(now - Duration::seconds(1), reset, 0.0);
+            fresh["windows"][1]["used_pct"] = json!(0.0);
+            if explicit {
+                fresh["windows"][1]["status"] = json!("rejected");
+                fresh["signals"] =
+                    json!({"unified_status":"rejected","representative_claim":"seven_day"});
+            }
+            let merged = obs
+                .observe_poll_after_reset(
+                    "cl-r28-all",
+                    fresh,
+                    &BTreeSet::from(["5h".into(), "7d".into()]),
+                    now - Duration::seconds(2),
+                )
+                .unwrap();
+            if explicit {
+                assert_eq!(merged["windows"][1]["status"], "rejected");
+                assert_eq!(merged["signals"]["unified_status"], "rejected");
+                assert_eq!(merged["signals"]["representative_claim"], "seven_day");
+            } else {
+                assert!(merged["signals"]["unified_status"].is_null());
+                assert!(merged["signals"]["limit_reached"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn r28_reset_cache_clock_preserves_header_published_after_the_get() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let now = Utc::now();
+        let reset = now + Duration::hours(1);
+        let fresh = r28_reset_cache_body(now - Duration::seconds(1), reset, 0.0);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            "rejected".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            "rejected".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reset.timestamp().to_string().parse().unwrap(),
+        );
+        let (before, _) = obs
+            .observe_headers_reported("cl-r28-race", Provider::Claude, &headers)
+            .unwrap();
+        assert!(
+            obs.observe_poll_after_reset(
+                "cl-r28-race",
+                fresh.clone(),
+                &BTreeSet::from(["5h".into()]),
+                now - Duration::seconds(2)
+            )
+            .is_none()
+        );
+        assert_eq!(obs.quota_snapshot("cl-r28-race").unwrap(), before);
+        let retained = obs
+            .observe_reset_poll("cl-r28-race", fresh, true, now - Duration::seconds(2))
+            .unwrap();
+        assert_eq!(
+            retained, before,
+            "ordinary reset facts also respect the cache clock"
+        );
+    }
+
     #[cfg(windows)]
     mod windows_only;
 }

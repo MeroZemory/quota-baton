@@ -3047,6 +3047,28 @@ impl AccountRuntime {
                 // partial or nonqualifying raw report. Never capture on receipt.
                 let mut application =
                     origin.and_then(|origin| wait_owner.accept(&account_id, origin));
+                // Reset observations arrive RAW. Neither Claude's ordinary
+                // complete flag nor a cache merged before Store proves coverage.
+                let mut recover_reset = false;
+                if let Some(reset) = &reset {
+                    let current = store.read_account_unlocked(&account_id).map_err(|_| ())?;
+                    let live = obs.quota_snapshot(&account_id);
+                    let covered = reset.complete() && Observability::reset_window_coverage(
+                        &reported, live.as_ref(), reset.started_at(), Utc::now());
+                    if application.is_some() && covered && reset.can_recover(&current, &reported, Utc::now()) {
+                        if let Some(merged) = obs.observe_poll_after_reset(
+                            &account_id, snapshot.clone(), reset.cleared(), reset.started_at()) {
+                            snapshot = merged;
+                            recover_reset = true;
+                        } else {
+                            // A newer header/expanded live inventory won the
+                            // cache lock. Never retry retirement with old facts.
+                            snapshot = obs.quota_snapshot(&account_id).ok_or(())?;
+                        }
+                    } else {
+                        snapshot = obs.observe_reset_poll(&account_id, snapshot, covered, reset.started_at()).ok_or(())?;
+                    }
+                }
                 let report_model = model.clone();
                 let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
                 let mut model = model;
@@ -3065,14 +3087,6 @@ impl AccountRuntime {
                 {
                     release.observe(&reported, &snapshot);
                 }
-                // Only an accepted pre-POST origin can authorize this extra
-                // native mutation. Store is held through classification/release.
-                let recover_reset = if let Some(reset) = &reset {
-                    let current = store.read_account_unlocked(&account_id).map_err(|_| ())?;
-                    application.is_some() && reset.can_recover(&current, &reported, Utc::now())
-                } else {
-                    false
-                };
                 if recover_reset {
                     // Release is not reproducible by the ordinary UsageSnapshot
                     // reducer. Its native hook revokes the old origin; never

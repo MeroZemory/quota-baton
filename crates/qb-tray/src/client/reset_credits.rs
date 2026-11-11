@@ -420,6 +420,9 @@ fn claude_inventory_line<Tz: TimeZone>(
             ));
         }
     }
+    if common.state == ResetCreditState::Stale {
+        line.text = qb_tray::i18n::format("{0} · 오래된 정보", &[line.text]);
+    }
     line.tooltip = line.text.clone();
     for g in &i.grants {
         line.tooltip.push_str(&format!(

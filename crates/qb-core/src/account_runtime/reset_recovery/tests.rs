@@ -56,6 +56,10 @@ impl Fixture {
             .unwrap();
         let obs = Arc::new(Observability::new(home.path(), None).unwrap());
         let runtime = AccountRuntime::new(store, obs, 0.0);
+        runtime.obs.observe_poll(&account.id, json!({"source":"poll","observed_at":now - Duration::seconds(20),"windows":[
+            {"name":"5h","used_pct":100,"reset_at":now + Duration::hours(1),"observed_at":now - Duration::seconds(20),"status":null},
+            {"name":"7d","used_pct":12,"reset_at":now + Duration::hours(1) + Duration::days(1),"observed_at":now - Duration::seconds(20),"status":null}
+        ]}), true).unwrap();
         Self {
             runtime,
             id: account.id,
@@ -93,18 +97,54 @@ impl Fixture {
         }
     }
 
-    async fn apply(&self, mut observation: ResetQuotaObservation) -> Account {
-        // The real Claude caller publishes the actual GET through this same
-        // native cache observer before handing the canonical snapshot to runtime.
-        observation.snapshot = self
-            .runtime
-            .obs
-            .observe_poll(&self.id, observation.snapshot, observation.complete)
-            .unwrap();
+    async fn apply(&self, observation: ResetQuotaObservation) -> Account {
+        // One raw observation; the native transaction owns the cache merge.
         self.runtime
             .apply_reset_quota_snapshot(observation)
             .await
             .unwrap()
+    }
+
+    async fn rejected_header(&self, window: &str, claim: &str) {
+        let reset = self.account().quota_cooling.unwrap().reset_at;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            "rejected".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            claim.parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_bytes(
+                format!("anthropic-ratelimit-unified-{window}-status").as_bytes(),
+            )
+            .unwrap(),
+            "rejected".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_bytes(
+                format!("anthropic-ratelimit-unified-{window}-reset").as_bytes(),
+            )
+            .unwrap(),
+            reset.timestamp().to_string().parse().unwrap(),
+        );
+        self.runtime
+            .obs
+            .observe_headers_reported(&self.id, Provider::Claude, &headers)
+            .unwrap();
+        self.runtime
+            .transition(
+                &self.id,
+                super::super::HealthSignal::Cooling {
+                    reason: HealthReason::Quota,
+                    until: reset,
+                    scope: "account".into(),
+                },
+            )
+            .await
+            .unwrap();
     }
 }
 
@@ -426,4 +466,150 @@ async fn codex_gets_only_ordinary_snapshot_reduction_without_reset_release() {
         before.quota_credit_releasable
     );
     assert!(!f.runtime.eligible(&f.id, None).await);
+}
+
+#[tokio::test]
+async fn partial_reset_get_cannot_drop_an_uncleared_exhausted_live_window_or_measure_capacity() {
+    for malformed in [false, true] {
+        let f = Fixture::new(Provider::Claude);
+        let mut before = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+        before["windows"][1]["used_pct"] = json!(100);
+        f.runtime
+            .obs
+            .observe_poll(&f.id, before.clone(), true)
+            .unwrap();
+        f.runtime
+            .store
+            .update_metadata(&f.id, |account| {
+                account.apply_health_signal(
+                    HealthSignal::UsageSnapshot {
+                        snapshot: before.clone(),
+                        model: None,
+                        projected_allowance: 0.0,
+                    },
+                    Utc::now() - Duration::seconds(5),
+                );
+            })
+            .unwrap();
+        assert_eq!(f.account().quota_cooling.unwrap().window, "7d");
+        let mut observation = f.observation().await;
+        observation.cleared = BTreeSet::from(["7d".into()]);
+        observation.reported["windows"][1]["used_pct"] = json!(0);
+        observation.reported["windows"][1]["reset_at"] = json!(
+            observation
+                .expected
+                .quota_cooling
+                .as_ref()
+                .unwrap()
+                .reset_at
+        );
+        observation.reported["windows"][0]["reset_at"] = before["windows"][0]["reset_at"].clone();
+        if malformed {
+            observation.reported["windows"][0]["used_pct"] = Value::Null;
+            observation.reported["windows"][0]["observed_at"] = Value::Null;
+        } else {
+            observation.reported["windows"]
+                .as_array_mut()
+                .unwrap()
+                .remove(0);
+        }
+        observation.snapshot = observation.reported.clone();
+        assert!(
+            observation.complete,
+            "real Claude parser's insufficient completeness hint"
+        );
+        let after = f.apply(observation).await;
+        assert!(matches!(
+            after.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        assert!(!f.runtime.eligible(&f.id, None).await);
+        let canonical = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+        let windows = canonical["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(
+            windows.iter().find(|w| w["name"] == "5h").unwrap()["used_pct"],
+            100.0
+        );
+        assert!(f.runtime.obs.placement_capacity_facts(&f.id).is_none());
+    }
+}
+
+#[tokio::test]
+async fn old_header_rejection_on_acknowledged_scope_retires_to_unknown_and_recovers() {
+    let f = Fixture::new(Provider::Claude);
+    f.rejected_header("5h", "five_hour").await;
+    let observation = f.observation().await;
+    let after = f.apply(observation).await;
+    assert_eq!(after.health, Health::Ready);
+    assert!(f.runtime.eligible(&f.id, None).await);
+    let canonical = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+    assert!(canonical["windows"][0]["status"].is_null());
+    assert!(canonical["signals"]["unified_status"].is_null());
+    assert!(canonical["signals"]["representative_claim"].is_null());
+    assert_eq!(canonical["windows"][0]["used_pct"], 0.0);
+    assert_eq!(canonical["windows"][1]["used_pct"], 12.0);
+    assert_eq!(
+        canonical["windows"].as_array().unwrap().len(),
+        2,
+        "Ultra absence needs no invented four-slot inventory"
+    );
+}
+
+#[tokio::test]
+async fn newer_or_unrelated_rejections_and_facts_only_refresh_keep_the_native_hold() {
+    for variant in ["newer", "unrelated", "facts_only"] {
+        let f = Fixture::new(Provider::Claude);
+        let observation = if variant == "newer" {
+            let observation = f.observation().await;
+            f.rejected_header("5h", "five_hour").await;
+            observation
+        } else {
+            f.rejected_header(
+                if variant == "unrelated" { "7d" } else { "5h" },
+                if variant == "unrelated" {
+                    "seven_day"
+                } else {
+                    "five_hour"
+                },
+            )
+            .await;
+            let mut observation = f.observation().await;
+            if variant == "facts_only" {
+                observation.cleared.clear();
+            }
+            observation
+        };
+        let before = f.account();
+        let after = f.apply(observation).await;
+        assert!(
+            matches!(
+                after.health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+            ),
+            "{variant}"
+        );
+        assert!(!f.runtime.eligible(&f.id, None).await, "{variant}");
+        if variant == "newer" {
+            assert_eq!(after.health, before.health);
+        }
+        let canonical = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+        let name = if variant == "unrelated" { "7d" } else { "5h" };
+        assert_eq!(
+            canonical["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["name"] == name)
+                .unwrap()["status"],
+            "rejected"
+        );
+        assert_eq!(canonical["signals"]["unified_status"], "rejected");
+    }
 }

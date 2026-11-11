@@ -5,7 +5,7 @@ use super::*;
 pub(crate) struct ResetQuotaObservation {
     pub(crate) expected: Account,
     pub(crate) cleared: BTreeSet<String>,
-    /// Canonical quota snapshot, published by the incumbent Claude observer.
+    /// RAW GET snapshot; runtime merges it only after native origin acceptance.
     pub(crate) snapshot: Value,
     /// Actual fresh GET facts, before any cache merge.
     pub(crate) reported: Value,
@@ -23,6 +23,15 @@ pub(super) struct ResetRecovery {
 }
 
 impl ResetRecovery {
+    pub(super) fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+    pub(super) fn cleared(&self) -> &BTreeSet<String> {
+        &self.cleared
+    }
+    pub(super) fn complete(&self) -> bool {
+        self.complete
+    }
     pub(super) fn can_recover(
         &self,
         current: &Account,
@@ -110,8 +119,16 @@ impl AccountRuntime {
             }),
         )
         .await
-        .map(|(account, _, _, applied)| {
-            if applied && complete {
+        .map(|(account, _, canonical, applied)| {
+            if applied
+                && complete
+                && Observability::reset_window_coverage(
+                    &reported,
+                    Some(&canonical),
+                    started_at,
+                    Utc::now(),
+                )
+            {
                 self.observe_polled_placement_capacity(&account, &reported, started_at);
             }
             account

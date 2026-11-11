@@ -713,37 +713,25 @@ impl UsagePoller {
                 }
             }
             let reported = snapshot.clone();
-            let snapshot = self
-                .obs
-                .observe_poll(&account.id, snapshot, complete)
-                .ok_or(Error::Unavailable)?;
-            if let Some(recovery) = recovery {
-                self.runtime
-                    .apply_reset_quota_snapshot(crate::account_runtime::ResetQuotaObservation {
-                        expected: recovery.expected,
-                        cleared: recovery.cleared,
-                        snapshot,
-                        reported,
-                        wait_origin: wait,
-                        outside_origin: outside,
-                        started_at,
-                        complete,
-                    })
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
-            } else {
-                self.runtime
-                    .apply_polled_quota_snapshot(
-                        &account.id,
-                        snapshot,
-                        &reported,
-                        wait,
-                        outside,
-                        Some((started_at, complete)),
-                    )
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
-            }
+            let (expected, cleared) = recovery.map_or_else(
+                || (account.clone(), BTreeSet::new()),
+                |recovery| (recovery.expected, recovery.cleared),
+            );
+            // The native Store/cache owner proves known-window completeness and
+            // fences retirement of inherited rejection before publishing facts.
+            self.runtime
+                .apply_reset_quota_snapshot(crate::account_runtime::ResetQuotaObservation {
+                    expected,
+                    cleared,
+                    snapshot,
+                    reported,
+                    wait_origin: wait,
+                    outside_origin: outside,
+                    started_at,
+                    complete,
+                })
+                .await
+                .map_err(|_| Error::Unavailable)?;
             return Ok(());
         }
         let (_, _, reconciled) = self

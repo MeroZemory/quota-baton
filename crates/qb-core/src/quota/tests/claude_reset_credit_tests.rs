@@ -741,6 +741,227 @@ mod r28_claude_reset_tests {
     }
 
     #[tokio::test]
+    async fn weekly_reset_partial_usage_cannot_erase_uncleared_exhausted_five_hour_window() {
+        for malformed_five_hour in [false, true] {
+            let f = fixture().await;
+            let mut initial_usage = usage(100);
+            initial_usage["seven_day"]["utilization"] = json!(100);
+            initial_usage["seven_day_opus"]["utilization"] = json!(29);
+            f.fake.state.push(reply(initial_usage.clone()));
+            f.fake.state.push(profile_reply(&f));
+            f.relay.quota.poll(&f.ids[0]).await.unwrap();
+            assert_requests_with_profiles(&f, 0, 1);
+            assert!(matches!(
+                f.relay.quota.poll(&f.ids[0]).await,
+                Err(PollError::TooSoon { .. })
+            ));
+            let before = f.account(0);
+            let cause = before.quota_cooling.as_ref().expect("poll-created hold");
+            assert_eq!(cause.window, "7d");
+            let before_snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+            let old_five_hour = before_snapshot["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|window| window["name"] == "5h")
+                .unwrap();
+            assert_eq!(old_five_hour["used_pct"], json!(100.0));
+            assert!(
+                old_five_hour["reset_at"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<chrono::DateTime<Utc>>()
+                    .unwrap()
+                    < cause.reset_at
+            );
+            assert!(!f.relay.accounts.eligible(&f.ids[0], None).await);
+
+            let mut weekly = grant("weekly", "Weekly reset", json!(["seven_day"]), 1);
+            weekly["type"] = json!("weekly");
+            weekly["percent_used"] = json!({"seven_day":100});
+            let mut inventory = initial_usage.clone();
+            inventory["cedar_ember"] = details(2)["cedar_ember"].clone();
+            inventory["cedar_ember"]["grants"] = json!([weekly]);
+            inventory["cedar_ember"]["next_grant_id"] = json!("weekly");
+            queue_preview(&f, inventory.clone());
+            let wire = f
+                .relay
+                .quota
+                .preview_reset_credit_grant(&f.ids[0], Some("weekly".into()))
+                .await
+                .unwrap();
+            let mut after_details = inventory.clone();
+            after_details["cedar_ember"]["grants"][0]["resets_left"] = json!(0);
+            after_details["cedar_ember"]["grants"][0]["usable_now"] = json!(false);
+            let mut partial = json!({"seven_day":{
+                "utilization":0,"resets_at":initial_usage["seven_day"]["resets_at"]}});
+            if malformed_five_hour {
+                partial["five_hour"] = json!({"utilization":"invalid","resets_at":"invalid"});
+            }
+            for value in [
+                inventory,
+                usage(100),
+                json!({"result":"reset","resets_left":0,"cleared":["seven_day"]}),
+                after_details,
+                partial,
+            ] {
+                f.fake.state.push(reply(value));
+            }
+            let result = f
+                .relay
+                .quota
+                .commit_reset_credit(f.ids[0].clone(), affirmative(&wire))
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, ResetCreditOutcome::Reset);
+            let after = f.account(0);
+            assert!(matches!(after.health, Health::Cooling { .. }));
+            assert!(after.quota_cooling.is_some());
+            assert!(!f.relay.accounts.eligible(&f.ids[0], None).await);
+            let views = f.relay.accounts.typed_views().await.unwrap();
+            let view = views.iter().find(|view| view.id == f.ids[0]).unwrap();
+            assert!(!view.pool_eligible);
+            let projected_five_hour = view
+                .windows
+                .iter()
+                .find(|window| window.name == "5h")
+                .expect("uncleared window remains projected");
+            assert_eq!(projected_five_hour.used_pct, Some(100.0));
+            let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+            let five_hour = snapshot["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|window| window["name"] == "5h")
+                .expect("partial GET cannot erase exhausted 5h");
+            assert_eq!(five_hour["used_pct"], old_five_hour["used_pct"]);
+            assert_eq!(five_hour["reset_at"], old_five_hour["reset_at"]);
+            assert_eq!(after.user_state, before.user_state);
+            assert_eq!(after.drain, before.drain);
+            assert_eq!(after.allow_credits, before.allow_credits);
+            assert_eq!(post_body(&f)["grant_id"], "weekly");
+            let requests = f.fake.state.requests();
+            assert_eq!(requests.len(), 9);
+            assert_eq!(requests.last().unwrap().path_and_query, USAGE);
+            assert_requests_with_profiles(&f, 1, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_reset_retires_preexisting_native_header_rejection_at_same_deadline() {
+        let f = fixture().await;
+        f.fake.state.push(reply(usage(100)));
+        f.fake.state.push(profile_reply(&f));
+        f.relay.quota.poll(&f.ids[0]).await.unwrap();
+        assert_requests_with_profiles(&f, 0, 1);
+        assert!(matches!(
+            f.relay.quota.poll(&f.ids[0]).await,
+            Err(PollError::TooSoon { .. })
+        ));
+        let poll_cause = f.account(0).quota_cooling.expect("poll-created hold");
+        assert_eq!(poll_cause.window, "5h");
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "rejected".to_owned()),
+            (
+                "anthropic-ratelimit-unified-reset",
+                poll_cause.reset_at.timestamp().to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour".to_owned(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-status",
+                "rejected".to_owned(),
+            ),
+            ("anthropic-ratelimit-unified-5h-utilization", "1".to_owned()),
+            (
+                "anthropic-ratelimit-unified-5h-reset",
+                poll_cause.reset_at.timestamp().to_string(),
+            ),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        // Actual header parsing, cache merge and native reduction happen before
+        // preview/commit captures any reset authority; no fabricated cache row.
+        let observed = f
+            .relay
+            .accounts
+            .observe_headers(&f.ids[0], Provider::Claude, &headers)
+            .await;
+        assert_eq!(observed.quota_until, Some(poll_cause.reset_at));
+        let before = f.account(0);
+        assert_eq!(before.quota_cooling.as_ref().unwrap().window, "5h");
+        assert_eq!(
+            before.quota_cooling.as_ref().unwrap().reset_at,
+            poll_cause.reset_at
+        );
+        assert!(!f.relay.accounts.eligible(&f.ids[0], None).await);
+        let rejected = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+        assert_eq!(rejected["signals"]["unified_status"], "rejected");
+        assert_eq!(rejected["signals"]["representative_claim"], "five_hour");
+        assert_eq!(
+            rejected["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|window| window["name"] == "5h")
+                .unwrap()["status"],
+            "rejected"
+        );
+
+        let wire = preview(&f, Some("full")).await;
+        let mut after_details = details(2);
+        after_details["cedar_ember"]["grants"][0]["resets_left"] = json!(0);
+        after_details["cedar_ember"]["grants"][0]["usable_now"] = json!(false);
+        queue_commit(
+            &f,
+            reply(json!({"result":"reset","resets_left":0,
+            "cleared":["five_hour","seven_day"]})),
+            after_details,
+            Some(usage(0)),
+        );
+        let result = f
+            .relay
+            .quota
+            .commit_reset_credit(f.ids[0].clone(), affirmative(&wire))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, ResetCreditOutcome::Reset);
+        assert!(!result.refresh_failed);
+        let after = f.account(0);
+        assert_eq!(after.health, Health::Ready);
+        assert!(after.quota_cooling.is_none());
+        assert!(f.relay.accounts.eligible(&f.ids[0], None).await);
+        let views = f.relay.accounts.typed_views().await.unwrap();
+        let view = views.iter().find(|view| view.id == f.ids[0]).unwrap();
+        assert!(view.pool_eligible);
+        assert!(view.quota_cooling.is_none());
+        let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+        let five_hour = snapshot["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|window| window["name"] == "5h")
+            .unwrap();
+        assert_eq!(five_hour["used_pct"], json!(0.0));
+        assert_eq!(five_hour["reset_at"], json!(poll_cause.reset_at));
+        assert_ne!(five_hour["status"], "rejected");
+        assert_ne!(snapshot["signals"]["unified_status"], "rejected");
+        assert_ne!(snapshot["signals"]["limit_reached"], json!(true));
+        assert_eq!(snapshot["credits"], rejected["credits"]);
+        assert_eq!(after.user_state, before.user_state);
+        assert_eq!(after.drain, before.drain);
+        assert_eq!(after.allow_credits, before.allow_credits);
+        assert_eq!(post_body(&f)["grant_id"], "full");
+        let requests = f.fake.state.requests();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.last().unwrap().path_and_query, USAGE);
+        assert_requests_with_profiles(&f, 1, 1);
+    }
+
+    #[tokio::test]
     async fn refusal_results_preserve_claude_facts_and_never_retry() {
         for (result_name, reason) in [
             ("already_used", "already_used"),

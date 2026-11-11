@@ -1494,11 +1494,14 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
         } else {
             v2::reset_credit_account_refusal(&row.raw)
         };
-        let zero = row
-            .raw
-            .reset_credits
-            .as_ref()
-            .is_some_and(|i| i.available_count == Some(0));
+        // Claude details are explicit-read only; a cached zero must not prevent
+        // checking for newly offered grants. This entry never authorizes a POST.
+        let zero = row.raw.provider == "codex"
+            && row
+                .raw
+                .reset_credits
+                .as_ref()
+                .is_some_and(|i| i.available_count == Some(0));
         let label = row
             .raw
             .reset_credits

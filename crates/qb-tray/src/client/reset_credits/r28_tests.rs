@@ -577,3 +577,109 @@ fn transport_refusals_explain_recovery_in_both_languages_without_generic_duplica
         });
     }
 }
+
+#[test]
+fn cached_claude_counts_and_expiry_are_visibly_stale_in_both_languages_including_zero() {
+    for language in [UiLanguage::Ko, UiLanguage::En] {
+        with_language(language, || {
+            for left in [0, 2] {
+                let mut g = grant("hidden-grant", "Full", true);
+                g.resets_left = left;
+                let mut i = inventory(vec![g]);
+                let fresh = inventory_line("claude", Some(&i), now());
+                i.state = ResetCreditState::Stale;
+                i.refusal = Some(ResetCreditRefusal::Stale);
+                let stale = inventory_line("claude", Some(&i), now());
+                assert_eq!(
+                    stale.text,
+                    qb_tray::i18n::format("{0} · 오래된 정보", &[fresh.text])
+                );
+                assert!(!stale.can_use);
+                assert!(!stale.text.contains("hidden-grant"));
+                assert!(stale.tooltip.contains(&stale.text));
+            }
+        });
+    }
+}
+
+#[test]
+fn claude_cached_zero_can_check_for_new_grants_without_cached_consumption_authority() {
+    let mut zero_grant = grant("old-hidden", "Full", false);
+    zero_grant.resets_left = 0;
+    let zero = inventory(vec![zero_grant]);
+    let v = view(Some(&zero), "active", "ready", "pro");
+    let scene = g::Scene::build(
+        &v,
+        g::Presentation {
+            overlay: g::Overlay::RowMenu("cl-secret".into()),
+            ..Default::default()
+        },
+        800.,
+    );
+    assert!(
+        scene
+            .sections
+            .iter()
+            .flat_map(|s| &s.rows)
+            .all(|r| r.reset_credit_action.is_none())
+    );
+    assert!(scene.popup.unwrap().items.iter().any(|item| item.enabled
+        && matches!(
+            item.target,
+            g::Target::Menu {
+                action: g::MenuAction::UseResetCredit,
+                ..
+            }
+        )));
+    let mut c = Consent::default();
+    let generation = c
+        .begin_with_inventory("cl-secret", false, Some(&zero))
+        .unwrap();
+    assert!(c.confirm("cl-secret", now()).is_none());
+    c.finish_read("cl-secret", generation, None);
+    assert!(!c.ready(generation, preview(zero.clone(), "old-hidden"), now()));
+    assert!(c.confirm("cl-secret", now()).is_none());
+    c.cancel();
+    let mut offered = grant("new-hidden", "Full", true);
+    offered.resets_left = 1;
+    let fresh = inventory(vec![offered]);
+    let generation = c
+        .begin_with_inventory("cl-secret", false, Some(&zero))
+        .unwrap();
+    c.finish_read("cl-secret", generation, None);
+    c.refreshed("cl-secret", "claude", &fresh);
+    assert!(c.confirm("cl-secret", now()).is_none());
+    assert!(c.ready(generation, preview(fresh, "new-hidden"), now()));
+    assert!(!c.sending);
+    assert!(c.confirm("cl-secret", now()).unwrap().confirm);
+    assert!(c.confirm("cl-secret", now()).is_none());
+
+    let codex = v2::project(
+        &serde_json::json!({"accounts":[{
+            "id":"cx-secret","provider":"codex","plan":"plus","user_state":"active",
+            "health":{"kind":"ready"},"reset_credits":{
+                "state":"fresh","observed_at":now().to_rfc3339(),"available_count":0,
+                "grants":[],"refusal":"no_credits"
+            }
+        }]})
+        .to_string(),
+        SystemTime::from(now()),
+    )
+    .unwrap();
+    let scene = g::Scene::build(
+        &codex,
+        g::Presentation {
+            overlay: g::Overlay::RowMenu("cx-secret".into()),
+            ..Default::default()
+        },
+        800.,
+    );
+    assert!(scene.popup.unwrap().items.iter().any(|item| !item.enabled
+        && matches!(
+            item.target,
+            g::Target::Menu {
+                action: g::MenuAction::UseResetCredit,
+                ..
+            }
+        )));
+}

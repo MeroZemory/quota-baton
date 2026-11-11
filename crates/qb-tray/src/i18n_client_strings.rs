@@ -298,5 +298,6 @@ pub(crate) const STRINGS: &[(&str, &str)] = &[
         "요청이 많습니다. 잠시 후 다시 확인해 주세요.",
         "Too many requests. Check again shortly.",
     ),
+    ("{0} · 오래된 정보", "{0} · stale"),
     ("{0} · 추천", "{0} · Recommended"),
 ];
