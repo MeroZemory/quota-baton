@@ -146,6 +146,23 @@ pub(super) fn endpoint_allowed(url: &reqwest::Url) -> bool {
 }
 
 impl UsagePoller {
+    pub(super) async fn claude_read_status(
+        &self,
+        account: &Account,
+        tokens: &crate::accounts::Tokens,
+        response: &reqwest::Response,
+    ) -> Result<(), Error> {
+        if account.provider == Provider::Claude
+            && matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+        {
+            self.claude_reset_auth_refusal(account, tokens).await;
+            return Err(Error::Ineligible);
+        }
+        Ok(())
+    }
     async fn claude_reset_auth_refusal(&self, account: &Account, tokens: &crate::accounts::Tokens) {
         let store = self.store.clone();
         let account = account.clone();

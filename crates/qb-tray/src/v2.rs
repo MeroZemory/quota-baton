@@ -123,7 +123,7 @@ impl Account {
 
 /// Explicit reset actions preserve pause/drain placement controls; grants supply plan eligibility.
 pub fn reset_credit_account_refusal(account: &Account) -> Option<&'static str> {
-    let reason = if account.provider != "codex" {
+    let reason = if !matches!(account.provider.as_str(), "codex" | "claude") {
         "리셋권 · 지원 안 함"
     } else if account.health.kind == "needs_relogin" {
         "먼저 다시 로그인해 주세요."
@@ -131,6 +131,11 @@ pub fn reset_credit_account_refusal(account: &Account) -> Option<&'static str> {
         "계정을 먼저 켜 주세요."
     } else if !matches!(account.user_state.as_str(), "active" | "paused") {
         "계정 상태를 먼저 확인해 주세요."
+    } else if account.provider == "claude"
+        && (account.plan.as_deref() == Some("free")
+            || account.health.kind == "plan_without_claude_code")
+    {
+        "Claude Code 사용 자격이 필요합니다."
     } else {
         return None;
     };
@@ -1057,9 +1062,15 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         usage,
         windows,
         credits,
-        reset_credits: (a.provider == "codex").then(|| {
-            crate::client::reset_credits::inventory_line(&a.provider, a.reset_credits.as_ref(), now)
-        }),
+        reset_credits: matches!(a.provider.as_str(), "codex" | "claude")
+            .then(|| {
+                crate::client::reset_credits::inventory_line(
+                    &a.provider,
+                    a.reset_credits.as_ref(),
+                    now,
+                )
+            })
+            .filter(|line| a.provider == "codex" || !line.text.is_empty()),
         forecast_lines: vec![forecast_summary.text],
         forecast_tooltip,
         forecast_warning: forecast_summary.warning,

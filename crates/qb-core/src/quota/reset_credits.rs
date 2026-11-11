@@ -222,6 +222,7 @@ impl UsagePoller {
             .send()
             .await
             .map_err(|_| Error::Unavailable)?;
+        self.claude_read_status(account, tokens, &response).await?;
         let value = reset_body(response).await?;
         let mut inventory = if account.provider == Provider::Claude {
             model::claude::parse_details(&value, Utc::now())
@@ -248,6 +249,7 @@ impl UsagePoller {
             .send()
             .await
             .map_err(|_| Error::Unavailable)?;
+        self.claude_read_status(account, tokens, &response).await?;
         let body = reset_body(response).await?;
         let bytes = serde_json::to_vec(&body).map_err(|_| Error::Unavailable)?;
         let snapshot = super::parse::snapshot(account.provider, &bytes, Utc::now())
@@ -624,6 +626,7 @@ impl UsagePoller {
             .send()
             .await
             .map_err(|_| Error::Unavailable)?;
+        self.claude_read_status(account, &tokens, &response).await?;
         let body = reset_body(response).await?;
         let bytes = serde_json::to_vec(&body).map_err(|_| Error::Unavailable)?;
         let snapshot = super::parse::snapshot(account.provider, &bytes, Utc::now())

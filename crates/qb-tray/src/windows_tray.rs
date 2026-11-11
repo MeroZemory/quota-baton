@@ -684,6 +684,10 @@ fn presentation(
                 .unwrap_or_default()
         } else if let Some(message) = consent.messages.get(id) {
             let mut text = i18n::static_text(message).to_owned();
+            if let Some(detail) = &consent.result_detail {
+                text.push('\n');
+                text.push_str(detail);
+            }
             if consent.success_limits
                 && let Some(row) = row_view(view, id)
             {
@@ -727,7 +731,47 @@ fn presentation(
             && consent.preview.as_ref().is_some_and(|p| p.account == id)
             && !consent.busy
             && !consent.unknown.contains_key(id);
-        active_overlay = if consent.preview.is_some() && !consent.terminal && refusal.is_none() {
+        active_overlay = if let Some(inventory) = &consent.choices
+            && let Some(i) = &inventory.claude
+            && !consent.busy
+            && refusal.is_none()
+        {
+            let recommendation = qb_tray::client::reset_credits::claude_recommendation(
+                inventory,
+                chrono::Utc::now(),
+            );
+            Overlay::ResetCreditChoices {
+                id: id.into(),
+                rows: i
+                    .grants
+                    .iter()
+                    .map(|g| {
+                        let mut detail = qb_tray::client::reset_credits::claude_grant_detail(i, g);
+                        if !consent.can_select(id, &g.id)
+                            && g.usable_now
+                            && let Some(reason) = inventory.refusal
+                        {
+                            detail.push('\n');
+                            detail.push_str(&qb_tray::client::reset_credits::refusal_text(reason));
+                        }
+                        if consent.unknown.contains_key(id) {
+                            detail.push('\n');
+                            detail.push_str(i18n::static_text(
+                                qb_tray::client::reset_credits::UNKNOWN,
+                            ));
+                        }
+                        geometry::ResetCreditChoice {
+                            id: g.id.clone(),
+                            label: qb_tray::client::reset_credits::claude_label(g),
+                            detail,
+                            recommended: recommendation.as_deref() == Some(g.id.as_str())
+                                && consent.can_select(id, &g.id),
+                            enabled: consent.can_select(id, &g.id),
+                        }
+                    })
+                    .collect(),
+            }
+        } else if consent.preview.is_some() && !consent.terminal && refusal.is_none() {
             Overlay::ResetCredits {
                 id: id.into(),
                 body,
@@ -744,6 +788,11 @@ fn presentation(
     let mut p = geometry::Presentation {
         expanded: session.expansion.clone(),
         pending_ids: session.pending_ids(),
+        reset_confirmation_title: session
+            .reset_credits
+            .preview
+            .as_ref()
+            .and_then(qb_tray::client::reset_credits::claude_preview_title),
         reset_busy: session.reset_credits.busy,
         reset_blocked: session.reset_credits.unknown.keys().cloned().collect(),
         reset_messages: session
@@ -861,6 +910,13 @@ fn repeated_activation(key: u32, flags: isize) -> bool {
     matches!(key, 0x0d | 0x20 | 0x79 | 0x5d) && (flags as usize & (1usize << 30)) != 0
 }
 fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
+    if scene
+        .targets
+        .iter()
+        .any(|h| matches!(h.target, HitTarget::SelectResetCredit { .. }))
+    {
+        return Some(HitTarget::CancelDialog);
+    }
     if scene
         .targets
         .iter()
@@ -1530,6 +1586,9 @@ fn reset_facts_changed(handle: isize) {
     }
 }
 fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
+    dispatch_reset_credit_grant(hwnd, id, refresh, None);
+}
+fn dispatch_reset_credit_grant(hwnd: HWND, id: String, refresh: bool, grant_id: Option<String>) {
     let view = projected();
     let Some(row) = row_view(&view, &id) else {
         return;
@@ -1541,6 +1600,11 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
     }
     let generation = {
         let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(grant) = &grant_id
+            && !state.reset_credits.can_select(&id, grant)
+        {
+            return;
+        }
         if state.pending(&id) {
             return;
         }
@@ -1556,6 +1620,7 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
     set_view(Some(format!("reset-credits:{id}")));
     let handle = hwnd.0 as isize;
     let failed_id = id.clone();
+    let provider = row.raw.provider.clone();
     let accepted = WORKER.get().is_some_and(|worker| {
         worker.submit(async move {
             use qb_tray::client::reset_credits::ActionError;
@@ -1573,18 +1638,37 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
             {
                 let mut state = session().lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(inventory) = &inventory {
-                    state.reset_credits.reconciled(&id, inventory);
+                    state.reset_credits.refreshed(&id, &provider, inventory);
                 }
             }
             reset_facts_changed(handle);
             let result = match (&client, &inventory) {
+                (Ok(client), Ok(_inventory)) if provider == "claude" && grant_id.is_some() => Some(
+                    client
+                        .preview_reset_credit_grant(&id, grant_id.as_deref())
+                        .await,
+                ),
                 (Ok(client), Ok(inventory))
-                    if qb_tray::client::reset_credits::inventory_line(
-                        "codex",
-                        Some(inventory),
-                        chrono::Utc::now(),
+                    if provider == "claude"
+                        && inventory.claude.as_ref().is_some_and(|i| {
+                            i.eligible && i.grants.len() == 1 && i.grants[0].usable_now
+                        }) =>
+                {
+                    let grant = &inventory.claude.as_ref().expect("checked above").grants[0];
+                    Some(
+                        client
+                            .preview_reset_credit_grant(&id, Some(&grant.id))
+                            .await,
                     )
-                    .can_use =>
+                }
+                (Ok(client), Ok(inventory))
+                    if provider == "codex"
+                        && qb_tray::client::reset_credits::inventory_line(
+                            "codex",
+                            Some(inventory),
+                            chrono::Utc::now(),
+                        )
+                        .can_use =>
                 {
                     Some(client.preview_reset_credit(&id).await)
                 }
@@ -1597,6 +1681,13 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                     .err()
                     .or_else(|| result.as_ref().and_then(|r| r.as_ref().err()));
                 state.reset_credits.finish_read(&id, generation, error);
+                if grant_id.is_none()
+                    && let Ok(inventory) = &inventory
+                {
+                    state
+                        .reset_credits
+                        .offer_choices(&id, generation, inventory);
+                }
                 if inventory.as_ref().is_ok_and(reset_inventory_no_credits) {
                     state
                         .reset_credits
@@ -1607,7 +1698,7 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                 if let Ok(inventory) = &inventory
                     && !reset_inventory_no_credits(inventory)
                     && !qb_tray::client::reset_credits::inventory_line(
-                        "codex",
+                        &provider,
                         Some(inventory),
                         chrono::Utc::now(),
                     )
@@ -1616,9 +1707,26 @@ fn dispatch_reset_credit(hwnd: HWND, id: String, refresh: bool) {
                     state.reset_credits.detail_unavailable = true;
                 }
                 if let Some(Ok(preview)) = result {
-                    state
-                        .reset_credits
-                        .ready(generation, preview, chrono::Utc::now());
+                    let provider_matches = matches!(
+                        (provider.as_str(), preview.grant.reset_type),
+                        (
+                            "codex",
+                            qb_proto::reset_credits::ResetCreditType::CodexRateLimits
+                        ) | (
+                            "claude",
+                            qb_proto::reset_credits::ResetCreditType::ClaudeRateLimits
+                        )
+                    );
+                    if provider_matches {
+                        state
+                            .reset_credits
+                            .ready(generation, preview, chrono::Utc::now());
+                    } else {
+                        state
+                            .reset_credits
+                            .messages
+                            .insert(id.clone(), qb_tray::client::reset_credits::STALE);
+                    }
                 }
             }
             reset_facts_changed(handle);
@@ -2664,6 +2772,9 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         HitTarget::TakeoverNext => windows_takeover::next(),
         HitTarget::TakeoverCommit => windows_takeover::commit(hwnd),
         HitTarget::ConfirmResetCredit(id) => confirm_reset_credit(hwnd, id),
+        HitTarget::SelectResetCredit { id, grant_id } => {
+            dispatch_reset_credit_grant(hwnd, id, false, Some(grant_id))
+        }
         HitTarget::ConfirmCredits(id) => {
             let current = projected();
             let confirmed = session()
@@ -2924,6 +3035,14 @@ fn tooltip_content(
             });
     }
     if let Some(popup) = &scene.popup {
+        if let Some(item) = popup
+            .items
+            .iter()
+            .find(|i| !i.enabled && contains(i.rect, x, y))
+            && matches!(item.target, HitTarget::SelectResetCredit { .. })
+        {
+            return item.detail.clone().map(|text| (text, item.rect));
+        }
         if let Some(item) = popup
             .items
             .iter()
@@ -3380,6 +3499,13 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
             .map(|b| b.label.clone())
             .unwrap_or_default(),
         HitTarget::ConfirmResetCredit(_) => i18n::text("1개 사용").into_owned(),
+        HitTarget::SelectResetCredit { .. } => frame
+            .scene
+            .popup
+            .as_ref()
+            .and_then(|p| p.items.iter().find(|i| &i.target == target))
+            .map(|i| format!("{} {}", i.text, i.detail.as_deref().unwrap_or_default()))
+            .unwrap_or_default(),
         HitTarget::ConfirmCredits(_) => i18n::text("크레딧 사용").into_owned(),
         HitTarget::ConfirmDelete(_) => i18n::text("계정 삭제").into_owned(),
         HitTarget::CancelDialog | HitTarget::LoginCancel => frame
@@ -5396,4 +5522,37 @@ fn r27_zero_with_refusal_is_not_a_confirmed_no_credit_result() {
     inventory.refusal = None;
     inventory.state = ResetCreditState::Stale;
     assert!(!reset_inventory_no_credits(&inventory));
+}
+
+#[test]
+fn r28_grant_list_defaults_to_cancel_even_when_a_recommendation_is_usable() {
+    let view = v2::project("{\"accounts\":[]}", SystemTime::UNIX_EPOCH).unwrap();
+    for language in [i18n::UiLanguage::Ko, i18n::UiLanguage::En] {
+        i18n::with_language(language, || {
+            let scene = geometry::Scene::build(
+                &view,
+                geometry::Presentation {
+                    overlay: Overlay::ResetCreditChoices {
+                        id: "synthetic-account".into(),
+                        rows: vec![geometry::ResetCreditChoice {
+                            id: "hidden-grant".into(),
+                            label: "Full".into(),
+                            detail: "2".into(),
+                            recommended: true,
+                            enabled: true,
+                        }],
+                    },
+                    ..Default::default()
+                },
+                480.,
+            );
+            assert_eq!(modal_default_focus(&scene), Some(HitTarget::CancelDialog));
+            assert!(
+                scene
+                    .targets
+                    .iter()
+                    .all(|h| !matches!(h.target, HitTarget::ConfirmResetCredit(_)))
+            );
+        });
+    }
 }

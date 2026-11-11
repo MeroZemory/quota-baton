@@ -692,6 +692,74 @@ mod r28_claude_reset_tests {
     }
 
     #[tokio::test]
+    async fn read_auth_errors_revoke_access_without_preview_authority_or_oauth_retry() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            for preview_window in [false, true] {
+                let f = fixture().await;
+                if preview_window {
+                    f.fake.state.push(reply(details(2)));
+                }
+                f.fake.state.push(ScriptedResponse::json(status, "{}"));
+                if preview_window {
+                    assert_eq!(
+                        f.relay
+                            .quota
+                            .preview_reset_credit_grant(&f.ids[0], Some("fable".into()))
+                            .await,
+                        Err(ResetError::Ineligible)
+                    );
+                } else {
+                    assert_eq!(
+                        f.relay.quota.refresh_reset_credits(&f.ids[0]).await,
+                        Err(ResetError::Ineligible)
+                    );
+                }
+                assert!(matches!(f.account(0).health, Health::NeedsRelogin { .. }));
+                let requests = f.fake.state.requests();
+                assert_eq!(requests.len(), if preview_window { 2 } else { 1 });
+                assert_eq!(requests[0].path_and_query, DETAILS);
+                if preview_window {
+                    assert_eq!(requests[1].path_and_query, USAGE);
+                }
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| request.method == reqwest::Method::GET)
+                );
+                let entry = f.relay.quota.reset_credits.entry(&f.ids[0]).unwrap();
+                assert!(entry.lock().await.preview.is_none());
+                assert!(
+                    f.relay
+                        .quota
+                        .preview_reset_credit_grant(&f.ids[0], Some("fable".into()))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    f.relay
+                        .quota
+                        .commit_reset_credit(
+                            f.ids[0].clone(),
+                            ResetCreditCommitRequest {
+                                preview_token: "synthetic-no-preview-authority".into(),
+                                confirm: true,
+                            }
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(f.fake.state.requests().len(), requests.len());
+                // The strict allowlist and auth checks reject any token refresh,
+                // profile lookup, extra read, or redemption POST.
+                assert_requests(&f, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn post_auth_errors_enter_normal_relogin_without_refresh_or_replay() {
         for status in [
             reqwest::StatusCode::UNAUTHORIZED,
