@@ -4,6 +4,8 @@ mod admin_view;
 pub(crate) use admin_view::pools as account_pools;
 mod outside_owner;
 mod outside_usage;
+mod reset_recovery;
+pub(crate) use reset_recovery::ResetQuotaObservation;
 mod selection;
 pub(crate) use selection::RuntimeUnavailableEvidence;
 mod wait_admission;
@@ -2680,6 +2682,7 @@ impl AccountRuntime {
                 (origin, publication),
                 None,
                 None,
+                None,
             )
             .await
             .ok();
@@ -2817,6 +2820,7 @@ impl AccountRuntime {
             (origin, wait_owner::ReportPublication::Immediate),
             None,
             None,
+            None,
         )
         .await
         .map(|(account, _, _, _)| account)
@@ -2850,6 +2854,7 @@ impl AccountRuntime {
                 origin: outside_origin,
             }),
             Some(report),
+            None,
         )
         .await
         .map(|(account, receipt, snapshot, quota_applied)| {
@@ -2898,6 +2903,7 @@ impl AccountRuntime {
         publication: (Option<ReportOrigin>, wait_owner::ReportPublication),
         outside: Option<outside_owner::PollApplication>,
         poll: Option<PollUsageReport>,
+        reset: Option<reset_recovery::ResetRecovery>,
     ) -> Result<(Account, Option<wait_owner::ReportReceipt>, Value, bool), ()> {
         let (origin, publication) = publication;
         let reported = reported.clone();
@@ -3059,12 +3065,30 @@ impl AccountRuntime {
                 {
                     release.observe(&reported, &snapshot);
                 }
+                // Only an accepted pre-POST origin can authorize this extra
+                // native mutation. Store is held through classification/release.
+                let recover_reset = if let Some(reset) = &reset {
+                    let current = store.read_account_unlocked(&account_id).map_err(|_| ())?;
+                    application.is_some() && reset.can_recover(&current, &reported, Utc::now())
+                } else {
+                    false
+                };
+                if recover_reset {
+                    // Release is not reproducible by the ordinary UsageSnapshot
+                    // reducer. Its native hook revokes the old origin; never
+                    // own-rotate or mint a quota/readiness proof for this change.
+                    drop(application.take());
+                }
                 let attributed = application.is_some();
-                let cause = match application.as_mut() {
-                    Some(report) => crate::accounts::MetadataCause::UsageReport(report),
-                    None => crate::accounts::MetadataCause::Mutation(
-                        crate::accounts::MetadataMutation::Ordinary,
-                    ),
+                let cause = if recover_reset {
+                    crate::accounts::MetadataCause::Mutation(crate::accounts::MetadataMutation::Release)
+                } else {
+                    match application.as_mut() {
+                        Some(report) => crate::accounts::MetadataCause::UsageReport(report),
+                        None => crate::accounts::MetadataCause::Mutation(
+                            crate::accounts::MetadataMutation::Ordinary,
+                        ),
+                    }
                 };
                 let mut ran = false;
                 let mut candidate = None;
@@ -3120,6 +3144,11 @@ impl AccountRuntime {
                             account.quota_cooling = None;
                             account.quota_credit_releasable = false;
                             removed_quota_hold = true;
+                        }
+                        if recover_reset {
+                            account.health = Health::Ready;
+                            account.quota_cooling = None;
+                            account.quota_credit_releasable = false;
                         }
                         account.apply_health_signal(
                             crate::accounts::HealthSignal::UsageSnapshot {

@@ -5,6 +5,7 @@ use qb_proto::{reset_credit_action::*, reset_credits::*};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 mod claude;
 
@@ -23,6 +24,26 @@ struct Fence {
     outcome: ResetCreditOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude: Option<claude::Witness>,
+}
+
+// Process-local authority captured before the confirmed Claude mutation.
+// It is never reconstructed from a durable Unknown fence after restart.
+struct ClaudeResetRecovery {
+    expected: Account,
+    origin: crate::account_runtime::ReportOrigin,
+    cleared: BTreeSet<String>,
+}
+
+fn claude_reset_quota_window(window: &str) -> Option<&'static str> {
+    // Only the four windows actually parsed by quota::parse::CLAUDE_WINDOWS.
+    // A reset-only key (including omelette) cannot invent a native quota scope.
+    match window {
+        "five_hour" => Some("5h"),
+        "seven_day" => Some("7d"),
+        "seven_day_opus" => Some("7d_oi"),
+        "seven_day_sonnet" => Some("7d_sonnet"),
+        _ => None,
+    }
 }
 
 #[derive(Serialize)]
@@ -311,7 +332,7 @@ impl UsagePoller {
                         if claude_settlement {
                             // Positive read-only proof may release old native quota
                             // holds only through another real usage observation.
-                            let _ = self.reset_success_usage(&account).await;
+                            let _ = self.reset_success_usage(&account, None).await;
                         }
                     } else {
                         entry.inventory = Some(inventory);
@@ -499,6 +520,12 @@ impl UsagePoller {
         {
             return Err(Error::Stale);
         }
+        let selected_clears = inventory
+            .claude
+            .as_ref()
+            .and_then(|facts| facts.grants.iter().find(|g| g.id == grant.id))
+            .map(|g| g.clears.clone())
+            .unwrap_or_default();
         let mut fence = Fence {
             version: 1,
             identity: account.identity.canonical_key(),
@@ -524,6 +551,11 @@ impl UsagePoller {
             })
         };
         self.reset_fence(&id, Some(fence.clone())).await?;
+        let reset_origin = if account.provider == Provider::Claude {
+            self.runtime.capture_poll_origin(&id).await
+        } else {
+            None
+        };
         // If takeover stopped this store while the durable write ran, leave
         // Unknown and refuse to send. The process lock spans both boundaries.
         if self.store.writes_stopped() {
@@ -590,7 +622,27 @@ impl UsagePoller {
             outcome,
             ResetCreditOutcome::Reset | ResetCreditOutcome::AlreadyRedeemed
         ) {
-            refresh_failed |= self.reset_success_usage(&account).await.is_err();
+            let recovery = if outcome == ResetCreditOutcome::Reset {
+                let cleared: BTreeSet<String> = claude_result
+                    .as_ref()
+                    .filter(|result| result.result == "reset")
+                    .into_iter()
+                    .flat_map(|result| &result.cleared)
+                    .filter(|window| selected_clears.contains(window))
+                    .filter_map(|window| claude_reset_quota_window(window))
+                    .map(str::to_owned)
+                    .collect();
+                reset_origin
+                    .filter(|_| !cleared.is_empty())
+                    .map(|origin| ClaudeResetRecovery {
+                        expected: current,
+                        origin,
+                        cleared,
+                    })
+            } else {
+                None
+            };
+            refresh_failed |= self.reset_success_usage(&account, recovery).await.is_err();
         }
         Ok(ResetCreditResult {
             account: id,
@@ -601,7 +653,11 @@ impl UsagePoller {
         })
     }
 
-    async fn reset_success_usage(&self, account: &Account) -> Result<(), Error> {
+    async fn reset_success_usage(
+        &self,
+        account: &Account,
+        recovery: Option<ClaudeResetRecovery>,
+    ) -> Result<(), Error> {
         // A confirmed reset gets one fresh read independent of the ordinary
         // auto/manual 5-minute budget. This is a GET, never a POST retry.
         let (current, tokens) = self.reset_credentials(&account.id).await?;
@@ -613,7 +669,11 @@ impl UsagePoller {
         let asof = table
             .as_ref()
             .map(|table| table.begin_usage_observation_for(&account.id));
-        let wait = self.runtime.capture_poll_origin(&account.id).await;
+        let wait = if let Some(recovery) = &recovery {
+            Some(recovery.origin.clone())
+        } else {
+            self.runtime.capture_poll_origin(&account.id).await
+        };
         let outside = self.runtime.capture_outside_poll_origin(&account.id);
         let started_at = Utc::now();
         let response = self
@@ -657,17 +717,33 @@ impl UsagePoller {
                 .obs
                 .observe_poll(&account.id, snapshot, complete)
                 .ok_or(Error::Unavailable)?;
-            self.runtime
-                .apply_polled_quota_snapshot(
-                    &account.id,
-                    snapshot,
-                    &reported,
-                    wait,
-                    outside,
-                    Some((started_at, complete)),
-                )
-                .await
-                .map_err(|_| Error::Unavailable)?;
+            if let Some(recovery) = recovery {
+                self.runtime
+                    .apply_reset_quota_snapshot(crate::account_runtime::ResetQuotaObservation {
+                        expected: recovery.expected,
+                        cleared: recovery.cleared,
+                        snapshot,
+                        reported,
+                        wait_origin: wait,
+                        outside_origin: outside,
+                        started_at,
+                        complete,
+                    })
+                    .await
+                    .map_err(|_| Error::Unavailable)?;
+            } else {
+                self.runtime
+                    .apply_polled_quota_snapshot(
+                        &account.id,
+                        snapshot,
+                        &reported,
+                        wait,
+                        outside,
+                        Some((started_at, complete)),
+                    )
+                    .await
+                    .map_err(|_| Error::Unavailable)?;
+            }
             return Ok(());
         }
         let (_, _, reconciled) = self

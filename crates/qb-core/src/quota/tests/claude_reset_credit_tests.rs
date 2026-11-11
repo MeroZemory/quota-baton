@@ -593,6 +593,154 @@ mod r28_claude_reset_tests {
     }
 
     #[tokio::test]
+    async fn full_reset_recovers_polled_native_quota_hold_without_changing_reset_times() {
+        let f = fixture().await;
+        f.fake.state.push(reply(usage(100)));
+        f.fake.state.push(profile_reply(&f));
+        f.relay.quota.poll(&f.ids[0]).await.unwrap();
+        assert_requests_with_profiles(&f, 0, 1);
+        assert!(matches!(
+            f.relay.quota.poll(&f.ids[0]).await,
+            Err(PollError::TooSoon { .. })
+        ));
+        let before = f.account(0);
+        let cause = before
+            .quota_cooling
+            .as_ref()
+            .expect("ordinary poll owns hold");
+        assert_eq!(cause.window, "5h");
+        assert!(matches!(before.health, Health::Cooling { .. }));
+        assert!(!f.relay.accounts.eligible(&f.ids[0], None).await);
+        let before_snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+        let wire = preview(&f, Some("full")).await;
+        let mut after_details = details(2);
+        after_details["cedar_ember"]["grants"][0]["resets_left"] = json!(0);
+        after_details["cedar_ember"]["grants"][0]["usable_now"] = json!(false);
+        queue_commit(
+            &f,
+            reply(json!({"result":"reset","resets_left":0,
+                "cleared":["five_hour","seven_day"]})),
+            after_details,
+            Some(usage(17)),
+        );
+        let result = f
+            .relay
+            .quota
+            .commit_reset_credit(f.ids[0].clone(), affirmative(&wire))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, ResetCreditOutcome::Reset);
+        assert!(!result.refresh_failed);
+        let after = f.account(0);
+        assert_eq!(after.health, Health::Ready);
+        assert!(after.quota_cooling.is_none());
+        assert!(!after.quota_credit_releasable);
+        assert!(f.relay.accounts.eligible(&f.ids[0], None).await);
+        assert_eq!(after.user_state, before.user_state);
+        assert_eq!(after.drain, before.drain);
+        assert_eq!(after.allow_credits, before.allow_credits);
+        let views = f.relay.accounts.typed_views().await.unwrap();
+        let view = views.iter().find(|view| view.id == f.ids[0]).unwrap();
+        assert!(view.pool_eligible);
+        assert!(view.quota_cooling.is_none());
+        let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+        assert_eq!(snapshot["credits"], before_snapshot["credits"]);
+        for (name, used) in [
+            ("5h", 17.0),
+            ("7d", 37.0),
+            ("7d_oi", 29.0),
+            ("7d_sonnet", 11.0),
+        ] {
+            let current = snapshot["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|window| window["name"] == name)
+                .unwrap();
+            let previous = before_snapshot["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|window| window["name"] == name)
+                .unwrap();
+            assert_eq!(current["used_pct"], json!(used));
+            assert_eq!(current["reset_at"], previous["reset_at"]);
+        }
+        assert_eq!(snapshot["windows"][0]["reset_at"], json!(cause.reset_at));
+        assert_eq!(post_body(&f)["grant_id"], "full");
+        let requests = f.fake.state.requests();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.last().unwrap().path_and_query, USAGE);
+        assert_requests_with_profiles(&f, 1, 1);
+    }
+
+    #[tokio::test]
+    async fn reset_without_selected_cleared_scope_keeps_native_hold_despite_fresh_zero_usage() {
+        for cleared in [None, Some(json!(["seven_day_opus"]))] {
+            let f = fixture().await;
+            f.fake.state.push(reply(usage(100)));
+            f.fake.state.push(profile_reply(&f));
+            f.relay.quota.poll(&f.ids[0]).await.unwrap();
+            assert_requests_with_profiles(&f, 0, 1);
+            assert!(matches!(
+                f.relay.quota.poll(&f.ids[0]).await,
+                Err(PollError::TooSoon { .. })
+            ));
+            let before = f.account(0);
+            let cause = before
+                .quota_cooling
+                .as_ref()
+                .expect("ordinary poll owns hold");
+            assert_eq!(cause.window, "5h");
+            assert!(!f.relay.accounts.eligible(&f.ids[0], None).await);
+            let before_snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+            let wire = preview(&f, Some("full")).await;
+            let mut response = json!({"result":"reset","resets_left":0});
+            if let Some(cleared) = cleared {
+                response["cleared"] = cleared;
+            }
+            let mut after_details = details(2);
+            after_details["cedar_ember"]["grants"][0]["resets_left"] = json!(0);
+            after_details["cedar_ember"]["grants"][0]["usable_now"] = json!(false);
+            queue_commit(&f, reply(response), after_details, Some(usage(0)));
+            let result = f
+                .relay
+                .quota
+                .commit_reset_credit(f.ids[0].clone(), affirmative(&wire))
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, ResetCreditOutcome::Reset);
+            assert!(!result.refresh_failed);
+            let after = f.account(0);
+            assert_eq!(after.health, before.health);
+            assert_eq!(after.quota_cooling, before.quota_cooling);
+            assert!(!f.relay.accounts.eligible(&f.ids[0], None).await);
+            assert_eq!(after.user_state, before.user_state);
+            assert_eq!(after.drain, before.drain);
+            assert_eq!(after.allow_credits, before.allow_credits);
+            let views = f.relay.accounts.typed_views().await.unwrap();
+            let view = views.iter().find(|view| view.id == f.ids[0]).unwrap();
+            assert!(!view.pool_eligible);
+            assert!(view.quota_cooling.is_some());
+            let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+            let current = snapshot["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|window| window["name"] == "5h")
+                .unwrap();
+            assert_eq!(current["used_pct"], json!(0.0));
+            assert_eq!(current["reset_at"], json!(cause.reset_at));
+            assert_eq!(snapshot["credits"], before_snapshot["credits"]);
+            assert_eq!(post_body(&f)["grant_id"], "full");
+            let requests = f.fake.state.requests();
+            assert_eq!(requests.len(), 9);
+            assert_eq!(requests.last().unwrap().path_and_query, USAGE);
+            assert_requests_with_profiles(&f, 1, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn refusal_results_preserve_claude_facts_and_never_retry() {
         for (result_name, reason) in [
             ("already_used", "already_used"),

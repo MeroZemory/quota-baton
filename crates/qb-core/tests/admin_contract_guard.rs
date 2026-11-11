@@ -493,6 +493,7 @@ const REQUIRED_PRODUCERS: &[&str] = &[
     "crates/qb-core/src/admin.rs",
     "crates/qb-core/src/http.rs",
     "crates/qb-core/src/account_runtime.rs",
+    "crates/qb-core/src/account_runtime/reset_recovery.rs",
     "crates/qb-core/src/account_runtime/admin_view.rs",
     "crates/qb-core/src/observability.rs",
     "crates/qb-core/src/relay.rs",
