@@ -255,10 +255,10 @@ fn usable(
     {
         return Err(Error::NotUsable);
     }
-    if let Some(start) = &grant.starts_at {
-        if parse_timestamp(start).map_err(|_| Error::NotUsable)? > now {
-            return Err(Error::NotUsable);
-        }
+    if let Some(start) = &grant.starts_at
+        && parse_timestamp(start).map_err(|_| Error::NotUsable)? > now
+    {
+        return Err(Error::NotUsable);
     }
     match &common.expires_at {
         ResetCreditExpiry::At { at } => {
@@ -322,10 +322,10 @@ pub(crate) fn choose<'a>(
     if facts.grants.iter().all(|g| g.resets_left == 0) {
         return Err(Error::NoCredits);
     }
-    if let Some(until) = &facts.cooldown_until {
-        if parse_timestamp(until).map_err(|_| Error::NotUsable)? > now {
-            return Err(Error::NotUsable);
-        }
+    if let Some(until) = &facts.cooldown_until
+        && parse_timestamp(until).map_err(|_| Error::NotUsable)? > now
+    {
+        return Err(Error::NotUsable);
     }
     let resolve = |id: &str| {
         let detail = facts
@@ -343,10 +343,10 @@ pub(crate) fn choose<'a>(
     if let Some(id) = id {
         return resolve(id).map(|(g, _)| g);
     }
-    if let Some(next) = &facts.next_grant_id {
-        if let Ok((g, _)) = resolve(next) {
-            return Ok(g);
-        }
+    if let Some(next) = &facts.next_grant_id
+        && let Ok((g, _)) = resolve(next)
+    {
+        return Ok(g);
     }
     let mut candidates: Vec<_> = facts
         .grants
