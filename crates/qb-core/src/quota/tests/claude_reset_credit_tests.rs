@@ -675,8 +675,15 @@ mod r28_claude_reset_tests {
     }
 
     #[tokio::test]
-    async fn reset_without_selected_cleared_scope_keeps_native_hold_despite_fresh_zero_usage() {
-        for cleared in [None, Some(json!(["seven_day_opus"]))] {
+    async fn reset_without_selected_cleared_scope_requires_ordinary_usage_release_margin() {
+        // Without acknowledgement of the causing window, only R29's ordinary
+        // observation rule may release: zero qualifies; 97% does not.
+        for (cleared, used) in [
+            (None, 0),
+            (Some(json!(["seven_day_opus"])), 0),
+            (None, 97),
+            (Some(json!(["seven_day_opus"])), 97),
+        ] {
             let f = fixture().await;
             f.fake.state.push(reply(usage(100)));
             f.fake.state.push(profile_reply(&f));
@@ -702,7 +709,7 @@ mod r28_claude_reset_tests {
             let mut after_details = details(2);
             after_details["cedar_ember"]["grants"][0]["resets_left"] = json!(0);
             after_details["cedar_ember"]["grants"][0]["usable_now"] = json!(false);
-            queue_commit(&f, reply(response), after_details, Some(usage(0)));
+            queue_commit(&f, reply(response), after_details, Some(usage(used)));
             let result = f
                 .relay
                 .quota
@@ -712,16 +719,25 @@ mod r28_claude_reset_tests {
             assert_eq!(result.outcome, ResetCreditOutcome::Reset);
             assert!(!result.refresh_failed);
             let after = f.account(0);
-            assert_eq!(after.health, before.health);
-            assert_eq!(after.quota_cooling, before.quota_cooling);
-            assert!(!f.relay.accounts.eligible(&f.ids[0], None).await);
+            let ordinary_release = used == 0;
+            if ordinary_release {
+                assert_eq!(after.health, Health::Ready);
+                assert!(after.quota_cooling.is_none());
+            } else {
+                assert_eq!(after.health, before.health);
+                assert_eq!(after.quota_cooling, before.quota_cooling);
+            }
+            assert_eq!(
+                f.relay.accounts.eligible(&f.ids[0], None).await,
+                ordinary_release
+            );
             assert_eq!(after.user_state, before.user_state);
             assert_eq!(after.drain, before.drain);
             assert_eq!(after.allow_credits, before.allow_credits);
             let views = f.relay.accounts.typed_views().await.unwrap();
             let view = views.iter().find(|view| view.id == f.ids[0]).unwrap();
-            assert!(!view.pool_eligible);
-            assert!(view.quota_cooling.is_some());
+            assert_eq!(view.pool_eligible, ordinary_release);
+            assert_eq!(view.quota_cooling.is_none(), ordinary_release);
             let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
             let current = snapshot["windows"]
                 .as_array()
@@ -729,7 +745,10 @@ mod r28_claude_reset_tests {
                 .iter()
                 .find(|window| window["name"] == "5h")
                 .unwrap();
-            assert_eq!(current["used_pct"], json!(0.0));
+            assert_eq!(
+                current["used_pct"],
+                json!(if ordinary_release { 0.0 } else { 97.0 })
+            );
             assert_eq!(current["reset_at"], json!(cause.reset_at));
             assert_eq!(snapshot["credits"], before_snapshot["credits"]);
             assert_eq!(post_body(&f)["grant_id"], "full");
