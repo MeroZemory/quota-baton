@@ -1094,7 +1094,7 @@ async fn poll_early_reset_uses_reset_movement_or_same_reset_margin() {
             h.seed_quota(reset).await;
             h.usage.state.push(usage(used, reset + delta));
             let account = h.state.quota.poll(&h.id).await.unwrap();
-            if delta.abs() > 300 || (delta == 0 && used <= 95.0) {
+            if delta.abs() > 300 || (delta.abs() <= 300 && used <= 95.0) {
                 assert_eq!(account.health, Health::Ready);
                 assert!(account.quota_cooling.is_none());
             } else {
