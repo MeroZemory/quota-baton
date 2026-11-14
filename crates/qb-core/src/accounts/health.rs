@@ -2,6 +2,9 @@
 use super::{Account, Health, HealthReason, Provider, QuotaCooling, UserState};
 use chrono::{DateTime, Duration, Utc};
 
+// Leave headroom after a request-level rejection near the limit.
+const EARLY_RESET_MAX_USED_PCT: f64 = 95.0;
+
 /// A health-owner judgement about this account at this exact selection instant.
 /// Missing credentials, retry exclusion and WS capacity are not health facts.
 pub(crate) struct UnusableEvidence {
@@ -580,9 +583,16 @@ impl Account {
             let early = windows.iter().any(|w| {
                 w["name"].as_str() == Some(evidence.window.as_str())
                     && timestamp(&w["observed_at"]).is_some_and(|t| t > evidence.started_at)
-                    && w["used_pct"].as_f64().is_some_and(|p| p < 100.0)
-                    && reset(w)
-                        .is_some_and(|r| (r - evidence.reset_at).abs() > Duration::seconds(300))
+                    && reset(w).is_some_and(|r| {
+                        w["used_pct"].as_f64().is_some_and(|p| {
+                            ((r - evidence.reset_at).abs() > Duration::seconds(300) && p < 100.0)
+                                || (r == evidence.reset_at
+                                    && p <= EARLY_RESET_MAX_USED_PCT
+                                    && w["status"] != "rejected"
+                                    && snapshot["signals"]["limit_reached"] != true
+                                    && !rejected)
+                        })
+                    })
             });
             if early {
                 self.health = Health::Ready;
@@ -1388,5 +1398,134 @@ pub(crate) mod tests {
         a.apply_health_signal(HealthSignal::NoChange, payment);
         assert_eq!(a.payment_until, None);
         assert!(a.eligible_at(None, payment));
+    }
+}
+
+#[cfg(test)]
+mod early_reset_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn held(provider: Provider) -> (Account, DateTime<Utc>, DateTime<Utc>) {
+        let mut account = super::tests::fixture();
+        account.provider = provider;
+        let now = DateTime::parse_from_rfc3339("2026-11-14T16:21:47Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset = now + Duration::days(2);
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot: json!({"windows":[{"name":"7d","used_pct":100,
+                    "reset_at":reset,"observed_at":now}]}),
+                model: None,
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+        assert!(account.quota_cooling.is_some());
+        assert!(!account.eligible_at(None, now));
+        (account, now, reset)
+    }
+
+    fn report(account: &mut Account, snapshot: Value, now: DateTime<Utc>) {
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot,
+                model: None,
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+    }
+
+    #[test]
+    fn r29_same_reset_release_uses_newer_causing_window_and_95_percent_margin() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for used in [46.0, 95.0, 95.001, 97.0] {
+                let (mut account, start, reset) = held(provider);
+                report(
+                    &mut account,
+                    json!({"windows":[{"name":"7d","used_pct":used,
+                    "status":"allowed_warning","reset_at":reset,
+                    "observed_at":start + Duration::seconds(1)}]}),
+                    start + Duration::seconds(1),
+                );
+                let released = used <= 95.0;
+                assert_eq!(
+                    account.health == Health::Ready,
+                    released,
+                    "{provider:?}/{used}"
+                );
+                assert_eq!(account.quota_cooling.is_none(), released);
+                assert_eq!(
+                    account.eligible_at(None, start + Duration::seconds(1)),
+                    released
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r29_same_reset_rejects_local_and_global_limit_signals() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for (status, signals) in [
+                ("rejected", json!({})),
+                ("allowed_warning", json!({"limit_reached":true})),
+                ("allowed_warning", json!({"unified_status":"rejected"})),
+            ] {
+                let (mut account, start, reset) = held(provider);
+                report(
+                    &mut account,
+                    json!({"signals":signals,"windows":[{
+                    "name":"7d","used_pct":46,"status":status,"reset_at":reset,
+                    "observed_at":start + Duration::seconds(1)}]}),
+                    start + Duration::seconds(1),
+                );
+                assert!(!account.eligible_at(None, start + Duration::seconds(1)));
+                assert!(account.quota_cooling.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn r29_same_reset_requires_fresh_matching_complete_window_facts() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let (held, start, reset) = held(provider);
+            for window in [
+                json!({"name":"7d","used_pct":46,"reset_at":reset,"observed_at":start}),
+                json!({"name":"7d","used_pct":46,"reset_at":reset,"observed_at":start-Duration::seconds(1)}),
+                json!({"name":"7d","used_pct":46,"reset_at":reset}),
+                json!({"name":"5h","used_pct":46,"reset_at":reset,"observed_at":start+Duration::seconds(1)}),
+                json!({"name":"7d","used_pct":46,"observed_at":start+Duration::seconds(1)}),
+                json!({"name":"7d","reset_at":reset,"observed_at":start+Duration::seconds(1)}),
+                json!({"name":"7d","used_pct":46,"reset_at":reset+Duration::seconds(300),"observed_at":start+Duration::seconds(1)}),
+            ] {
+                let mut account = held.clone();
+                report(
+                    &mut account,
+                    json!({"windows":[window]}),
+                    start + Duration::seconds(1),
+                );
+                assert_eq!(account, held);
+            }
+        }
+    }
+
+    #[test]
+    fn r29_moved_reset_retains_existing_less_than_100_percent_rule() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for shift in [-301, 301] {
+                let (mut account, start, reset) = held(provider);
+                report(
+                    &mut account,
+                    json!({"windows":[{"name":"7d","used_pct":97,
+                    "reset_at":reset+Duration::seconds(shift),
+                    "observed_at":start+Duration::seconds(1)}]}),
+                    start + Duration::seconds(1),
+                );
+                assert_eq!(account.health, Health::Ready);
+                assert_eq!(account.quota_cooling, None);
+            }
+        }
     }
 }

@@ -107,6 +107,14 @@ impl Fixture {
         }
     }
 
+    async fn grant_only_observation(&self) -> ResetQuotaObservation {
+        let mut observation = self.observation().await;
+        // Exclude independent R29 ordinary release to test private grant authority.
+        observation.reported["windows"][0]["used_pct"] = json!(97);
+        observation.snapshot = observation.reported.clone();
+        observation
+    }
+
     async fn apply(&self, observation: ResetQuotaObservation) -> Account {
         // One raw observation; the native transaction owns the cache merge.
         self.runtime
@@ -174,8 +182,134 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn r29_same_reset_warning_poll_makes_weekly_held_account_chosen_again() {
+    use crate::{
+        bindings::{BindingTable, Candidate, Decision},
+        config::RoutingConfig,
+    };
+
+    for provider in [Provider::Claude, Provider::Codex] {
+        let f = Fixture::new(provider);
+        let table = BindingTable::new(f.home.path(), RoutingConfig::default()).unwrap();
+        let reset = Utc::now() + Duration::days(2);
+        let short_reset = Utc::now() + Duration::hours(1);
+        let choose = || {
+            let account = f.account();
+            let candidate = Candidate {
+                quota: f
+                    .runtime
+                    .selection_quota(&account, f.runtime.obs.quota_snapshot(&f.id)),
+                account,
+                inflight: 0,
+            };
+            f.runtime
+                .with_selection_admission(&table, provider, None, |eligible| {
+                    table.choose_with_hold_at_admitted_coverage(
+                        provider,
+                        None,
+                        None,
+                        None,
+                        &[candidate],
+                        None,
+                        0,
+                        true,
+                        false,
+                        Utc::now(),
+                        None,
+                        |id| eligible(id, false),
+                    )
+                })
+                .unwrap()
+        };
+
+        for (used, status) in [(100, "rejected"), (46, "allowed_warning")] {
+            let account = f.account();
+            let started_at = Utc::now();
+            if used == 46 {
+                assert!(started_at > account.quota_cooling.as_ref().unwrap().started_at);
+            }
+            let wait_origin = f.runtime.capture_poll_origin(&f.id).await;
+            let outside_origin = f.runtime.capture_outside_poll_origin(&f.id);
+            let reported = json!({"source":"poll","observed_at":started_at,"windows":[
+                {"name":"5h","used_pct":0,"status":"allowed",
+                    "reset_at":short_reset,"observed_at":started_at},
+                {"name":"7d","used_pct":used,"status":status,
+                    "reset_at":reset,"observed_at":started_at}
+            ]});
+            let account = if provider == Provider::Codex {
+                f.runtime
+                    .apply_polled_usage_report(
+                        PollUsageReport {
+                            access_token: zeroize::Zeroizing::new(
+                                f.runtime
+                                    .store
+                                    .tokens(&account)
+                                    .unwrap()
+                                    .access_token
+                                    .clone(),
+                            ),
+                            account,
+                            started_at,
+                            snapshot: reported,
+                            complete: true,
+                        },
+                        wait_origin,
+                        outside_origin,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .0
+            } else {
+                let snapshot = f
+                    .runtime
+                    .obs
+                    .observe_poll(&f.id, reported.clone(), true)
+                    .unwrap();
+                f.runtime
+                    .apply_polled_quota_snapshot(
+                        &f.id,
+                        snapshot,
+                        &reported,
+                        wait_origin,
+                        outside_origin,
+                        Some((started_at, true)),
+                    )
+                    .await
+                    .unwrap()
+            };
+            if used == 100 {
+                let cause = account.quota_cooling.as_ref().unwrap();
+                assert_eq!(cause.window, "7d");
+                assert_eq!(cause.reset_at, reset);
+                assert!(matches!(
+                    account.health,
+                    Health::Cooling {
+                        reason: HealthReason::Quota,
+                        ..
+                    }
+                ));
+                assert!(matches!(choose(), Decision::None));
+            } else {
+                assert_eq!(account.health, Health::Ready);
+                assert!(account.quota_cooling.is_none());
+                let cached = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+                assert_eq!(cached["windows"][1]["reset_at"], json!(reset));
+                match choose() {
+                    Decision::Selected { account, lease, .. } => {
+                        assert_eq!(account, f.id);
+                        lease.dispatched();
+                    }
+                    other => panic!("{provider:?}: expected released account, got {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn unchanged_reset_timestamp_recovers_native_pool_and_revokes_pre_release_origins() {
-    for used in [0, 17] {
+    for used in [0, 17, 97] {
         let f = Fixture::new(Provider::Claude);
         let mut observation = f.observation().await;
         let before = observation.expected.clone();
@@ -252,7 +386,7 @@ async fn remaining_exhausted_window_is_reduced_again_and_still_blocks_the_pool()
 #[tokio::test]
 async fn equal_value_quota_rejection_invalidates_pre_post_origin_without_generation_change() {
     let f = Fixture::new(Provider::Claude);
-    let observation = f.observation().await;
+    let observation = f.grant_only_observation().await;
     let before = f.account();
     {
         let _guard = f.runtime.store.transaction().unwrap();
@@ -277,7 +411,7 @@ async fn equal_value_quota_rejection_invalidates_pre_post_origin_without_generat
     assert!(!f.runtime.eligible(&f.id, None).await);
     assert_eq!(
         f.runtime.obs.quota_snapshot(&f.id).unwrap()["windows"][0]["used_pct"],
-        0.0,
+        97.0,
         "actual facts still publish without release authority"
     );
 }
@@ -286,7 +420,7 @@ async fn equal_value_quota_rejection_invalidates_pre_post_origin_without_generat
 async fn missing_or_foreign_origin_cannot_recover_native_cooling() {
     for foreign in [false, true] {
         let f = Fixture::new(Provider::Claude);
-        let mut observation = f.observation().await;
+        let mut observation = f.grant_only_observation().await;
         let other = foreign.then(|| Fixture::new(Provider::Claude));
         observation.wait_origin = if let Some(other) = &other {
             let origin = other.runtime.capture_poll_origin(&other.id).await;
@@ -318,7 +452,7 @@ async fn incomplete_stale_unknown_rejected_or_uncleared_cause_never_authorizes_r
         "exhausted",
     ] {
         let f = Fixture::new(Provider::Claude);
-        let mut observation = f.observation().await;
+        let mut observation = f.grant_only_observation().await;
         match invalid {
             "partial" => observation.complete = false,
             "missing" => {
@@ -379,7 +513,7 @@ async fn changed_hold_auth_payment_or_user_choice_after_pre_post_capture_is_pres
         "hold", "auth", "payment", "revoked", "disabled", "paused", "drain",
     ] {
         let f = Fixture::new(Provider::Claude);
-        let observation = f.observation().await;
+        let observation = f.grant_only_observation().await;
         f.runtime
             .store
             .update_metadata(&f.id, |account| match change {
@@ -439,7 +573,7 @@ async fn accepted_origin_does_not_replace_exact_expected_account_facts() {
         "cause",
     ] {
         let f = Fixture::new(Provider::Claude);
-        let mut observation = f.observation().await;
+        let mut observation = f.grant_only_observation().await;
         match mismatch {
             "generation" => observation.expected.generation += 1,
             "identity" => {
@@ -481,7 +615,7 @@ async fn accepted_origin_does_not_replace_exact_expected_account_facts() {
 #[tokio::test]
 async fn codex_gets_only_ordinary_snapshot_reduction_without_reset_release() {
     let f = Fixture::new(Provider::Codex);
-    let observation = f.observation().await;
+    let observation = f.grant_only_observation().await;
     let before = f.account();
     let after = f.apply(observation).await;
     assert_eq!(after.health, before.health);
