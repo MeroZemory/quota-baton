@@ -191,7 +191,29 @@ async fn r29_same_reset_warning_poll_makes_weekly_held_account_chosen_again() {
     for provider in [Provider::Claude, Provider::Codex] {
         let f = Fixture::new(provider);
         let table = BindingTable::new(f.home.path(), RoutingConfig::default()).unwrap();
-        let reset = Utc::now() + Duration::days(2);
+        let live_held: DateTime<Utc> = "2026-11-16T06:00:00.500136Z".parse().unwrap();
+        let live_quota: DateTime<Utc> = "2026-11-16T06:00:00.503919Z".parse().unwrap();
+        let live_forecast: DateTime<Utc> = "2026-11-16T05:59:59.916538Z".parse().unwrap();
+        // Translate by whole seconds so the live subsecond components and gaps
+        // survive without making the runtime fixture depend on a past reset.
+        let offset =
+            Duration::seconds((Utc::now() + Duration::days(2)).timestamp() - live_held.timestamp());
+        let held_reset = live_held + offset;
+        let quota_reset = live_quota + offset;
+        let forecast_reset = live_forecast + offset;
+        assert_eq!(quota_reset - held_reset, Duration::microseconds(3_783));
+        assert_eq!(held_reset - forecast_reset, Duration::microseconds(583_598));
+        assert_eq!(
+            quota_reset - forecast_reset,
+            Duration::microseconds(587_381)
+        );
+        f.runtime.obs.dashboard().observe_usage_forecast(
+            &f.id,
+            "7d",
+            100.0,
+            Some(forecast_reset),
+            Utc::now(),
+        );
         let short_reset = Utc::now() + Duration::hours(1);
         let choose = || {
             let account = f.account();
@@ -230,11 +252,12 @@ async fn r29_same_reset_warning_poll_makes_weekly_held_account_chosen_again() {
             }
             let wait_origin = f.runtime.capture_poll_origin(&f.id).await;
             let outside_origin = f.runtime.capture_outside_poll_origin(&f.id);
+            let reported_reset = if used == 100 { held_reset } else { quota_reset };
             let reported = json!({"source":"poll","observed_at":started_at,"windows":[
                 {"name":"5h","used_pct":0,"status":"allowed",
                     "reset_at":short_reset,"observed_at":started_at},
                 {"name":"7d","used_pct":used,"status":status,
-                    "reset_at":reset,"observed_at":started_at}
+                    "reset_at":reported_reset,"observed_at":started_at}
             ]});
             let account = if provider == Provider::Codex {
                 f.runtime
@@ -281,7 +304,7 @@ async fn r29_same_reset_warning_poll_makes_weekly_held_account_chosen_again() {
             if used == 100 {
                 let cause = account.quota_cooling.as_ref().unwrap();
                 assert_eq!(cause.window, "7d");
-                assert_eq!(cause.reset_at, reset);
+                assert_eq!(cause.reset_at, held_reset);
                 assert!(matches!(
                     account.health,
                     Health::Cooling {
@@ -289,12 +312,23 @@ async fn r29_same_reset_warning_poll_makes_weekly_held_account_chosen_again() {
                         ..
                     }
                 ));
+                // The quota cache and forecast can advance independently of the
+                // durable hold. Publish the jittered cache value without folding
+                // it into the native hold before the recovering ordinary poll.
+                let mut cached = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+                let observed_at = Utc::now();
+                cached["observed_at"] = json!(observed_at);
+                cached["windows"][1]["observed_at"] = json!(observed_at);
+                cached["windows"][1]["reset_at"] = json!(quota_reset);
+                let cached = f.runtime.obs.observe_poll(&f.id, cached, true).unwrap();
+                assert_eq!(cached["windows"][1]["reset_at"], json!(quota_reset));
+                assert_eq!(f.account().quota_cooling.unwrap().reset_at, held_reset);
                 assert!(matches!(choose(), Decision::None));
             } else {
                 assert_eq!(account.health, Health::Ready);
                 assert!(account.quota_cooling.is_none());
                 let cached = f.runtime.obs.quota_snapshot(&f.id).unwrap();
-                assert_eq!(cached["windows"][1]["reset_at"], json!(reset));
+                assert_eq!(cached["windows"][1]["reset_at"], json!(quota_reset));
                 match choose() {
                     Decision::Selected { account, lease, .. } => {
                         assert_eq!(account, f.id);
@@ -303,6 +337,20 @@ async fn r29_same_reset_warning_poll_makes_weekly_held_account_chosen_again() {
                     other => panic!("{provider:?}: expected released account, got {other:?}"),
                 }
             }
+            let forecast = f
+                .runtime
+                .obs
+                .dashboard()
+                .usage_forecast(&f.id, Utc::now(), None);
+            assert_eq!(
+                forecast
+                    .windows
+                    .iter()
+                    .find(|window| window.name == "7d")
+                    .unwrap()
+                    .reset_at,
+                Some(forecast_reset),
+            );
         }
     }
 }

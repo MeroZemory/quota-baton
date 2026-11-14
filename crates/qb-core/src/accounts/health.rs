@@ -586,7 +586,7 @@ impl Account {
                     && reset(w).is_some_and(|r| {
                         w["used_pct"].as_f64().is_some_and(|p| {
                             ((r - evidence.reset_at).abs() > Duration::seconds(300) && p < 100.0)
-                                || (r == evidence.reset_at
+                                || ((r - evidence.reset_at).abs() <= Duration::seconds(300)
                                     && p <= EARLY_RESET_MAX_USED_PCT
                                     && w["status"] != "rejected"
                                     && snapshot["signals"]["limit_reached"] != true
@@ -1412,7 +1412,9 @@ mod early_reset_tests {
         let now = DateTime::parse_from_rfc3339("2026-11-14T16:21:47Z")
             .unwrap()
             .with_timezone(&Utc);
-        let reset = now + Duration::days(2);
+        let reset = DateTime::parse_from_rfc3339("2026-11-16T06:00:00.500136Z")
+            .unwrap()
+            .with_timezone(&Utc);
         account.apply_health_signal(
             HealthSignal::UsageSnapshot {
                 snapshot: json!({"windows":[{"name":"7d","used_pct":100,
@@ -1446,7 +1448,7 @@ mod early_reset_tests {
                 report(
                     &mut account,
                     json!({"windows":[{"name":"7d","used_pct":used,
-                    "status":"allowed_warning","reset_at":reset,
+                    "status":"allowed_warning","reset_at":reset+Duration::microseconds(3783),
                     "observed_at":start + Duration::seconds(1)}]}),
                     start + Duration::seconds(1),
                 );
@@ -1477,7 +1479,7 @@ mod early_reset_tests {
                 report(
                     &mut account,
                     json!({"signals":signals,"windows":[{
-                    "name":"7d","used_pct":46,"status":status,"reset_at":reset,
+                    "name":"7d","used_pct":46,"status":status,"reset_at":reset+Duration::microseconds(3783),
                     "observed_at":start + Duration::seconds(1)}]}),
                     start + Duration::seconds(1),
                 );
@@ -1498,7 +1500,6 @@ mod early_reset_tests {
                 json!({"name":"5h","used_pct":46,"reset_at":reset,"observed_at":start+Duration::seconds(1)}),
                 json!({"name":"7d","used_pct":46,"observed_at":start+Duration::seconds(1)}),
                 json!({"name":"7d","reset_at":reset,"observed_at":start+Duration::seconds(1)}),
-                json!({"name":"7d","used_pct":46,"reset_at":reset+Duration::seconds(300),"observed_at":start+Duration::seconds(1)}),
             ] {
                 let mut account = held.clone();
                 report(
@@ -1507,6 +1508,47 @@ mod early_reset_tests {
                     start + Duration::seconds(1),
                 );
                 assert_eq!(account, held);
+            }
+        }
+    }
+
+    #[test]
+    fn r291_live_reset_jitter_and_inclusive_300_second_band_keep_usage_margin() {
+        let live_window = DateTime::parse_from_rfc3339("2026-11-16T06:00:00.503919Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let live_forecast = DateTime::parse_from_rfc3339("2026-11-16T05:59:59.916538Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for provider in [Provider::Claude, Provider::Codex] {
+            for used in [46.0, 95.0, 97.0] {
+                let (held, start, reset) = held(provider);
+                assert_ne!(live_window, reset);
+                assert_ne!(live_forecast, reset);
+                assert_eq!(live_window - reset, Duration::microseconds(3783));
+                assert_eq!(reset - live_forecast, Duration::microseconds(583598));
+                for observed_reset in [
+                    live_window,
+                    live_forecast,
+                    reset - Duration::seconds(300),
+                    reset + Duration::seconds(300),
+                ] {
+                    let mut account = held.clone();
+                    report(
+                        &mut account,
+                        json!({"windows":[{"name":"7d",
+                        "used_pct":used,"status":"allowed_warning",
+                        "reset_at":observed_reset,
+                        "observed_at":start+Duration::seconds(1)}]}),
+                        start + Duration::seconds(1),
+                    );
+                    assert_eq!(
+                        account.health == Health::Ready,
+                        used <= 95.0,
+                        "{provider:?}/{used}/{observed_reset}"
+                    );
+                    assert_eq!(account.quota_cooling.is_none(), used <= 95.0);
+                }
             }
         }
     }

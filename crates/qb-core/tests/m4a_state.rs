@@ -995,7 +995,7 @@ mod runtime_regressions {
     }
 
     #[tokio::test]
-    async fn s3_early_reset_requires_fresh_causing_window_and_shift_over_300_seconds() {
+    async fn s3_early_reset_requires_fresh_causing_window_and_reset_band_usage_margin() {
         let f = Fixture::new(&[Provider::Codex], 0.0);
         let now = Utc::now();
         let reset = now + Duration::hours(1);
@@ -1028,8 +1028,11 @@ mod runtime_regressions {
                 evidence.started_at,
             )],
             vec![window("7d", 20.0, weekly + Duration::hours(1), fresh)],
-            vec![window("5h", 20.0, reset + Duration::seconds(1), fresh)],
-            vec![window("5h", 20.0, reset + Duration::seconds(300), fresh)],
+            // Fresh observations inside the equivalence band still need <=95%.
+            vec![window("5h", 97.0, reset - Duration::seconds(300), fresh)],
+            vec![window("5h", 97.0, reset, fresh)],
+            vec![window("5h", 97.0, reset + Duration::seconds(1), fresh)],
+            vec![window("5h", 97.0, reset + Duration::seconds(300), fresh)],
             vec![window("5h", 100.0, reset + Duration::seconds(301), fresh)],
         ] {
             let a = f.snapshot(windows, json!({}), None).await;
@@ -1051,6 +1054,35 @@ mod runtime_regressions {
             .await;
         assert_eq!(a.health, Health::Ready);
         assert!(a.quota_cooling.is_none());
+
+        // R29.1 also releases fresh causing-window usage within the inclusive
+        // reset-equivalence band; each case begins with its own durable hold.
+        for used in [20.0, 95.0] {
+            for shift in [-300, 0, 1, 300] {
+                let cooled = f
+                    .snapshot(
+                        vec![window("5h", 100.0, reset, Utc::now())],
+                        json!({}),
+                        None,
+                    )
+                    .await;
+                let cause = cooled.quota_cooling.unwrap();
+                let a = f
+                    .snapshot(
+                        vec![window(
+                            "5h",
+                            used,
+                            cause.reset_at + Duration::seconds(shift),
+                            cause.started_at + Duration::seconds(1),
+                        )],
+                        json!({}),
+                        None,
+                    )
+                    .await;
+                assert_eq!(a.health, Health::Ready, "{used}/{shift}");
+                assert!(a.quota_cooling.is_none(), "{used}/{shift}");
+            }
+        }
     }
 
     #[tokio::test]
