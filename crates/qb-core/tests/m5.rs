@@ -1086,19 +1086,22 @@ async fn poll_observed_exhaustion_and_credit_hold_use_limiting_reset() {
 }
 
 #[tokio::test]
-async fn poll_early_reset_requires_more_than_three_hundred_seconds() {
-    for delta in [301, -301, 300, -300, 0] {
-        let h = Harness::new(Provider::Codex, false).await;
-        let reset = Utc::now().timestamp() + 3600;
-        h.seed_quota(reset).await;
-        h.usage.state.push(usage(25.0, reset + delta));
-        let account = h.state.quota.poll(&h.id).await.unwrap();
-        if delta.abs() > 300 {
-            assert_eq!(account.health, Health::Ready);
-        } else {
-            assert_quota(&account, reset);
+async fn poll_early_reset_uses_reset_movement_or_same_reset_margin() {
+    for used in [25.0, 97.0] {
+        for delta in [301, -301, 300, -300, 0] {
+            let h = Harness::new(Provider::Codex, false).await;
+            let reset = Utc::now().timestamp() + 3600;
+            h.seed_quota(reset).await;
+            h.usage.state.push(usage(used, reset + delta));
+            let account = h.state.quota.poll(&h.id).await.unwrap();
+            if delta.abs() > 300 || (delta == 0 && used <= 95.0) {
+                assert_eq!(account.health, Health::Ready);
+                assert!(account.quota_cooling.is_none());
+            } else {
+                assert_quota(&account, reset);
+            }
+            assert_eq!(h.usage.state.requests().len(), 1);
         }
-        assert_eq!(h.usage.state.requests().len(), 1);
     }
 }
 

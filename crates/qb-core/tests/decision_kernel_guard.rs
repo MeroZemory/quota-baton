@@ -1769,16 +1769,33 @@ fn native_file_readset(
     source: &str,
     roots: &[(&'static str, &str, &str)],
     imports: &[&str],
+    closed_constants: &[(&'static str, &str)],
 ) -> Vec<String> {
     let file = syn::parse_file(source).expect("native readset syntax");
     let mut errors = Vec::new();
     let mut seen = BTreeSet::new();
     let mut functions = Vec::new();
+    let mut constant_counts = BTreeMap::new();
+    let mut scalar_bindings = Vec::new();
     for item in file.items {
         match item {
             Item::Use(u) => {
                 if !imports.iter().any(|i| compact(i) == compact(&tokens(&u))) {
                     errors.push("changed native root imports".into());
+                }
+            }
+            Item::Const(c) => {
+                if let Some((name, declaration)) =
+                    closed_constants.iter().find(|(name, _)| c.ident == *name)
+                {
+                    *constant_counts.entry(*name).or_insert(0) += 1;
+                    if compact(&tokens(&c)) == compact(declaration) {
+                        scalar_bindings.push((*name, Shape::Scalar));
+                    } else {
+                        errors.push(format!(
+                            "unrecorded readset: changed native constant {name}"
+                        ));
+                    }
                 }
             }
             Item::Fn(f) => functions.push((String::new(), f.sig, f.attrs, f.block)),
@@ -1794,6 +1811,13 @@ fn native_file_readset(
                 }
             }
             _ => {}
+        }
+    }
+    for (name, _) in closed_constants {
+        if constant_counts.get(name) != Some(&1) {
+            errors.push(format!(
+                "unrecorded readset: missing/duplicate native constant {name}"
+            ));
         }
     }
     for (found_owner, sig, attrs, block) in functions {
@@ -1817,12 +1841,9 @@ fn native_file_readset(
         } else {
             &block
         };
-        errors.extend(check_function(
-            block,
-            &native_bindings(owner, &name),
-            true,
-            owner,
-        ));
+        let mut bindings = native_bindings(owner, &name);
+        bindings.extend(scalar_bindings.iter().cloned());
+        errors.extend(check_function(block, &bindings, true, owner));
     }
     for (owner, name, _) in roots {
         if !seen.contains(&format!("{owner}::{name}")) {
@@ -1840,11 +1861,16 @@ fn native_readset(health: &str, credits: &str, history: &str) -> Vec<String> {
             "use super::{Account, Health, HealthReason, Provider, QuotaCooling, UserState};",
             "use chrono::{DateTime, Duration, Utc};",
         ],
+        &[(
+            "EARLY_RESET_MAX_USED_PCT",
+            "const EARLY_RESET_MAX_USED_PCT: f64 = 95.0;",
+        )],
     );
     errors.extend(native_file_readset(
         credits,
         CREDIT_ROOTS,
         &["use serde_json::Value;"],
+        &[],
     ));
     // Bounded trusted seam: pure String -> WindowName validation; it receives
     // neither Account nor raw Value. Pin this small conversion, not health bodies.
@@ -2141,6 +2167,34 @@ fn native_readset_contains_only_captured_fields_and_closed_callees() {
     assert_eq!(
         native_value_seams(ACCOUNTS_SOURCE, MOVE_GUARD_SOURCE),
         Vec::<String>::new()
+    );
+}
+
+#[test]
+fn native_early_reset_scalar_requires_exact_declaration_and_no_hidden_reads() {
+    let declaration = "const EARLY_RESET_MAX_USED_PCT: f64 = 95.0;";
+    for planted in [
+        "",
+        "const EARLY_RESET_MAX_USED_PCT: f64 = 96.0;",
+        "const EARLY_RESET_MAX_USED_PCT: f32 = 95.0;",
+        "static EARLY_RESET_MAX_USED_PCT: f64 = 95.0;",
+        "pub const EARLY_RESET_MAX_USED_PCT: f64 = 95.0;",
+        "#[cfg(any())] const EARLY_RESET_MAX_USED_PCT: f64 = 95.0;",
+        "const EARLY_RESET_MAX_USED_PCT: f64 = { let _hidden = GLOBAL; 95.0 };",
+        "const EARLY_RESET_MAX_USED_PCT: f64 = 95.0; const EARLY_RESET_MAX_USED_PCT: f64 = 95.0;",
+    ] {
+        let fixture = HEALTH_SOURCE.replacen(declaration, planted, 1);
+        assert_ne!(fixture, HEALTH_SOURCE, "stale constant declaration fixture");
+        assert_readset_rejected(
+            native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+            planted,
+        );
+    }
+    let planted = "let _hidden = UNREVIEWED_EARLY_RESET_MAX_USED_PCT;";
+    let fixture = plant_after(HEALTH_SOURCE, "use serde_json::Value;", planted);
+    assert_readset_rejected(
+        native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+        planted,
     );
 }
 
