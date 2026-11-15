@@ -200,6 +200,8 @@ Overview fixture heights:
 
 **Usage lines: one per account window (user, 2026-10-21).** Every account-scoped window with a known value gets its own usage line and bar, so a reset time is never shown without the window it belongs to. Claude and Codex Plus/Pro accounts show two lines, `5시간` then `주간`. A Codex Free account shows one line, `30일`. Lines are ordered from the shortest window to the longest. The user's reason: a lone "7시 초기화" next to an account that had just had its weekly reset read as a weekly reset.
 
+**Claude model limits (user, 2026-11-15).** Known numeric model-weekly windows follow the account windows on separate lines; they never become the account binding window. An explicitly identified request model labels its model-weekly window and quota chip, for example `Fable 주간` and `Fable 한도 도달`. Without a proven model name the window remains `모델 주간` and the chip `일부 모델 한도`. A retained rejected/exhausted model window with a future reset also shows this scoped status when native account health is Ready. Account-wide cooling remains `계정 한도 도달`; model facts cannot relabel an actual account hold or override paused, disabled, authentication or payment states. Missing numeric usage is not displayed as zero. Card, tray status and CLI distinguish known model cooling from account cooling.
+
 The rules below describe one usage line and apply to each line. Each additional line adds 26 DIP to the row (16 line + 4 gap + 4 bar + 2 spacing). The "binding window" choice now only decides which window drives the row's chip and the colour of the summary dot. Every window is always shown.
 
 **Usage line** (16 high, 6 below line 1, or below the previous bar):

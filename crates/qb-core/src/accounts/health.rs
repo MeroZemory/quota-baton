@@ -53,6 +53,166 @@ mod claude_model_window_tests {
     use serde_json::json;
 
     #[test]
+    fn claude_model_window_generic_weekly_claim_does_not_widen_request_hold() {
+        let now = Utc::now();
+        let until = now + Duration::hours(18);
+        let mut account = super::tests::fixture();
+        account.provider = Provider::Claude;
+        account.apply_health_signal(
+            HealthSignal::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope: "model:claude-fable-5-2".into(),
+            },
+            now - Duration::hours(1),
+        );
+        let before = account.health.clone();
+        // The usage poll supplies an allowed account window, retains the older
+        // rejected model window, and inherits the request's generic claim.
+        let snapshot = json!({"windows":[
+            {"name":"7d","used_pct":65.0,"reset_at":until,"observed_at":now,"status":"allowed"},
+            {"name":"7d_oi","used_pct":100.0,"reset_at":until,"observed_at":now-Duration::hours(2),"status":"rejected"}
+        ],"signals":{"unified_status":"rejected","representative_claim":"seven_day",
+            "overage_status":"rejected","retry_after_seconds":71378.0}});
+        for model in [None, Some("claude-haiku-4-5"), Some("claude-fable-5-2")] {
+            account.apply_health_signal(
+                HealthSignal::UsageSnapshot {
+                    snapshot: snapshot.clone(),
+                    model: model.map(str::to_owned),
+                    projected_allowance: 0.0,
+                },
+                now,
+            );
+            assert_eq!(account.health, before, "{model:?}");
+            assert!(account.eligible_at(Some("claude-haiku-4-5"), now));
+            assert!(!account.eligible_at(Some("claude-fable-5-2"), now));
+        }
+        // Repair only the diagnosed poll-created account hold, using its newer
+        // causing-window observation; preserve a real model request hold above.
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until,
+            scope: "account".into(),
+        };
+        account.quota_cooling = Some(QuotaCooling {
+            window: "7d".into(),
+            reset_at: until,
+            started_at: now - Duration::minutes(1),
+        });
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot: snapshot.clone(),
+                model: None,
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+        assert_eq!(account.health, Health::Ready);
+        // The same model-context reconstruction used by C7 must still exclude
+        // Fable/Opus after the erroneous native account hold has recovered.
+        for (model, eligible) in [
+            ("claude-haiku-4-5", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-fable-5-2", false),
+            ("claude-opus-5-5", false),
+        ] {
+            let mut effective = account.clone();
+            let mut projection = snapshot.clone();
+            projection["signals"] = serde_json::Value::Null;
+            effective.apply_health_signal(
+                HealthSignal::UsageSnapshot {
+                    snapshot: projection,
+                    model: Some(model.into()),
+                    projected_allowance: 0.0,
+                },
+                now,
+            );
+            assert_eq!(effective.eligible_at(Some(model), now), eligible, "{model}");
+        }
+    }
+
+    #[test]
+    fn claude_model_window_generic_claim_recovery_requires_unambiguous_account_facts() {
+        let now = Utc::now();
+        let until = now + Duration::hours(18);
+        for case in [
+            "account_rejected",
+            "account_full",
+            "unknown_window",
+            "unknown_claim",
+            "missing_usage",
+            "missing_status",
+            "active_limit",
+            "limit_reached",
+            "paid_serving",
+            "insufficient_margin",
+            "not_newer",
+            "codex",
+            "native_account",
+            "auth",
+            "payment",
+        ] {
+            let mut account = super::tests::fixture();
+            account.provider = Provider::Claude;
+            account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope: "account".into(),
+            };
+            account.quota_cooling = Some(QuotaCooling {
+                window: "7d".into(),
+                reset_at: until,
+                started_at: now - Duration::minutes(1),
+            });
+            let mut snapshot = json!({"windows":[
+                {"name":"7d","used_pct":65,"reset_at":until,"observed_at":now,"status":"allowed"},
+                {"name":"7d_oi","used_pct":100,"reset_at":until,"observed_at":now-Duration::hours(2),"status":"rejected"}
+            ],"signals":{"unified_status":"rejected","representative_claim":"seven_day"}});
+            match case {
+                "account_rejected" => snapshot["windows"][0]["status"] = json!("rejected"),
+                "account_full" => snapshot["windows"][0]["used_pct"] = json!(100),
+                "unknown_window" => snapshot["windows"][1]["name"] = json!("opaque_bucket"),
+                "unknown_claim" => {
+                    snapshot["signals"]["representative_claim"] = json!("seven_day_unknown")
+                }
+                "missing_usage" => snapshot["windows"][0]["used_pct"] = json!(null),
+                "missing_status" => snapshot["windows"][0]["status"] = json!(null),
+                "active_limit" => snapshot["signals"]["active_limit"] = json!("7d"),
+                "limit_reached" => snapshot["signals"]["limit_reached"] = json!(true),
+                "paid_serving" => snapshot["signals"]["serving_from_credits"] = json!(true),
+                "insufficient_margin" => snapshot["windows"][0]["used_pct"] = json!(95.1),
+                "not_newer" => {
+                    snapshot["windows"][0]["observed_at"] = json!(now - Duration::minutes(1))
+                }
+                "codex" => account.provider = Provider::Codex,
+                "native_account" => account.quota_cooling = None,
+                "auth" | "payment" => {
+                    account.health = Health::Cooling {
+                        reason: if case == "auth" {
+                            HealthReason::Auth
+                        } else {
+                            HealthReason::Payment
+                        },
+                        until,
+                        scope: "account".into(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let before = account.health.clone();
+            account.apply_health_signal(
+                HealthSignal::UsageSnapshot {
+                    snapshot,
+                    model: None,
+                    projected_allowance: 0.0,
+                },
+                now,
+            );
+            assert_eq!(account.health, before, "{case}");
+        }
+    }
+
+    #[test]
     fn claude_model_window_other_family_observation_does_not_replace_native_hold() {
         let now = Utc::now();
         let until = now + Duration::days(1);
@@ -695,7 +855,47 @@ impl Account {
         // available upstream keeps serving from credits, so only an explicit
         // rejection (or a request-level usage_limit_reached, handled in relay)
         // makes the hold global (D19 correction, 2026-10-21 outage).
-        let rejected = snapshot["signals"]["unified_status"] == "rejected";
+        // Claude's generic representative claim can name seven_day even when
+        // that account window is explicitly allowed and only 7d_oi is rejected.
+        // Keep the model rejection, but do not promote it to account evidence.
+        // Missing/unknown facts and explicit account-limit claims remain global.
+        let model_only_rejection = self.provider == Provider::Claude
+            && snapshot["signals"]["active_limit"].is_null()
+            && snapshot["signals"]["limit_reached"] != true
+            && snapshot["signals"]["serving_from_credits"] != true
+            && snapshot["signals"]["representative_claim"]
+                .as_str()
+                .is_none_or(|claim| {
+                    matches!(
+                        claim,
+                        "five_hour"
+                            | "5h"
+                            | "seven_day"
+                            | "7d"
+                            | "seven_day_opus"
+                            | "7d_oi"
+                            | "seven_day_sonnet"
+                            | "7d_sonnet"
+                    )
+                })
+            && fresh
+                .iter()
+                .any(|w| matches!(w["name"].as_str(), Some("5h" | "7d")))
+            && fresh.iter().all(|w| match w["name"].as_str() {
+                Some("5h" | "7d") => {
+                    w["status"] == "allowed"
+                        && w["used_pct"]
+                            .as_f64()
+                            .is_some_and(|p| p.is_finite() && (0.0..100.0).contains(&p))
+                }
+                Some("7d_oi" | "7d_sonnet") => true,
+                _ => false,
+            })
+            && fresh.iter().any(|w| {
+                matches!(w["name"].as_str(), Some("7d_oi" | "7d_sonnet"))
+                    && w["status"] == "rejected"
+            });
+        let rejected = snapshot["signals"]["unified_status"] == "rejected" && !model_only_rejection;
         let global = (snapshot["signals"]["limit_reached"] == true && !paid_allowed) || rejected;
         let serving = credits && snapshot["signals"]["serving_from_credits"] == true;
         let qualifies = |w: &Value| {

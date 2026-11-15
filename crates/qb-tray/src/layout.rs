@@ -1298,8 +1298,44 @@ pub fn health_chip(account: &Account, now: SystemTime) -> String {
         return crate::i18n::format("속도 조절 중 · {0}초", &[seconds.to_string()]);
     }
     match account.health.kind.as_str() {
-        "ready" => crate::i18n::static_text("준비됨").into(),
+        "ready" => {
+            let now: DateTime<chrono::Utc> = now.into();
+            if account.provider == "claude"
+                && account.windows.iter().any(|w| {
+                    matches!(
+                        w.name.as_str(),
+                        "7d_oi" | "7d_sonnet" | "seven_day_opus" | "seven_day_sonnet"
+                    ) && (w.status.as_deref() == Some("rejected")
+                        || w.used_pct
+                            .is_some_and(|used| used.is_finite() && used >= 100.))
+                        && w.reset_at
+                            .as_deref()
+                            .and_then(|s| s.parse::<DateTime<chrono::Utc>>().ok())
+                            .is_some_and(|reset| reset > now)
+                })
+            {
+                crate::i18n::static_text("일부 모델 한도").into()
+            } else {
+                crate::i18n::static_text("준비됨").into()
+            }
+        }
         "cooling" => {
+            if account.health.reason.as_deref() == Some("quota") {
+                if let Some(model) = v2::quota_model_name(account.health.scope.as_deref()) {
+                    let label = crate::i18n::format("{0} 한도 도달", &[model]);
+                    return account.health.until.as_deref().map_or_else(
+                        || label.clone(),
+                        |until| format!("{label} · {}", short_time(until, now)),
+                    );
+                }
+                if account.health.scope.as_deref() == Some("account") {
+                    let label = crate::i18n::static_text("계정 한도 도달");
+                    return account.health.until.as_deref().map_or_else(
+                        || label.into(),
+                        |until| format!("{label} · {}", short_time(until, now)),
+                    );
+                }
+            }
             let label = match account.health.reason.as_deref() {
                 Some("quota") => crate::i18n::static_text("한도"),
                 Some("rate") | Some("auth") | Some("link_stale") => {

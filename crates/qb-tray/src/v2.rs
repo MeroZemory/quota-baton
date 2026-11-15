@@ -823,7 +823,8 @@ pub fn window_label(name: &str) -> String {
     match name {
         "5h" | "primary" => crate::i18n::static_text("5시간").into(),
         "7d" | "secondary" => crate::i18n::static_text("주간").into(),
-        "7d_oi" => crate::i18n::static_text("모델 주간 (7d_oi)").into(),
+        "7d_oi" => crate::i18n::static_text("모델 주간").into(),
+        "7d_sonnet" => crate::i18n::static_text("Sonnet 주간").into(),
         "seven_day_opus" => crate::i18n::static_text("Opus 주간").into(),
         "seven_day_sonnet" => crate::i18n::static_text("Sonnet 주간").into(),
         _ => {
@@ -839,6 +840,46 @@ pub fn window_label(name: &str) -> String {
         }
     }
 }
+
+pub(crate) fn quota_model_name(scope: Option<&str>) -> Option<String> {
+    let model = scope?.strip_prefix("model:")?.trim();
+    if model.is_empty() {
+        return None;
+    }
+    for (family, label) in [
+        ("fable", "Fable"),
+        ("opus", "Opus"),
+        ("sonnet", "Sonnet"),
+        ("haiku", "Haiku"),
+    ] {
+        if model == family || model.starts_with(&format!("claude-{family}-")) {
+            return Some(label.into());
+        }
+    }
+    Some(clean(model))
+}
+
+fn model_window(name: &str) -> bool {
+    matches!(
+        name,
+        "7d_oi" | "7d_sonnet" | "seven_day_opus" | "seven_day_sonnet"
+    )
+}
+
+fn cached_model_limit(a: &Account, now: DateTime<Utc>) -> bool {
+    a.provider == "claude"
+        && a.windows.iter().any(|w| {
+            model_window(&w.name)
+                && (w.extra.get("status").and_then(Value::as_str) == Some("rejected")
+                    || w.used_pct
+                        .is_some_and(|used| used.is_finite() && used >= 100.))
+                && w.reset_at
+                    .as_deref()
+                    .and_then(timestamp)
+                    .is_some_and(|reset| reset > now)
+        })
+}
+
 fn metric(w: &Window, a: &Account, now: DateTime<Utc>) -> WindowMetric {
     let used = w
         .used_pct
@@ -858,7 +899,14 @@ fn metric(w: &Window, a: &Account, now: DateTime<Utc>) -> WindowMetric {
     let scope = a.health.scope.as_deref().unwrap_or("");
     WindowMetric {
         raw: w.clone(),
-        label: window_label(&w.name),
+        label: if w.name == "7d_oi"
+            && let Some(model) = quota_model_name(a.health.scope.as_deref())
+            && matches!(model.as_str(), "Fable" | "Opus")
+        {
+            crate::i18n::format("{0} 주간", &[model])
+        } else {
+            window_label(&w.name)
+        },
         account_scoped: scoped,
         used,
         remaining: used.map(|n| 100 - n),
@@ -1003,7 +1051,10 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         let text = crate::i18n::static_text("사용량 확인 전").into();
         let lines = windows
             .iter()
-            .filter(|w| w.account_scoped && w.used.is_some())
+            .filter(|w| {
+                (w.account_scoped || (a.provider == "claude" && model_window(&w.raw.name)))
+                    && w.used.is_some()
+            })
             .cloned()
             .map(|window| UsageLine {
                 bar_tone: bar_tone(a, window.remaining),
@@ -1448,18 +1499,16 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         ),
         _ => None,
     };
-    if matches!(row.state, Ready | InUse)
-        && a.health.kind == "cooling"
-        && a.health.reason.as_deref() == Some("quota")
-        && let Some(model) = a
-            .health
-            .scope
-            .as_deref()
-            .and_then(|scope| scope.strip_prefix("model:"))
-            .filter(|model| !model.is_empty())
+    let limited_model = (a.health.kind == "cooling" && a.health.reason.as_deref() == Some("quota"))
+        .then(|| quota_model_name(a.health.scope.as_deref()))
+        .flatten();
+    if matches!(row.state, Ready | InUse) && (limited_model.is_some() || cached_model_limit(a, now))
     {
         row.chip = Some(Chip {
-            text: crate::i18n::static_text("일부 모델 한도").into(),
+            text: limited_model.as_ref().map_or_else(
+                || crate::i18n::static_text("일부 모델 한도").into(),
+                |model| crate::i18n::format("{0} 한도 도달", &[model.to_owned()]),
+            ),
             tone: Tone::Limit,
         });
         let message = if a.pool_eligible == Some(true) {
@@ -1467,7 +1516,10 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         } else {
             "{0} 한도 도달 · 해당 모델만 제한"
         };
-        row.reason = Some(crate::i18n::format(message, &[clean(model)]));
+        row.reason = Some(crate::i18n::format(
+            message,
+            &[limited_model.unwrap_or_else(|| crate::i18n::static_text("모델 주간").into())],
+        ));
     }
     if row.reason.is_none()
         && !matches!(row.state, Disabled | Paused)
@@ -2606,8 +2658,8 @@ mod tests {
         let projected = view(vec![account.clone()], 1);
         let row = actual_row(&projected, "model-quota");
         assert_eq!(row.group, Group::Ready);
-        assert_eq!(row.chip.as_ref().unwrap().text, "일부 모델 한도");
-        assert!(row.reason.as_ref().unwrap().contains("claude-fable-5-2"));
+        assert_eq!(row.chip.as_ref().unwrap().text, "Fable 한도 도달");
+        assert!(row.reason.as_ref().unwrap().contains("Fable"));
         assert!(row.reason.as_ref().unwrap().contains("다른 모델 사용 가능"));
         assert_eq!(summary(&projected).verdict, Verdict::Available);
         assert_eq!(summary(&projected).todo, 0);
@@ -2640,6 +2692,48 @@ mod tests {
                 .text,
             "일시정지"
         );
+    }
+    #[test]
+    fn cached_model_quota_has_a_separate_meter_and_never_labels_account_exhausted() {
+        let mut account = base("3030");
+        account["provider"] = json!("claude");
+        account["windows"] = json!([
+            {"name":"7d","used_pct":65.,"status":"allowed","reset_at":"2099-01-01T00:00:00Z"},
+            {"name":"7d_oi","used_pct":100.,"status":"rejected","reset_at":"2099-01-01T00:00:00Z"}
+        ]);
+        let projected = view(vec![account.clone()], 0);
+        let row = actual_row(&projected, "3030");
+        assert_eq!(row.group, Group::Ready);
+        assert_eq!(row.chip.as_ref().unwrap().text, "일부 모델 한도");
+        let usage = row.usage.as_ref().unwrap();
+        assert_eq!(usage.binding.as_ref().unwrap().raw.name, "7d");
+        assert_eq!(usage.lines.len(), 2);
+        assert_eq!(usage.lines[0].window.remaining, Some(35));
+        assert_eq!(usage.lines[1].window.remaining, Some(0));
+        assert_eq!(usage.lines[1].window.label, "모델 주간");
+        let legacy: crate::Account = serde_json::from_value(account.clone()).unwrap();
+        assert_eq!(crate::health_chip(&legacy, now().into()), "일부 모델 한도");
+        account["health"] =
+            json!({"kind":"cooling","reason":"quota","scope":"model:claude-fable-5-2"});
+        let projected = view(vec![account.clone()], 0);
+        let row = actual_row(&projected, "3030");
+        assert_eq!(row.chip.as_ref().unwrap().text, "Fable 한도 도달");
+        assert_eq!(
+            row.usage.as_ref().unwrap().lines[1].window.label,
+            "Fable 주간"
+        );
+        let legacy: crate::Account = serde_json::from_value(account.clone()).unwrap();
+        assert_eq!(crate::health_chip(&legacy, now().into()), "Fable 한도 도달");
+        account["health"]["scope"] = json!("account");
+        let projected = view(vec![account.clone()], 0);
+        assert_eq!(
+            actual_row(&projected, "3030").chip.as_ref().unwrap().text,
+            "계정 한도 도달"
+        );
+        account["health"] = json!({"kind":"ready"});
+        account["windows"][1]["reset_at"] = json!("2000-01-01T00:00:00Z");
+        let projected = view(vec![account], 0);
+        assert!(actual_row(&projected, "3030").chip.is_none());
     }
     #[test]
     fn authoritative_pools_and_nonvacuous_credits() {

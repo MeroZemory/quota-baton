@@ -1,6 +1,8 @@
 //! Client presentation copy only; protocol codes and account metadata stay unchanged.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
     ("일부 모델 한도", "Model limit"),
+    ("모델 주간", "Model weekly"),
+    ("{0} 주간", "{0} weekly"),
     (
         "{0} 한도 도달 · 다른 모델 사용 가능",
         "{0} limit reached · Other models available",

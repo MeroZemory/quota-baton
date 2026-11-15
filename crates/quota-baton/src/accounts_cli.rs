@@ -169,7 +169,7 @@ fn account_list_row(account: &serde_json::Value, english: bool) -> String {
         source.origin_label(english),
         source.refresh_owner().label(english),
         translated(&account["user_state"]),
-        localized_health_label(&account["health"], english),
+        account_health_label(account, english),
         cell(&account["token_meta"]["expires_at"])
     )
 }
@@ -204,6 +204,18 @@ pub(crate) fn health_label(value: &serde_json::Value) -> String {
     match value["kind"].as_str() {
         Some("plan_without_claude_code") => "Free 요금제 · Claude Code 사용 불가".into(),
         Some("ready") => "준비됨".into(),
+        Some("cooling") if value["reason"] == "quota" => {
+            if let Some(model) = value["scope"]
+                .as_str()
+                .and_then(|s| s.strip_prefix("model:"))
+            {
+                format!("모델 한도 도달 ({model})")
+            } else if value["scope"] == "account" {
+                "계정 한도 도달".into()
+            } else {
+                "대기 중".into()
+            }
+        }
         Some("cooling") => "대기 중".into(),
         Some("needs_relogin") => "재로그인 필요".into(),
         _ => "알 수 없음".into(),
@@ -211,11 +223,72 @@ pub(crate) fn health_label(value: &serde_json::Value) -> String {
 }
 
 fn localized_health_label(value: &serde_json::Value, english: bool) -> String {
-    if english && value["kind"] == "plan_without_claude_code" {
+    if english && value["kind"] == "cooling" && value["reason"] == "quota" {
+        if let Some(model) = value["scope"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("model:"))
+        {
+            format!("Model limit reached ({model})")
+        } else if value["scope"] == "account" {
+            "Account limit reached".into()
+        } else {
+            health_label(value)
+        }
+    } else if english && value["kind"] == "plan_without_claude_code" {
         "Free plan · no Claude Code access".into()
     } else {
         health_label(value)
     }
+}
+
+fn account_health_label(account: &serde_json::Value, english: bool) -> String {
+    if account["provider"] == "claude"
+        && account["health"]["kind"] == "ready"
+        && account["windows"].as_array().is_some_and(|windows| {
+            windows.iter().any(|w| {
+                matches!(
+                    w["name"].as_str(),
+                    Some("7d_oi" | "7d_sonnet" | "seven_day_opus" | "seven_day_sonnet")
+                ) && (w["status"] == "rejected"
+                    || w["used_pct"]
+                        .as_f64()
+                        .is_some_and(|used| used.is_finite() && used >= 100.))
+                    && w["reset_at"]
+                        .as_str()
+                        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                        .is_some_and(|reset| reset > chrono::Utc::now())
+            })
+        })
+    {
+        if english {
+            "Model limit".into()
+        } else {
+            "일부 모델 한도".into()
+        }
+    } else {
+        localized_health_label(&account["health"], english)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn model_quota_status_does_not_claim_account_quota() {
+    let mut health =
+        serde_json::json!({"kind":"cooling","reason":"quota","scope":"model:claude-fable-5-2"});
+    assert!(localized_health_label(&health, false).starts_with("모델 한도 도달"));
+    assert!(localized_health_label(&health, true).starts_with("Model limit reached"));
+    health["scope"] = serde_json::json!("account");
+    assert_eq!(localized_health_label(&health, false), "계정 한도 도달");
+    assert_eq!(
+        localized_health_label(&health, true),
+        "Account limit reached"
+    );
+    let account = serde_json::json!({"provider":"claude","health":{"kind":"ready"},"windows":[
+        {"name":"7d","used_pct":65,"status":"allowed","reset_at":"2099-01-01T00:00:00Z"},
+        {"name":"7d_oi","used_pct":100,"status":"rejected","reset_at":"2099-01-01T00:00:00Z"}
+    ]});
+    assert_eq!(account_health_label(&account, false), "일부 모델 한도");
+    assert_eq!(account_health_label(&account, true), "Model limit");
 }
 
 #[cfg(test)]
@@ -749,7 +822,7 @@ fn status_account_row(account: &serde_json::Value, windows: &str, english: bool)
         {
             "인증 확인 대기".into()
         } else {
-            localized_health_label(&account["health"], english)
+            account_health_label(account, english)
         },
         windows,
         translated(&account["health"]["reason"]),
