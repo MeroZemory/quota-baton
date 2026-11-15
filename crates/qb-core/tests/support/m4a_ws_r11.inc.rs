@@ -172,7 +172,7 @@ mod r11_actual {
                     admin_token: "synthetic-admin-key".into(),
                 },
                 relay::router(h.state.clone()),
-                axum::Router::new(),
+                qb_core::admin::runtime_routes(h.state.clone(), 0),
             )
             .await
             .unwrap();
@@ -698,76 +698,173 @@ mod r11_actual {
     }
 
     #[tokio::test]
-    async fn r11_ws_model_plan_denial_keeps_signal_refreshes_bound_only_and_never_shops() {
+    async fn r11_ws_model_plan_denial_keeps_signal_and_retries_only_on_entitled_successor() {
         for handshake in [false, true] {
-            let t = LaunchHarness::new(2).await;
-            let launch = t.issue(Some(&t.h.ids[0])).await;
-            let denied = if handshake {
-                "synthetic-model"
-            } else {
-                "alternate-model"
-            };
-            let message = format!(
-                "The '{denied}' model is not supported when using Codex with a ChatGPT account"
-            );
-            let error =
-                json!({"type":"error","status":400,"error":{"message":message}}).to_string();
-            let before = t.catalogs.requests.lock().unwrap().len();
-            if handshake {
-                t.catalogs.set(&t.h, &launch.account, &["alternate-model"]);
-                t.h.fake.state.push_handshake(
-                    StatusCode::BAD_REQUEST,
-                    error.clone(),
-                    HeaderMap::new(),
-                );
-                let Error::Http(response) =
-                    connect_async(t.request(&launch.base_url, Some("r11-plan")))
-                        .await
-                        .unwrap_err()
-                else {
-                    panic!("original model-plan failure expected")
+            for successor in [false, true] {
+                let t = LaunchHarness::new(if successor { 2 } else { 1 }).await;
+                let launch = t.issue(Some(&t.h.ids[0])).await;
+                let denied = if handshake {
+                    "synthetic-model"
+                } else {
+                    "alternate-model"
                 };
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-                assert_eq!(
-                    response.body().as_ref().unwrap().as_slice(),
-                    error.as_bytes()
+                let message = format!(
+                    "The '{denied}' model is not supported when using Codex with a ChatGPT account"
                 );
-                assert!(t.data().is_empty());
-            } else {
-                let mut client = t.connect(&launch, Some("r11-plan")).await;
-                t.catalogs.set(&t.h, &launch.account, &["synthetic-model"]);
-                t.h.fake.state.push_reply([Message::text(error.clone())]);
-                let raw = r#"{"type":"response.create","model":"alternate-model","input":[]}"#;
-                client.send(Message::text(raw)).await.unwrap();
-                assert_eq!(receive(&mut client).await, Message::text(error));
-                assert_eq!(t.data(), vec![Message::text(raw)], "no capability replay");
-                drop(client);
+                let error =
+                    json!({"type":"error","status":400,"error":{"message":message}}).to_string();
+                let before = t.catalogs.requests.lock().unwrap().len();
+                let raw = format!(r#"{{"type":"response.create","model":"{denied}","input":[]}}"#);
+                let mut replacement = None;
+                if handshake {
+                    t.catalogs.set(&t.h, &launch.account, &["alternate-model"]);
+                    t.h.fake.state.push_handshake(
+                        StatusCode::BAD_REQUEST,
+                        error.clone(),
+                        HeaderMap::new(),
+                    );
+                    let result = connect_async(t.request(&launch.base_url, Some("r11-plan"))).await;
+                    if successor {
+                        let (client, response) = result.unwrap();
+                        assert_eq!(response.headers()["x-quota-baton-account"], t.h.ids[1]);
+                        replacement = Some(client);
+                    } else {
+                        let Error::Http(response) = result.unwrap_err() else {
+                            panic!("original model-plan failure expected without successor")
+                        };
+                        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                        assert_eq!(
+                            response.body().as_ref().unwrap().as_slice(),
+                            error.as_bytes()
+                        );
+                    }
+                    assert!(t.data().is_empty());
+                } else {
+                    let mut client = t.connect(&launch, Some("r11-plan")).await;
+                    t.catalogs.set(&t.h, &launch.account, &["synthetic-model"]);
+                    t.h.fake.state.push_reply([Message::text(error.clone())]);
+                    client.send(Message::text(raw.clone())).await.unwrap();
+                    if successor {
+                        assert_close(receive(&mut client).await, 1012);
+                    } else {
+                        assert_eq!(receive(&mut client).await, Message::text(error));
+                    }
+                    assert_eq!(
+                        t.data(),
+                        vec![Message::text(raw.clone())],
+                        "no capability replay"
+                    );
+                    drop(client);
+                }
+                let account = t.h.store.load(&launch.account).unwrap();
+                assert_eq!(account.health, Health::Ready);
+                assert!(
+                    account.eligible(Some(denied)),
+                    "model denial is catalog evidence, not native cooling"
+                );
+                assert!(account.eligible(Some(if handshake {
+                    "alternate-model"
+                } else {
+                    "synthetic-model"
+                })));
+                let response = reqwest::Client::new()
+                    .get(format!("http://{}/admin/v1/models", t.h.servers.admin_addr))
+                    .bearer_auth("synthetic-admin-key")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let union: Value = response.json().await.unwrap();
+                let provider = union["providers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|provider| provider["provider"] == "codex")
+                    .unwrap();
+                let entitled: std::collections::BTreeSet<String> = provider["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|model| model["id"] == denied)
+                    .map(|model| {
+                        model["accounts"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|account| account["id"].as_str().unwrap().to_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(
+                    entitled,
+                    if successor {
+                        std::collections::BTreeSet::from([t.h.ids[1].clone()])
+                    } else {
+                        std::collections::BTreeSet::new()
+                    },
+                    "admin union excludes the denied source while native health stays Ready"
+                );
+                if !handshake || !successor {
+                    assert_eq!(
+                        t.h.state
+                            .bindings
+                            .current(Some("codex:r11-plan"))
+                            .as_deref(),
+                        Some(launch.account.as_str())
+                    );
+                }
+                let requests = t.catalogs.requests.lock().unwrap().clone();
+                let token = t.h.store.tokens(&account).unwrap();
+                assert!(
+                    requests[before..]
+                        .iter()
+                        .all(|request| request != &format!("Bearer {}", token.access_token)),
+                    "denial does not force a source catalog refresh"
+                );
+                capacity_count(&t.h, &launch.account, 0).await;
+                if successor {
+                    if !handshake {
+                        let (client, response) =
+                            connect_async(t.request(&launch.base_url, Some("r11-plan")))
+                                .await
+                                .unwrap();
+                        assert_eq!(response.headers()["x-quota-baton-account"], t.h.ids[1]);
+                        replacement = Some(client);
+                    }
+                    let mut client = replacement.unwrap();
+                    assert_eq!(
+                        t.data().len(),
+                        usize::from(!handshake),
+                        "reconnect never replays the create"
+                    );
+                    t.turn(&mut client, &raw).await;
+                    assert_eq!(
+                        t.data(),
+                        vec![Message::text(raw); if handshake { 1 } else { 2 }]
+                    );
+                    assert_eq!(
+                        t.h.fake.state.requests().len(),
+                        2,
+                        "one entitled successor dial"
+                    );
+                    assert_eq!(
+                        t.h.state
+                            .bindings
+                            .current(Some("codex:r11-plan"))
+                            .as_deref(),
+                        Some(t.h.ids[1].as_str())
+                    );
+                    client.close(None).await.unwrap();
+                    drop(client);
+                    capacity_count(&t.h, &t.h.ids[1], 0).await;
+                } else {
+                    assert_eq!(
+                        t.h.fake.state.requests().len(),
+                        1,
+                        "no unentitled successor dial"
+                    );
+                }
             }
-            let account = t.h.store.load(&launch.account).unwrap();
-            assert!(
-                matches!(&account.health, Health::Cooling { reason: HealthReason::Permission, scope, until } if scope == &format!("model:{denied}") && *until > Utc::now())
-            );
-            assert!(!account.eligible(Some(denied)));
-            assert!(account.eligible(Some(if handshake {
-                "alternate-model"
-            } else {
-                "synthetic-model"
-            })));
-            assert_eq!(
-                t.h.state
-                    .bindings
-                    .current(Some("codex:r11-plan"))
-                    .as_deref(),
-                Some(launch.account.as_str())
-            );
-            let requests = t.catalogs.requests.lock().unwrap().clone();
-            let token = t.h.store.tokens(&account).unwrap();
-            assert_eq!(
-                &requests[before..],
-                &[format!("Bearer {}", token.access_token)]
-            );
-            assert_eq!(t.h.fake.state.requests().len(), 1, "no second account dial");
-            capacity_count(&t.h, &launch.account, 0).await;
         }
     }
 
@@ -876,174 +973,247 @@ mod r11_actual {
     #[tokio::test]
     async fn r11_ws_live_ordinary_same_account_promotion_enforces_managed_models() {
         for binary in [false, true] {
-            let t = LaunchHarness::new(2).await;
-            let key = "r11-live-promoted";
-            let canonical = format!("codex:{key}");
-            let base = format!("http://{}/v1", t.h.servers.data_addr);
-            let (mut client, response) = connect_async(t.request(&base, Some(key))).await.unwrap();
-            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
-            let account = response.headers()["x-quota-baton-account"]
-                .to_str()
-                .unwrap()
-                .to_owned();
-            capacity_count(&t.h, &account, 1).await;
-            let first = r#"{ "type":"response.create", "model":"synthetic-model", "input":[] }"#;
-            t.turn(&mut client, first).await;
-            assert!(
-                !t.h.state
-                    .bindings
-                    .launch_info(&canonical, Utc::now())
+            for strict in [false, true] {
+                let t = LaunchHarness::new(2).await;
+                let key = "r11-live-promoted";
+                let canonical = format!("codex:{key}");
+                let base = format!("http://{}/v1", t.h.servers.data_addr);
+                let (mut client, response) =
+                    connect_async(t.request(&base, Some(key))).await.unwrap();
+                assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+                let account = response.headers()["x-quota-baton-account"]
+                    .to_str()
                     .unwrap()
-                    .managed
-            );
-            assert_eq!(t.data(), vec![Message::text(first)]);
+                    .to_owned();
+                capacity_count(&t.h, &account, 1).await;
+                let first =
+                    r#"{ "type":"response.create", "model":"synthetic-model", "input":[] }"#;
+                t.turn(&mut client, first).await;
+                assert!(
+                    !t.h.state
+                        .bindings
+                        .launch_info(&canonical, Utc::now())
+                        .unwrap()
+                        .managed
+                );
+                assert_eq!(t.data(), vec![Message::text(first)]);
 
-            // The other account supports the rejected model. Promotion must
-            // keep this live socket on its existing account without shopping.
-            let other = t.h.ids.iter().find(|id| **id != account).unwrap();
-            t.catalogs
-                .set(&t.h, other, &["synthetic-model", "other-account-only"]);
-            let launch =
-                t.h.state
-                    .issue_launch(
-                        relay::LaunchRequest {
-                            model: Some("synthetic-model".into()),
-                            model_is_explicit: true,
-                            account_pref: Some(account.clone()),
-                            resume_id: Some(key.into()),
-                            move_for_model: false,
-                            urgent: false,
-                        },
-                        t.h.servers.data_addr.port(),
-                    )
+                // Promotion preserves the incumbent socket. A later unsent model
+                // change can request a client reconnect, subject to native guards.
+                let other = t.h.ids.iter().find(|id| **id != account).unwrap();
+                t.catalogs
+                    .set(&t.h, other, &["synthetic-model", "other-account-only"]);
+                let launch =
+                    t.h.state
+                        .issue_launch(
+                            relay::LaunchRequest {
+                                model: Some("synthetic-model".into()),
+                                model_is_explicit: true,
+                                account_pref: Some(account.clone()),
+                                resume_id: Some(key.into()),
+                                move_for_model: false,
+                                urgent: false,
+                            },
+                            t.h.servers.data_addr.port(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    launch.account, account,
+                    "same-account live resume remains legitimate"
+                );
+                let response = reqwest::Client::new()
+                    .get(&launch.catalog_url)
+                    .bearer_auth("synthetic-local-key")
+                    .header("session-id", key)
+                    .send()
                     .await
                     .unwrap();
-            assert_eq!(
-                launch.account, account,
-                "same-account live resume remains legitimate"
-            );
-            let response = reqwest::Client::new()
-                .get(&launch.catalog_url)
-                .bearer_auth("synthetic-local-key")
-                .header("session-id", key)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let menu = response.json::<Value>().await.unwrap();
-            assert!(
-                menu["models"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["slug"] == "alternate-model")
-            );
-            assert!(
-                !menu["models"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["slug"] == "other-account-only")
-            );
-            let promoted =
-                t.h.state
-                    .bindings
-                    .launch_info(&canonical, Utc::now())
-                    .unwrap();
-            assert!(promoted.managed);
-            assert_eq!(promoted.account, account);
-            assert_eq!(promoted.canonical_key, canonical);
-            assert!(promoted.advertised_models.contains("alternate-model"));
-            let routing = t.h.state.bindings.routing_view();
-            let moves: Vec<_> =
-                t.h.ledger()
-                    .into_iter()
-                    .filter(|row| row["event"] == "session_move")
-                    .collect();
-            let catalog_before = t.catalogs.requests.lock().unwrap().len();
-
-            let unsupported =
-                r#"{ "type":"response.create", "model":"other-account-only", "input":[] }"#;
-            let frame = |raw: &str| {
-                if binary {
-                    Message::binary(raw.as_bytes().to_vec())
-                } else {
-                    Message::text(raw.to_owned())
+                assert_eq!(response.status(), StatusCode::OK);
+                let menu = response.json::<Value>().await.unwrap();
+                assert!(
+                    menu["models"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["slug"] == "alternate-model")
+                );
+                assert!(
+                    !menu["models"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["slug"] == "other-account-only")
+                );
+                let promoted =
+                    t.h.state
+                        .bindings
+                        .launch_info(&canonical, Utc::now())
+                        .unwrap();
+                assert!(promoted.managed);
+                assert_eq!(promoted.account, account);
+                assert_eq!(promoted.canonical_key, canonical);
+                assert!(promoted.advertised_models.contains("alternate-model"));
+                if strict {
+                    t.h.state
+                        .bindings
+                        .set_routing_session(
+                            &qb_core::routing::session_id(&canonical),
+                            Some(qb_core::routing::Settings {
+                                mode: qb_core::routing::Mode::Strict,
+                                reset_wait_secs: 0,
+                                on_5h_limit: qb_core::routing::On5hLimit::Wait,
+                            }),
+                            None,
+                            false,
+                        )
+                        .unwrap();
                 }
-            };
-            client.send(frame(unsupported)).await.unwrap();
-            let Message::Text(error) = receive(&mut client).await else {
-                panic!("local model explanation expected")
-            };
-            let error: Value = serde_json::from_str(&error).unwrap();
-            assert_eq!(error["error"]["code"], "model_not_supported");
-            assert!(!error["error"]["message"].as_str().unwrap().is_ascii());
-            assert_eq!(
-                t.data(),
-                vec![Message::text(first)],
-                "unsupported turn never reaches upstream"
-            );
-            assert_eq!(
-                t.h.fake.state.requests().len(),
-                1,
-                "no move or replacement WS dial"
-            );
-            assert_eq!(
-                t.h.state
-                    .bindings
-                    .launch_info(&canonical, Utc::now())
-                    .unwrap(),
-                promoted
-            );
-            capacity_count(&t.h, &account, 1).await;
-            let row = t.h.store.load(&account).unwrap();
-            let token = t.h.store.tokens(&row).unwrap();
-            assert_eq!(
-                &t.catalogs.requests.lock().unwrap()[catalog_before..],
-                &[format!("Bearer {}", token.access_token)],
-                "unsupported-model refresh only visits the bound account"
-            );
+                let routing = t.h.state.bindings.routing_view();
+                let moves: Vec<_> =
+                    t.h.ledger()
+                        .into_iter()
+                        .filter(|row| row["event"] == "session_move")
+                        .collect();
+                let catalog_before = t.catalogs.requests.lock().unwrap().len();
 
-            // Keep using the original ordinary socket after the local error.
-            let supported = r#"{ "input":[], "type" : "response.create", "model":"alternate-model", "fixture_extra":{"preserve":true} }"#;
-            let supported_frame = frame(supported);
-            t.h.fake
-                .state
-                .push_reply([Message::text(r#"{"type":"response.completed"}"#)]);
-            client.send(supported_frame.clone()).await.unwrap();
-            assert_eq!(
-                receive(&mut client).await,
-                Message::text(r#"{"type":"response.completed"}"#)
-            );
-            assert_eq!(t.data(), vec![Message::text(first), supported_frame]);
-            assert_eq!(t.h.fake.state.requests().len(), 1);
-            let after =
-                t.h.state
-                    .bindings
-                    .launch_info(&canonical, Utc::now())
-                    .unwrap();
-            assert_eq!(after.account, account);
-            assert_eq!(after.canonical_key, canonical);
-            assert_eq!(after.current_model.as_deref(), Some("alternate-model"));
-            assert_eq!(after.advertised_models, promoted.advertised_models);
-            assert_eq!(
-                t.h.state.bindings.export().unwrap()["bindings"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                1
-            );
-            assert_eq!(t.h.state.bindings.routing_view(), routing);
-            assert_eq!(
-                t.h.ledger()
-                    .into_iter()
-                    .filter(|row| row["event"] == "session_move")
-                    .collect::<Vec<_>>(),
-                moves
-            );
-            client.close(None).await.unwrap();
-            drop(client);
-            capacity_count(&t.h, &account, 0).await;
+                let unsupported =
+                    r#"{ "type":"response.create", "model":"other-account-only", "input":[] }"#;
+                let frame = |raw: &str| {
+                    if binary {
+                        Message::binary(raw.as_bytes().to_vec())
+                    } else {
+                        Message::text(raw.to_owned())
+                    }
+                };
+                client.send(frame(unsupported)).await.unwrap();
+                if !strict {
+                    assert_close(receive(&mut client).await, 1012);
+                    assert_eq!(
+                        t.data(),
+                        vec![Message::text(first)],
+                        "unsent create never reaches incumbent"
+                    );
+                    assert_eq!(
+                        t.h.fake.state.requests().len(),
+                        1,
+                        "no server reconnect or replay"
+                    );
+                    assert_eq!(
+                        t.h.state
+                            .bindings
+                            .launch_info(&canonical, Utc::now())
+                            .unwrap(),
+                        promoted,
+                        "preview does not move the live incumbent"
+                    );
+                    drop(client);
+                    capacity_count(&t.h, &account, 0).await;
+                    let (mut reconnected, response) =
+                        connect_async(t.request(&base, Some(key))).await.unwrap();
+                    assert_eq!(response.headers()["x-quota-baton-account"], other.as_str());
+                    assert_eq!(
+                        t.data(),
+                        vec![Message::text(first)],
+                        "upgrade never replays the unsent create"
+                    );
+                    let retried = frame(unsupported);
+                    t.h.fake
+                        .state
+                        .push_reply([Message::text(r#"{"type":"response.completed"}"#)]);
+                    reconnected.send(retried.clone()).await.unwrap();
+                    assert_eq!(
+                        receive(&mut reconnected).await,
+                        Message::text(r#"{"type":"response.completed"}"#)
+                    );
+                    assert_eq!(t.data(), vec![Message::text(first), retried]);
+                    assert_eq!(t.h.fake.state.requests().len(), 2);
+                    let after =
+                        t.h.state
+                            .bindings
+                            .launch_info(&canonical, Utc::now())
+                            .unwrap();
+                    assert_eq!(after.account, *other);
+                    assert_eq!(after.current_model.as_deref(), Some("other-account-only"));
+                    reconnected.close(None).await.unwrap();
+                    drop(reconnected);
+                    capacity_count(&t.h, other, 0).await;
+                    continue;
+                }
+                let Message::Text(error) = receive(&mut client).await else {
+                    panic!("local model explanation expected")
+                };
+                let error: Value = serde_json::from_str(&error).unwrap();
+                assert_eq!(error["error"]["code"], "model_not_supported");
+                assert!(!error["error"]["message"].as_str().unwrap().is_ascii());
+                assert_eq!(
+                    t.data(),
+                    vec![Message::text(first)],
+                    "unsupported turn never reaches upstream"
+                );
+                assert_eq!(
+                    t.h.fake.state.requests().len(),
+                    1,
+                    "no move or replacement WS dial"
+                );
+                assert_eq!(
+                    t.h.state
+                        .bindings
+                        .launch_info(&canonical, Utc::now())
+                        .unwrap(),
+                    promoted
+                );
+                capacity_count(&t.h, &account, 1).await;
+                let row = t.h.store.load(&account).unwrap();
+                let token = t.h.store.tokens(&row).unwrap();
+                assert!(
+                    t.catalogs.requests.lock().unwrap()[catalog_before..]
+                        .iter()
+                        .all(|request| request != &format!("Bearer {}", token.access_token)),
+                    "guard veto does not force a source catalog refresh"
+                );
+
+                // Keep using the original ordinary socket after the local error.
+                let supported = r#"{ "input":[], "type" : "response.create", "model":"alternate-model", "fixture_extra":{"preserve":true} }"#;
+                let supported_frame = frame(supported);
+                t.h.fake
+                    .state
+                    .push_reply([Message::text(r#"{"type":"response.completed"}"#)]);
+                client.send(supported_frame.clone()).await.unwrap();
+                assert_eq!(
+                    receive(&mut client).await,
+                    Message::text(r#"{"type":"response.completed"}"#)
+                );
+                assert_eq!(t.data(), vec![Message::text(first), supported_frame]);
+                assert_eq!(t.h.fake.state.requests().len(), 1);
+                let after =
+                    t.h.state
+                        .bindings
+                        .launch_info(&canonical, Utc::now())
+                        .unwrap();
+                assert_eq!(after.account, account);
+                assert_eq!(after.canonical_key, canonical);
+                assert_eq!(after.current_model.as_deref(), Some("alternate-model"));
+                assert_eq!(after.advertised_models, promoted.advertised_models);
+                assert_eq!(
+                    t.h.state.bindings.export().unwrap()["bindings"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(t.h.state.bindings.routing_view(), routing);
+                assert_eq!(
+                    t.h.ledger()
+                        .into_iter()
+                        .filter(|row| row["event"] == "session_move")
+                        .collect::<Vec<_>>(),
+                    moves
+                );
+                client.close(None).await.unwrap();
+                drop(client);
+                capacity_count(&t.h, &account, 0).await;
+            }
         }
     }
 

@@ -1147,13 +1147,39 @@ mod tests {
 
     #[tokio::test]
     async fn r30_managed_failover_keeps_cooling_entitled_destinations_for_limit_selection() {
-        let (f, info) = model_admission_fixture(true).await;
+        let (f, info) = model_admission_fixture(false).await;
         let second = second_issue_account(&f).await;
+        // Apply holds after adding all accounts: the Linux synthetic seeder
+        // rebuilds both files, whereas Windows import preserves old health.
         let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+        f.relay
+            .store
+            .update_metadata(&f.id, |a| {
+                quota_hold(a, None, reset + chrono::Duration::hours(2))
+            })
+            .unwrap();
         f.relay
             .store
             .update_metadata(&second, |a| quota_hold(a, Some("common"), reset))
             .unwrap();
+        assert!(!f.relay.store.load(&f.id).unwrap().eligible(Some("common")));
+        assert!(
+            !f.relay
+                .store
+                .load(&second)
+                .unwrap()
+                .eligible(Some("common"))
+        );
+        assert!(
+            f.relay
+                .catalogs
+                .view(&second)
+                .unwrap()
+                .observation
+                .last_known()
+                .is_none()
+        );
+        let requests_before = f.upstream.state.requests().len();
         f.reply(StatusCode::OK, json!({"models":[{"slug":"common"}]}));
         let candidates = f
             .relay
@@ -1179,6 +1205,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let requests = f.upstream.state.requests();
+        assert_eq!(requests.len(), requests_before + 1);
+        assert_eq!(
+            requests.last().unwrap().headers["chatgpt-account-id"],
+            "second-account"
+        );
         assert!(candidates.iter().any(|c| c.account.id == second));
         assert!(
             !candidates

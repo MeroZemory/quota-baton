@@ -324,6 +324,7 @@ fn ready_cached_model_status_recovers_without_mutating_observation_or_native_hol
     let status = runtime.model_quota_status(&account, model, now).unwrap();
     assert_eq!(status.window.as_deref(), Some("7d_oi"));
     assert_eq!(status.reset_at, reset);
+    assert_eq!(status.observed_reset_at, Some(reset));
     assert!(status.model_limited);
     assert_eq!(
         Some(status.reset_at),
@@ -346,6 +347,7 @@ fn ready_cached_model_status_recovers_without_mutating_observation_or_native_hol
     };
     let status = runtime.model_quota_status(&account, model, now).unwrap();
     assert_eq!(status.reset_at, reset);
+    assert_eq!(status.observed_reset_at, None);
     assert!(status.model_limited);
     assert_eq!(
         status.window, None,
@@ -418,8 +420,9 @@ async fn mixed_entitled_native_later_and_cached_ready_earlier_uses_earlier_429()
     let (runtime, _home) = runtime();
     let cached = save_account(&runtime, "cached", Provider::Codex);
     let native = save_account(&runtime, "native", Provider::Codex);
+    let nonlimit = save_account(&runtime, "link-stale", Provider::Codex);
     let model = "a";
-    for account in [&cached, &native] {
+    for account in [&cached, &native, &nonlimit] {
         catalog(&runtime, &account.id, &[model]);
     }
     let now = Utc::now();
@@ -445,6 +448,16 @@ async fn mixed_entitled_native_later_and_cached_ready_earlier_uses_earlier_429()
             }
         })
         .unwrap();
+    runtime
+        .store
+        .update_metadata(&nonlimit.id, |account| {
+            account.health = Health::Cooling {
+                reason: HealthReason::LinkStale,
+                until: now + Duration::minutes(1),
+                scope: "account".into(),
+            };
+        })
+        .unwrap();
     let response = runtime
         .unavailable_known(Provider::Codex, false, Some(model))
         .await;
@@ -460,4 +473,139 @@ async fn mixed_entitled_native_later_and_cached_ready_earlier_uses_earlier_429()
         .unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"]["resets_at"], earlier.timestamp());
+}
+
+#[test]
+fn native_observed_reset_requires_exact_deadline_and_model_fences() {
+    let (runtime, _home) = runtime();
+    let mut account = account("native", Provider::Claude);
+    let now = Utc::now();
+    let reset = now + Duration::hours(1);
+    let model = Some("claude-fable-5-2");
+    account.health = Health::Cooling {
+        reason: HealthReason::Quota,
+        until: reset,
+        scope: "model:claude-fable-5-2".into(),
+    };
+    let unknown = runtime.model_quota_status(&account, model, now).unwrap();
+    assert_eq!(unknown.reset_at, reset);
+    assert_eq!(unknown.observed_reset_at, None);
+    assert_eq!(unknown.window, None);
+    runtime.observe_quota_reset(&account.id, Some(reset));
+    assert_eq!(
+        runtime
+            .model_quota_status(&account, model, now)
+            .unwrap()
+            .observed_reset_at,
+        Some(reset)
+    );
+    assert!(
+        runtime
+            .model_quota_status(&account, Some("claude-sonnet-5-5"), now)
+            .is_none()
+    );
+    if let Health::Cooling { until, .. } = &mut account.health {
+        *until += Duration::seconds(1);
+    }
+    let mismatched = runtime.model_quota_status(&account, model, now).unwrap();
+    assert_eq!(mismatched.reset_at, reset + Duration::seconds(1));
+    assert_eq!(mismatched.observed_reset_at, None);
+    runtime.observe_quota_reset(&account.id, None);
+    assert_eq!(
+        runtime
+            .model_quota_status(&account, model, now)
+            .unwrap()
+            .observed_reset_at,
+        None
+    );
+}
+
+#[test]
+fn persisted_quota_evidence_keeps_its_actual_reset_without_promoting_health_deadline() {
+    let (runtime, _home) = runtime();
+    let mut account = account("native", Provider::Claude);
+    let now = Utc::now();
+    let observed_reset = now + Duration::hours(1);
+    let deadline = observed_reset + Duration::seconds(10);
+    account.health = Health::Cooling {
+        reason: HealthReason::Quota,
+        until: deadline,
+        scope: "model:claude-fable-5-2".into(),
+    };
+    account.quota_cooling = Some(crate::accounts::QuotaCooling {
+        window: "7d_oi".into(),
+        reset_at: observed_reset,
+        started_at: now - Duration::minutes(2),
+    });
+    let model = Some("claude-fable-5-2");
+    let status = runtime.model_quota_status(&account, model, now).unwrap();
+    assert_eq!(status.reset_at, deadline);
+    assert_eq!(status.observed_reset_at, Some(observed_reset));
+    assert_eq!(status.window.as_deref(), Some("7d_oi"));
+    account.quota_cooling.as_mut().unwrap().started_at = now + Duration::seconds(1);
+    let invalid = runtime.model_quota_status(&account, model, now).unwrap();
+    assert_eq!(invalid.observed_reset_at, None);
+    assert_eq!(invalid.window, None);
+    account.quota_cooling.as_mut().unwrap().started_at = now - Duration::hours(1);
+    account.quota_cooling.as_mut().unwrap().reset_at = now;
+    assert_eq!(
+        runtime
+            .model_quota_status(&account, model, now)
+            .unwrap()
+            .observed_reset_at,
+        None
+    );
+}
+
+#[test]
+fn another_models_native_observation_cannot_extend_cached_requested_model_reset() {
+    let (runtime, _home) = runtime();
+    let mut account = account("native", Provider::Claude);
+    let now = Utc::now();
+    let native_reset = now + Duration::hours(5);
+    let cached_reset = now + Duration::hours(2);
+    account.health = Health::Cooling {
+        reason: HealthReason::Quota,
+        until: native_reset,
+        scope: "model:claude-sonnet-5-5".into(),
+    };
+    runtime.observe_quota_reset(&account.id, Some(native_reset));
+    cached_fable(
+        &runtime,
+        &account.id,
+        now - Duration::seconds(19),
+        cached_reset,
+        100.0,
+    );
+    let before = runtime.obs.quota_snapshot(&account.id).unwrap();
+    let status = runtime
+        .model_quota_status(&account, Some("claude-fable-5-2"), now)
+        .unwrap();
+    assert_eq!(status.reset_at, cached_reset);
+    assert_eq!(status.observed_reset_at, Some(cached_reset));
+    assert_eq!(runtime.observed_quota_reset(&account), Some(native_reset));
+    assert_eq!(runtime.obs.quota_snapshot(&account.id).unwrap(), before);
+}
+
+#[test]
+fn volatile_only_quota_deadline_does_not_invent_observed_reset() {
+    let (runtime, _home) = runtime();
+    let account = account("volatile", Provider::Claude);
+    let now = Utc::now();
+    let reset = now + Duration::hours(1);
+    runtime.volatile.lock().unwrap().insert(
+        account.id.clone(),
+        Health::Cooling {
+            reason: HealthReason::Quota,
+            until: reset,
+            scope: "model:claude-fable-5-2".into(),
+        },
+    );
+    let status = runtime
+        .model_quota_status(&account, Some("claude-fable-5-2"), now)
+        .unwrap();
+    assert_eq!(status.reset_at, reset);
+    assert_eq!(status.observed_reset_at, None);
+    assert_eq!(status.window, None);
+    assert!(status.model_limited);
 }

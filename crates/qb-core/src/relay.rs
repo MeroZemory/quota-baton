@@ -3150,11 +3150,11 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 state.accounts.invalidate_quota_rejection(&account.id).await;
             }
         }
-        // Response-only model hints scope the health signal; they do not change
-        // the model of the request actually sent. Preserve that exact context
-        // for the sealed failed-attempt handoff and every same-body successor.
+        // Response-only model hints can identify a catalog denial, but they do
+        // not change the model of the request actually sent. Preserve that exact
+        // context for the failed-attempt handoff and every same-body successor.
         if decision.kind == outcome::Kind::ModelPermission {
-            if let Some(model) = request_model.as_deref()
+            if let Some(model) = request_model.as_deref().or(decision.model.as_deref())
                 && state.catalogs.deny_model(&account.id, model).is_err()
             {
                 return failure(

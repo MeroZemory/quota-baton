@@ -989,6 +989,13 @@ impl Readset {
             {
                 Shape::Scalar
             }
+            Shape::Scalar
+                if self.native
+                    && compact(&tokens(expr)) == "u8::is_ascii_digit"
+                    && args == [Shape::Scalar] =>
+            {
+                Shape::Scalar
+            }
             _ => self.reject("unreviewed callback"),
         }
     }
@@ -1072,6 +1079,7 @@ impl Readset {
                         | "str::to_owned"
                         | "Utc"
                 ) || path.starts_with("Refusal::")
+                    || (self.native && path == "u8::is_ascii_digit")
                 {
                     Scalar
                 } else {
@@ -1368,6 +1376,10 @@ impl Readset {
             ("group", [Scalar]) => Scalar,
             ("timestamp", [Shape::JsonScalar]) if self.native => Scalar.optional(),
             (
+                "claude_window_applies_to_model",
+                [Shape::Optional(window), Shape::Optional(model)],
+            ) if self.native && **window == Scalar && **model == Scalar => Scalar,
+            (
                 "crate::accounts::health::UnusableEvidence::observe",
                 [Object("Account"), Shape::Optional(s), Scalar, Scalar],
             ) if **s == Scalar => Object("UnusableEvidence").optional(),
@@ -1446,6 +1458,14 @@ impl Readset {
             }
             ("values", Shape::Map(s), []) => (*s.clone()).rows(),
             ("iter", Shape::Rows(_), []) => base,
+            ("as_bytes", Scalar, []) if self.native => Scalar.rows(),
+            ("all", Shape::Rows(item), [_]) if self.native && **item == Scalar => {
+                if self.callback(&call.args[0], &[Scalar]) == Scalar {
+                    Scalar
+                } else {
+                    self.reject("non-scalar all predicate")
+                }
+            }
             ("last" | "next", Shape::Rows(s), []) => (*s.clone()).optional(),
             ("min", Shape::Rows(s), []) if !s.bulk() => (*s.clone()).optional(),
             ("min_by_key" | "max_by_key", Shape::Rows(s), [_]) => {
@@ -1627,6 +1647,11 @@ fn kernel_readset(source: &str, permit: bool) -> Vec<String> {
 // Unselected HealthSignal arms are outside this UsageSnapshot-only boundary.
 const HEALTH_ROOTS: &[(&str, &str, &str)] = &[
     (
+        "",
+        "claude_window_applies_to_model",
+        "fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool",
+    ),
+    (
         "Account",
         "eligible_at",
         "fn eligible_at(&self, model: Option<&str>, now: DateTime<Utc>) -> bool",
@@ -1733,6 +1758,9 @@ fn native_bindings(owner: &'static str, name: &str) -> Vec<(&'static str, Shape)
         vec![("self", Object(owner))]
     };
     let mut args = match name {
+        "claude_window_applies_to_model" => {
+            vec![("window", Scalar.optional()), ("model", Scalar.optional())]
+        }
         "eligible_at" => vec![("model", Scalar.optional()), ("now", Scalar)],
         "claude_free_plan" => vec![],
         "expire" | "expire_health" => vec![("now", Scalar)],
@@ -2279,6 +2307,88 @@ fn planted_native_fields_patterns_helpers_and_escapes_fail_readset() {
     assert_readset_rejected(
         native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
         "defined but unreviewed helper",
+    );
+}
+
+#[test]
+fn native_model_window_helper_requires_exact_root_and_typed_arguments() {
+    let signature =
+        "fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool";
+    assert!(HEALTH_SOURCE.contains(signature), "stale model-window root");
+    for replacement in [
+        "fn renamed_model_window_helper(window: Option<&str>, model: Option<&str>) -> bool",
+        "fn claude_window_applies_to_model(window: &str, model: Option<&str>) -> bool",
+        "#[allow(dead_code)] fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool",
+    ] {
+        let fixture = HEALTH_SOURCE.replacen(signature, replacement, 1);
+        assert_readset_rejected(
+            native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+            replacement,
+        );
+    }
+    let fixture = format!("{HEALTH_SOURCE}\n{signature} {{ true }}");
+    assert_readset_rejected(
+        native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+        "duplicate model-window root",
+    );
+    let call = "claude_window_applies_to_model(w[\"name\"].as_str(), model)";
+    assert!(HEALTH_SOURCE.contains(call), "stale model-window call");
+    let fixture =
+        HEALTH_SOURCE.replacen(call, "claude_window_applies_to_model(w.clone(), model)", 1);
+    assert_readset_rejected(
+        native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+        "whole window passed to scalar helper",
+    );
+}
+
+#[test]
+fn planted_model_window_helper_body_and_callbacks_remain_closed() {
+    let root =
+        "fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool {";
+    for planted in [
+        "let _hidden = UNRECORDED_MODEL_OWNER;",
+        "let _hidden = unreviewed_model_helper(window);",
+        "let _hidden = window.as_bytes();",
+        "let _hidden = [window].iter().all(|value| value);",
+        "let _hidden = [1u8].iter().all(|byte| { let _hidden = UNRECORDED_MODEL_OWNER; true });",
+    ] {
+        let fixture = plant_after(HEALTH_SOURCE, root, planted);
+        assert_readset_rejected(
+            native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+            planted,
+        );
+    }
+    let callback = "u8::is_ascii_digit";
+    assert!(HEALTH_SOURCE.contains(callback), "stale byte predicate");
+    let fixture = HEALTH_SOURCE.replacen(callback, "u8::unreviewed_predicate", 1);
+    assert_readset_rejected(
+        native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+        "unreviewed byte callback",
+    );
+    let closure = "|name: &str| matches!(name,";
+    assert!(HEALTH_SOURCE.contains(closure), "stale family callback");
+    let fixture = HEALTH_SOURCE.replacen(
+        closure,
+        "|name: &str| matches!({ let _hidden = UNRECORDED_MODEL_OWNER; name },",
+        1,
+    );
+    assert_readset_rejected(
+        native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+        "external read inside inspected family closure",
+    );
+}
+
+#[test]
+fn model_window_scalar_behavior_mutation_remains_an_allowed_readset() {
+    let needle = "matches!(name, \"fable\" | \"opus\" | \"sonnet\" | \"haiku\")";
+    assert!(
+        HEALTH_SOURCE.contains(needle),
+        "stale family behavior fault"
+    );
+    let fixture = HEALTH_SOURCE.replacen(needle, "matches!(name, \"opus\")", 1);
+    assert_eq!(
+        native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+        Vec::<String>::new()
     );
 }
 

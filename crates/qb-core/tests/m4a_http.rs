@@ -1666,11 +1666,90 @@ async fn c6_row_6a_model_plan_denial_scopes_then_allows_other_model() {
     let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
     h.fake.state.push(ScriptedResponse::json(StatusCode::BAD_REQUEST,r#"{"error":{"message":"The 'fixture-pro' model is not supported when using Codex with a ChatGPT account"}}"#));
     h.fake.state.push(ok());
-    assert_eq!(h.send(Provider::Codex, "{}").await.status(), 200);
-    let a = h.store.load(&h.ids()[0]).unwrap();
-    assert!(a.eligible(Some("fixture-other")));
-    assert!(!a.eligible(Some("fixture-pro")));
+    let response = h.send(Provider::Codex, "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request.body == "{}"));
+    assert_ne!(
+        requests[0].headers["authorization"],
+        requests[1].headers["authorization"]
+    );
+    let source = h
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|account| {
+            requests[0].headers["authorization"]
+                == format!("Bearer {}", h.store.tokens(account).unwrap().access_token)
+        })
+        .unwrap();
+    assert_response_hint_denial_is_model_scoped(&h, &source.id).await;
 }
+
+/// Exercise rejection membership through real routing: native account health
+/// remains Ready, the denied model cannot use the sole active source, and an
+/// unrelated model still reaches that source. No private cache access is needed.
+async fn assert_response_hint_denial_is_model_scoped(h: &Harness, source_id: &str) {
+    let source = h.store.load(source_id).unwrap();
+    assert_eq!(source.health, Health::Ready);
+    assert!(source.eligible(Some("fixture-pro")));
+    assert!(source.eligible(Some("fixture-other")));
+    for id in h.ids().into_iter().filter(|id| id != source_id) {
+        h.state
+            .accounts
+            .change(&id, Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+    }
+    let before = h
+        .fake
+        .state
+        .requests()
+        .iter()
+        .filter(|r| r.path_and_query == "/responses")
+        .count();
+    let denied = h
+        .send(Provider::Codex, r#"{"model":"fixture-pro","input":[]}"#)
+        .await;
+    assert!(!denied.status().is_success());
+    denied.bytes().await.unwrap();
+    assert_eq!(
+        h.fake
+            .state
+            .requests()
+            .iter()
+            .filter(|r| r.path_and_query == "/responses")
+            .count(),
+        before,
+        "the exact response-attributed model must be denied before another provider dispatch"
+    );
+    let other = r#"{ "model":"fixture-other", "input":[] }"#;
+    h.fake.state.push(ok());
+    let response = h.send(Provider::Codex, other).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let calls = h.fake.state.requests();
+    let data: Vec<_> = calls
+        .iter()
+        .filter(|r| r.path_and_query == "/responses")
+        .collect();
+    assert_eq!(data.len(), before + 1);
+    assert_eq!(data.last().unwrap().body.as_ref(), other.as_bytes());
+    assert_eq!(
+        data.last().unwrap().headers["authorization"],
+        format!(
+            "Bearer {}",
+            h.store
+                .tokens(&h.store.load(source_id).unwrap())
+                .unwrap()
+                .access_token
+        )
+    );
+}
+
 #[tokio::test]
 async fn n6t_http_response_model_hint_preserves_actual_keyed_attempt_and_body() {
     let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
@@ -1706,11 +1785,12 @@ async fn n6t_http_response_model_hint_preserves_actual_keyed_attempt_and_body() 
         .unwrap();
     assert_ne!(source.id, successor);
     assert!(source.eligible(Some("fixture-other")));
-    assert!(!source.eligible(Some("fixture-pro")));
+    assert_eq!(source.health, Health::Ready);
     assert_eq!(
         h.state.bindings.current(Some(&format!("codex:{session}"))),
         Some(successor)
     );
+    assert_response_hint_denial_is_model_scoped(&h, &source.id).await;
 }
 
 #[tokio::test]
@@ -4235,7 +4315,7 @@ async fn r11_http_entry_new_model_refreshes_only_bound_catalog_before_dispatch()
 }
 
 #[tokio::test]
-async fn r11_http_entry_upstream_model_denial_refreshes_menu_without_shopping() {
+async fn r11_http_entry_upstream_model_denial_replays_once_without_rewriting_or_eager_refresh() {
     let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
     let launch = r11_http_issue(&h).await;
     let before = h.fake.state.requests().len();
@@ -4243,36 +4323,78 @@ async fn r11_http_entry_upstream_model_denial_refreshes_menu_without_shopping() 
         StatusCode::BAD_REQUEST,
         r#"{"error":{"code":"model_not_found","message":"model is not supported when using Codex with a ChatGPT account"}}"#,
     ));
-    h.fake.state.push(ScriptedResponse::json(
-        StatusCode::OK,
-        r#"{"models":[{"slug":"replacement"}]}"#,
-    ));
+    h.fake.state.push(ok());
+    let body = r#"{ "model":"synthetic-model", "input":[] }"#;
     let response = reqwest::Client::new()
         .post(format!("{}/responses", launch.base_url))
         .bearer_auth("synthetic-client")
         .header("session-id", "r11-denied-model")
-        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .body(body)
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["error"]["type"],
-        "model_not_supported"
-    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let successor = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    assert_ne!(successor, launch.account);
     let calls = h.fake.state.requests();
     let added = &calls[before..];
-    assert_eq!(added.len(), 2);
-    assert_eq!(added[0].path_and_query, "/responses");
-    assert!(added[1].path_and_query.starts_with("/models"));
     assert_eq!(
+        added.len(),
+        2,
+        "one same-model replay without an eager catalog refresh"
+    );
+    for call in added {
+        assert_eq!(call.path_and_query, "/responses");
+        assert_eq!(call.body.as_ref(), body.as_bytes());
+    }
+    assert_ne!(
         added[0].headers["chatgpt-account-id"],
         added[1].headers["chatgpt-account-id"]
     );
     assert_eq!(
         h.state.bindings.current(Some("codex:r11-denied-model")),
-        Some(launch.account)
+        Some(successor.clone())
     );
+    assert_eq!(h.store.load(&launch.account).unwrap().health, Health::Ready);
+    assert_eq!(
+        r30_admin_model_accounts(&h, "synthetic-model").await,
+        std::collections::BTreeSet::from([successor])
+    );
+}
+
+async fn r30_admin_model_accounts(h: &Harness, model: &str) -> std::collections::BTreeSet<String> {
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/admin/v1/models", h.servers.admin_addr))
+        .bearer_auth("synthetic-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let union: Value = response.json().await.unwrap();
+    let provider = union["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["provider"] == "codex")
+        .unwrap();
+    provider["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == model)
+        .map(|m| {
+            m["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["id"].as_str().unwrap().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[tokio::test]
@@ -4745,64 +4867,58 @@ async fn r11_http_entry_invalid_model_metadata_never_dispatches() {
 }
 
 #[tokio::test]
-async fn r11_http_entry_model_denial_keeps_hold_when_catalog_does_not_remove_model() {
-    for refresh_fails in [false, true] {
-        let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
-        let launch = r11_http_issue(&h).await;
-        h.fake.state.push(ScriptedResponse::json(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"The 'synthetic-model' model is not supported when using Codex with a ChatGPT account"}}"#,
-        ));
-        h.fake.state.push(ScriptedResponse::json(
-            if refresh_fails {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::OK
-            },
-            if refresh_fails {
-                "{}"
-            } else {
-                r#"{"models":[{"slug":"synthetic-model"}]}"#
-            },
-        ));
-        let client = reqwest::Client::new();
-        let send = || {
-            client
-                .post(format!("{}/responses", launch.base_url))
-                .bearer_auth("synthetic-client")
-                .header("session-id", "r11-model-hold")
-                .body(r#"{"model":"synthetic-model","input":[]}"#)
-                .send()
-        };
-        let response = send().await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        response.bytes().await.unwrap();
-        let account = h.store.load(&launch.account).unwrap();
-        assert!(!account.eligible(Some("synthetic-model")));
-        assert!(account.eligible(Some("different-model")));
-        assert!(matches!(
-            account.health,
-            Health::Cooling {
-                reason: HealthReason::Permission,
-                ..
-            }
-        ));
-        let response = tokio::time::timeout(Duration::from_secs(10), send())
+async fn r11_http_entry_model_denial_retains_membership_override_and_refuses_second_dispatch() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let before = h.fake.state.requests().len();
+    let upstream = r#"{"error":{"message":"The 'synthetic-model' model is not supported when using Codex with a ChatGPT account"}}"#;
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::BAD_REQUEST, upstream));
+    let client = reqwest::Client::new();
+    let send = || {
+        client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", "r11-model-hold")
+            .body(r#"{"model":"synthetic-model","input":[]}"#)
+            .send()
+    };
+    let response = send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        upstream.as_bytes()
+    );
+    let account = h.store.load(&launch.account).unwrap();
+    assert_eq!(account.health, Health::Ready);
+    assert!(account.eligible(Some("synthetic-model")));
+    assert!(account.eligible(Some("different-model")));
+    assert!(
+        r30_admin_model_accounts(&h, "synthetic-model")
             .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(response.status(), StatusCode::OK);
-        response.bytes().await.unwrap();
-        assert_eq!(
-            h.fake
-                .state
-                .requests()
-                .iter()
-                .filter(|r| r.path_and_query == "/responses")
-                .count(),
-            1
-        );
-    }
+            .is_empty()
+    );
+    let response = tokio::time::timeout(Duration::from_secs(10), send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["type"],
+        "model_not_supported"
+    );
+    let calls = h.fake.state.requests();
+    assert_eq!(
+        calls.len(),
+        before + 1,
+        "denial must neither eagerly refresh nor dispatch the same model again"
+    );
+    assert_eq!(calls[before].path_and_query, "/responses");
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-model-hold")),
+        Some(launch.account)
+    );
 }
 
 #[tokio::test]

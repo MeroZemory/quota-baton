@@ -375,7 +375,7 @@ fn codex_usage_reply(input: u64, cached: u64) -> ScriptedResponse {
 }
 
 #[tokio::test]
-async fn ordinary_codex_http_model_hint_measures_move_without_routing_model() {
+async fn ordinary_codex_http_requested_model_preserves_move_accounting() {
     let h = Harness::new_provider(5, Provider::Codex).await;
     let body = r#"{"model":"r14-synthetic-model","input":[]}"#;
     let session = "r14-ordinary-codex";
@@ -412,8 +412,10 @@ async fn ordinary_codex_http_model_hint_measures_move_without_routing_model() {
         .collect();
     assert_eq!(turns.len(), 5);
     assert!(
-        turns.iter().all(|row| row["model"].is_null()),
-        "accounting hint changed legacy request model metadata"
+        turns
+            .iter()
+            .all(|row| row["model"] == "r14-synthetic-model"),
+        "R30 records the actual requested model without changing move accounting"
     );
     assert_eq!(
         rows.iter()

@@ -120,7 +120,7 @@ impl RelayState {
             return;
         }
         let window = status.window;
-        let mut reset_at = Some(status.reset_at);
+        let mut reset_at = status.observed_reset_at;
         let mut earliest_account = None;
         let mut model_limited = entitled.contains(&account.id) && status.model_limited;
         if next.is_none() {
@@ -135,7 +135,9 @@ impl RelayState {
                 .filter_map(|a| {
                     self.accounts
                         .model_quota_status(a, model, now)
-                        .map(|status| (a.id.clone(), status.reset_at))
+                        .and_then(|status| {
+                            status.observed_reset_at.map(|reset| (a.id.clone(), reset))
+                        })
                 })
                 .min_by_key(|(_, reset)| *reset);
             reset_at = earliest.as_ref().map(|(_, reset)| *reset);

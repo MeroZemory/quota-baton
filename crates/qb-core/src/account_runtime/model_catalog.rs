@@ -7,7 +7,10 @@ mod tests;
 /// Projection only; never persist its reducer output as an observed account.
 pub(crate) struct ModelQuotaStatus {
     pub window: Option<String>,
+    /// Operational cooldown deadline, which may include a local fallback.
     pub reset_at: DateTime<Utc>,
+    /// Observed provider reset only; absence must remain null in notices.
+    pub observed_reset_at: Option<DateTime<Utc>>,
     pub model_limited: bool,
 }
 
@@ -166,10 +169,20 @@ impl AccountRuntime {
         if projected_scope.is_none() && volatile_scope.is_none() {
             return None;
         }
+        let evidence = projected_scope
+            .and_then(|_| effective.quota_cooling.as_ref())
+            .filter(|quota| quota.reset_at > now && quota.started_at <= now);
+        // The existing observation fence checks account/health/deadline, but
+        // not model scope. Never lend another model's native reset to this one.
+        let native_observed =
+            quota_scope(&account.health).and_then(|_| self.observed_quota_reset(account));
         Some(ModelQuotaStatus {
-            window: projected_scope
-                .and_then(|_| effective.quota_cooling.as_ref().map(|q| q.window.clone())),
+            window: evidence.map(|quota| quota.window.clone()),
             reset_at: self.model_limited_until_projected(account, &effective, model, now)?,
+            observed_reset_at: native_observed
+                .into_iter()
+                .chain(evidence.map(|quota| quota.reset_at))
+                .max(),
             model_limited: projected_scope == Some(true) || volatile_scope == Some(true),
         })
     }

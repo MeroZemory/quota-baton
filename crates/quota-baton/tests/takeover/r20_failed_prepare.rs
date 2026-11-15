@@ -4,11 +4,11 @@ use super::*;
 
 #[tokio::test]
 async fn r20_failed_quota_prepare_allows_fresh_successor_retry() {
+    let _serial = SERIAL
+        .get_or_init(|| TokioMutex::const_new(()))
+        .lock()
+        .await;
     tokio::time::timeout(HARD, async {
-        let _serial = SERIAL
-            .get_or_init(|| TokioMutex::const_new(()))
-            .lock()
-            .await;
         let upstream = CatalogUpstream::start().await;
         let home = Home::new(&upstream.url).await;
         let account = accounts(&home, 1).remove(0);

@@ -217,8 +217,10 @@ mod r11_review {
         .await;
         assert_eq!(status, StatusCode::OK, "{reply}");
         assert_ne!(reply["account"], source);
-        assert_eq!(reply["model"], "synthetic-model",
-            "implicit resume preserves the proved model, not the held default");
+        assert_eq!(
+            reply["model"], "synthetic-model",
+            "implicit resume preserves the proved model, not the held default"
+        );
         assert_eq!(
             h.state
                 .bindings
@@ -227,7 +229,8 @@ mod r11_review {
         );
         assert_eq!(h.fake.state.requests().len(), calls_before);
         assert!(h.ledger().iter().any(|row| row["event"] == "binding_move"
-            && row["from"] == source && row["to"] == reply["account"]
+            && row["from"] == source
+            && row["to"] == reply["account"]
             && row["reason"] == "forced"));
     }
 
@@ -528,7 +531,7 @@ mod r11_review {
     }
 
     #[tokio::test]
-    async fn r11_review_restart_never_recovers_an_unproved_new_model_via_other_account() {
+    async fn r11_review_restart_paused_source_refuses_unproved_model_without_dispatch() {
         let (h, launch, persisted) = r11_http_restart_fixture().await;
         h.store
             .update_metadata(&persisted.account, |account| {
@@ -536,10 +539,6 @@ mod r11_review {
             })
             .unwrap();
         let before = h.fake.state.requests().len();
-        h.fake.state.push(ScriptedResponse::json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{}"#,
-        ));
         let response = reqwest::Client::new()
             .post(format!("{}/responses", launch.base_url))
             .bearer_auth("synthetic-client")
@@ -551,8 +550,15 @@ mod r11_review {
         assert_ne!(response.status(), StatusCode::OK);
         response.bytes().await.unwrap();
         let calls = h.fake.state.requests();
-        assert_eq!(calls.len(), before + 1);
-        assert!(calls.last().unwrap().path_and_query.starts_with("/models"));
+        // R27.1 excludes the paused source before catalog network I/O.
+        assert_eq!(calls.len(), before);
+        let unchanged = h
+            .state
+            .bindings
+            .launch_info(&persisted.canonical_key, Utc::now())
+            .unwrap();
+        assert_eq!(unchanged.current_model, persisted.current_model);
+        assert_eq!(unchanged.advertised_models, persisted.advertised_models);
         assert_eq!(
             h.state
                 .bindings

@@ -136,13 +136,17 @@ account until its next successful catalog refresh. Codex launch catalogs retain
 their existing validation and consent rules. A conversation can move to an
 entitled account under existing routing safeguards when its requested model
 changes; the requested model is never substituted. Replayable requests rejected
-as unavailable for that account may try one entitled successor.
+as unavailable for that account may try one entitled successor. For an unsent
+WebSocket create, a qualified 1012 close asks the client to reconnect through
+normal selection; qb does not replay a create on a new socket.
 
 If all entitled accounts are limited, a relay's 429 `retry-after` and quota
 notice recovery identity refer only to that entitled set. A launch returns
 `launch_unavailable` with `reason: "model_limited"`, `retry_after` (seconds),
 `earliest_account` and `reset_at`, rather than adding a wait. Existing near-reset
-holds use the same entitled pool.
+holds use the same entitled pool. Notice reset times remain null when the
+provider supplied no reset evidence; a local cooldown deadline does not become
+an observed provider reset.
 
 Logins do not target an account: the identity the user authorizes is created
 or updated, and `account_id` in the result names it. Check it against the

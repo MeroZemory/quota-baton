@@ -37,20 +37,19 @@ use tokio_tungstenite::{
 const HARD: Duration = Duration::from_secs(60);
 static SERIAL: OnceLock<TokioMutex<()>> = OnceLock::new();
 
-// The outer timeout includes setup, polling, streaming, CLI waits, and cleanup.
+// The actual-case timeout excludes queue wait and includes setup, polling,
+// streaming, CLI waits, and cleanup.
 macro_rules! e2e {
     ($name:ident, $body:block) => {
         #[tokio::test]
         async fn $name() {
-            tokio::time::timeout(HARD, async {
-                let _serial = SERIAL
-                    .get_or_init(|| TokioMutex::const_new(()))
-                    .lock()
-                    .await;
-                $body
-            })
-            .await
-            .expect(concat!(stringify!($name), " exceeded hard timeout"));
+            let _serial = SERIAL
+                .get_or_init(|| TokioMutex::const_new(()))
+                .lock()
+                .await;
+            tokio::time::timeout(HARD, async { $body })
+                .await
+                .expect(concat!(stringify!($name), " exceeded hard timeout"));
         }
     };
 }

@@ -2328,7 +2328,11 @@ impl AccountRuntime {
                     })
                     .filter_map(|other| {
                         self.model_quota_status(other, model, now)
-                            .map(|status| (other.id.clone(), status.reset_at))
+                            .and_then(|status| {
+                                status
+                                    .observed_reset_at
+                                    .map(|reset| (other.id.clone(), reset))
+                            })
                     })
                     .min_by_key(|(_, reset)| *reset);
                 let reset_at = json!(earliest.as_ref().map(|(_, reset)| *reset));
@@ -3477,7 +3481,12 @@ impl AccountRuntime {
         let now = Utc::now();
         let mut cooling = Vec::new();
         for a in &candidates {
-            if let Some(until) = self.model_limited_until(a, model, now) {
+            let quota = self.model_quota_status(a, model, now);
+            if let Some(until) = quota
+                .as_ref()
+                .map(|status| status.reset_at)
+                .or_else(|| self.model_limited_until(a, model, now))
+            {
                 // A cached, exact-model exhausted window can block an otherwise
                 // Ready row too. Combine concurrent holds per account before
                 // taking the earliest recovery across entitled accounts.
@@ -3485,19 +3494,21 @@ impl AccountRuntime {
                     matches!(health, Health::Cooling { reason: HealthReason::Quota | HealthReason::Auth, until, scope }
                         if *until > now && (scope == "account" || model.is_some_and(|m| scope == &format!("model:{m}"))))
                 });
-                cooling.push((*a, until, replay));
+                let priority = replay || quota.is_some();
+                cooling.push((*a, until, replay, priority));
             }
             if self.probing(&a.id)
                 || ((a.auth_probe_pending || a.auth_failures > 0) && a.health == Health::Ready)
             {
-                cooling.push((*a, now + Duration::seconds(1), false));
+                cooling.push((*a, now + Duration::seconds(1), false, false));
             }
         }
         if !cooling.is_empty() {
-            // Recovery is the earliest entitled account, whether its native
-            // limit was observed on a request or reconstructed from a fresh poll.
-            cooling.sort_by_key(|(_, until, replay)| (*until, !*replay));
-            let (a, until, replay) = cooling[0];
+            // Genuine native or reconstructed quota limits precede non-quota
+            // fallback cooling. Within that group, use the earliest entitled
+            // recovery; only a native selected account can replay its body.
+            cooling.sort_by_key(|(_, until, replay, priority)| (!*priority, *until, !*replay));
+            let (a, until, replay, _) = cooling[0];
             let seconds = (until - Utc::now()).num_seconds().max(1);
             let mut result = if !websocket
                 && replay
