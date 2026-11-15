@@ -6,7 +6,6 @@ use crate::{
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
-use tower::ServiceExt;
 
 struct Fixture {
     relay: Arc<RelayState>,
@@ -26,7 +25,7 @@ impl Fixture {
         let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
         let obs = Arc::new(crate::observability::Observability::new(home.path(), None).unwrap());
         let config = crate::config::Config::default();
-        // No schedulers or listeners: all catalogs and credentials are synthetic.
+        // No schedulers: all catalogs and credentials are synthetic.
         let relay = Arc::new(
             RelayState::new(
                 store,
@@ -103,22 +102,29 @@ impl Fixture {
     }
 
     async fn models(&self) -> AdminModels {
-        let response = super::super::runtime_routes(self.relay.clone(), 0)
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/admin/v1/models")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap()
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = super::super::runtime_routes(self.relay.clone(), 0);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        // Use the existing router constructor without selecting OS-specific
+        // state fields or adding a test-only transport dependency.
+        let result = async {
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()?
+                .get(format!("http://{address}/admin/v1/models"))
+                .send()
+                .await?;
+            let status = response.status();
+            Ok::<_, reqwest::Error>((status, response.bytes().await?))
+        }
+        .await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let (status, body) = result.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).unwrap()
     }
 }
 
