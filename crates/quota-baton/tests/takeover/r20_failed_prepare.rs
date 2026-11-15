@@ -1,4 +1,4 @@
-//! Real failed quota persistence followed by a fresh native takeover recipient.
+//! Real failed quota persistence, automatic drain recovery and a fresh owner.
 
 use super::*;
 
@@ -105,19 +105,23 @@ async fn r20_failed_quota_prepare_allows_fresh_successor_retry() {
         assert!(!phase(&home, owner.pid, "lease_released"));
         assert!(!phase(&home, first.pid, "lease_acquired"));
 
-        // The first process has actually exited. Only remove our empty exact
-        // obstruction; preserve all other state and retry through the real CLI.
+        // The first process has actually exited. Repair only the exact empty
+        // obstruction. The incumbent must finish draining without another HTTP
+        // request; its original listener-transfer readiness deadline still bounds
+        // shutdown when the intended recipient has already exited.
         fs::remove_dir(&quota).unwrap();
+        assert!(owner.wait(Duration::from_secs(45)).await.success());
+        until(|| phase(&home, owner.pid, "lease_released")).await;
         let mut command = home.command();
         command.args(["serve", "--takeover"]).env("QB_LOG", "info");
         let second = Core::from_command(command, home.path.join("failed-prepare-second.stderr"));
         assert_ne!(first.pid, second.pid);
         ready(&client, &home, &token, second.pid).await;
-        assert!(owner.wait(Duration::from_secs(10)).await.success());
         assert!(second.status().is_none());
         lease_busy(&home);
-        until(|| phase(&home, owner.pid, "lease_released")).await;
-        until(|| phase(&home, second.pid, "bindings_imported")).await;
+        // The old owner already exited and released its lease; persisted state
+        // replaces the memory-only import on this independent fresh startup.
+        until(|| phase(&home, second.pid, "listening")).await;
         until(|| {
             fs::read(&quota)
                 .ok()

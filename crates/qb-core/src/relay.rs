@@ -481,6 +481,7 @@ impl RelayState {
         }
         self.quota.close_reset_credits().await;
         if self.tokens.shutdown_refreshes().await.is_err() {
+            tracing::warn!("Takeover refresh shutdown failed; retaining credential lease");
             return Err(());
         }
         let bindings = self.bindings.clone();
@@ -488,13 +489,22 @@ impl RelayState {
         let obs = self.observability.clone();
         let exported = crate::boxes::spawn_blocking(move || {
             store.stop_writes();
-            obs.freeze_quota()?;
-            bindings.freeze()?;
-            let exported = bindings.export()?;
+            obs.freeze_quota().inspect_err(|_| {
+                tracing::warn!("Takeover quota flush failed; retaining credential lease");
+            })?;
+            bindings.freeze().inspect_err(|_| {
+                tracing::warn!("Takeover binding flush failed; retaining credential lease");
+            })?;
+            let exported = bindings.export().inspect_err(|_| {
+                tracing::warn!("Takeover binding export failed; retaining credential lease");
+            })?;
             obs.shutdown_replay();
             Ok::<_, anyhow::Error>(exported)
         })
         .await
+        .inspect_err(|_| {
+            tracing::warn!("Takeover preparation worker failed; retaining credential lease");
+        })
         .ok()
         .and_then(Result::ok)
         .ok_or(())?;

@@ -200,9 +200,37 @@ pub(crate) fn notify_ready() -> Result<()> {
 pub(crate) async fn wait_for_shutdown(relay: Arc<RelayState>) -> Result<()> {
     tokio::select! {
         result = tokio::signal::ctrl_c() => { result?; }
-        _ = relay.wait_for_drain() => {}
+        _ = async {
+            relay.wait_for_drain_start().await;
+            finish_drain_preparation(&relay).await;
+        } => {}
     }
     Ok(())
+}
+
+async fn finish_drain_preparation(relay: &RelayState) {
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        // The HTTP caller may still own drain_gate. Prefer its completion over
+        // another export; cancellation or failure leaves preparation to us.
+        tokio::select! {
+            biased;
+            _ = relay.wait_for_drain() => return,
+            prepared = relay.begin_drain() => {
+                if prepared.is_ok() {
+                    return;
+                }
+            }
+        }
+        // No listener closure or lease release is safe until preparation wins.
+        tracing::warn!("Drain preparation incomplete; retaining lease and retrying");
+        tokio::select! {
+            biased;
+            _ = relay.wait_for_drain() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
 }
 
 /// Main calls after box admission and schedulers stop, immediately before
