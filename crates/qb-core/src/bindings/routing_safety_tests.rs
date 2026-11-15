@@ -2,6 +2,100 @@ use super::tests::{candidate, fixture_dir};
 use super::*;
 
 #[test]
+fn claude_model_window_selection_keeps_other_families_available() {
+    for (window, held_model, requested, account_used, chosen) in [
+        (
+            "7d_oi",
+            "claude-fable-5-2",
+            Some("claude-sonnet-5-5"),
+            51.0,
+            true,
+        ),
+        (
+            "7d_oi",
+            "claude-fable-5-2",
+            Some("claude-fable-5-2"),
+            51.0,
+            false,
+        ),
+        (
+            "7d_oi",
+            "claude-fable-5-2",
+            Some("claude-opus-4-1"),
+            51.0,
+            false,
+        ),
+        (
+            "7d_oi",
+            "claude-fable-5-2",
+            Some("claude-haiku-4-5"),
+            51.0,
+            true,
+        ),
+        (
+            "7d_sonnet",
+            "claude-sonnet-5-5",
+            Some("claude-fable-5-2"),
+            51.0,
+            true,
+        ),
+        (
+            "7d_oi",
+            "claude-fable-5-2",
+            Some("claude-sonnet-5-5"),
+            100.0,
+            false,
+        ),
+        (
+            "7d_oi",
+            "claude-fable-5-2",
+            Some("synthetic-model"),
+            51.0,
+            false,
+        ),
+        ("7d_oi", "claude-fable-5-2", None, 51.0, true),
+    ] {
+        let root = fixture_dir();
+        let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+        let now = Utc::now();
+        let until = now + chrono::Duration::days(1);
+        let mut c = candidate("cl-model-window", 51.0, 24, 1);
+        c.account.health = Health::Cooling {
+            reason: crate::accounts::HealthReason::Quota,
+            until,
+            scope: format!("model:{held_model}"),
+        };
+        c.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: window.into(),
+            reset_at: until,
+            started_at: now - chrono::Duration::minutes(1),
+        });
+        assert_eq!(
+            c.account.eligible_at(requested, now),
+            requested != Some(held_model)
+        );
+        c.quota = Some(serde_json::json!({"observed_at":now,"windows":[
+            {"name":"7d","used_pct":account_used,"reset_at":until,"observed_at":now,"status":"allowed"},
+            {"name":window,"used_pct":100.0,"reset_at":until,"observed_at":now,"status":"rejected"}
+        ],"signals":{"unified_status":"rejected"}}));
+        let decision = table.choose(
+            Provider::Claude,
+            Some("claude:model-window"),
+            None,
+            requested,
+            &[c],
+            None,
+            100,
+        );
+        assert_eq!(
+            matches!(decision, Decision::Selected { .. }),
+            chosen,
+            "window={window} requested={requested:?} account_used={account_used}"
+        );
+    }
+}
+
+#[test]
 fn failed_root_selection_cannot_accumulate_unbounded_cost_metadata() {
     let (_root, t, _cs) = fixture();
     let before = t.data.lock().unwrap().last_request_bytes.len();

@@ -5,6 +5,208 @@ use chrono::{DateTime, Duration, Utc};
 // Leave headroom after a request-level rejection near the limit.
 const EARLY_RESET_MAX_USED_PCT: f64 = 95.0;
 
+/// Unknown models/windows keep the existing conservative interpretation.
+fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return true;
+    };
+    let known_family = |name: &str| matches!(name, "fable" | "opus" | "sonnet" | "haiku");
+    let family = if known_family(model) {
+        model
+    } else {
+        let Some(canonical) = model.strip_prefix("claude-") else {
+            return true;
+        };
+        let mut parts = canonical.split('-');
+        let first = parts.next().unwrap_or_default();
+        if known_family(first) {
+            first
+        } else if !first.is_empty() && first.as_bytes().iter().all(u8::is_ascii_digit) {
+            // Older canonical IDs put the generation before the family name.
+            let Some(family) = parts
+                .find(|part| part.is_empty() || !part.as_bytes().iter().all(u8::is_ascii_digit))
+            else {
+                return true;
+            };
+            if known_family(family) {
+                family
+            } else {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    };
+    !matches!(
+        (window, family),
+        (Some("7d_oi" | "seven_day_opus"), "sonnet" | "haiku")
+            | (
+                Some("7d_sonnet" | "seven_day_sonnet"),
+                "fable" | "opus" | "haiku"
+            )
+    )
+}
+
+#[cfg(test)]
+mod claude_model_window_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn claude_model_window_other_family_observation_does_not_replace_native_hold() {
+        let now = Utc::now();
+        let until = now + Duration::days(1);
+        let mut account = super::tests::fixture();
+        account.provider = Provider::Claude;
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until,
+            scope: "model:claude-fable-5-2".into(),
+        };
+        account.quota_cooling = Some(QuotaCooling {
+            window: "7d_oi".into(),
+            reset_at: until,
+            started_at: now - Duration::minutes(1),
+        });
+        let before = account.health.clone();
+        account.apply_health_signal(HealthSignal::UsageSnapshot {
+            snapshot:json!({"windows":[
+                {"name":"7d","used_pct":51,"reset_at":until,"observed_at":now,"status":"allowed"},
+                {"name":"7d_oi","used_pct":100,"reset_at":until+Duration::days(1),"observed_at":now,"status":"rejected"}
+            ],"signals":{"unified_status":"rejected"}}),
+            model:Some("claude-sonnet-5-5".into()), projected_allowance:0.0
+        }, now);
+        assert_eq!(account.health, before);
+        assert!(account.eligible_at(Some("claude-sonnet-5-5"), now));
+        assert!(!account.eligible_at(Some("claude-fable-5-2"), now));
+    }
+
+    #[test]
+    fn claude_model_window_snapshot_preserves_global_attribution_and_request_holds() {
+        for (provider, window, model, account_used, held) in [
+            (
+                Provider::Claude,
+                "7d_oi",
+                Some("claude-sonnet-5-5"),
+                51.0,
+                false,
+            ),
+            (
+                Provider::Claude,
+                "7d_oi",
+                Some("claude-fable-5-2"),
+                51.0,
+                true,
+            ),
+            (
+                Provider::Claude,
+                "7d_sonnet",
+                Some("claude-fable-5-2"),
+                51.0,
+                false,
+            ),
+            (
+                Provider::Claude,
+                "7d_oi",
+                Some("claude-haiku-4-5"),
+                51.0,
+                false,
+            ),
+            (Provider::Claude, "7d_oi", Some("sonnet"), 51.0, false),
+            (
+                Provider::Claude,
+                "7d_oi",
+                Some("claude-3-5-sonnet-20241022"),
+                51.0,
+                false,
+            ),
+            (Provider::Claude, "7d_oi", Some("opus"), 51.0, true),
+            (Provider::Claude, "7d_sonnet", Some("haiku"), 51.0, false),
+            (
+                Provider::Claude,
+                "opaque_bucket",
+                Some("claude-sonnet-5-5"),
+                51.0,
+                true,
+            ),
+            (
+                Provider::Claude,
+                "7d_oi",
+                Some("synthetic-model"),
+                51.0,
+                true,
+            ),
+            (
+                Provider::Claude,
+                "7d_oi",
+                Some("claude-3-unknown-sonnet"),
+                51.0,
+                true,
+            ),
+            (Provider::Claude, "7d_oi", None, 51.0, false),
+            (
+                Provider::Claude,
+                "7d_oi",
+                Some("claude-sonnet-5-5"),
+                100.0,
+                true,
+            ),
+            (
+                Provider::Codex,
+                "7d_oi",
+                Some("claude-sonnet-5-5"),
+                51.0,
+                true,
+            ),
+        ] {
+            let now = Utc::now();
+            let until = now + Duration::days(1);
+            let snapshot = json!({"windows":[
+                {"name":"7d","used_pct":account_used,"reset_at":until,"observed_at":now,"status":"allowed"},
+                {"name":window,"used_pct":100.0,"reset_at":until,"observed_at":now,"status":"rejected"}
+            ],"signals":{"unified_status":"rejected"}});
+            let mut account = super::tests::fixture();
+            account.provider = provider;
+            account.apply_health_signal(
+                HealthSignal::UsageSnapshot {
+                    snapshot: snapshot.clone(),
+                    model: model.map(str::to_owned),
+                    projected_allowance: 0.0,
+                },
+                now,
+            );
+            assert_eq!(
+                matches!(account.health, Health::Cooling { .. }),
+                held,
+                "{provider:?} {window} {model:?}"
+            );
+            if let Some(model) = model {
+                account.apply_health_signal(
+                    HealthSignal::Cooling {
+                        reason: HealthReason::Quota,
+                        until: until + Duration::hours(1),
+                        scope: format!("model:{model}"),
+                    },
+                    now,
+                );
+                let actual_rejection = account.health.clone();
+                account.apply_health_signal(
+                    HealthSignal::UsageSnapshot {
+                        snapshot,
+                        model: Some(model.into()),
+                        projected_allowance: 0.0,
+                    },
+                    now,
+                );
+                assert_eq!(
+                    account.health, actual_rejection,
+                    "actual request rejection remains authoritative"
+                );
+            }
+        }
+    }
+}
+
 /// A health-owner judgement about this account at this exact selection instant.
 /// Missing credentials, retry exclusion and WS capacity are not health facts.
 pub(crate) struct UnusableEvidence {
@@ -534,7 +736,12 @@ impl Account {
                 fresh
                     .iter()
                     .copied()
-                    .filter(|w| subbucket(w) && qualifies(w))
+                    .filter(|w| {
+                        subbucket(w)
+                            && qualifies(w)
+                            && (self.provider != Provider::Claude
+                                || claude_window_applies_to_model(w["name"].as_str(), model))
+                    })
                     .collect::<Vec<_>>(),
             )
         };
