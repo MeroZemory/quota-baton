@@ -1,6 +1,98 @@
 use super::*;
 
 #[test]
+fn ordinary_claude_poll_model_recovery_requires_fresh_complete_known_scopes() {
+    for guard in [
+        "recovered",
+        "model_claim",
+        "omitted",
+        "null",
+        "unknown_claim",
+        "other_model",
+        "partial",
+        "incoming_rejection",
+        "near_limit",
+        "allowed_global",
+    ] {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let at = Utc::now() - Duration::seconds(10);
+        let start = at + Duration::seconds(1);
+        let reset = at + Duration::days(1);
+        let mut old = json!({"source":"headers","observed_at":at,"windows":[
+            {"name":"7d","used_pct":51,"reset_at":reset,"observed_at":at,"status":"allowed"},
+            {"name":"7d_oi","used_pct":100,"reset_at":reset,"observed_at":at,"status":"rejected"}
+        ],"signals":{"unified_status":"rejected"}});
+        if guard == "allowed_global" {
+            old["signals"]["unified_status"] = json!("allowed");
+        }
+        if guard == "unknown_claim" {
+            old["signals"]["representative_claim"] = json!("opaque");
+        }
+        if guard == "model_claim" {
+            old["signals"]["representative_claim"] = json!("seven_day_opus");
+        }
+        if guard == "other_model" {
+            old["windows"].as_array_mut().unwrap().push(json!({"name":"7d_sonnet","used_pct":100,"reset_at":reset,"observed_at":at,"status":"rejected"}));
+        }
+        obs.observe_poll("cl-model-recovery", old.clone(), true)
+            .unwrap();
+        let mut fresh = json!({"source":"poll","observed_at":start,"windows":[
+            {"name":"7d","used_pct":51,"reset_at":reset,"observed_at":start,"status":"allowed"},
+            {"name":"7d_oi","used_pct":0,"reset_at":reset,"observed_at":start}
+        ],"signals":{}});
+        if guard == "omitted" || guard == "null" {
+            fresh["windows"].as_array_mut().unwrap().pop();
+        }
+        if guard == "null" {
+            fresh["windows"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name":"7d_oi","used_pct":null,"reset_at":reset,"observed_at":null}));
+        }
+        if guard == "incoming_rejection" {
+            fresh["signals"]["unified_status"] = json!("rejected");
+        }
+        if guard == "near_limit" {
+            fresh["windows"][1]["used_pct"] = json!(97);
+        }
+        let merged = obs
+            .observe_claude_poll("cl-model-recovery", fresh, guard != "partial", start)
+            .unwrap();
+        let recovered = matches!(guard, "recovered" | "model_claim" | "allowed_global");
+        if guard == "allowed_global" {
+            assert_eq!(merged["signals"]["unified_status"], "allowed");
+        } else {
+            assert_eq!(
+                merged["signals"]["unified_status"].is_null(),
+                recovered,
+                "{guard}"
+            );
+        }
+        let model = merged["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == "7d_oi")
+            .unwrap();
+        assert_eq!(model["status"].is_null(), recovered, "{guard}");
+        if matches!(guard, "omitted" | "null") {
+            assert_eq!(model["used_pct"].as_f64(), Some(100.0));
+            assert_eq!(model["observed_at"], old["windows"][1]["observed_at"]);
+        }
+        if guard == "other_model" {
+            assert!(
+                merged["windows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w["name"] == "7d_sonnet" && w["status"] == "rejected")
+            );
+        }
+    }
+}
+
+#[test]
 fn ordinary_claude_poll_retirement_preserves_partial_rejected_and_unrelated_evidence() {
     for guard in [
         "healthy",
@@ -17,6 +109,7 @@ fn ordinary_claude_poll_retirement_preserves_partial_rejected_and_unrelated_evid
         "newer_window",
         "informational",
         "explicit_allowed",
+        "unrelated_near_model",
     ] {
         let dir = directory();
         let obs = Observability::new(dir.path(), None).unwrap();
@@ -68,6 +161,9 @@ fn ordinary_claude_poll_retirement_preserves_partial_rejected_and_unrelated_evid
             "explicit_allowed" => {
                 fresh["signals"] = json!({"unified_status":"allowed", "limit_reached":false,"overage_status":"allowed","retry_after_seconds":12.0})
             }
+            "unrelated_near_model" => {
+                fresh["windows"].as_array_mut().unwrap().push(json!({"name":"7d_oi","used_pct":97,"reset_at":reset,"observed_at":start,"status":"allowed"}));
+            }
             _ => {}
         }
         let merged =
@@ -80,7 +176,7 @@ fn ordinary_claude_poll_retirement_preserves_partial_rejected_and_unrelated_evid
         let merged = merged.unwrap();
         assert_eq!(
             merged["signals"]["unified_status"].is_null(),
-            guard == "healthy",
+            matches!(guard, "healthy" | "unrelated_near_model"),
             "{guard}"
         );
         assert_eq!(merged["credits"], before["credits"], "{guard}");
@@ -94,10 +190,20 @@ fn ordinary_claude_poll_retirement_preserves_partial_rejected_and_unrelated_evid
             assert_eq!(merged["signals"]["retry_after_seconds"], 12.0);
             assert!(merged["windows"][0]["status"].is_null());
         }
-        if guard == "healthy" {
+        if matches!(guard, "healthy" | "unrelated_near_model") {
             assert!(merged["windows"][0]["status"].is_null());
             assert!(merged["signals"]["unified_reset_at"].is_null());
             assert!(merged["signals"]["retry_after_seconds"].is_null());
+        }
+        if guard == "unrelated_near_model" {
+            let window = merged["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["name"] == "7d_oi")
+                .unwrap();
+            assert_eq!(window["used_pct"].as_f64(), Some(97.0));
+            assert_eq!(window["status"], "allowed");
         }
         if guard == "paid" {
             assert_eq!(merged["signals"]["active_limit"], "credits");

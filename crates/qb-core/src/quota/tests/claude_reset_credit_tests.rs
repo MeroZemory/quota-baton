@@ -16,6 +16,147 @@ mod r28_claude_reset_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_claude_poll_preserves_omitted_model_hold_then_recovers_fresh_model_usage() {
+        let f = fixture().await;
+        let reset = "2099-11-07T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "rejected".to_owned()),
+            (
+                "anthropic-ratelimit-unified-reset",
+                reset.timestamp().to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-status",
+                "allowed".to_owned(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-utilization",
+                "0.51".to_owned(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-reset",
+                reset.timestamp().to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d_oi-status",
+                "rejected".to_owned(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d_oi-utilization",
+                "1".to_owned(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d_oi-reset",
+                reset.timestamp().to_string(),
+            ),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        f.relay
+            .accounts
+            .observe_headers_for_model(
+                &f.ids[0],
+                Provider::Claude,
+                &headers,
+                Some("claude-fable-5-2"),
+            )
+            .await;
+        let before = f.account(0);
+        assert!(
+            matches!(&before.health, Health::Cooling {scope,..} if scope=="model:claude-fable-5-2")
+        );
+        assert_eq!(before.quota_cooling.as_ref().unwrap().window, "7d_oi");
+        let original = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap()["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == "7d_oi")
+            .unwrap()
+            .clone();
+        let mut body = json!({"five_hour":null,"seven_day":{"utilization":51,"resets_at":reset,"status":"allowed"}});
+        f.fake.state.push(reply(body.clone()));
+        f.fake.state.push(profile_reply(&f));
+        f.relay.quota.poll(&f.ids[0]).await.unwrap();
+        assert_eq!(f.account(0).health, before.health);
+        assert_eq!(f.account(0).quota_cooling, before.quota_cooling);
+        let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+        assert_eq!(
+            snapshot["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["name"] == "7d_oi")
+                .unwrap(),
+            &original,
+            "omission cannot invent a new observation or erase rejection attribution"
+        );
+        assert!(
+            f.relay
+                .accounts
+                .eligible(&f.ids[0], Some("claude-sonnet-5-5"))
+                .await
+        );
+        assert!(
+            !f.relay
+                .accounts
+                .eligible(&f.ids[0], Some("claude-fable-5-2"))
+                .await
+        );
+        for (model, chosen) in [("claude-sonnet-5-5", true), ("claude-fable-5-2", false)] {
+            let candidate = crate::bindings::Candidate {
+                account: f.account(0),
+                quota: Some(snapshot.clone()),
+                inflight: 0,
+            };
+            let decision = f.relay.bindings.choose(
+                Provider::Claude,
+                Some(&format!("claude:preserved-{model}")),
+                None,
+                Some(model),
+                &[candidate],
+                None,
+                100,
+            );
+            assert_eq!(
+                matches!(decision, crate::bindings::Decision::Selected { .. }),
+                chosen,
+                "{model}"
+            );
+        }
+        body["seven_day_opus"] = json!({"utilization":0,"resets_at":reset});
+        f.fake.state.push(reply(body));
+        f.fake.state.push(profile_reply(&f));
+        fresh_poller(&f).poll(&f.ids[0]).await.unwrap();
+        assert_eq!(f.account(0).health, Health::Ready);
+        assert!(f.account(0).quota_cooling.is_none());
+        assert!(
+            f.relay
+                .accounts
+                .eligible(&f.ids[0], Some("claude-fable-5-2"))
+                .await
+        );
+        let recovered = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+        assert!(recovered["signals"]["unified_status"].is_null());
+        assert!(
+            recovered["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["name"] == "7d_oi")
+                .unwrap()["status"]
+                .is_null()
+        );
+        assert!(
+            f.fake
+                .state
+                .requests()
+                .iter()
+                .all(|request| request.method == reqwest::Method::GET)
+        );
+    }
+
+    #[tokio::test]
     async fn ordinary_claude_poll_recovers_merged_header_hold_without_reset_post() {
         for (used, partial, rejected, ready) in [
             (0, false, false, true),

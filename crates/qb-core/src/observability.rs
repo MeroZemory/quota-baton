@@ -273,9 +273,12 @@ fn claude_poll_retires_rejection(next: &serde_json::Value, old: &serde_json::Val
     let signals = &old["signals"];
     if signals["unified_status"] != "rejected"
         && signals["limit_reached"] != true
-        && !previous
-            .iter()
-            .any(|w| matches!(w["name"].as_str(), Some("5h" | "7d")) && w["status"] == "rejected")
+        && !previous.iter().any(|w| {
+            matches!(
+                w["name"].as_str(),
+                Some("5h" | "7d" | "7d_oi" | "7d_sonnet")
+            ) && w["status"] == "rejected"
+        })
     {
         return false;
     }
@@ -284,7 +287,7 @@ fn claude_poll_retires_rejection(next: &serde_json::Value, old: &serde_json::Val
     }
     for key in ["active_limit", "representative_claim"] {
         if let Some(claim) = signals[key].as_str()
-            && !matches!(reset_window_name(claim), Some("5h" | "7d"))
+            && reset_window_name(claim).is_none()
         {
             return false;
         }
@@ -322,7 +325,14 @@ fn claude_poll_retires_rejection(next: &serde_json::Value, old: &serde_json::Val
                     .iter()
                     .find(|w| w["name"] == name)
                     .is_some_and(healthy),
-                "7d_oi" | "7d_sonnet" => prior["status"] != "rejected",
+                "7d_oi" | "7d_sonnet" => {
+                    !(prior["status"] == "rejected"
+                        || prior["used_pct"].as_f64().is_some_and(|used| used >= 100.0))
+                        || windows
+                            .iter()
+                            .find(|w| w["name"] == name)
+                            .is_some_and(healthy)
+                }
                 _ => false,
             }
         })
@@ -1550,7 +1560,10 @@ impl Observability {
                             for key in ["used_pct", "reset_at", "observed_at", "status"] {
                                 let reset_status = key == "status"
                                     && ((retire_claude
-                                        && matches!(window["name"].as_str(), Some("5h" | "7d")))
+                                        && matches!(
+                                            window["name"].as_str(),
+                                            Some("5h" | "7d" | "7d_oi" | "7d_sonnet")
+                                        ))
                                         || window["name"]
                                             .as_str()
                                             .is_some_and(|name| reset_scopes.contains(name)));
@@ -1561,7 +1574,14 @@ impl Observability {
                                     updated[key] = window[key].clone();
                                 }
                             }
-                        } else if preserve_missing_windows {
+                        } else if preserve_missing_windows
+                            || (matches!(mode, Some(QuotaMerge::ClaudePoll { .. }))
+                                && matches!(window["name"].as_str(), Some("7d_oi" | "7d_sonnet"))
+                                && (window["status"] == "rejected"
+                                    || window["used_pct"]
+                                        .as_f64()
+                                        .is_some_and(|used| used >= 100.0)))
+                        {
                             new.push(window.clone());
                         }
                     }
