@@ -113,8 +113,36 @@ URLs as secrets and do not log them.
 | Finish a paste login | `POST /admin/v1/accounts/login/<login_id>/submit` | Body `{"input":"<code or final redirect URL>"}`; one submission per login. |
 | Poll or cancel a login | `GET /admin/v1/accounts/login/<login_id>`, `POST .../cancel` | `{status: pending\|completed\|failed\|cancelled\|expired, account_id?, error?}`. |
 | Account state and usage | `GET /admin/v1/state` | `accounts[]` with `id`, `label`, `provider`, `plan`, `health`, `user_state`, `windows[]` (`name` such as `5h`, `7d` or `<n>m`, `used_pct`, `reset_at`, `status`, `observed_at`), `usage_forecast`, `pacing`. |
+| Provider model union | `GET /admin/v1/models` | `{providers:[{provider,models:[{id,display_name?,efforts?,default_effort?,accounts:[{id,usable_now,limited_until?}],observed_at,stale}]}],observed_at}`. Same admin authentication on the socket and port. |
 | Changes | `GET /admin/v1/events` | Event stream for state changes, including an account that needs a new login. |
 | Box keys and launches | see [Give each box its own key](#give-each-box-its-own-key) | Launch body `{model, model_is_explicit?, account_pref?, resume_id?, move_for_model?}`; `model` is required without a prior binding. Reply `{base_url, catalog_url, account, model}`. |
+
+The model union includes assignable accounts only. Names and reasoning efforts are
+included only when the provider reports them; model IDs are forwarded unchanged.
+Catalogs refresh every five minutes with each account's own credential. A failed
+refresh retains its last successful raw answer and observation time. A model is
+`stale` when its newest contributing observation is more than ten minutes old;
+stale models remain listed. `usable_now` checks native health, quota windows and
+holds for that exact model, while `limited_until` reports its current hold end.
+Consumers must ignore unknown additive fields.
+
+The cached model union can be polled once a minute. This version does not emit a
+`models_changed` event; existing event kinds are unchanged.
+
+Requests naming a model use accounts entitled to that model. Unknown Claude
+catalogs do not block startup; when no Claude catalog knows a model, normal
+selection permits the provider to answer it. Explicit model denials exclude that
+account until its next successful catalog refresh. Codex launch catalogs retain
+their existing validation and consent rules. A conversation can move to an
+entitled account under existing routing safeguards when its requested model
+changes; the requested model is never substituted. Replayable requests rejected
+as unavailable for that account may try one entitled successor.
+
+If all entitled accounts are limited, a relay's 429 `retry-after` and quota
+notice recovery identity refer only to that entitled set. A launch returns
+`launch_unavailable` with `reason: "model_limited"`, `retry_after` (seconds),
+`earliest_account` and `reset_at`, rather than adding a wait. Existing near-reset
+holds use the same entitled pool.
 
 Logins do not target an account: the identity the user authorizes is created
 or updated, and `account_id` in the result names it. Check it against the

@@ -1,4 +1,6 @@
 pub(super) mod capacity;
+#[cfg(test)]
+mod model_entitlement_tests;
 mod poll_reset;
 mod pump;
 pub(super) mod ws_attempt;
@@ -27,6 +29,66 @@ impl RetriedToken {
     }
 }
 static RETRIED_TOKENS: std::sync::Mutex<Vec<RetriedToken>> = std::sync::Mutex::new(Vec::new());
+
+// A bodyless reconnect needs the model of an UNSENT create too. This is only
+// side metadata: the next upgrade must obtain its own catalog/move admission.
+struct UnsentModelReconnect {
+    relay: std::sync::Weak<RelayState>,
+    key: String,
+    source: String,
+    model: String,
+    expires_at: std::time::Instant,
+}
+static UNSENT_MODEL_RECONNECTS: std::sync::Mutex<Vec<UnsentModelReconnect>> =
+    std::sync::Mutex::new(Vec::new());
+const MAX_UNSENT_MODEL_RECONNECTS: usize = 4096;
+
+fn remember_unsent_model(
+    relay: &Arc<RelayState>,
+    key: &str,
+    source: &str,
+    model: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let now = std::time::Instant::now();
+    let expires_at = deadline.into_std().min(now + RETRY_MARKER_TTL);
+    if expires_at <= now || key.len() > 1024 || !crate::catalog::valid_model_id(model) {
+        return false;
+    }
+    let Ok(mut entries) = UNSENT_MODEL_RECONNECTS.lock() else {
+        return false;
+    };
+    entries.retain(|entry| entry.relay.strong_count() > 0 && entry.expires_at > now);
+    let owner = Arc::downgrade(relay);
+    entries.retain(|entry| !(entry.relay.ptr_eq(&owner) && entry.key == key));
+    if entries.len() >= MAX_UNSENT_MODEL_RECONNECTS {
+        return false;
+    }
+    entries.push(UnsentModelReconnect {
+        relay: owner,
+        key: key.to_owned(),
+        source: source.to_owned(),
+        model: model.to_owned(),
+        expires_at,
+    });
+    true
+}
+
+fn unsent_reconnect_model(
+    relay: &Arc<RelayState>,
+    key: Option<&str>,
+    source: Option<&str>,
+) -> Option<String> {
+    let (key, source) = (key?, source?);
+    let now = std::time::Instant::now();
+    let owner = Arc::downgrade(relay);
+    let mut entries = UNSENT_MODEL_RECONNECTS.lock().ok()?;
+    entries.retain(|entry| entry.relay.strong_count() > 0 && entry.expires_at > now);
+    entries
+        .iter()
+        .find(|entry| entry.relay.ptr_eq(&owner) && entry.key == key && entry.source == source)
+        .map(|entry| entry.model.clone())
+}
 
 fn token_retried(relay: &Arc<RelayState>, account: &str, token: &str, mark: bool) -> bool {
     use sha2::{Digest, Sha256};
@@ -376,7 +438,8 @@ async fn upgrade_inner(
     // failed precommit turn so model-scoped health and evidence stay scoped.
     if session.model.is_none() {
         let source = state.bindings.current(session.key.as_deref());
-        session.model = state.reconnect_model(session.key.as_deref(), source.as_deref());
+        session.model = unsent_reconnect_model(&state, session.key.as_deref(), source.as_deref())
+            .or_else(|| state.reconnect_model(session.key.as_deref(), source.as_deref()));
     }
     completion.session(&session);
     let ticket = state.observability.capture_request(&parts.headers, &[]);
@@ -393,6 +456,7 @@ async fn upgrade_inner(
         .write_buffer_size(0);
     let mut tried = std::collections::BTreeSet::new();
     let mut forbidden = 0;
+    let mut model_denials = 0;
     let mut last_error = None;
     // One pacing deadline for the entire upgrade, including retries and
     // account selection. C7 reset-hold and token/network budgets stay separate.
@@ -1061,15 +1125,13 @@ async fn upgrade_inner(
             {
                 return network_failure();
             }
-            if managed.is_some() && decision.kind == super::outcome::Kind::ModelPermission {
-                // Keep C6 row 6a's durable model hold above, then refresh only
-                // this account. A capability denial never authorizes shopping.
-                let _ = tokio::time::timeout_at(
-                    launch_deadline,
-                    state.launch_catalog(&account.id, true, true),
-                )
-                .await;
-                return error.into_response();
+            if decision.kind == super::outcome::Kind::ModelPermission {
+                if let Some(model) = session.model.as_deref()
+                    && state.catalogs.deny_model(&account.id, model).is_err()
+                {
+                    return network_failure();
+                }
+                model_denials += 1;
             }
             if failover {
                 completion.failure_evidence = failure_evidence;
@@ -1130,7 +1192,7 @@ async fn upgrade_inner(
                 super::outcome::Kind::Payment | super::outcome::Kind::ModelPermission
             );
             let response = error.into_response();
-            if !failover || forbidden == 2 {
+            if !failover || forbidden == 2 || model_denials >= 2 {
                 return response;
             }
             last_error = preserve_last.then_some(response);

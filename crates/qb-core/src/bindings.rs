@@ -2149,6 +2149,15 @@ impl BindingTable {
             .copied()
             .unwrap_or(0)
     }
+    /// Resolve the same physical source used by canonical rebind, including an
+    /// unkeyed sticky row or a durable policy anchor after live-row pruning.
+    /// This observation grants no dispatch or move authority.
+    pub(crate) fn model_source(&self, provider: Provider, key: Option<&str>) -> Option<String> {
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        self.prune(&mut d, Utc::now());
+        self.rebind_source(&d, provider, key)
+    }
+
     pub fn current(&self, key: Option<&str>) -> Option<String> {
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut d, Utc::now());
@@ -2806,6 +2815,46 @@ impl BindingTable {
         root_hint: Option<&crate::boxes::RootHint>,
         admit: impl FnOnce(&str) -> Option<DispatchAdmission>,
     ) -> Decision {
+        self.choose_with_hold_at_admitted_proof_entitled(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            move_evidence,
+            None,
+            observations,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            now,
+            coverage,
+            root_hint,
+            admit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_with_hold_at_admitted_proof_entitled(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        move_evidence: &[Candidate],
+        entitled_targets: Option<&BTreeSet<String>>,
+        observations: MoveObservations,
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        coverage: Option<&BTreeSet<String>>,
+        root_hint: Option<&crate::boxes::RootHint>,
+        admit: impl FnOnce(&str) -> Option<DispatchAdmission>,
+    ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let capture = decision_tape::Capture::begin(self, || decision_tape::Inputs {
             entry: decision_tape::Entry::Chooser,
@@ -2861,7 +2910,7 @@ impl BindingTable {
                 model,
                 candidates,
                 move_evidence,
-                None,
+                entitled_targets,
                 observations,
                 pinned,
                 now,
@@ -5210,6 +5259,36 @@ mod tests {
             crate::routing::Mode::Strict
         );
     }
+    #[test]
+    fn r30_model_source_matches_native_sticky_and_pruned_anchor_resolution() {
+        let (_dir, t) = table();
+        let a = candidate("a", 10.0, 8, 1);
+        drop(choose(&t, None, std::slice::from_ref(&a)));
+        assert_eq!(t.current(None), None);
+        assert_eq!(t.model_source(Provider::Claude, None).as_deref(), Some("a"));
+        assert_eq!(t.model_source(Provider::Codex, None), None);
+        let key = "claude:r30-anchor";
+        t.policies
+            .set_session(&crate::routing::session_id(key), None, None, Some("a"))
+            .unwrap();
+        drop(choose(&t, Some(key), std::slice::from_ref(&a)));
+        assert_eq!(t.routing_plan(Some(key)).anchor.as_deref(), Some("a"));
+        {
+            let mut d = t.data.lock().unwrap();
+            d.bindings.clear();
+            d.groups.clear();
+        }
+        assert_eq!(t.current(Some(key)), None);
+        assert_eq!(
+            t.model_source(Provider::Claude, Some(key)).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            t.model_source(Provider::Claude, Some("claude:foreign")),
+            None
+        );
+    }
+
     #[test]
     fn warm_binding_and_unbound_stay_despite_thresholds_and_drain() {
         let (_dir, t) = table();

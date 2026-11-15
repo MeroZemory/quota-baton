@@ -65,6 +65,27 @@ pub(super) struct Context {
 }
 
 impl Context {
+    // Unknown ordinary catalogs retain their existing fallback. A managed
+    // unknown source still goes through admit_data_model's proved-model rules.
+    // A known miss or an explicit denial never authorizes this physical leg.
+    fn socket_model_entitled(&self, model: Option<&str>) -> bool {
+        let (Some(relay), Some(model)) = (&self.relay, model) else {
+            return true;
+        };
+        if !relay
+            .catalogs
+            .is_model_denied(&self.account, model)
+            .is_ok_and(|denied| !denied)
+        {
+            return false;
+        }
+        relay.catalogs.view(&self.account).is_ok_and(|view| {
+            view.observation
+                .last_known()
+                .is_none_or(|known| known.supported().contains(model))
+        })
+    }
+
     pub(super) fn launch_deadline(&self) -> Instant {
         Instant::now()
             + Duration::from_secs(
@@ -113,6 +134,9 @@ impl Context {
         model: Option<&str>,
         deadline: Instant,
     ) -> Result<(), DataLaunchError> {
+        if !self.socket_model_entitled(model) {
+            return Err(DataLaunchError::Changed);
+        }
         let Some(info) = self.managed_launch(deadline).await? else {
             return Ok(());
         };
@@ -120,7 +144,14 @@ impl Context {
         tokio::select! {
             biased;
             _ = relay.wait_for_drain_start() => Err(DataLaunchError::Unavailable),
-            result = relay.admit_data_model(&info, model, deadline) => result.map(|_| ()),
+            result = relay.admit_data_model(&info, model, deadline) => {
+                let accepted = result?;
+                if self.socket_model_entitled(accepted.as_deref()) {
+                    Ok(())
+                } else {
+                    Err(DataLaunchError::Changed)
+                }
+            },
         }
     }
 
@@ -681,24 +712,12 @@ async fn apply_error(
         runtime.transition(&context.account, signal).await?;
     }
     if decision.kind == Kind::ModelPermission
-        && let Some(relay) = &context.relay
+        && let (Some(relay), Some(model)) = (&context.relay, model)
     {
-        let deadline = context.launch_deadline();
-        if context
-            .managed_launch(deadline)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            // Persist the model-specific denial before observing a changed or
-            // unchanged menu. Refresh this socket's account without replay.
-            tokio::select! {
-                biased;
-                _ = relay.wait_for_drain_start() => {},
-                _ = tokio::time::timeout_at(deadline, relay.launch_catalog(&context.account, true, true)) => {},
-            }
-        }
+        relay
+            .catalogs
+            .deny_model(&context.account, model)
+            .map_err(|_| ())?;
     }
     // No replay of a WS response.create across connections. C7 is resolved
     // on the next placement of this session (including precommit reconnect).
@@ -959,6 +978,98 @@ impl CreateLifetime {
     }
 }
 
+// Preview only: a physical socket's pin must not publish a placement change.
+// The native selector revalidates current catalog evidence, Strict policy and
+// move guards after the client reconnects. No create bytes are retained/replayed.
+async fn reconnect_unsent_create(
+    context: &Context,
+    model: Option<&str>,
+    create: &CreateLifetime,
+) -> bool {
+    let Some(relay) = &context.relay else {
+        return false;
+    };
+    tokio::select! {
+        biased;
+        _ = relay.wait_for_drain_start() => false,
+        _ = tokio::time::sleep_until(create.operation.deadline()) => false,
+        result = preview_unsent_create_reconnect(context, model, create) => result,
+    }
+}
+
+async fn preview_unsent_create_reconnect(
+    context: &Context,
+    model: Option<&str>,
+    create: &CreateLifetime,
+) -> bool {
+    let (Some(relay), Some(key), Some(model)) =
+        (&context.relay, context.session.key.as_deref(), model)
+    else {
+        return false;
+    };
+    if !create.live(context)
+        || context.socket_model_entitled(Some(model))
+        || relay.bindings.current(Some(key)).as_deref() != Some(context.account.as_str())
+    {
+        return false;
+    }
+    let tried = std::collections::BTreeSet::from([context.account.clone()]);
+    let mut candidates = match relay
+        .candidates(Codex, Some(key), Some(model), &tried)
+        .await
+    {
+        Ok(candidates) => candidates,
+        Err(()) => return false,
+    };
+    match context.managed_launch(create.operation.deadline()).await {
+        Ok(Some(info)) => {
+            let managed = super::super::http_data::ManagedHttp {
+                info,
+                model: model.to_owned(),
+            };
+            candidates = match relay
+                .launch_candidates(&managed, candidates, &tried, create.operation.deadline())
+                .await
+            {
+                Ok((candidates, _)) => candidates,
+                Err(()) => return false,
+            };
+        }
+        Ok(None) => {}
+        Err(_) => return false,
+    }
+    // Unknown destination catalogs cannot prove that a model-only reconnect
+    // has somewhere to go. Admission on the next upgrade owns the actual proof.
+    candidates.retain(|candidate| {
+        candidate.account.id != context.account
+            && !candidate.account.drain
+            && relay
+                .catalogs
+                .entitled_accounts(std::slice::from_ref(&candidate.account.id), model, false)
+                .is_ok_and(|ids| ids.contains(&candidate.account.id))
+    });
+    let selected = relay.bindings.preview(
+        Codex,
+        Some(key),
+        context.session.parent.as_deref(),
+        Some(model),
+        &candidates,
+        relay.pins.get(Codex, Some(key)).as_deref(),
+        0,
+    );
+    create.live(context)
+        && !context.socket_model_entitled(Some(model))
+        && relay.bindings.current(Some(key)).as_deref() == Some(context.account.as_str())
+        && matches!(selected, crate::bindings::PreviewDecision::Selected { account } if account != context.account)
+        && super::remember_unsent_model(
+            relay,
+            key,
+            &context.account,
+            model,
+            create.operation.deadline(),
+        )
+}
+
 async fn native_initial_eligible(
     context: &Context,
     model: Option<&str>,
@@ -979,7 +1090,7 @@ async fn eligible_unsent_create(
     unknown_model: bool,
     create: &CreateLifetime,
 ) -> bool {
-    if !create.live(context) {
+    if !create.live(context) || !context.socket_model_entitled(model) {
         return false;
     }
     if native_initial_eligible(context, model, unknown_model).await {
@@ -1057,6 +1168,7 @@ enum InspectFailure {
     Expired,
     Ineligible,
     ReservationUnavailable,
+    ModelEntitlement,
 }
 type InitialInspection = BoxFuture<'static, Result<CurrentCompletion, InspectFailure>>;
 
@@ -1065,6 +1177,7 @@ enum InitialAdmission {
     Ready,
     Expired,
     Rejected { expired: bool },
+    ModelEntitlement,
 }
 
 fn inspect_initial(context: Arc<Context>, pending: &PendingInspection) -> InitialInspection {
@@ -1083,6 +1196,9 @@ fn inspect_initial(context: Arc<Context>, pending: &PendingInspection) -> Initia
     Box::pin(async move {
         if !create.live(&context) {
             return Err(InspectFailure::Expired);
+        }
+        if !context.socket_model_entitled(model.as_deref()) {
+            return Err(InspectFailure::ModelEntitlement);
         }
         #[cfg(feature = "testkit")]
         if !wait_dispatch_until(
@@ -1165,6 +1281,9 @@ fn admit_initial(
             && eligible_unsent_create(&context, model.as_deref(), unknown_model, &create).await;
         if !create.live(&context) {
             return InitialAdmission::Expired;
+        }
+        if !context.socket_model_entitled(model.as_deref()) {
+            return InitialAdmission::ModelEntitlement;
         }
         if eligible {
             return InitialAdmission::Ready;
@@ -2014,6 +2133,19 @@ where
                 },
             );
         }
+        if matches!(message, Message::Text(_) | Message::Binary(_))
+            && !context.socket_model_entitled(model.as_deref())
+        {
+            return (
+                sink,
+                false,
+                Delivered {
+                    bytes: 0,
+                    terminal: Some("model_not_supported"),
+                    ..delivered
+                },
+            );
+        }
         if matches!(message, Message::Text(_) | Message::Binary(_)) {
             // Opaque/observer data can also consume usage. Control frames do
             // not taint outside-use attribution, but every possible data send
@@ -2519,6 +2651,16 @@ async fn run_with_read_timeout(
                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         continue;
                     }
+                    Err(InspectFailure::ModelEntitlement) => {
+                        if current.is_empty()
+                            && reconnect_unsent_create(&context, pending.model.as_deref(), &pending.create).await {
+                            ending = Some((Some(CloseFrame { code:1012.into(), reason:"".into() }), "model_entitlement_reconnect"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        } else {
+                            pending_launch_error = Some(launch_error(DataLaunchError::UnsupportedModel));
+                        }
+                        continue;
+                    }
                 };
                 model = pending.model.clone();
                 active.model = model.clone();
@@ -2552,6 +2694,20 @@ async fn run_with_read_timeout(
                     if let Some(active) = current.get_mut(&pending.request) { active.completion.record.outcome = "request_timeout".into(); }
                     ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), "request_timeout"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    continue;
+                }
+                if admission == InitialAdmission::ModelEntitlement {
+                    let dispatch_model = current.get(&pending.request).and_then(|active| active.model.clone());
+                    let reconnect = current.len() == 1
+                        && current.get(&pending.request).is_some_and(|active| !active.committed)
+                        && reconnect_unsent_create(&context, dispatch_model.as_deref(), &pending.create).await;
+                    current.remove(&pending.request);
+                    if reconnect {
+                        ending = Some((Some(CloseFrame { code:1012.into(), reason:"".into() }), "model_entitlement_reconnect"));
+                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    } else {
+                        pending_launch_error = Some(launch_error(DataLaunchError::UnsupportedModel));
+                    }
                     continue;
                 }
                 if let InitialAdmission::Rejected { expired } = admission {
@@ -2709,6 +2865,10 @@ async fn run_with_read_timeout(
                     }
                     if !managed && context.has_managed_binding() {
                         return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some(PROMOTED_BEFORE_WRITE), completed: false });
+                    }
+                    let dispatch_model = current.get(&pending.request).and_then(|active| active.model.as_deref());
+                    if !context.socket_model_entitled(dispatch_model) {
+                        return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("model_not_supported"), completed: false });
                     }
                     let mut dispatch_key = current.get(&pending.request).and_then(|active| active.physical_key.clone());
                     if managed && let Some(relay) = &context.relay {
@@ -2882,11 +3042,12 @@ async fn run_with_read_timeout(
                                 continue;
                             }
                         }
-                        if let Message::Text(text) = &message && response_create(text.as_str()) {
+                        if matches!(&message, Message::Text(_) | Message::Binary(_))
+                            && super::super::wire_metadata::Metadata::parse(&message.clone().into_data()).is_some_and(|meta| meta.create()) {
                             draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                             if draining { continue; }
                             let pending = PendingInspection {
-                                model: super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()),
+                                model: requested_create_model(&message.clone().into_data()).ok().flatten(),
                                 session: Session { key: context.session.key.clone(), parent: context.session.parent.clone(), model: context.session.model.clone() },
                                 managed: false, create: CreateLifetime::new(context.launch_deadline()), message, reservation,
                             };
@@ -3124,7 +3285,6 @@ async fn run_with_read_timeout(
                                 // Row 13a excludes row 3 rate limits and requires a current request.
                                 if current.len() == 1 && request.and_then(|id| current.get(&id)).is_some_and(|active| !active.committed)
                                     && decision.as_ref().is_some_and(|decision| decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate)
-                                    && !(managed_socket && decision.as_ref().is_some_and(|decision| decision.kind == crate::relay::outcome::Kind::ModelPermission))
                                     && reconnect_available(&context, active_model.as_deref(), decision.as_ref().expect("qualified failure")).await.unwrap_or(false) {
                                     if let Some(mut active) = request.and_then(|id| current.remove(&id)) {
                                         active.upstream(Some(event));

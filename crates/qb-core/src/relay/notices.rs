@@ -57,50 +57,9 @@ pub(crate) fn limiting_window(
     )
 }
 
-pub(crate) fn model_quota_applies(account: &Account, model: Option<&str>) -> bool {
-    matches!(&account.health, Health::Cooling { reason: HealthReason::Quota, until, scope }
-        if *until > Utc::now() && scope.strip_prefix("model:").is_some_and(|blocked| model == Some(blocked)))
-}
-
 pub(crate) fn quota_applies(account: &Account, model: Option<&str>) -> bool {
     matches!(&account.health, Health::Cooling { reason: HealthReason::Quota, until, scope }
         if *until > Utc::now() && (scope == "account" || scope.strip_prefix("model:").is_some_and(|blocked| model == Some(blocked))))
-}
-
-/// Latest real blocking window per account; callers take the provider minimum.
-pub(crate) fn limiting_reset(
-    account: &Account,
-    snapshot: &Value,
-    model: Option<&str>,
-    observed: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
-    if !quota_applies(account, model) {
-        return None;
-    }
-    let now = Utc::now();
-    let scoped = model_quota_applies(account, model);
-    let windows = snapshot["windows"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|w| {
-            w["name"]
-                .as_str()
-                .is_some_and(|name| name.contains('_') == scoped)
-        })
-        .filter(|w| {
-            w["used_pct"].as_f64().is_some_and(|used| used >= 100.0) || w["status"] == "rejected"
-        })
-        .filter(|w| {
-            timestamp(&w["observed_at"])
-                .is_some_and(|t| t <= now && now.signed_duration_since(t).num_seconds() <= 300)
-        })
-        .filter_map(|w| timestamp(&w["reset_at"]));
-    windows
-        .chain(limiting_window(account, snapshot).1)
-        .chain(observed)
-        .filter(|reset| *reset > now)
-        .max()
 }
 
 impl RelayState {
@@ -130,15 +89,20 @@ impl RelayState {
             return;
         };
         let now = Utc::now();
-        if account.user_state != UserState::Active
-            || account.drain
-            || !quota_applies(account, model)
-        {
+        if account.user_state != UserState::Active || account.drain {
             return;
         }
+        let Some(status) = self.accounts.model_quota_status(account, model, now) else {
+            return;
+        };
+        let entitled = self
+            .accounts
+            .model_entitled_accounts(&accounts, account.provider, model);
         let eligible = |a: &Account| {
             a.provider == account.provider
+                && entitled.contains(&a.id)
                 && a.eligible_at(model, now)
+                && self.accounts.model_quota_status(a, model, now).is_none()
                 && credential_ids.contains(&a.id)
                 && !self.accounts.probing(&a.id)
                 && !self.accounts.blocked_in_memory(&a.id)
@@ -155,30 +119,36 @@ impl RelayState {
         if next.is_none() && accounts.iter().any(eligible) {
             return;
         }
-        let snapshot = self.observability.quota_snapshot(id).unwrap_or_default();
-        let (window, mut reset_at) = limiting_window(account, &snapshot);
-        reset_at = reset_at.or_else(|| self.accounts.observed_quota_reset(account));
+        let window = status.window;
+        let mut reset_at = Some(status.reset_at);
         let mut earliest_account = None;
-        let mut model_limited = model_quota_applies(account, model);
+        let mut model_limited = entitled.contains(&account.id) && status.model_limited;
         if next.is_none() {
             let earliest = accounts
                 .iter()
                 .filter(|a| {
-                    a.provider == account.provider && a.user_state == UserState::Active && !a.drain
+                    a.provider == account.provider
+                        && entitled.contains(&a.id)
+                        && a.user_state == UserState::Active
+                        && !a.drain
                 })
                 .filter_map(|a| {
-                    let snapshot = self.observability.quota_snapshot(&a.id).unwrap_or_default();
-                    limiting_reset(a, &snapshot, model, self.accounts.observed_quota_reset(a))
-                        .map(|reset| (a.id.clone(), reset))
+                    self.accounts
+                        .model_quota_status(a, model, now)
+                        .map(|status| (a.id.clone(), status.reset_at))
                 })
                 .min_by_key(|(_, reset)| *reset);
             reset_at = earliest.as_ref().map(|(_, reset)| *reset);
             earliest_account = earliest.map(|(id, _)| id);
             model_limited |= accounts.iter().any(|a| {
                 a.provider == account.provider
+                    && entitled.contains(&a.id)
                     && a.user_state == UserState::Active
                     && !a.drain
-                    && model_quota_applies(a, model)
+                    && self
+                        .accounts
+                        .model_quota_status(a, model, now)
+                        .is_some_and(|status| status.model_limited)
             });
         }
         self.accounts.set_quota_notice(

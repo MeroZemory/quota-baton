@@ -269,6 +269,23 @@ impl RelayState {
         selected
     }
 
+    fn launch_bound_entitled(&self, managed: &ManagedHttp) -> Result<bool, ()> {
+        if self
+            .catalogs
+            .is_model_denied(&managed.info.account, &managed.model)
+            .map_err(|_| ())?
+        {
+            return Ok(false);
+        }
+        let view = self.catalogs.view(&managed.info.account).map_err(|_| ())?;
+        // Preserve proved-current-model recovery when a restarted source has
+        // no catalog. A new model needs positive destination entitlement.
+        Ok(view.observation.last_known().map_or(
+            managed.info.current_model.as_deref() == Some(managed.model.as_str()),
+            |catalog| catalog.supported().contains(&managed.model),
+        ))
+    }
+
     pub(super) async fn launch_candidates(
         &self,
         managed: &ManagedHttp,
@@ -276,9 +293,10 @@ impl RelayState {
         tried: &BTreeSet<String>,
         deadline: tokio::time::Instant,
     ) -> Result<(Vec<crate::bindings::Candidate>, Option<BTreeSet<String>>), ()> {
-        // An otherwise usable binding cannot be moved for menu maintenance,
-        // overload balancing, or a new preference on an existing launch.
-        let bound_usable = !tried.contains(&managed.info.account)
+        // Retain an otherwise usable binding only while it supports the
+        // requested model. Model changes still pass the ordinary move guards.
+        let bound_usable = self.launch_bound_entitled(managed)?
+            && !tried.contains(&managed.info.account)
             && self
                 .dispatch_data_allowed(
                     Some(&managed.info.canonical_key),
@@ -305,14 +323,31 @@ impl RelayState {
         }
         let mut compatible = BTreeSet::new();
         let mut coverage = BTreeSet::new();
-        for candidate in &candidates {
+        // Catalog discovery includes unknown accounts; final collection below
+        // applies the shared requested-model entitlement filter.
+        let discovery = self
+            .candidates(
+                Provider::Codex,
+                Some(&managed.info.canonical_key),
+                None,
+                tried,
+            )
+            .await?;
+        for candidate in &discovery {
             // Retain the original account for C7's near-reset hold decision.
             // Unknown destination entitlements never authorize a move.
             if candidate.account.id == managed.info.account {
-                compatible.insert(candidate.account.id.clone());
+                if self.launch_bound_entitled(managed)? {
+                    compatible.insert(candidate.account.id.clone());
+                }
                 continue;
             }
-            if !candidate.account.eligible(Some(&managed.model)) || candidate.account.drain {
+            if !launch::catalog_assignable(&candidate.account)
+                || self
+                    .catalogs
+                    .is_model_denied(&candidate.account.id, &managed.model)
+                    .map_err(|_| ())?
+            {
                 continue;
             }
             if self.is_draining() {
@@ -325,7 +360,12 @@ impl RelayState {
             .await
             .map_err(|_| ())?;
             let Ok(catalog) = catalog else { continue };
-            if catalog.supported().contains(&managed.model) {
+            if catalog.supported().contains(&managed.model)
+                && !self
+                    .catalogs
+                    .is_model_denied(&candidate.account.id, &managed.model)
+                    .map_err(|_| ())?
+            {
                 compatible.insert(candidate.account.id.clone());
                 if managed
                     .info
@@ -346,7 +386,8 @@ impl RelayState {
                 tried,
             )
             .await?;
-        if !tried.contains(&managed.info.account)
+        if self.launch_bound_entitled(managed)?
+            && !tried.contains(&managed.info.account)
             && self
                 .dispatch_data_allowed(
                     Some(&managed.info.canonical_key),

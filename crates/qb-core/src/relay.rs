@@ -13,7 +13,10 @@ mod ledger;
 #[cfg(test)]
 #[path = "relay/lineage_http_tests.rs"]
 mod lineage_http_tests;
+mod model_entitlements;
+pub(crate) use model_entitlements::ModelEntitlementEvidence;
 mod models;
+pub(crate) use launch::catalog_assignable;
 mod native_reset;
 pub(crate) mod notices;
 mod outcome;
@@ -158,7 +161,7 @@ pub struct RelayState {
     pub quota: Arc<crate::quota::UsagePoller>,
     pub bindings: Arc<crate::bindings::BindingTable>,
     pub(crate) launch_tokens: crate::launch_tokens::LaunchTokenRegistry,
-    pub(crate) catalogs: crate::catalog::CatalogCache,
+    pub(crate) catalogs: Arc<crate::catalog::CatalogCache>,
     catalog_slots: tokio::sync::Semaphore,
     catalog_changed: Notify,
     burst: Mutex<crate::burst::BurstTracker>,
@@ -822,11 +825,11 @@ impl RelayState {
             );
         }
         Ok(Self {
+            catalogs: accounts.catalogs.clone(),
             accounts,
             quota,
             bindings,
             launch_tokens: crate::launch_tokens::LaunchTokenRegistry::default(),
-            catalogs: crate::catalog::CatalogCache::default(),
             catalog_slots: tokio::sync::Semaphore::new(4),
             catalog_changed: Notify::new(),
             rate_hold_secs: config.routing.rate_hold_secs,
@@ -1034,7 +1037,7 @@ impl RelayState {
         let runtime = self.accounts.clone();
         let obs = self.observability.clone();
         let bindings = self.bindings.clone();
-        crate::boxes::spawn_blocking(move || {
+        let collected = crate::boxes::spawn_blocking(move || {
             let mut candidates = Vec::new();
             let mut evidence = Vec::new();
             let mut store_evidence = Vec::new();
@@ -1168,7 +1171,24 @@ impl RelayState {
             ))
         })
         .await
-        .map_err(|_| ())?
+        .map_err(|_| ())??;
+        let (mut candidates, evidence, observed, store_evidence, runtime_evidence) = collected;
+        let accounts: Vec<_> = evidence.iter().map(|row| row.account.clone()).collect();
+        let incumbent = self.bindings.model_source(provider, key);
+        let entitled = self.accounts.model_entitled_accounts_with_incumbent(
+            &accounts,
+            provider,
+            model,
+            incumbent.as_deref(),
+        );
+        candidates.retain(|row| entitled.contains(&row.account.id));
+        Ok((
+            candidates,
+            evidence,
+            observed,
+            store_evidence,
+            runtime_evidence,
+        ))
     }
 
     async fn note_client_rate(&self, provider: Provider, account: &str, key: Option<&str>) {
@@ -1494,6 +1514,14 @@ impl RelayState {
             let owned_model = model.map(str::to_owned);
             let choices = candidates.clone();
             let evidence = move_evidence.clone();
+            let source_accounts: Vec<_> = evidence.iter().map(|row| row.account.clone()).collect();
+            let incumbent = self.bindings.model_source(provider, session.key.as_deref());
+            let entitled_targets = self.accounts.model_entitled_accounts_with_incumbent(
+                &source_accounts,
+                provider,
+                model,
+                incumbent.as_deref(),
+            );
             let hold_allowed = !completion.reset_hold_used;
             let hold_timed_out = completion.reset_hold_timed_out;
             let root_hint = completion.root_hint().cloned();
@@ -1504,19 +1532,27 @@ impl RelayState {
             let selection_operation = operation.clone();
             // Refresh after every await/hold: an expired or recovered hint
             // must not shadow a newer native health/selection decision.
-            let reconnect_source = self.bindings.current(session.key.as_deref());
+            let reconnect_source = self.bindings.model_source(provider, session.key.as_deref());
+            let catalog_cache = self.catalogs.clone();
+            let catalog_lifetime = completion.failure_lifetime.clone();
+            let catalog_deadline = completion.precommit_deadline.unwrap_or(deadline.into_std());
+            let catalog_source = reconnect_source
+                .as_deref()
+                .and_then(|id| evidence.iter().find(|row| row.account.id == id))
+                .map(|row| row.account.clone());
             let failure_evidence = completion.failure_evidence.clone().or_else(|| {
                 self.reconnect_failure(session.key.as_deref(), reconnect_source.as_deref(), model)
             });
             let choice = crate::boxes::spawn_blocking(move || {
                 let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
-                    table.choose_with_hold_at_admitted_proof_and_root_hint(
+                    table.choose_with_hold_at_admitted_proof_entitled(
                         provider,
                         key.as_deref(),
                         parent.as_deref(),
                         owned_model.as_deref(),
                         &choices,
                         &evidence,
+                        Some(&entitled_targets),
                         crate::bindings::MoveObservations {
                             source: source_observed,
                             target: target_observed,
@@ -1549,7 +1585,19 @@ impl RelayState {
                             denied_choice.store(!allowed, Ordering::Release);
                             if allowed {
                                 admission.map(|admission| {
+                                    let catalog = catalog_source.as_ref().and_then(|source| {
+                                        ModelEntitlementEvidence::observe(
+                                            catalog_cache,
+                                            key.as_deref(),
+                                            source,
+                                            account,
+                                            owned_model.as_deref(),
+                                            catalog_deadline,
+                                            &catalog_lifetime,
+                                        )
+                                    });
                                     admission
+                                        .with_catalog(catalog)
                                         .with_failure(failure_evidence)
                                         .with_pin(pin_evidence)
                                         .with_store_evidence(store_evidence)
@@ -2535,6 +2583,15 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     } else {
         None
     };
+    // A bounded metadata peek supplies entitlement context without changing the
+    // forwarded body or C8 session identity. Managed launches validated it above.
+    if provider == Provider::Codex
+        && managed_http.is_none()
+        && parts.method == Method::POST
+        && matches!(path, "/v1/responses" | "/v1/responses/compact")
+    {
+        session.model = launch::request_model(&parts.headers, &upload.prefix).ok();
+    }
     // input_bytes may be only the first streaming chunk, not full context.
     completion.selection_cost = routing_input_cost(&parts.headers, &upload.prefix, provider);
     if let Some(bytes) = completion.selection_cost {
@@ -2749,6 +2806,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     let mut rate_relay_retry_after = None;
     let mut rate_relayed = false;
     let mut permission_denials = 0;
+    let mut model_denials = 0;
     let mut probe = state.claim_probe(&mut account).await;
     let (status, response_headers, held) = loop {
         if !account.eligible(request_model.as_deref()) {
@@ -3095,32 +3153,19 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         // Response-only model hints scope the health signal; they do not change
         // the model of the request actually sent. Preserve that exact context
         // for the sealed failed-attempt handoff and every same-body successor.
-        if managed_http.is_some() && decision.kind == outcome::Kind::ModelPermission {
-            // A failed or unchanged catalog refresh must not erase C6 row 6a's
-            // observed model-specific denial. Keep its normal durable hold.
-            if let Some(signal) = decision.signal.take()
-                && state
-                    .accounts
-                    .transition(&account.id, signal)
-                    .await
-                    .is_err()
+        if decision.kind == outcome::Kind::ModelPermission {
+            if let Some(model) = request_model.as_deref()
+                && state.catalogs.deny_model(&account.id, model).is_err()
             {
                 return failure(
                     &mut completion,
                     StatusCode::BAD_GATEWAY,
                     provider,
-                    "store_error",
-                    "Could not persist account health",
+                    "catalog_error",
+                    "Could not retain model entitlement evidence",
                 );
             }
-            // New entitlement evidence belongs to this account. Refresh its menu
-            // without replaying the rejected model on a different account.
-            let _ = tokio::time::timeout_at(
-                data_deadline,
-                state.launch_catalog(&account.id, true, true),
-            )
-            .await;
-            return http_data::error(&mut completion, launch::DataLaunchError::UnsupportedModel);
+            model_denials += 1;
         }
         if decision.kind == outcome::Kind::Revoked && credentials::is_linked(&account) {
             decision.kind = outcome::Kind::Auth;
@@ -3388,7 +3433,11 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 break (status, response_headers, held);
             }
         }
-        if !decision.failover() || retained.is_none() || permission_denials >= 2 {
+        if !decision.failover()
+            || retained.is_none()
+            || permission_denials >= 2
+            || model_denials >= 2
+        {
             break (status, response_headers, held);
         }
         if let Some(copy) = retained.as_ref()

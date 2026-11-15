@@ -82,37 +82,42 @@ pub struct LaunchRequest {
 
 pub use qb_proto::admin_launch::LaunchReply;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum LaunchError {
     Invalid,
     Unavailable,
+    ModelLimited {
+        retry_after: u64,
+        earliest_account: String,
+        reset_at: chrono::DateTime<chrono::Utc>,
+    },
     ConsentRequired,
     UnsupportedModel,
     Capacity,
     Store,
 }
 impl LaunchError {
-    pub fn status(self) -> StatusCode {
+    pub fn status(&self) -> StatusCode {
         match self {
             Self::Invalid => StatusCode::BAD_REQUEST,
             Self::ConsentRequired | Self::UnsupportedModel => StatusCode::CONFLICT,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
-    pub fn code(self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::Invalid => "invalid_launch",
-            Self::Unavailable => "launch_unavailable",
+            Self::Unavailable | Self::ModelLimited { .. } => "launch_unavailable",
             Self::ConsentRequired => "model_move_consent_required",
             Self::UnsupportedModel => "model_not_supported",
             Self::Capacity => "launch_capacity",
             Self::Store => "launch_store_error",
         }
     }
-    pub fn message(self) -> &'static str {
+    pub fn message(&self) -> &'static str {
         match self {
             Self::Invalid => "실행 옵션이 올바르지 않습니다.",
-            Self::Unavailable => {
+            Self::Unavailable | Self::ModelLimited { .. } => {
                 "모델 목록을 확인한 사용 가능 계정이 없습니다. 잠시 후 다시 실행해 주세요."
             }
             Self::ConsentRequired => {
@@ -127,6 +132,64 @@ impl LaunchError {
             Self::Store => "계정 연결을 안전하게 저장하지 못했습니다. 코어 로그를 확인해 주세요.",
         }
     }
+}
+
+/// Catalog assignment is independent of quota readiness (R27.1).
+pub(crate) fn catalog_assignable(account: &Account) -> bool {
+    if account.user_state != UserState::Active
+        || account.drain
+        || matches!(
+            account.health,
+            crate::accounts::Health::NeedsRelogin { .. }
+                | crate::accounts::Health::PlanWithoutClaudeCode
+        )
+    {
+        return false;
+    }
+    account.provider != Provider::Claude || account.plan.as_deref() != Some("free")
+}
+
+fn model_limited_launch(
+    runtime: &crate::account_runtime::AccountRuntime,
+    candidates: &[crate::bindings::Candidate],
+    entitlements: &crate::bindings::LaunchEntitlements,
+    model: Option<&str>,
+) -> Option<LaunchError> {
+    let model = model?;
+    let now = chrono::Utc::now();
+    let entitled: Vec<_> = candidates
+        .iter()
+        .filter(|c| {
+            catalog_assignable(&c.account)
+                && entitlements
+                    .get(&c.account.id)
+                    .is_some_and(|models| models.contains(model))
+        })
+        .collect();
+    if entitled.is_empty() {
+        return None;
+    }
+    // Require applicable quota evidence for every entitled account. A different
+    // model's window or a non-quota failure must not supply this recovery time.
+    let resets: Option<Vec<_>> = entitled
+        .into_iter()
+        .map(|c| {
+            if !c.account.eligible_at(Some(model), now)
+                && !notices::quota_applies(&c.account, Some(model))
+            {
+                return None;
+            }
+            runtime
+                .model_limited_until(&c.account, Some(model), now)
+                .map(|reset| (reset, c.account.id.clone()))
+        })
+        .collect();
+    let (reset_at, earliest_account) = resets?.into_iter().min()?;
+    Some(LaunchError::ModelLimited {
+        retry_after: reset_at.signed_duration_since(now).num_seconds().max(1) as u64,
+        earliest_account,
+        reset_at,
+    })
 }
 
 fn validate_issue_request(request: &LaunchRequest, port: u16) -> Result<(), LaunchError> {
@@ -509,6 +572,7 @@ mod tests {
     use std::{fs, path::Path};
 
     mod handover_tests;
+    mod r30_acceptance;
     mod scoped_issue_tests;
 
     #[test]
@@ -932,6 +996,229 @@ mod tests {
             .find(|a| a.email == "second@example.invalid")
             .unwrap()
             .id
+    }
+
+    fn quota_hold(
+        account: &mut Account,
+        model: Option<&str>,
+        reset: chrono::DateTime<chrono::Utc>,
+    ) {
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until: reset,
+            scope: model.map_or_else(|| "account".into(), |m| format!("model:{m}")),
+        };
+        account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: reset,
+            started_at: chrono::Utc::now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn r30_launch_fetches_cooling_entitled_account_and_reports_its_recovery() {
+        let f = Fixture::new().await;
+        let second = second_issue_account(&f).await;
+        warm_issue_catalog(&f, &f.id, &["common"]).await;
+        let reset = chrono::Utc::now() + chrono::Duration::hours(4);
+        f.relay
+            .store
+            .update_metadata(&second, |a| quota_hold(a, Some("special"), reset))
+            .unwrap();
+        // The cooling account has no cached catalog: issuance must fetch it.
+        f.reply(StatusCode::OK, json!({"models":[{"slug":"special"}]}));
+        let error = f
+            .relay
+            .issue_launch(issue_request(Some("special")), 10200)
+            .await
+            .err()
+            .expect("cooling entitled model must fail issuance");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), "launch_unavailable");
+        match error {
+            LaunchError::ModelLimited {
+                retry_after,
+                earliest_account,
+                reset_at,
+            } => {
+                assert_eq!(earliest_account, second);
+                assert_eq!(reset_at, reset);
+                assert!((14390..=14400).contains(&retry_after));
+            }
+            other => panic!("expected entitled model limit, got {other:?}"),
+        }
+        let requests = f.upstream.state.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].headers["chatgpt-account-id"], "second-account");
+        assert!(f.relay.bindings.current(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn r30_limited_recovery_excludes_unentitled_and_other_model_holds() {
+        let f = Fixture::new().await;
+        let mut entitled = f.relay.store.load(&f.id).unwrap();
+        let mut other = entitled.clone();
+        other.id = "other".into();
+        let now = chrono::Utc::now();
+        let reset = now + chrono::Duration::hours(4);
+        quota_hold(&mut entitled, Some("special"), reset);
+        quota_hold(&mut other, None, now + chrono::Duration::minutes(1));
+        let mut rows = vec![
+            crate::bindings::Candidate {
+                account: entitled,
+                quota: None,
+                inflight: 0,
+            },
+            crate::bindings::Candidate {
+                account: other,
+                quota: None,
+                inflight: 0,
+            },
+        ];
+        let entitlements = BTreeMap::from([(f.id.clone(), BTreeSet::from(["special".into()]))]);
+        assert!(
+            matches!(model_limited_launch(&f.relay.accounts, &rows, &entitlements, Some("special")),
+            Some(LaunchError::ModelLimited { reset_at, .. }) if reset_at == reset)
+        );
+        // An applicable hold is required; a different model cannot block this one.
+        quota_hold(&mut rows[0].account, Some("different"), reset);
+        assert!(
+            model_limited_launch(&f.relay.accounts, &rows, &entitlements, Some("special"))
+                .is_none()
+        );
+        assert!(
+            model_limited_launch(&f.relay.accounts, &rows, &entitlements, Some("absent")).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn r30_managed_new_model_admits_entitled_destination_and_excludes_healthy_source() {
+        let (f, info) = model_admission_fixture(false).await;
+        let second = second_issue_account(&f).await;
+        warm_issue_catalog(&f, &second, &["common", "special"]).await;
+        // The source's forced re-observation confirms that it lacks the pick.
+        f.reply(StatusCode::OK, json!({"models":[{"slug":"common"}]}));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            f.relay
+                .admit_data_model(&info, Some("special"), deadline)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("special")
+        );
+        let candidates = f
+            .relay
+            .candidates(
+                Provider::Codex,
+                Some(&info.canonical_key),
+                Some("special"),
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap();
+        let managed = http_data::ManagedHttp {
+            info: info.clone(),
+            model: "special".into(),
+        };
+        let (candidates, coverage) = f
+            .relay
+            .launch_candidates(&managed, candidates, &BTreeSet::new(), deadline)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].account.id, second);
+        assert!(coverage.unwrap().contains(&second));
+        // Admission is side metadata; selection owns the actual guarded move.
+        assert_eq!(
+            f.relay.bindings.current(Some(&info.canonical_key)),
+            Some(f.id.clone())
+        );
+        assert_eq!(
+            f.relay
+                .bindings
+                .launch_info(&info.canonical_key, chrono::Utc::now())
+                .unwrap()
+                .current_model
+                .as_deref(),
+            Some("special")
+        );
+    }
+
+    #[tokio::test]
+    async fn r30_managed_failover_keeps_cooling_entitled_destinations_for_limit_selection() {
+        let (f, info) = model_admission_fixture(true).await;
+        let second = second_issue_account(&f).await;
+        let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+        f.relay
+            .store
+            .update_metadata(&second, |a| quota_hold(a, Some("common"), reset))
+            .unwrap();
+        f.reply(StatusCode::OK, json!({"models":[{"slug":"common"}]}));
+        let candidates = f
+            .relay
+            .candidates(
+                Provider::Codex,
+                Some(&info.canonical_key),
+                Some("common"),
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap();
+        let managed = http_data::ManagedHttp {
+            info,
+            model: "common".into(),
+        };
+        let (candidates, _) = f
+            .relay
+            .launch_candidates(
+                &managed,
+                candidates,
+                &BTreeSet::new(),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(candidates.iter().any(|c| c.account.id == second));
+        assert!(
+            !candidates
+                .iter()
+                .find(|c| c.account.id == second)
+                .unwrap()
+                .account
+                .eligible(Some("common"))
+        );
+    }
+
+    #[tokio::test]
+    async fn r30_catalog_assignment_excludes_paused_drain_disabled_relogin_and_free() {
+        let f = Fixture::new().await;
+        let mut account = f.relay.store.load(&f.id).unwrap();
+        quota_hold(
+            &mut account,
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        assert!(catalog_assignable(&account));
+        for state in [UserState::Paused, UserState::Disabled] {
+            account.user_state = state;
+            assert!(!catalog_assignable(&account));
+        }
+        account.user_state = UserState::Active;
+        account.drain = true;
+        assert!(!catalog_assignable(&account));
+        account.drain = false;
+        account.health = Health::NeedsRelogin {
+            reason: "test".into(),
+            since: chrono::Utc::now(),
+        };
+        assert!(!catalog_assignable(&account));
+        account.health = Health::Ready;
+        account.provider = Provider::Claude;
+        account.plan = Some("free".into());
+        assert!(!catalog_assignable(&account));
+        account.plan = Some("max".into());
+        assert!(catalog_assignable(&account));
     }
 
     #[test]
@@ -2157,7 +2444,7 @@ impl RelayState {
             .candidates(
                 Provider::Codex,
                 resume_key.as_deref(),
-                request.model.as_deref(),
+                None,
                 &BTreeSet::new(),
             )
             .await
@@ -2166,7 +2453,7 @@ impl RelayState {
         // Stale evidence is allowed only for the already bound account.
         let mut ids: BTreeSet<String> = candidates
             .iter()
-            .filter(|c| c.account.eligible(None))
+            .filter(|c| catalog_assignable(&c.account))
             .map(|c| c.account.id.clone())
             .collect();
         let bound_usable = prior.as_ref().is_some_and(|info| {
@@ -2205,14 +2492,20 @@ impl RelayState {
                 // Refresh only a missing explicit pick, inside the SAME issue
                 // budget; this never bypasses destination admission or D30.
                 if refresh_missing_catalog
-                    && explicit_model.is_some_and(|model| !catalog.supported().contains(model))
+                    && explicit_model.is_some_and(|model| {
+                        !catalog.supported().contains(model)
+                            && !self.catalogs.is_model_denied(&id, model).unwrap_or(true)
+                    })
                 {
                     catalog = self
                         .launch_catalog(&id, true, existing)
                         .await
                         .map_err(|_| ())?;
                 }
-                Ok(catalog.supported().clone())
+                let mut supported = catalog.supported().clone();
+                supported
+                    .retain(|model| !self.catalogs.is_model_denied(&id, model).unwrap_or(true));
+                Ok(supported)
             },
         )
         .await?
@@ -2222,7 +2515,7 @@ impl RelayState {
             .candidates_with_evidence(
                 Provider::Codex,
                 resume_key.as_deref(),
-                request.model.as_deref(),
+                None,
                 &BTreeSet::new(),
             )
             .await
@@ -2253,6 +2546,12 @@ impl RelayState {
         } else {
             request.model.clone().or(prior_model)
         };
+        let limited = model_limited_launch(
+            &self.accounts,
+            &candidates,
+            &entitlements,
+            admission_model.as_deref(),
+        );
         let box_scope = box_authority
             .as_ref()
             .map(|(_, authority)| authority.scope().clone());
@@ -2329,7 +2628,16 @@ impl RelayState {
                                         .authorize_model_move_for_issue(consent, Some(&operation))
                                 },
                             )
-                            .map_err(issue_binding_error)?;
+                            .map_err(|error| {
+                                if matches!(error, crate::bindings::LaunchError::NoEligibleAccount)
+                                {
+                                    limited
+                                        .clone()
+                                        .unwrap_or_else(|| issue_binding_error(error))
+                                } else {
+                                    issue_binding_error(error)
+                                }
+                            })?;
                         if request.urgent {
                             table
                                 .set_routing_session_urgent(
@@ -2449,9 +2757,15 @@ impl RelayState {
         if self.is_draining() {
             return Err(RefreshFailure::Cancelled);
         }
-        #[cfg(any(test, all(feature = "testkit", debug_assertions)))]
-        if !self.codex_base.starts_with("http://127.0.0.1:") {
-            return Err(RefreshFailure::Transport);
+        // Excluded accounts do not even trigger credential refresh work.
+        let store = self.store.clone();
+        let account_id = id.to_owned();
+        let before = crate::boxes::spawn_blocking(move || store.load(&account_id))
+            .await
+            .map_err(|_| RefreshFailure::Cancelled)?
+            .map_err(|_| RefreshFailure::Unauthorized)?;
+        if !catalog_assignable(&before) {
+            return Err(RefreshFailure::Cancelled);
         }
         let (mut account, mut tokens) = self
             .tokens
@@ -2462,20 +2776,38 @@ impl RelayState {
             )
             .await
             .map_err(|_| RefreshFailure::Unauthorized)?;
-        if account.provider != Provider::Codex {
-            return Err(RefreshFailure::Unauthorized);
+        if !catalog_assignable(&account) {
+            return Err(RefreshFailure::Cancelled);
+        }
+        let base = match account.provider {
+            Provider::Codex => &self.codex_base,
+            Provider::Claude => &self.anthropic_base,
+        };
+        #[cfg(any(test, all(feature = "testkit", debug_assertions)))]
+        if !base.starts_with("http://127.0.0.1:") {
+            return Err(RefreshFailure::Transport);
         }
         for attempt in 0..2 {
             if self.is_draining() {
                 return Err(RefreshFailure::Cancelled);
             }
-            let headers =
-                super::headers::upstream(&HeaderMap::new(), &account, &tokens.access_token)
-                    .map_err(|_| RefreshFailure::Unauthorized)?;
-            let mut response = self
-                .client
-                .get(format!("{}/models", self.codex_base))
-                .query(&[("client_version", "0.163.0")])
+            if !catalog_assignable(&account) {
+                return Err(RefreshFailure::Cancelled);
+            }
+            let mut source_headers = HeaderMap::new();
+            if account.provider == Provider::Claude {
+                source_headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            }
+            let headers = super::headers::upstream(&source_headers, &account, &tokens.access_token)
+                .map_err(|_| RefreshFailure::Unauthorized)?;
+            let request = match account.provider {
+                Provider::Codex => self
+                    .client
+                    .get(format!("{base}/models"))
+                    .query(&[("client_version", "0.163.0")]),
+                Provider::Claude => self.client.get(format!("{base}/v1/models")),
+            };
+            let mut response = request
                 .headers(headers)
                 .header("accept", "application/json")
                 .header(
@@ -2570,11 +2902,7 @@ impl RelayState {
                 else {
                     continue;
                 };
-                for account in accounts.into_iter().filter(|a| {
-                    a.provider == Provider::Codex
-                        && a.user_state == UserState::Active
-                        && a.eligible(None)
-                }) {
+                for account in accounts.into_iter().filter(catalog_assignable) {
                     if relay.is_draining() {
                         return;
                     }
@@ -2748,9 +3076,12 @@ impl RelayState {
         // restart. Destination entitlement and policy gates still run before
         // dispatch; an unproved new pick never gets this exception.
         if let Some(catalog) = catalog.as_mut() {
-            if !catalog.supported().contains(&model) {
-                // A menu can change between launches. Re-observe only this account;
-                // an unsupported pick never shops other accounts or sends the body.
+            let denied = self
+                .catalogs
+                .is_model_denied(&info.account, &model)
+                .map_err(|_| DataLaunchError::Unavailable)?;
+            if !denied && !catalog.supported().contains(&model) {
+                // Refresh a missing pick before looking for an entitled destination.
                 if let Ok(Ok(updated)) = tokio::time::timeout_at(
                     deadline,
                     self.launch_catalog(&info.account, true, true),
@@ -2760,8 +3091,46 @@ impl RelayState {
                     *catalog = updated;
                 }
             }
-            if !catalog.supported().contains(&model) {
-                return Err(DataLaunchError::UnsupportedModel);
+            if denied || !catalog.supported().contains(&model) {
+                let candidates = self
+                    .candidates(
+                        Provider::Codex,
+                        Some(&info.canonical_key),
+                        None,
+                        &BTreeSet::new(),
+                    )
+                    .await
+                    .map_err(|_| DataLaunchError::Unavailable)?;
+                let mut entitled = false;
+                for candidate in candidates
+                    .iter()
+                    .filter(|c| c.account.id != info.account && catalog_assignable(&c.account))
+                {
+                    if self
+                        .catalogs
+                        .is_model_denied(&candidate.account.id, &model)
+                        .map_err(|_| DataLaunchError::Unavailable)?
+                    {
+                        continue;
+                    }
+                    if let Ok(Ok(destination)) = tokio::time::timeout_at(
+                        deadline,
+                        self.launch_catalog(&candidate.account.id, false, false),
+                    )
+                    .await
+                        && destination.supported().contains(&model)
+                        && !self
+                            .catalogs
+                            .is_model_denied(&candidate.account.id, &model)
+                            .map_err(|_| DataLaunchError::Unavailable)?
+                    {
+                        entitled = true;
+                        break;
+                    }
+                }
+                if !entitled {
+                    return Err(DataLaunchError::UnsupportedModel);
+                }
             }
         }
         if self.is_draining() {

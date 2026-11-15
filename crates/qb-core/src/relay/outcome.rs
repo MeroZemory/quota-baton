@@ -203,6 +203,44 @@ mod failure_evidence_tests {
     }
 
     #[test]
+    fn r30_model_denial_is_exact_and_does_not_invent_timed_health() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for status in [
+                StatusCode::BAD_REQUEST,
+                StatusCode::FORBIDDEN,
+                StatusCode::NOT_FOUND,
+            ] {
+                let decision = classify(
+                    provider,
+                    status,
+                    &HeaderMap::new(),
+                    br#"{"error":{"code":"model_not_available"}}"#,
+                    Some("special"),
+                );
+                assert_eq!(decision.kind, Kind::ModelPermission);
+                assert!(decision.signal.is_none());
+            }
+            let unknown = classify(
+                provider,
+                StatusCode::FORBIDDEN,
+                &HeaderMap::new(),
+                br#"{"error":{"message":"permission denied"}}"#,
+                Some("special"),
+            );
+            assert_eq!(unknown.kind, Kind::Permission);
+            assert!(unknown.signal.is_some());
+            let unspecified = classify(
+                provider,
+                StatusCode::FORBIDDEN,
+                &HeaderMap::new(),
+                br#"{"error":{"code":"model_not_available"}}"#,
+                None,
+            );
+            assert_eq!(unspecified.kind, Kind::Permission);
+        }
+    }
+
+    #[test]
     fn n6t_body_model_does_not_replace_unknown_upgrade_request_context() {
         let source = account();
         let alive = Arc::new(AtomicBool::new(true));
@@ -773,6 +811,24 @@ fn classify_inner(
         } else {
             decision.kind = Kind::Auth;
         }
+    } else if model.is_some()
+        && matches!(
+            effective,
+            StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        )
+        && (matches!(
+            code,
+            "model_not_available" | "model_not_found" | "model_not_supported" | "unsupported_model"
+        ) || (provider == Provider::Claude
+            && kind == "not_found_error"
+            && effective == StatusCode::NOT_FOUND)
+            || message
+                .to_ascii_lowercase()
+                .contains("model is not available for this account"))
+    {
+        decision.kind = Kind::ModelPermission;
+        // Catalog denial is observation-only and ends on a successful refresh.
+        // Do not manufacture a provider-wide or timed permission hold here.
     } else if effective == StatusCode::FORBIDDEN
         || (effective.is_success() && kind == "permission_error")
     {
@@ -806,13 +862,6 @@ fn classify_inner(
                 .filter(|m| !m.is_empty() && m.len() <= 128)
                 .and_then(crate::observability::safe_identifier)
         });
-        if let Some(m) = &decision.model {
-            decision.signal = cooling(
-                HealthReason::Permission,
-                now + Duration::hours(6),
-                format!("model:{m}"),
-            );
-        }
     } else if effective == StatusCode::PAYMENT_REQUIRED
         || (provider == Provider::Claude
             && effective == StatusCode::BAD_REQUEST

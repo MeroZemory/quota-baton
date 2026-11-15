@@ -8,6 +8,7 @@ mod reset_recovery;
 pub(crate) use reset_recovery::ResetQuotaObservation;
 mod selection;
 pub(crate) use selection::RuntimeUnavailableEvidence;
+mod model_catalog;
 mod wait_admission;
 mod wait_owner;
 mod wait_proof;
@@ -992,6 +993,7 @@ mod orphan_reconciliation_tests;
 
 pub struct AccountRuntime {
     pub store: Arc<AccountStore>,
+    pub(crate) catalogs: Arc<crate::catalog::CatalogCache>,
     outside_owner: Arc<outside_owner::OutsideOwner>,
     wait_owner: Arc<wait_owner::WaitOwner>,
     obs: Arc<Observability>,
@@ -1210,6 +1212,7 @@ impl AccountRuntime {
         }
         Arc::new(Self {
             outside_owner: Arc::new(outside_owner::OutsideOwner::new(store.home())),
+            catalogs: Arc::new(crate::catalog::CatalogCache::default()),
             store,
             wait_owner,
             obs,
@@ -2263,6 +2266,7 @@ impl AccountRuntime {
             credential_ids.contains(&a.id)
                 && !a.drain
                 && a.eligible_at(model, now)
+                && self.model_quota_status(a, model, now).is_none()
                 && !self.probing(&a.id)
                 && !self.blocked_in_memory(&a.id)
                 && !a.auth_probe_pending
@@ -2274,6 +2278,7 @@ impl AccountRuntime {
                 return false;
             };
             let model = entry.model.as_deref();
+            let entitled = self.model_entitled_accounts(&accounts, a.provider, model);
             let notice = &mut entry.notice;
             if notice_state(a) != entry.state || a.user_state != UserState::Active {
                 return false;
@@ -2292,13 +2297,14 @@ impl AccountRuntime {
                 {
                     return false;
                 }
-            } else if !crate::relay::notices::quota_applies(a, model) {
+            } else if self.model_quota_status(a, model, now).is_none() {
                 return false;
             }
             if notice["action"] == "failover"
                 && !accounts.iter().any(|other| {
                     notice["next_account"] == other.id
                         && other.provider == a.provider
+                        && entitled.contains(&other.id)
                         && available(other, model)
                 })
             {
@@ -2307,7 +2313,7 @@ impl AccountRuntime {
             if notice["action"] == "exhausted" {
                 if accounts
                     .iter()
-                    .any(|other| other.provider == a.provider && available(other, model))
+                    .any(|other| entitled.contains(&other.id) && available(other, model))
                 {
                     return false;
                 }
@@ -2316,27 +2322,26 @@ impl AccountRuntime {
                     .iter()
                     .filter(|other| {
                         other.provider == a.provider
+                            && entitled.contains(&other.id)
                             && other.user_state == UserState::Active
                             && !other.drain
                     })
                     .filter_map(|other| {
-                        let snapshot = self.obs.quota_snapshot(&other.id).unwrap_or_default();
-                        crate::relay::notices::limiting_reset(
-                            other,
-                            &snapshot,
-                            model,
-                            self.observed_quota_reset(other),
-                        )
-                        .map(|reset| (other.id.clone(), reset))
+                        self.model_quota_status(other, model, now)
+                            .map(|status| (other.id.clone(), status.reset_at))
                     })
                     .min_by_key(|(_, reset)| *reset);
                 let reset_at = json!(earliest.as_ref().map(|(_, reset)| *reset));
                 let earliest_account = json!(earliest.map(|(id, _)| id));
-                let model_limited = json!(accounts.iter().any(|other| other.provider
-                    == a.provider
-                    && other.user_state == UserState::Active
-                    && !other.drain
-                    && crate::relay::notices::model_quota_applies(other, model)));
+                let model_limited = json!(accounts.iter().any(|other| {
+                    other.provider == a.provider
+                        && entitled.contains(&other.id)
+                        && other.user_state == UserState::Active
+                        && !other.drain
+                        && self
+                            .model_quota_status(other, model, now)
+                            .is_some_and(|status| status.model_limited)
+                }));
                 if notice["reset_at"] != reset_at
                     || notice["earliest_account"] != earliest_account
                     || notice["model_limited"] != model_limited
@@ -3459,26 +3464,28 @@ impl AccountRuntime {
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
+        let entitled = self.model_entitled_accounts(&accounts, provider, model);
         let candidates: Vec<_> = accounts
             .iter()
-            .filter(|a| a.provider == provider && a.user_state == UserState::Active)
+            .filter(|a| {
+                a.provider == provider
+                    && a.user_state == UserState::Active
+                    && entitled.contains(&a.id)
+            })
             .collect();
         let volatile = self.volatile.lock().map(|v| v.clone()).unwrap_or_default();
         let now = Utc::now();
         let mut cooling = Vec::new();
         for a in &candidates {
-            for health in std::iter::once(&a.health).chain(volatile.get(&a.id)) {
-                if let Health::Cooling {
-                    reason,
-                    until,
-                    scope,
-                } = health
-                    && *until > now
-                    && (scope == "account" || model.is_some_and(|m| scope == &format!("model:{m}")))
-                {
-                    let replay = matches!(reason, HealthReason::Quota | HealthReason::Auth);
-                    cooling.push((*a, *until, replay));
-                }
+            if let Some(until) = self.model_limited_until(a, model, now) {
+                // A cached, exact-model exhausted window can block an otherwise
+                // Ready row too. Combine concurrent holds per account before
+                // taking the earliest recovery across entitled accounts.
+                let replay = std::iter::once(&a.health).chain(volatile.get(&a.id)).any(|health| {
+                    matches!(health, Health::Cooling { reason: HealthReason::Quota | HealthReason::Auth, until, scope }
+                        if *until > now && (scope == "account" || model.is_some_and(|m| scope == &format!("model:{m}"))))
+                });
+                cooling.push((*a, until, replay));
             }
             if self.probing(&a.id)
                 || ((a.auth_probe_pending || a.auth_failures > 0) && a.health == Health::Ready)
@@ -3487,9 +3494,9 @@ impl AccountRuntime {
             }
         }
         if !cooling.is_empty() {
-            // Prefer genuine limit-response resets when available. Other
-            // temporary blockers still produce row 14, using the native shape.
-            cooling.sort_by_key(|(_, until, replay)| (!*replay, *until));
+            // Recovery is the earliest entitled account, whether its native
+            // limit was observed on a request or reconstructed from a fresh poll.
+            cooling.sort_by_key(|(_, until, replay)| (*until, !*replay));
             let (a, until, replay) = cooling[0];
             let seconds = (until - Utc::now()).num_seconds().max(1);
             let mut result = if !websocket

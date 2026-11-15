@@ -4,6 +4,7 @@
 pub(crate) struct DispatchAdmission {
     capacity: Option<crate::relay::CapacityMoveEvidence>,
     failure: Option<crate::relay::RequestFailureEvidence>,
+    catalog: Option<crate::relay::ModelEntitlementEvidence>,
     pin: Option<crate::debug_pin::DebugPinEvidence>,
     store: Vec<crate::accounts::StoreUnavailableEvidence>,
     runtime: Vec<crate::account_runtime::RuntimeUnavailableEvidence>,
@@ -14,6 +15,7 @@ impl DispatchAdmission {
         Self {
             capacity: None,
             failure: None,
+            catalog: None,
             pin: None,
             store: Vec::new(),
             runtime: Vec::new(),
@@ -25,10 +27,19 @@ impl DispatchAdmission {
         Self {
             capacity: Some(proof),
             failure: None,
+            catalog: None,
             pin: None,
             store: Vec::new(),
             runtime: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_catalog(
+        mut self,
+        catalog: Option<crate::relay::ModelEntitlementEvidence>,
+    ) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     pub(crate) fn with_failure(
@@ -85,6 +96,13 @@ impl DispatchAdmission {
             source.is_some_and(|source| p.applies_to(key, source, model, std::time::Instant::now()))
         }) {
             return Some(MoveReason::Rejected(proof));
+        }
+        if let Some(proof) = self.catalog.as_ref().filter(|proof| {
+            source.is_some_and(|source| {
+                proof.applies_to(provider, key, source, to, model, std::time::Instant::now())
+            })
+        }) {
+            return Some(MoveReason::Catalog(proof));
         }
         if let Some(proof) = self.runtime.iter().find(|p| p.applies_to(from)) {
             return Some(MoveReason::RuntimeUnavailable(proof));

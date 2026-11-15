@@ -10,6 +10,7 @@ pub mod admin_error;
 pub mod admin_import;
 pub mod admin_launch;
 pub mod admin_login;
+pub mod admin_models;
 pub mod admin_phase0;
 pub mod admin_pool;
 pub mod admin_refresh;

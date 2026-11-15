@@ -12,6 +12,7 @@ use qb_proto::admin_action::{
     AccountActionReply, ClearedReply, ProjectReply, ReleaseHoldReply, RoutingMutationReply,
     UpdatedReply,
 };
+mod models;
 mod reset_credits;
 
 pub use source_features::{account_routes, account_routes_with_poller};
@@ -181,6 +182,7 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
                 axum::routing::get(dashboard_usage),
             )
             .route("/admin/v1/state", axum::routing::get(runtime_state))
+            .route("/admin/v1/models", axum::routing::get(models::cached))
             .route("/admin/v1/events", axum::routing::get(runtime_events))
             .route("/admin/v1/accounts/{id}/{action}", post(account_action))
             .route(
@@ -258,14 +260,24 @@ async fn issue_launch(
                 .insert("pragma", axum::http::HeaderValue::from_static("no-cache"));
             response
         }
-        Err(error) => (
-            error.status(),
-            Json(serde_json::json!({"error":{
-                "code":error.code(),"message":error.message(),
-            }})),
-        )
-            .into_response(),
+        Err(error) => launch_error(error),
     }
+}
+
+fn launch_error(error: crate::relay::LaunchError) -> Response {
+    let mut detail = serde_json::json!({"code": error.code(), "message": error.message()});
+    if let crate::relay::LaunchError::ModelLimited {
+        retry_after,
+        earliest_account,
+        reset_at,
+    } = &error
+    {
+        detail["reason"] = serde_json::json!("model_limited");
+        detail["retry_after"] = serde_json::json!(retry_after);
+        detail["earliest_account"] = serde_json::json!(earliest_account);
+        detail["reset_at"] = serde_json::json!(reset_at);
+    }
+    (error.status(), Json(serde_json::json!({"error": detail}))).into_response()
 }
 
 #[derive(serde::Deserialize)]

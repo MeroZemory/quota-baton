@@ -7,7 +7,11 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+mod union;
+pub use union::UnionModel;
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const MAX_ACCOUNTS: usize = 64;
@@ -25,6 +29,7 @@ pub(crate) fn valid_model_id(id: &str) -> bool {
 }
 
 type Clock = dyn Fn() -> Instant + Send + Sync;
+type WallClock = dyn Fn() -> DateTime<Utc> + Send + Sync;
 
 // Content-bearing types deliberately have no derived Debug or serialization.
 macro_rules! redacted_debug {
@@ -73,6 +78,7 @@ pub struct KnownCatalog {
     raw: Value,
     supported: BTreeSet<String>,
     observed_at: Instant,
+    observed_at_wallclock: DateTime<Utc>,
 }
 
 impl KnownCatalog {
@@ -87,6 +93,10 @@ impl KnownCatalog {
 
     pub fn observed_at(&self) -> Instant {
         self.observed_at
+    }
+
+    pub fn observed_at_wallclock(&self) -> DateTime<Utc> {
+        self.observed_at_wallclock
     }
 }
 
@@ -119,6 +129,7 @@ pub struct CatalogView {
 
 struct Entry {
     observation: Observation,
+    denied_models: BTreeSet<String>,
     completed_at: Option<Instant>,
     active_ticket: Option<u64>,
 }
@@ -131,6 +142,7 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     clock: Arc<Clock>,
+    wallclock: Arc<WallClock>,
 }
 
 impl Inner {
@@ -158,12 +170,17 @@ impl Default for CatalogCache {
 
 impl CatalogCache {
     fn with_clock(clock: Arc<Clock>) -> Self {
+        Self::with_clocks(clock, Arc::new(Utc::now))
+    }
+
+    fn with_clocks(clock: Arc<Clock>, wallclock: Arc<WallClock>) -> Self {
         Self(Arc::new(Inner {
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 last_ticket: 0,
             }),
             clock,
+            wallclock,
         }))
     }
 
@@ -214,6 +231,7 @@ impl CatalogCache {
             .entry(account.to_owned())
             .or_insert(Entry {
                 observation: Observation::Unknown,
+                denied_models: BTreeSet::new(),
                 completed_at: None,
                 active_ticket: None,
             })
@@ -238,6 +256,74 @@ impl CatalogCache {
             return Err(CatalogError::RefreshInFlight);
         }
         Ok(state.entries.remove(account).is_some())
+    }
+
+    /// Callers supply only the provider's assignable accounts. Unknown catalogs
+    /// may be admitted for Claude; a retained catalog remains known evidence.
+    /// Explicit upstream denials always win, even before the first catalog.
+    pub fn entitled_accounts(
+        &self,
+        accounts: &[String],
+        model: &str,
+        unknown_fallback: bool,
+    ) -> Result<BTreeSet<String>, CatalogError> {
+        if !valid_model_id(model) {
+            return Err(CatalogError::InvalidModelId);
+        }
+        for account in accounts {
+            validate_account(account)?;
+        }
+        let state = self.0.lock();
+        Ok(accounts
+            .iter()
+            .filter(|account| {
+                let entry = state.entries.get(account.as_str());
+                !entry.is_some_and(|entry| entry.denied_models.contains(model))
+                    && entry
+                        .and_then(|entry| entry.observation.last_known())
+                        .map_or(unknown_fallback, |known| known.supported.contains(model))
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Process-local rejection override. Failure/cancellation does not clear it;
+    /// the next successfully validated catalog refresh clears all overrides.
+    pub fn deny_model(&self, account: &str, model: &str) -> Result<(), CatalogError> {
+        validate_account(account)?;
+        if !valid_model_id(model) {
+            return Err(CatalogError::InvalidModelId);
+        }
+        let mut state = self.0.lock();
+        if !state.entries.contains_key(account) && state.entries.len() >= MAX_ACCOUNTS {
+            return Err(CatalogError::AccountCapacity);
+        }
+        let entry = state.entries.entry(account.to_owned()).or_insert(Entry {
+            observation: Observation::Unknown,
+            denied_models: BTreeSet::new(),
+            completed_at: None,
+            active_ticket: None,
+        });
+        if entry.denied_models.len() >= MAX_MODELS && !entry.denied_models.contains(model) {
+            return Err(CatalogError::TooManyModels);
+        }
+        entry.denied_models.insert(model.to_owned());
+        Ok(())
+    }
+
+    /// Also used by the caller's Claude nowhere-model fallback, which must not
+    /// accidentally re-admit an account explicitly rejected by the provider.
+    pub fn is_model_denied(&self, account: &str, model: &str) -> Result<bool, CatalogError> {
+        validate_account(account)?;
+        if !valid_model_id(model) {
+            return Err(CatalogError::InvalidModelId);
+        }
+        Ok(self
+            .0
+            .lock()
+            .entries
+            .get(account)
+            .is_some_and(|entry| entry.denied_models.contains(model)))
     }
 }
 
@@ -284,11 +370,15 @@ impl RefreshGuard {
         }
         let now = (self.inner.clock)();
         entry.observation = match parsed {
-            Ok(Ok((raw, supported))) => Observation::Known(Arc::new(KnownCatalog {
-                raw,
-                supported,
-                observed_at: now,
-            })),
+            Ok(Ok((raw, supported))) => {
+                entry.denied_models.clear();
+                Observation::Known(Arc::new(KnownCatalog {
+                    raw,
+                    supported,
+                    observed_at: now,
+                    observed_at_wallclock: (self.inner.wallclock)(),
+                }))
+            }
             outcome => Observation::RefreshFailed {
                 previous: entry.observation.last_known().cloned(),
                 reason: match outcome {
@@ -329,7 +419,8 @@ redacted_debug!(
     Observation,
     CatalogView,
     CatalogCache,
-    RefreshGuard
+    RefreshGuard,
+    UnionModel
 );
 
 fn parse_catalog(raw: Value) -> Result<(Value, BTreeSet<String>), CatalogError> {
@@ -428,6 +519,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
+    mod r30;
+
     struct Fixture {
         cache: CatalogCache,
         seconds: Arc<AtomicU64>,
@@ -437,10 +530,20 @@ mod tests {
             let origin = Instant::now();
             let seconds = Arc::new(AtomicU64::new(0));
             let clock_seconds = Arc::clone(&seconds);
+            let wallclock_seconds = Arc::clone(&seconds);
             Self {
-                cache: CatalogCache::with_clock(Arc::new(move || {
-                    origin + Duration::from_secs(clock_seconds.load(Ordering::SeqCst))
-                })),
+                cache: CatalogCache::with_clocks(
+                    Arc::new(move || {
+                        origin + Duration::from_secs(clock_seconds.load(Ordering::SeqCst))
+                    }),
+                    Arc::new(move || {
+                        DateTime::from_timestamp(
+                            1_800_000_000 + wallclock_seconds.load(Ordering::SeqCst) as i64,
+                            0,
+                        )
+                        .unwrap()
+                    }),
+                ),
                 seconds,
             }
         }

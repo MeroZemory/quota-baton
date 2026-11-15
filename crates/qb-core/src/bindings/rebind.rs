@@ -12,6 +12,7 @@ pub(super) enum MoveReason<'a> {
     RuntimeUnavailable(&'a crate::account_runtime::RuntimeUnavailableEvidence),
     Capacity(&'a crate::relay::CapacityMoveEvidence),
     Rejected(&'a crate::relay::RequestFailureEvidence),
+    Catalog(&'a crate::relay::ModelEntitlementEvidence),
     StoreUnavailable(&'a crate::accounts::StoreUnavailableEvidence),
     UserPin(&'a crate::debug_pin::DebugPinEvidence),
     ExplicitModelConsent(&'a LaunchPolicyMove),
@@ -141,6 +142,16 @@ impl MoveReason<'_> {
             Self::Capacity(proof) => proof.applies_to(from, cx.account),
             Self::Rejected(proof) => source.is_some_and(|source| {
                 proof.applies_to(cx.key, source, cx.model, std::time::Instant::now())
+            }),
+            Self::Catalog(proof) => source.is_some_and(|source| {
+                proof.applies_to(
+                    cx.provider,
+                    cx.key,
+                    source,
+                    cx.account,
+                    cx.model,
+                    std::time::Instant::now(),
+                )
             }),
             Self::StoreUnavailable(proof) => proof.applies_to(from, source),
             Self::UserPin(proof) => proof.applies_to(cx.provider, cx.key, cx.account),
