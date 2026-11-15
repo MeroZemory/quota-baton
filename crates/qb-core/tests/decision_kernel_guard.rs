@@ -2315,20 +2315,31 @@ fn native_model_window_helper_requires_exact_root_and_typed_arguments() {
     let signature =
         "fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool";
     assert!(HEALTH_SOURCE.contains(signature), "stale model-window root");
-    for replacement in [
-        "fn renamed_model_window_helper(window: Option<&str>, model: Option<&str>) -> bool",
-        "fn claude_window_applies_to_model(window: &str, model: Option<&str>) -> bool",
-        "#[allow(dead_code)] fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool",
+    for (replacement, expected) in [
+        (
+            "fn renamed_model_window_helper(window: Option<&str>, model: Option<&str>) -> bool",
+            "missing native root ::claude_window_applies_to_model",
+        ),
+        (
+            "fn claude_window_applies_to_model(window: &str, model: Option<&str>) -> bool",
+            "changed native root signature ::claude_window_applies_to_model",
+        ),
+        (
+            "#[allow(dead_code)] fn claude_window_applies_to_model(window: Option<&str>, model: Option<&str>) -> bool",
+            "changed native root signature ::claude_window_applies_to_model",
+        ),
     ] {
         let fixture = HEALTH_SOURCE.replacen(signature, replacement, 1);
-        assert_readset_rejected(
+        assert_eq!(
             native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
-            replacement,
+            vec![expected.to_owned()],
+            "structural root plant: {replacement}",
         );
     }
     let fixture = format!("{HEALTH_SOURCE}\n{signature} {{ true }}");
-    assert_readset_rejected(
+    assert_eq!(
         native_readset(&fixture, CREDITS_SOURCE, HISTORY_SOURCE),
+        vec!["changed native root signature ::claude_window_applies_to_model".to_owned()],
         "duplicate model-window root",
     );
     let call = "claude_window_applies_to_model(w[\"name\"].as_str(), model)";
