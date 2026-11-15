@@ -194,7 +194,14 @@ pub(super) fn is_complete_snapshot(provider: Provider, body: &[u8]) -> bool {
                     })
                 })
         }
-        Provider::Claude => true,
+        Provider::Claude => ["five_hour", "seven_day"].iter().all(|slot| {
+            root.get(*slot).is_some_and(|value| {
+                value.is_null()
+                    || (value.is_object()
+                        && number(&value["utilization"]).is_some()
+                        && reset(value, Utc::now()).is_some())
+            })
+        }),
     }
 }
 

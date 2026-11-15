@@ -15,6 +15,216 @@ mod r28_claude_reset_tests {
         ScriptedResponse::json(reqwest::StatusCode::OK, value.to_string())
     }
 
+    #[tokio::test]
+    async fn ordinary_claude_poll_recovers_merged_header_hold_without_reset_post() {
+        for (used, partial, rejected, ready) in [
+            (0, false, false, true),
+            (51, false, false, true),
+            (95, false, false, true),
+            (97, false, false, false),
+            (0, true, false, false),
+            (0, false, true, false),
+        ] {
+            let f = fixture().await;
+            let reset = "2099-11-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (name, value) in [
+                ("anthropic-ratelimit-unified-status", "rejected".to_owned()),
+                (
+                    "anthropic-ratelimit-unified-reset",
+                    reset.timestamp().to_string(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-representative-claim",
+                    "five_hour".to_owned(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-5h-status",
+                    "rejected".to_owned(),
+                ),
+                ("anthropic-ratelimit-unified-5h-utilization", "1".to_owned()),
+                (
+                    "anthropic-ratelimit-unified-5h-reset",
+                    reset.timestamp().to_string(),
+                ),
+            ] {
+                headers.insert(name, value.parse().unwrap());
+            }
+            f.relay
+                .accounts
+                .observe_headers(&f.ids[0], Provider::Claude, &headers)
+                .await;
+            let before = f.account(0);
+            assert!(before.quota_cooling.is_some());
+            let mut fresh = usage(used);
+            if partial {
+                fresh.as_object_mut().unwrap().remove("seven_day");
+            }
+            if rejected {
+                fresh["five_hour"]["status"] = json!("rejected");
+            }
+            f.fake.state.push(reply(fresh));
+            f.fake.state.push(profile_reply(&f));
+            f.relay.quota.poll(&f.ids[0]).await.unwrap();
+            let after = f.account(0);
+            assert_eq!(
+                after.health == Health::Ready,
+                ready,
+                "used={used} partial={partial} rejected={rejected}"
+            );
+            assert_eq!(f.relay.accounts.eligible(&f.ids[0], None).await, ready);
+            let views = f.relay.accounts.typed_views().await.unwrap();
+            assert_eq!(
+                views
+                    .iter()
+                    .find(|v| v.id == f.ids[0])
+                    .unwrap()
+                    .pool_eligible,
+                ready
+            );
+            let merged = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+            assert_eq!(merged["signals"]["unified_status"] != "rejected", ready);
+            assert_eq!(after.allow_credits, before.allow_credits);
+            assert_eq!(after.drain, before.drain);
+            assert_eq!(after.user_state, before.user_state);
+            assert_requests_with_profiles(&f, 0, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_claude_poll_preserves_independent_auth_payment_and_model_holds() {
+        for reason in [
+            HealthReason::Auth,
+            HealthReason::Payment,
+            HealthReason::Quota,
+        ] {
+            let f = fixture().await;
+            let until = "2099-11-07T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+            let scope = if reason == HealthReason::Quota {
+                "model:claude-opus-4"
+            } else {
+                "account"
+            };
+            f.relay
+                .quota
+                .store
+                .update_metadata(&f.ids[0], |account| {
+                    account.health = Health::Cooling {
+                        reason,
+                        until,
+                        scope: scope.into(),
+                    };
+                    if reason == HealthReason::Payment {
+                        account.payment_until = Some(until);
+                    }
+                    if reason == HealthReason::Quota {
+                        account.quota_cooling = Some(crate::accounts::QuotaCooling {
+                            window: "7d_oi".into(),
+                            reset_at: until,
+                            started_at: Utc::now() - chrono::Duration::seconds(1),
+                        });
+                    }
+                })
+                .unwrap();
+            let before = f.account(0);
+            let mut fresh = usage(0);
+            fresh["seven_day_opus"]["utilization"] = json!(100);
+            f.fake.state.push(reply(fresh));
+            f.fake.state.push(profile_reply(&f));
+            f.relay.quota.poll(&f.ids[0]).await.unwrap();
+            assert_eq!(f.account(0).health, before.health, "{reason:?}");
+            assert_eq!(
+                f.account(0).quota_cooling,
+                before.quota_cooling,
+                "{reason:?}"
+            );
+            assert_requests_with_profiles(&f, 0, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_claude_poll_recovers_known_weekly_inventory_with_explicit_null_five_hour() {
+        for shape in ["null", "omitted", "malformed", "known_five_hour"] {
+            let f = fixture().await;
+            let reset = "2099-11-07T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (name, value) in [
+                ("anthropic-ratelimit-unified-status", "rejected".to_owned()),
+                (
+                    "anthropic-ratelimit-unified-reset",
+                    reset.timestamp().to_string(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-representative-claim",
+                    "seven_day".to_owned(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-7d-status",
+                    "rejected".to_owned(),
+                ),
+                ("anthropic-ratelimit-unified-7d-utilization", "1".to_owned()),
+                (
+                    "anthropic-ratelimit-unified-7d-reset",
+                    reset.timestamp().to_string(),
+                ),
+            ] {
+                headers.insert(name, value.parse().unwrap());
+            }
+            if shape == "known_five_hour" {
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-status",
+                    "rejected".parse().unwrap(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    "1".parse().unwrap(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    (reset - chrono::Duration::days(1))
+                        .timestamp()
+                        .to_string()
+                        .parse()
+                        .unwrap(),
+                );
+            }
+            f.relay
+                .accounts
+                .observe_headers(&f.ids[0], Provider::Claude, &headers)
+                .await;
+            assert_eq!(f.account(0).quota_cooling.as_ref().unwrap().window, "7d");
+            let mut fresh = json!({"five_hour":null,"seven_day":{"utilization":51,"resets_at":reset,"status":"allowed"}});
+            if shape == "omitted" {
+                fresh.as_object_mut().unwrap().remove("five_hour");
+            }
+            if shape == "malformed" {
+                fresh["five_hour"] = json!({"utilization":0});
+            }
+            f.fake.state.push(reply(fresh));
+            f.fake.state.push(profile_reply(&f));
+            f.relay.quota.poll(&f.ids[0]).await.unwrap();
+            let ready = shape == "null";
+            assert_eq!(f.account(0).health == Health::Ready, ready, "{shape}");
+            assert_eq!(
+                f.relay.accounts.eligible(&f.ids[0], None).await,
+                ready,
+                "{shape}"
+            );
+            assert_eq!(f.account(0).quota_cooling.is_none(), ready, "{shape}");
+            let views = f.relay.accounts.typed_views().await.unwrap();
+            assert_eq!(
+                views
+                    .iter()
+                    .find(|v| v.id == f.ids[0])
+                    .unwrap()
+                    .pool_eligible,
+                ready,
+                "{shape}"
+            );
+            assert_requests_with_profiles(&f, 0, 1);
+        }
+    }
+
     fn usage(used: u64) -> Value {
         json!({
             "five_hour":{"utilization":used,"resets_at":"2099-11-01T00:00:00Z"},

@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn claude_complete_requires_explicit_account_inventory_and_valid_numeric_windows() {
+    let complete =
+        json!({"five_hour":null,"seven_day":{"utilization":51,"resets_at":"2099-11-07T00:00:00Z"}});
+    assert!(is_complete_snapshot(
+        Provider::Claude,
+        &serde_json::to_vec(&complete).unwrap()
+    ));
+    for malformed in [
+        json!({}),
+        json!(false),
+        json!({"utilization":51}),
+        json!({"utilization":-1,"resets_at":"2099-11-07T00:00:00Z"}),
+        json!({"utilization":"NaN","resets_at":"2099-11-07T00:00:00Z"}),
+        json!({"utilization":51,"resets_at":"invalid"}),
+    ] {
+        let mut body = complete.clone();
+        body["five_hour"] = malformed;
+        assert!(
+            !is_complete_snapshot(Provider::Claude, &serde_json::to_vec(&body).unwrap()),
+            "{body}"
+        );
+    }
+    for missing in ["five_hour", "seven_day"] {
+        let mut body = complete.clone();
+        body.as_object_mut().unwrap().remove(missing);
+        assert!(!is_complete_snapshot(
+            Provider::Claude,
+            &serde_json::to_vec(&body).unwrap()
+        ));
+    }
+}
+
+#[test]
 fn r18_explicit_pro_categories_are_retained_without_numeric_tier_inference() {
     for tier in ["pro", "prolite", "promax"] {
         let mut body = report();

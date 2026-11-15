@@ -198,6 +198,9 @@ struct Snapshot {
 
 #[derive(Clone, Copy)]
 enum QuotaMerge<'a> {
+    ClaudePoll {
+        started_at: DateTime<Utc>,
+    },
     Removed(&'a crate::accounts::QuotaCooling),
     Reset {
         cleared: &'a BTreeSet<String>,
@@ -255,6 +258,85 @@ fn reset_healthy_windows(
                 .then(|| name.to_owned())
         })
         .collect()
+}
+
+// Ordinary usage can supersede old request headers only with complete, newer
+// account-window facts. Missing fields and unrelated scopes confer no authority.
+fn claude_poll_retires_rejection(next: &serde_json::Value, old: &serde_json::Value) -> bool {
+    const MAX_RECOVERY_USED_PCT: f64 = 95.0;
+    let Some(previous) = old["windows"].as_array().filter(|rows| !rows.is_empty()) else {
+        return false;
+    };
+    let Some(windows) = next["windows"].as_array() else {
+        return false;
+    };
+    let signals = &old["signals"];
+    if signals["unified_status"] != "rejected"
+        && signals["limit_reached"] != true
+        && !previous
+            .iter()
+            .any(|w| matches!(w["name"].as_str(), Some("5h" | "7d")) && w["status"] == "rejected")
+    {
+        return false;
+    }
+    if signals["active_limit"] == "credits" || signals["serving_from_credits"] == true {
+        return false;
+    }
+    for key in ["active_limit", "representative_claim"] {
+        if let Some(claim) = signals[key].as_str()
+            && !matches!(reset_window_name(claim), Some("5h" | "7d"))
+        {
+            return false;
+        }
+    }
+    let healthy = |window: &serde_json::Value| {
+        window["used_pct"]
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && (0.0..=MAX_RECOVERY_USED_PCT).contains(&n))
+            && window["status"] != "rejected"
+            && window["observed_at"] == next["observed_at"]
+            && window["reset_at"]
+                .as_str()
+                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                .is_some()
+    };
+    let healthy_account_window = |name: &str| {
+        windows
+            .iter()
+            .find(|w| w["name"] == name)
+            .is_some_and(healthy)
+    };
+    ["active_limit", "representative_claim"].iter().all(|key| {
+        signals[*key]
+            .as_str()
+            .is_none_or(|claim| reset_window_name(claim).is_some_and(healthy_account_window))
+    }) && windows
+        .iter()
+        .any(|w| matches!(w["name"].as_str(), Some("5h" | "7d")) && healthy(w))
+        && previous.iter().all(|prior| {
+            let Some(name) = prior["name"].as_str() else {
+                return false;
+            };
+            match name {
+                "5h" | "7d" => windows
+                    .iter()
+                    .find(|w| w["name"] == name)
+                    .is_some_and(healthy),
+                "7d_oi" | "7d_sonnet" => prior["status"] != "rejected",
+                _ => false,
+            }
+        })
+        && windows.iter().all(|w| {
+            matches!(
+                w["name"].as_str(),
+                Some("5h" | "7d" | "7d_oi" | "7d_sonnet")
+            ) && w["status"] != "rejected"
+                && (!matches!(w["name"].as_str(), Some("5h" | "7d")) || healthy(w))
+        })
+        && next["signals"]["unified_status"] != "rejected"
+        && next["signals"]["limit_reached"] != true
+        && next["signals"]["active_limit"] != "credits"
+        && next["signals"]["serving_from_credits"] != true
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Signals {
@@ -948,6 +1030,28 @@ impl Observability {
         self.remember(id, &next, !replace_windows, None)
     }
 
+    pub(crate) fn observe_claude_poll(
+        &self,
+        id: &str,
+        value: serde_json::Value,
+        complete: bool,
+        started_at: DateTime<Utc>,
+    ) -> Option<serde_json::Value> {
+        let mut next: Snapshot = serde_json::from_value(value).ok()?;
+        next.observed_at = started_at;
+        for window in &mut next.windows {
+            if window.observed_at.is_some() {
+                window.observed_at = Some(started_at);
+            }
+        }
+        self.remember(
+            id,
+            &next,
+            !complete,
+            Some(QuotaMerge::ClaudePoll { started_at }),
+        )
+    }
+
     /// Reset GETs must cover the LIVE known inventory, not an invented fixed
     /// four-slot schema. Numeric freshness also gates placement measurements.
     pub(crate) fn reset_window_coverage(
@@ -1401,6 +1505,9 @@ impl Observability {
             };
             // 부분 헤더 응답은 기존 창 정보를 지우지 않는다.
             if let Some(old) = snapshots.get(id) {
+                let retire_claude = matches!(mode, Some(QuotaMerge::ClaudePoll { .. }))
+                    && !preserve_missing_windows
+                    && claude_poll_retires_rejection(&value, old);
                 // Headers publish before taking Store. Check and merge under
                 // this one lock, or a late poll could erase their rejection.
                 let fence = match mode {
@@ -1408,6 +1515,7 @@ impl Observability {
                         QuotaMerge::Reset { started_at, .. }
                         | QuotaMerge::ResetFacts { started_at, .. },
                     ) => Some(started_at),
+                    Some(QuotaMerge::ClaudePoll { started_at }) => Some(started_at),
                     Some(QuotaMerge::Removed(_)) => Some(next.observed_at),
                     None => None,
                 };
@@ -1416,6 +1524,15 @@ impl Observability {
                         .as_str()
                         .and_then(|s| s.parse::<DateTime<Utc>>().ok())
                         .is_none_or(|at| at >= fence)
+                        || (matches!(mode, Some(QuotaMerge::ClaudePoll { .. }))
+                            && old["windows"].as_array().is_some_and(|windows| {
+                                windows.iter().any(|w| {
+                                    w["observed_at"]
+                                        .as_str()
+                                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                                        .is_some_and(|at| at >= fence)
+                                })
+                            }))
                 }) {
                     // Refusal is explicit: even H == R cannot turn the prior
                     // cache into a successful GET publication or measurement.
@@ -1432,9 +1549,11 @@ impl Observability {
                                 && reset_moved(&updated["reset_at"], &window["reset_at"]);
                             for key in ["used_pct", "reset_at", "observed_at", "status"] {
                                 let reset_status = key == "status"
-                                    && window["name"]
-                                        .as_str()
-                                        .is_some_and(|name| reset_scopes.contains(name));
+                                    && ((retire_claude
+                                        && matches!(window["name"].as_str(), Some("5h" | "7d")))
+                                        || window["name"]
+                                            .as_str()
+                                            .is_some_and(|name| reset_scopes.contains(name)));
                                 if updated[key].is_null()
                                     && !(key == "status" && reset_changed)
                                     && !reset_status
@@ -1462,6 +1581,21 @@ impl Observability {
                     serde_json::from_value::<Signals>(value["signals"].clone()),
                     serde_json::from_value::<Signals>(old["signals"].clone()),
                 ) {
+                    if retire_claude {
+                        if prior_signals.unified_status.as_deref() == Some("rejected") {
+                            prior_signals.unified_status = None;
+                        }
+                        prior_signals.unified_reset_at = None;
+                        prior_signals.representative_claim = None;
+                        if prior_signals.overage_status.as_deref() == Some("rejected") {
+                            prior_signals.overage_status = None;
+                        }
+                        prior_signals.retry_after_seconds = None;
+                        if prior_signals.limit_reached == Some(true) {
+                            prior_signals.limit_reached = None;
+                        }
+                        prior_signals.active_limit = None;
+                    }
                     if fresh_reset && !matches!(mode, Some(QuotaMerge::Reset { .. })) {
                         prior_signals.unified_status = None;
                         prior_signals.limit_reached = None;
@@ -2469,6 +2603,9 @@ fn retain(dir: &Path, today: NaiveDate, cap: u64) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    mod claude_poll_tests {
+        include!("observability/claude_poll_tests.rs");
+    }
     use super::*;
     use serde_json::{Value, json};
 

@@ -662,14 +662,31 @@ fn classify_inner(
                     resets.push(t);
                 }
             }
-            if !has("anthropic-ratelimit-unified-5h-status", "rejected")
+            let model_only = !has("anthropic-ratelimit-unified-5h-status", "rejected")
                 && !has("anthropic-ratelimit-unified-7d-status", "rejected")
-                && has("anthropic-ratelimit-unified-7d_oi-status", "rejected")
-                && let Some(model) = model
-            {
+                && (has("anthropic-ratelimit-unified-7d_oi-status", "rejected")
+                    || has(
+                        "anthropic-ratelimit-unified-representative-claim",
+                        "seven_day_opus",
+                    )
+                    || has("anthropic-ratelimit-unified-representative-claim", "7d_oi"));
+            if model_only {
+                let Some(model) = model else {
+                    return decision;
+                };
                 scope = format!("model:{model}");
+                if !resets.iter().any(|reset| *reset > now)
+                    && let Some(reset) =
+                        header_timestamp(headers, "anthropic-ratelimit-unified-7d_oi-reset")
+                {
+                    resets.push(reset);
+                }
             }
-            if let Some(t) = header_timestamp(headers, "anthropic-ratelimit-unified-reset") {
+            // Window rejections identify the cause. A broad unified deadline
+            // may describe another limit and must not erase that native cause.
+            if !resets.iter().any(|reset| *reset > now)
+                && let Some(t) = header_timestamp(headers, "anthropic-ratelimit-unified-reset")
+            {
                 resets.push(t);
             }
         } else {
@@ -722,15 +739,6 @@ fn classify_inner(
                     resets.extend(known.into_iter().min());
                 }
             }
-        }
-        if provider == Provider::Claude
-            && scope == "account"
-            && !has("anthropic-ratelimit-unified-5h-status", "rejected")
-            && !has("anthropic-ratelimit-unified-7d-status", "rejected")
-            && has("anthropic-ratelimit-unified-7d_oi-status", "rejected")
-            && model.is_none()
-        {
-            return decision;
         }
         decision.quota_reset = resets.iter().copied().filter(|reset| *reset > now).max();
         let until = resets
@@ -875,6 +883,207 @@ pub(super) fn error_value(raw: &[u8]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_quota_model_claim_never_blocks_an_entire_account() {
+        let reset = Utc::now() + Duration::hours(2);
+        for claim in ["seven_day_opus", "7d_oi"] {
+            for model in [None, Some("claude-fable-5-2")] {
+                let mut headers = HeaderMap::new();
+                for (name, value) in [
+                    ("anthropic-ratelimit-unified-status", "rejected".to_owned()),
+                    (
+                        "anthropic-ratelimit-unified-reset",
+                        reset.timestamp().to_string(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-representative-claim",
+                        claim.to_owned(),
+                    ),
+                ] {
+                    headers.insert(name, value.parse().unwrap());
+                }
+                let decision = classify(
+                    Provider::Claude,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &headers,
+                    br#"{"error":{"type":"rate_limit_error"}}"#,
+                    model,
+                );
+                assert_eq!(decision.kind, Kind::Quota);
+                if let Some(model) = model {
+                    assert!(
+                        matches!(decision.signal, Some(HealthSignal::Cooling { scope, .. }) if scope == format!("model:{model}"))
+                    );
+                } else {
+                    assert!(
+                        decision.signal.is_none(),
+                        "unknown model cannot create an account-wide hold"
+                    );
+                }
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-status",
+                    "rejected".parse().unwrap(),
+                );
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    reset.timestamp().to_string().parse().unwrap(),
+                );
+                let decision = classify(
+                    Provider::Claude,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &headers,
+                    br#"{"error":{"type":"rate_limit_error"}}"#,
+                    model,
+                );
+                assert!(
+                    matches!(decision.signal, Some(HealthSignal::Cooling { scope, .. }) if scope == "account"),
+                    "an actual account-window rejection must not be narrowed by a model claim"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_quota_prefers_rejected_window_resets_over_unified_reset() {
+        let now = Utc::now();
+        let short = DateTime::from_timestamp((now + Duration::hours(1)).timestamp(), 0).unwrap();
+        let weekly = DateTime::from_timestamp((now + Duration::days(2)).timestamp(), 0).unwrap();
+        for (short_rejected, weekly_rejected, short_reset, expected) in [
+            (true, false, Some(short), short),
+            (false, true, Some(short), weekly),
+            (true, true, Some(short), weekly),
+            (true, false, None, weekly),
+            (true, false, Some(now - Duration::hours(1)), weekly),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "anthropic-ratelimit-unified-status",
+                "rejected".parse().unwrap(),
+            );
+            headers.insert(
+                "anthropic-ratelimit-unified-reset",
+                weekly.timestamp().to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "anthropic-ratelimit-unified-5h-status",
+                if short_rejected {
+                    "rejected"
+                } else {
+                    "allowed"
+                }
+                .parse()
+                .unwrap(),
+            );
+            headers.insert(
+                "anthropic-ratelimit-unified-7d-status",
+                if weekly_rejected {
+                    "rejected"
+                } else {
+                    "allowed"
+                }
+                .parse()
+                .unwrap(),
+            );
+            headers.insert(
+                "anthropic-ratelimit-unified-7d-reset",
+                weekly.timestamp().to_string().parse().unwrap(),
+            );
+            if let Some(reset) = short_reset {
+                headers.insert(
+                    "anthropic-ratelimit-unified-5h-reset",
+                    reset.timestamp().to_string().parse().unwrap(),
+                );
+            }
+            let decision = classify(
+                Provider::Claude,
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                br#"{"error":{"type":"rate_limit_error"}}"#,
+                Some("claude-fable-5-2"),
+            );
+            assert_eq!(decision.kind, Kind::Quota);
+            assert_eq!(decision.quota_reset, Some(expected));
+            assert!(
+                matches!(decision.signal, Some(HealthSignal::Cooling { reason: HealthReason::Quota, until, scope }) if until == expected && scope == "account")
+            );
+        }
+    }
+
+    #[test]
+    fn claude_quota_failure_preserves_the_observed_causing_window() {
+        use crate::accounts::{Account, Identity};
+        use serde_json::json;
+        let identity = Identity::Claude {
+            account_uuid: "synthetic-quota-cause".into(),
+            organization_uuid: None,
+            email: "cause@example.invalid".into(),
+        };
+        let mut account: Account = serde_json::from_value(json!({
+            "schema":1,"id":identity.id(),"provider":"claude","label":"Synthetic",
+            "email":"cause@example.invalid","identity":identity,"source":{"kind":"oauth"},
+            "user_state":"active","health":{"kind":"ready"},"generation":0,
+            "token_meta":{"expires_at":null,"last_refresh_at":null,"refresh_uncertain":false}
+        }))
+        .unwrap();
+        let now = Utc::now();
+        let short = DateTime::from_timestamp((now + Duration::hours(1)).timestamp(), 0).unwrap();
+        let weekly = DateTime::from_timestamp((now + Duration::days(2)).timestamp(), 0).unwrap();
+        account.apply_health_signal(crate::accounts::HealthSignal::UsageSnapshot {
+            snapshot: json!({"source":"headers","observed_at":now,"windows":[
+                {"name":"5h","used_pct":100,"reset_at":short,"observed_at":now,"status":"rejected"},
+                {"name":"7d","used_pct":7,"reset_at":weekly,"observed_at":now,"status":"allowed"}
+            ],"signals":{"unified_status":"rejected","representative_claim":"five_hour","unified_reset_at":weekly}}),
+            model: Some("claude-fable-5-2".into()), projected_allowance:0.0
+        }, now);
+        let cause = account.quota_cooling.clone();
+        assert_eq!(cause.as_ref().unwrap().window, "5h");
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "rejected".to_owned()),
+            (
+                "anthropic-ratelimit-unified-reset",
+                weekly.timestamp().to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-status",
+                "rejected".to_owned(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset",
+                short.timestamp().to_string(),
+            ),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let decision = classify(
+            Provider::Claude,
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            br#"{"error":{"type":"rate_limit_error"}}"#,
+            Some("claude-fable-5-2"),
+        );
+        let Some(HealthSignal::Cooling {
+            reason,
+            until,
+            scope,
+        }) = decision.signal
+        else {
+            panic!("expected quota cooling");
+        };
+        account.apply_health_signal(
+            crate::accounts::HealthSignal::Cooling {
+                reason,
+                until,
+                scope,
+            },
+            now + Duration::milliseconds(1),
+        );
+        assert_eq!(
+            account.quota_cooling, cause,
+            "a later unrelated unified reset must not erase native cause evidence"
+        );
+    }
+
     #[test]
     fn quota_fallback_uses_one_wall_clock_sample_across_a_second_boundary() {
         let base = DateTime::parse_from_rfc3339("2026-10-20T00:00:00.900Z")

@@ -652,7 +652,7 @@ impl UsagePoller {
                 let reported = snapshot.clone();
                 let snapshot = self
                     .obs
-                    .observe_poll(id, snapshot, replace_windows)
+                    .observe_claude_poll(id, snapshot, replace_windows, usage_started_at)
                     .ok_or(PollError::Unavailable)?;
                 if probe.is_some() {
                     self.runtime

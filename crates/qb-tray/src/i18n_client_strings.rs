@@ -1,5 +1,14 @@
 //! Client presentation copy only; protocol codes and account metadata stay unchanged.
 pub(crate) const STRINGS: &[(&str, &str)] = &[
+    ("일부 모델 한도", "Model limit"),
+    (
+        "{0} 한도 도달 · 다른 모델 사용 가능",
+        "{0} limit reached · Other models available",
+    ),
+    (
+        "{0} 한도 도달 · 해당 모델만 제한",
+        "{0} limit reached · This model only",
+    ),
     ("로그인 요청이 올바르지 않습니다", "Invalid sign-in request"),
     (
         "로그인 응답을 확인할 수 없습니다",

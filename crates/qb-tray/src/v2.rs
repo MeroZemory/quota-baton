@@ -779,7 +779,7 @@ fn state_style(s: DisplayState) -> (Group, Option<Chip>) {
         ),
         Quota => (
             Group::Waiting,
-            crate::i18n::static_text("한도 도달"),
+            crate::i18n::static_text("계정 한도 도달"),
             Tone::Limit,
         ),
         Auth => (
@@ -1448,6 +1448,27 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         ),
         _ => None,
     };
+    if matches!(row.state, Ready | InUse)
+        && a.health.kind == "cooling"
+        && a.health.reason.as_deref() == Some("quota")
+        && let Some(model) = a
+            .health
+            .scope
+            .as_deref()
+            .and_then(|scope| scope.strip_prefix("model:"))
+            .filter(|model| !model.is_empty())
+    {
+        row.chip = Some(Chip {
+            text: crate::i18n::static_text("일부 모델 한도").into(),
+            tone: Tone::Limit,
+        });
+        let message = if a.pool_eligible == Some(true) {
+            "{0} 한도 도달 · 다른 모델 사용 가능"
+        } else {
+            "{0} 한도 도달 · 해당 모델만 제한"
+        };
+        row.reason = Some(crate::i18n::format(message, &[clean(model)]));
+    }
     if row.reason.is_none()
         && !matches!(row.state, Disabled | Paused)
         && row.group != Group::NeedsAction
@@ -2575,6 +2596,50 @@ mod tests {
                 .contains("사용 제한")
         );
         assert_eq!(summary(&v).todo, 0);
+    }
+    #[test]
+    fn model_quota_is_distinct_from_account_quota_and_remains_available() {
+        let mut account = base("model-quota");
+        account["pool_eligible"] = json!(true);
+        account["health"] =
+            json!({"kind":"cooling","reason":"quota","scope":"model:claude-fable-5-2"});
+        let projected = view(vec![account.clone()], 1);
+        let row = actual_row(&projected, "model-quota");
+        assert_eq!(row.group, Group::Ready);
+        assert_eq!(row.chip.as_ref().unwrap().text, "일부 모델 한도");
+        assert!(row.reason.as_ref().unwrap().contains("claude-fable-5-2"));
+        assert!(row.reason.as_ref().unwrap().contains("다른 모델 사용 가능"));
+        assert_eq!(summary(&projected).verdict, Verdict::Available);
+        assert_eq!(summary(&projected).todo, 0);
+        account["pool_eligible"] = json!(false);
+        let unavailable = view(vec![account.clone()], 0);
+        assert!(
+            actual_row(&unavailable, "model-quota")
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("해당 모델만 제한")
+        );
+        account["health"]["scope"] = json!("account");
+        let projected = view(vec![account.clone()], 0);
+        let row = actual_row(&projected, "model-quota");
+        assert_eq!(row.group, Group::Waiting);
+        assert_eq!(row.chip.as_ref().unwrap().text, "계정 한도 도달");
+        account["health"]["scope"] = json!("model:claude-fable-5-2");
+        account["user_state"] = json!("paused");
+        let projected = view(vec![account], 0);
+        assert_eq!(
+            actual_row(&projected, "model-quota").state,
+            DisplayState::Paused
+        );
+        assert_eq!(
+            actual_row(&projected, "model-quota")
+                .chip
+                .as_ref()
+                .unwrap()
+                .text,
+            "일시정지"
+        );
     }
     #[test]
     fn authoritative_pools_and_nonvacuous_credits() {
