@@ -6,6 +6,7 @@ use crate::{
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
+use tower::ServiceExt;
 
 struct Fixture {
     relay: Arc<RelayState>,
@@ -102,13 +103,15 @@ impl Fixture {
     }
 
     async fn models(&self) -> AdminModels {
-        let response = cached(State(RuntimeAdmin {
-            relay: self.relay.clone(),
-            data_port: 0,
-            #[cfg(all(windows, feature = "testkit"))]
-            adoption_probe: None,
-        }))
-        .await;
+        let response = super::super::runtime_routes(self.relay.clone(), 0)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin/v1/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), 64 * 1024)
