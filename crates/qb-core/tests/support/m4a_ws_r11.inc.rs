@@ -1099,13 +1099,25 @@ mod r11_actual {
                         1,
                         "no server reconnect or replay"
                     );
-                    assert_eq!(
+                    // Admission records a catalog-validated pick before preview;
+                    // model metadata alone does not move the incumbent.
+                    let picked =
                         t.h.state
                             .bindings
                             .launch_info(&canonical, Utc::now())
-                            .unwrap(),
-                        promoted,
-                        "preview does not move the live incumbent"
+                            .unwrap();
+                    assert_eq!(picked.account, promoted.account);
+                    assert_eq!(picked.canonical_key, promoted.canonical_key);
+                    assert_eq!(picked.managed, promoted.managed);
+                    assert_eq!(picked.advertised_models, promoted.advertised_models);
+                    assert_eq!(picked.current_model.as_deref(), Some("other-account-only"));
+                    assert_eq!(t.h.state.bindings.routing_view(), routing);
+                    assert_eq!(
+                        t.h.ledger()
+                            .into_iter()
+                            .filter(|row| row["event"] == "session_move")
+                            .collect::<Vec<_>>(),
+                        moves
                     );
                     drop(client);
                     capacity_count(&t.h, &account, 0).await;
@@ -1156,21 +1168,47 @@ mod r11_actual {
                     1,
                     "no move or replacement WS dial"
                 );
-                assert_eq!(
+                // Strict vetoes placement; it does not undo the validated pick.
+                let picked =
                     t.h.state
                         .bindings
                         .launch_info(&canonical, Utc::now())
-                        .unwrap(),
-                    promoted
+                        .unwrap();
+                assert_eq!(picked.account, promoted.account);
+                assert_eq!(picked.canonical_key, promoted.canonical_key);
+                assert_eq!(picked.managed, promoted.managed);
+                assert_eq!(picked.advertised_models, promoted.advertised_models);
+                assert_eq!(picked.current_model.as_deref(), Some("other-account-only"));
+                assert_eq!(t.h.state.bindings.routing_view(), routing);
+                assert_eq!(
+                    t.h.ledger()
+                        .into_iter()
+                        .filter(|row| row["event"] == "session_move")
+                        .collect::<Vec<_>>(),
+                    moves
                 );
                 capacity_count(&t.h, &account, 1).await;
                 let row = t.h.store.load(&account).unwrap();
                 let token = t.h.store.tokens(&row).unwrap();
-                assert!(
-                    t.catalogs.requests.lock().unwrap()[catalog_before..]
+                let other_row = t.h.store.load(other).unwrap();
+                let other_token = t.h.store.tokens(&other_row).unwrap();
+                let source_auth = format!("Bearer {}", token.access_token);
+                let destination_auth = format!("Bearer {}", other_token.access_token);
+                let requests = t.catalogs.requests.lock().unwrap().clone();
+                let refreshes = &requests[catalog_before..];
+                assert_eq!(
+                    refreshes
                         .iter()
-                        .all(|request| request != &format!("Bearer {}", token.access_token)),
-                    "guard veto does not force a source catalog refresh"
+                        .filter(|request| **request == source_auth)
+                        .count(),
+                    1,
+                    "missing pick refreshes the source with its own credential"
+                );
+                assert!(
+                    refreshes
+                        .iter()
+                        .all(|request| request == &source_auth || request == &destination_auth),
+                    "catalog refreshes use the source or destination account credential"
                 );
 
                 // Keep using the original ordinary socket after the local error.

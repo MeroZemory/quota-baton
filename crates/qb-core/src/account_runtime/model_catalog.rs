@@ -170,7 +170,7 @@ impl AccountRuntime {
             return None;
         }
         let evidence = projected_scope
-            .and_then(|_| effective.quota_cooling.as_ref())
+            .and(effective.quota_cooling.as_ref())
             .filter(|quota| quota.reset_at > now && quota.started_at <= now);
         // The existing observation fence checks account/health/deadline, but
         // not model scope. Never lend another model's native reset to this one.
