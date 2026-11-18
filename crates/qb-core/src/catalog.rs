@@ -77,6 +77,7 @@ pub enum RefreshFailure {
 pub struct KnownCatalog {
     raw: Value,
     supported: BTreeSet<String>,
+    client_version: Option<String>,
     observed_at: Instant,
     observed_at_wallclock: DateTime<Utc>,
 }
@@ -89,6 +90,11 @@ impl KnownCatalog {
 
     pub fn supported(&self) -> &BTreeSet<String> {
         &self.supported
+    }
+
+    /// Client version used for this successful observation, when supplied.
+    pub fn client_version(&self) -> Option<&str> {
+        self.client_version.as_deref()
     }
 
     pub fn observed_at(&self) -> Instant {
@@ -132,6 +138,7 @@ struct Entry {
     denied_models: BTreeSet<String>,
     completed_at: Option<Instant>,
     active_ticket: Option<u64>,
+    invalidated: bool,
 }
 
 struct State {
@@ -226,22 +233,33 @@ impl CatalogCache {
             .checked_add(1)
             .ok_or(CatalogError::TicketExhausted)?;
         state.last_ticket = ticket;
-        state
-            .entries
-            .entry(account.to_owned())
-            .or_insert(Entry {
-                observation: Observation::Unknown,
-                denied_models: BTreeSet::new(),
-                completed_at: None,
-                active_ticket: None,
-            })
-            .active_ticket = Some(ticket);
+        let entry = state.entries.entry(account.to_owned()).or_insert(Entry {
+            observation: Observation::Unknown,
+            denied_models: BTreeSet::new(),
+            completed_at: None,
+            active_ticket: None,
+            invalidated: false,
+        });
+        entry.active_ticket = Some(ticket);
+        // Consume only invalidations preceding this admission. A later mark_due
+        // survives this guard's completion or cancellation.
+        entry.invalidated = false;
         Ok(Some(RefreshGuard {
             inner: Arc::clone(&self.0),
             account: account.to_owned(),
             ticket,
             finished: false,
         }))
+    }
+
+    /// Request another refresh without discarding facts, denials or singleflight.
+    /// Unknown accounts are already due; marking one never allocates an entry.
+    pub fn mark_due(&self, account: &str) -> Result<(), CatalogError> {
+        validate_account(account)?;
+        if let Some(entry) = self.0.lock().entries.get_mut(account) {
+            entry.invalidated = true;
+        }
+        Ok(())
     }
 
     /// Explicit lifecycle cleanup only. Never remove an in-flight account.
@@ -303,6 +321,7 @@ impl CatalogCache {
             denied_models: BTreeSet::new(),
             completed_at: None,
             active_ticket: None,
+            invalidated: false,
         });
         if entry.denied_models.len() >= MAX_MODELS && !entry.denied_models.contains(model) {
             return Err(CatalogError::TooManyModels);
@@ -335,9 +354,10 @@ fn validate_account(account: &str) -> Result<(), CatalogError> {
 }
 
 fn due(entry: &Entry, now: Instant) -> bool {
-    entry
-        .completed_at
-        .is_none_or(|last| now.saturating_duration_since(last) >= REFRESH_INTERVAL)
+    entry.invalidated
+        || entry
+            .completed_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= REFRESH_INTERVAL)
 }
 
 /// Move into the HTTP future; cancellation/unwind releases admission on Drop.
@@ -353,7 +373,17 @@ impl RefreshGuard {
     /// Validate outside the mutex. Failure preserves the previous known catalog.
     /// Upstream failure is recorded successfully (Ok); invalid JSON returns Err
     /// as well as recording InvalidCatalog. A stale completion changes nothing.
-    pub fn finish(mut self, reply: Result<Value, RefreshFailure>) -> Result<(), CatalogError> {
+    pub fn finish(self, reply: Result<Value, RefreshFailure>) -> Result<(), CatalogError> {
+        self.finish_with_client_version(reply, None)
+    }
+
+    /// Atomically publish the version with its validated catalog. Failure keeps
+    /// the previous observation and its version; stale tickets publish neither.
+    pub fn finish_with_client_version(
+        mut self,
+        reply: Result<Value, RefreshFailure>,
+        client_version: Option<String>,
+    ) -> Result<(), CatalogError> {
         let parsed = reply.map(parse_catalog);
         let validation_error = match &parsed {
             Ok(Err(error)) => Some(*error),
@@ -375,6 +405,7 @@ impl RefreshGuard {
                 Observation::Known(Arc::new(KnownCatalog {
                     raw,
                     supported,
+                    client_version,
                     observed_at: now,
                     observed_at_wallclock: (self.inner.wallclock)(),
                 }))
@@ -520,6 +551,7 @@ mod tests {
     use std::thread;
 
     mod r30;
+    mod r31;
 
     struct Fixture {
         cache: CatalogCache,

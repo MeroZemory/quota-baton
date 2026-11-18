@@ -693,7 +693,7 @@ mod tests {
         assert!(b.unwrap().supported().contains("synthetic-model"));
         let calls = f.upstream.state.requests();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].path_and_query, "/models?client_version=0.163.0");
+        assert_eq!(calls[0].path_and_query, "/models?client_version=0.170.0");
         assert_eq!(
             calls[0].headers["authorization"],
             "Bearer catalog-synthetic-access-0"
@@ -832,6 +832,107 @@ mod tests {
             .strip_suffix("/v1")
             .unwrap()
     }
+    #[tokio::test]
+    async fn r31_scoped_menu_refreshes_and_new_model_launch_survives_restart() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::collections::BTreeMap;
+        use tokio::net::TcpListener;
+
+        let f = Fixture::new().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.upstream.codex_base = format!("http://{}", listener.local_addr().unwrap());
+        let provider = Router::new().route(
+            "/models",
+            get(|Query(query): Query<BTreeMap<String, String>>| async move {
+                let version = query.get("client_version").map(String::as_str);
+                let mut models = vec![json!({"slug":"common"})];
+                if matches!(version, Some("0.171.0" | "0.172.0")) {
+                    models.push(json!({"slug":"gpt-6.2-sol"}));
+                }
+                Json(json!({"models": models, "fixture_version": version}))
+            }),
+        );
+        let upstream = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let make_relay = || {
+            Arc::new(
+                RelayState::new(
+                    f.relay.store.clone(),
+                    &config,
+                    f.relay.observability.clone(),
+                    Arc::new(DebugPins::default()),
+                )
+                .unwrap(),
+            )
+        };
+        let relay = make_relay();
+        let initial = relay.launch_catalog(&f.id, false, false).await.unwrap();
+        assert_eq!(initial.client_version(), Some("0.170.0"));
+        assert_eq!(initial.raw()["fixture_version"], "0.170.0");
+        assert!(!initial.supported().contains("gpt-6.2-sol"));
+        let launch = relay
+            .issue_launch(issue_request(Some("common")), 10200)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = super::super::router(relay.clone());
+        let core = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let menu_url = format!("http://{address}/l/{}/v1/models", issued_handle(&launch));
+        let value: serde_json::Value = client
+            .get(&menu_url)
+            .query(&[("client_version", "0.171.0")])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(value["fixture_version"], "0.171.0");
+        assert_eq!(value["models"][1]["slug"], "gpt-6.2-sol");
+        let model = relay
+            .issue_launch(issue_request(Some("gpt-6.2-sol")), 10200)
+            .await
+            .unwrap();
+        assert_eq!(model.account, f.id);
+        assert_eq!(model.model.as_deref(), Some("gpt-6.2-sol"));
+        for older in ["0.169.0", "0.999.0-preview"] {
+            let value: serde_json::Value = client
+                .get(&menu_url)
+                .query(&[("client_version", older)])
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(value["fixture_version"], "0.171.0");
+        }
+        let _ = client
+            .post(format!("http://{address}/v1/responses"))
+            .header("user-agent", "codex-tui/0.172.0")
+            .json(&json!({"model": "common", "input": "synthetic"}))
+            .send()
+            .await
+            .unwrap();
+        let raised = relay.launch_catalog(&f.id, false, false).await.unwrap();
+        assert_eq!(raised.raw()["fixture_version"], "0.172.0");
+        core.abort();
+        let _ = core.await;
+        drop(relay);
+        let restarted = make_relay();
+        let fresh = restarted.launch_catalog(&f.id, false, false).await.unwrap();
+        assert_eq!(fresh.client_version(), Some("0.172.0"));
+        assert_eq!(fresh.raw()["fixture_version"], "0.172.0");
+        upstream.abort();
+        let _ = upstream.await;
+    }
+
     async fn warm_issue_catalog(f: &Fixture, id: &str, models: &[&str]) {
         f.reply(
             StatusCode::OK,
@@ -2119,12 +2220,24 @@ impl<'a> CatalogRefreshOwner<'a> {
         }
     }
 
+    #[cfg(test)]
     fn finish(
-        mut self,
+        self,
         reply: Result<serde_json::Value, crate::catalog::RefreshFailure>,
     ) -> Result<(), crate::catalog::CatalogError> {
+        self.finish_with_client_version(reply, None)
+    }
+
+    fn finish_with_client_version(
+        mut self,
+        reply: Result<serde_json::Value, crate::catalog::RefreshFailure>,
+        client_version: Option<String>,
+    ) -> Result<(), crate::catalog::CatalogError> {
         // finish consumes the guard and releases its cache lock before self Drop.
-        self.guard.take().expect("refresh owner").finish(reply)
+        self.guard
+            .take()
+            .expect("refresh owner")
+            .finish_with_client_version(reply, client_version)
     }
 }
 
@@ -2735,13 +2848,40 @@ impl RelayState {
         existing: bool,
     ) -> Result<Arc<KnownCatalog>, ()> {
         let deadline = tokio::time::Instant::now() + CATALOG_DEADLINE;
+        let store = self.store.clone();
+        let account_id = id.to_owned();
+        let codex = crate::boxes::spawn_blocking(move || store.load(&account_id))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?
+            .provider
+            == Provider::Codex;
+        let mut force = force;
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            let version = codex.then(|| self.codex_catalog_version.effective());
+            let current = self.catalogs.view(id).map_err(|_| ())?;
+            let matches_version = |catalog: &KnownCatalog| {
+                version.is_none_or(|required| {
+                    catalog
+                        .client_version()
+                        .and_then(super::catalog_client_version::Version::parse)
+                        .is_some_and(|used| used >= required)
+                })
+            };
+            let outdated = codex
+                && !current
+                    .observation
+                    .last_known()
+                    .is_some_and(|c| matches_version(c));
             let notified = self.catalog_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             match self.catalogs.begin_refresh(
                 id,
-                if force {
+                if force || outdated {
                     RefreshMode::Force
                 } else {
                     RefreshMode::IfDue
@@ -2749,38 +2889,55 @@ impl RelayState {
             ) {
                 Ok(Some(guard)) => {
                     let owner = CatalogRefreshOwner::new(guard, &self.catalog_changed);
-                    let result = tokio::time::timeout_at(deadline, self.fetch_launch_catalog(id))
-                        .await
-                        .unwrap_or(Err(RefreshFailure::Transport));
-                    let _ = owner.finish(result);
-                    break;
+                    let result =
+                        tokio::time::timeout_at(deadline, self.fetch_launch_catalog(id, version))
+                            .await
+                            .unwrap_or(Err(RefreshFailure::Transport));
+                    let _ =
+                        owner.finish_with_client_version(result, version.map(|v| v.to_string()));
                 }
-                Ok(None) => break,
+                Ok(None) => {}
                 Err(CatalogError::RefreshInFlight) => {
                     tokio::time::timeout_at(deadline, notified)
                         .await
                         .map_err(|_| ())?;
-                    if self.catalogs.view(id).map_err(|_| ())?.refreshing {
-                        continue;
-                    }
-                    // The completed singleflight satisfies this caller's force
-                    // request; do not immediately issue another forced fetch.
-                    break;
+                    force = false;
+                    continue;
                 }
                 Err(_) => return Err(()),
             }
-        }
-        match self.catalogs.view(id).map_err(|_| ())?.observation {
-            Observation::Known(catalog) => Ok(catalog),
-            Observation::RefreshFailed {
-                previous: Some(catalog),
-                ..
-            } if existing && catalog.observed_at().elapsed() < BOUND_STALE_LIMIT => Ok(catalog),
-            _ => Err(()),
+            // A concurrent version raise cannot make an older in-flight answer current.
+            let required = codex.then(|| self.codex_catalog_version.effective());
+            let observation = self.catalogs.view(id).map_err(|_| ())?.observation;
+            let catalog = match observation {
+                Observation::Known(catalog) => catalog,
+                Observation::RefreshFailed {
+                    previous: Some(catalog),
+                    ..
+                } if existing && catalog.observed_at().elapsed() < BOUND_STALE_LIMIT => catalog,
+                _ => return Err(()),
+            };
+            let usable_version = required.is_none_or(|required| {
+                catalog
+                    .client_version()
+                    .and_then(super::catalog_client_version::Version::parse)
+                    .is_some_and(|used| used >= required)
+            });
+            if usable_version {
+                return Ok(catalog);
+            }
+            if required == version {
+                return Err(());
+            }
+            force = false;
         }
     }
 
-    async fn fetch_launch_catalog(&self, id: &str) -> Result<serde_json::Value, RefreshFailure> {
+    async fn fetch_launch_catalog(
+        &self,
+        id: &str,
+        client_version: Option<super::catalog_client_version::Version>,
+    ) -> Result<serde_json::Value, RefreshFailure> {
         let _slot = self
             .catalog_slots
             .acquire()
@@ -2833,10 +2990,10 @@ impl RelayState {
             let headers = super::headers::upstream(&source_headers, &account, &tokens.access_token)
                 .map_err(|_| RefreshFailure::Unauthorized)?;
             let request = match account.provider {
-                Provider::Codex => self
-                    .client
-                    .get(format!("{base}/models"))
-                    .query(&[("client_version", "0.163.0")]),
+                Provider::Codex => self.client.get(format!("{base}/models")).query(&[(
+                    "client_version",
+                    client_version.expect("Codex fetch version").to_string(),
+                )]),
                 Provider::Claude => self.client.get(format!("{base}/v1/models")),
             };
             let mut response = request
@@ -2925,16 +3082,20 @@ impl RelayState {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! {
+                let codex_only = tokio::select! {
                     _ = relay.wait_for_drain() => return,
-                    _ = tick.tick() => {}
-                }
+                    _ = tick.tick() => false,
+                    _ = relay.catalog_version_changed.notified() => true,
+                };
                 let store = relay.store.clone();
                 let Ok(Ok(accounts)) = crate::boxes::spawn_blocking(move || store.list()).await
                 else {
                     continue;
                 };
                 for account in accounts.into_iter().filter(catalog_assignable) {
+                    if codex_only && account.provider != Provider::Codex {
+                        continue;
+                    }
                     if relay.is_draining() {
                         return;
                     }

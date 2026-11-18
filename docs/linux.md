@@ -103,6 +103,8 @@ requests over the Unix socket.
 
 ### Orchestrator API
 
+Codex model observations use the highest client version recorded by the core across restarts, with a built-in 0.170.0 floor. Newer Codex clients trigger prompt catalog refresh; older clients do not downgrade the catalog. Provider model metadata is passed through unchanged. Claude catalog behavior and the union response shape are unchanged.
+
 These `/admin/v1` routes are stable for orchestrators. A breaking change gets
 a new version. Responses never contain tokens; treat login codes and redirect
 URLs as secrets and do not log them.

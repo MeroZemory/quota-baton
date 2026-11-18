@@ -1,6 +1,8 @@
 mod takeover_handover;
 pub use takeover_handover::MAX_REPLY_BYTES as MAX_TAKEOVER_REPLY_BYTES;
 mod box_scope;
+mod catalog_client_observation;
+mod catalog_client_version;
 pub(crate) mod credentials;
 #[cfg(test)]
 mod handover_tests;
@@ -164,6 +166,8 @@ pub struct RelayState {
     pub(crate) catalogs: Arc<crate::catalog::CatalogCache>,
     catalog_slots: tokio::sync::Semaphore,
     catalog_changed: Notify,
+    codex_catalog_version: Arc<catalog_client_version::CatalogClientVersion>,
+    catalog_version_changed: Notify,
     burst: Mutex<crate::burst::BurstTracker>,
     rate_hold_secs: u64,
     rate_hold_max_retries: u32,
@@ -825,6 +829,10 @@ impl RelayState {
             );
         }
         Ok(Self {
+            codex_catalog_version: Arc::new(catalog_client_version::CatalogClientVersion::open(
+                store.home(),
+            )?),
+            catalog_version_changed: Notify::new(),
             catalogs: accounts.catalogs.clone(),
             accounts,
             quota,
@@ -2409,6 +2417,18 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
 }
 
 async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
+    if state
+        .observe_codex_catalog_client(request.uri(), request.headers())
+        .await
+        .is_err()
+    {
+        return native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Provider::Codex,
+            "server_error",
+            "Catalog client version could not be recorded",
+        );
+    }
     let project = match crate::routing::take_project(request.headers_mut()) {
         Ok(project) => project,
         Err(_) => {
@@ -2796,6 +2816,33 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     if let Some(query) = parts.uri.query() {
         url.push('?');
         url.push_str(query);
+    }
+    if provider == Provider::Codex && parts.method == Method::GET && path == "/v1/models" {
+        // Ordinary pass-through catalog requests obey the same monotonic floor
+        // as cached account observations; preserve every unrelated query pair.
+        let Ok(mut catalog_url) = reqwest::Url::parse(&url) else {
+            return failure(
+                &mut completion,
+                StatusCode::BAD_GATEWAY,
+                provider,
+                "server_error",
+                "Invalid catalog URL",
+            );
+        };
+        let query: Vec<(String, String)> = catalog_url
+            .query_pairs()
+            .filter(|(key, _)| key != "client_version")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        catalog_url.set_query(None);
+        catalog_url
+            .query_pairs_mut()
+            .extend_pairs(query)
+            .append_pair(
+                "client_version",
+                &state.codex_catalog_version.effective().to_string(),
+            );
+        url = catalog_url.to_string();
     }
     let mut body_to_send = upload.body;
     let mut network_retry = false;
