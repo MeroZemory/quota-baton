@@ -128,9 +128,10 @@ impl Fixture {
                     .begin_refresh(&account.id, RefreshMode::Force),
             )
             .unwrap()
-            .finish(Ok(
-                json!({"models":models.iter().map(|id| json!({"slug":id})).collect::<Vec<_>>()}),
-            ))
+            .finish_with_client_version(
+                Ok(json!({"models":models.iter().map(|id| json!({"slug":id})).collect::<Vec<_>>()})),
+                Some(relay.codex_catalog_version.effective().to_string()),
+            )
             .unwrap();
         }
         let candidate = Candidate {

@@ -212,9 +212,9 @@ async fn every_route_preserves_path_query_and_c3_headers() {
         ("POST", "/v1/images/edits", false, "/images/edits"),
         (
             "GET",
-            "/v1/models?client_version=0.162.1",
+            "/v1/models?client_version=0.162.1&fixture=retained",
             false,
-            "/models?client_version=0.162.1",
+            "/models?fixture=retained&client_version=0.170.0",
         ),
     ] {
         // Image routes now require a known paid account and a valid operation
