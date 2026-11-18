@@ -41,3 +41,6 @@ pub(crate) use box_sockets::SocketSet as NativeSocketSet;
 
 mod admin_socket;
 pub(crate) use admin_socket::{admin_socket_path_if_allowed, start_admin_socket};
+
+#[cfg(test)]
+pub(crate) use std::os::unix::fs::symlink as create_test_symlink;
