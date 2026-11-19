@@ -35,6 +35,17 @@ impl AccountRuntime {
         model: Option<&str>,
         incumbent: Option<&str>,
     ) -> BTreeSet<String> {
+        self.model_entitlements(accounts, provider, model, incumbent, |_, _| {})
+    }
+
+    pub(crate) fn model_entitlements(
+        &self,
+        accounts: &[Account],
+        provider: Provider,
+        model: Option<&str>,
+        incumbent: Option<&str>,
+        mut rejected: impl FnMut(&str, &'static str),
+    ) -> BTreeSet<String> {
         let Some(model) = model else {
             return accounts
                 .iter()
@@ -44,25 +55,46 @@ impl AccountRuntime {
         };
         let ids: Vec<_> = accounts
             .iter()
+            .filter(|account| account.provider == provider)
             .filter(|account| {
-                account.provider == provider
-                    && (crate::relay::catalog_assignable(account)
-                        || (incumbent == Some(account.id.as_str())
-                            && account.user_state == UserState::Active
-                            && account.drain
-                            && !(provider == Provider::Claude
-                                && account.plan.as_deref() == Some("free"))
-                            && !matches!(
-                                account.health,
-                                Health::NeedsRelogin { .. } | Health::PlanWithoutClaudeCode
-                            )))
+                let assignable = crate::relay::catalog_assignable(account)
+                    || (incumbent == Some(account.id.as_str())
+                        && account.user_state == UserState::Active
+                        && account.drain
+                        && !(provider == Provider::Claude
+                            && account.plan.as_deref() == Some("free"))
+                        && !matches!(
+                            account.health,
+                            Health::NeedsRelogin { .. } | Health::PlanWithoutClaudeCode
+                        ));
+                if !assignable {
+                    let gate = match account.user_state {
+                        UserState::Disabled => "disabled",
+                        UserState::Paused => "paused",
+                        _ if matches!(account.health, Health::NeedsRelogin { .. }) => {
+                            "needs_relogin"
+                        }
+                        _ if account.drain => "drain",
+                        _ => "assignability",
+                    };
+                    rejected(&account.id, gate);
+                }
+                assignable
             })
             .map(|account| account.id.clone())
             .collect();
         let Ok(entitled) = self.catalogs.entitled_accounts(&ids, model, true) else {
+            for id in &ids {
+                rejected(id, "catalog_lookup");
+            }
             return BTreeSet::new();
         };
         if provider != Provider::Claude {
+            for id in &ids {
+                if !entitled.contains(id) {
+                    rejected(id, "catalog_entitlement");
+                }
+            }
             return entitled;
         }
         for id in &ids {

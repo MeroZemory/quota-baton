@@ -275,6 +275,7 @@ impl BindingTable {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if self.rebind_source(&d, cx.provider, cx.key).as_deref() != cx.from {
             decision_tape::check(self, decision_tape::Check::RebindSource, false);
+            super::selection_diagnostics::record(cx.account, "rebind_source");
             return Err(RebindError::Evidence);
         }
         decision_tape::check(self, decision_tape::Check::RebindSource, true);
@@ -285,6 +286,7 @@ impl BindingTable {
             .unwrap_or_else(|| format!("unidentified:{}", cx.provider.as_str()));
         if cx.guard_key != expected_guard {
             decision_tape::check(self, decision_tape::Check::RebindGuard, false);
+            super::selection_diagnostics::record(cx.account, "rebind_guard");
             return Err(RebindError::Evidence);
         }
         decision_tape::check(self, decision_tape::Check::RebindGuard, true);
@@ -309,11 +311,13 @@ impl BindingTable {
             }))
         {
             decision_tape::check(self, decision_tape::Check::RebindEvidence, false);
+            super::selection_diagnostics::record(cx.account, "rebind_move_proof");
             return Err(RebindError::Evidence);
         }
         decision_tape::check(self, decision_tape::Check::RebindEvidence, true);
         if !moving && permit.is_some() {
             decision_tape::check(self, decision_tape::Check::RebindPermit, false);
+            super::selection_diagnostics::record(cx.account, "rebind_permit");
             return Err(RebindError::Evidence);
         }
         decision_tape::check(self, decision_tape::Check::RebindPermit, true);

@@ -98,6 +98,8 @@ pub struct SelectionEvaluation {
     pub decision: SelectionDecision,
     /// The native shell emits diagnostics; evaluation itself performs no I/O.
     pub diagnostics: Vec<HoldDiagnostic>,
+    /// Rejections observed at executed gates; separate from reset-hold logging.
+    pub rejections: Vec<(String, &'static str)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,9 +238,12 @@ pub fn select(inputs: &DecisionInputs) -> Result<SelectionEvaluation, SelectionI
         .find(|row| row.account.id == *account)
         .is_some_and(|row| return_blocked(inputs, row));
     if selected_blocked && !alternatives.is_empty() {
+        selected.rejections.push((account.clone(), "return_guard"));
         let mut alternative = select_ordered(inputs, &alternatives);
         selected.diagnostics.append(&mut alternative.diagnostics);
         alternative.diagnostics = selected.diagnostics;
+        selected.rejections.append(&mut alternative.rejections);
+        alternative.rejections = selected.rejections;
         return Ok(alternative);
     }
     Ok(selected)
@@ -323,8 +328,15 @@ fn select_ordered(inputs: &DecisionInputs, candidates: &[CandidateInput]) -> Sel
         affinity::retained_binding(inputs, &hint.key).map(|binding| binding.account.as_str())
     });
     let mut diagnostics = Vec::new();
-    let (choice, label) =
-        select_ranked(inputs, candidates, &plan, hinted_account, &mut diagnostics);
+    let mut rejections = Vec::new();
+    let (choice, label) = select_ranked(
+        inputs,
+        candidates,
+        &plan,
+        hinted_account,
+        &mut diagnostics,
+        &mut rejections,
+    );
     let rebalance = if matches!(
         label,
         SelectionLabel::ColdRebalance | SelectionLabel::Overload
@@ -363,6 +375,7 @@ fn select_ordered(inputs: &DecisionInputs, candidates: &[CandidateInput]) -> Sel
             budget_source,
         },
         diagnostics,
+        rejections,
     }
 }
 
@@ -393,6 +406,7 @@ fn prefer_root_hint<T>(pool: &mut Vec<(&CandidateInput, T)>, account: Option<&st
 fn prefer_pacing_and_evidence(
     pool: &mut Vec<(&CandidateInput, &m::Metrics)>,
     inputs: &DecisionInputs,
+    rejections: &mut Vec<(String, &'static str)>,
 ) {
     let s = inputs.selection.as_deref().expect("selection context");
     if pool.iter().any(|(row, _)| {
@@ -403,18 +417,29 @@ fn prefer_pacing_and_evidence(
             .unwrap_or(false)
     }) {
         pool.retain(|(row, _)| {
-            !s.metrics
+            let allowed = !s
+                .metrics
                 .pacing
                 .get(&row.account.id)
                 .copied()
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !allowed {
+                rejections.push((row.account.id.clone(), "placement_pacing"));
+            }
+            allowed
         });
     }
     if pool
         .iter()
         .any(|(row, _)| !m::placement_capped_for(inputs, row).expect("selection context"))
     {
-        pool.retain(|(row, _)| !m::placement_capped_for(inputs, row).expect("selection context"));
+        pool.retain(|(row, _)| {
+            let allowed = !m::placement_capped_for(inputs, row).expect("selection context");
+            if !allowed {
+                rejections.push((row.account.id.clone(), "placement_cap"));
+            }
+            allowed
+        });
     } else if let Some(minimum) = pool
         .iter()
         .map(|(row, _)| {
@@ -425,10 +450,14 @@ fn prefer_pacing_and_evidence(
         .min()
     {
         pool.retain(|(row, _)| {
-            m::placement_evidence_for(inputs, row)
+            let allowed = m::placement_evidence_for(inputs, row)
                 .expect("selection context")
                 .1
-                == minimum
+                == minimum;
+            if !allowed {
+                rejections.push((row.account.id.clone(), "placement_evidence_partition"));
+            }
+            allowed
         });
     }
 }
@@ -480,6 +509,7 @@ fn select_ranked(
     plan: &crate::routing::Plan,
     hinted_account: Option<&str>,
     diagnostics: &mut Vec<HoldDiagnostic>,
+    rejections: &mut Vec<(String, &'static str)>,
 ) -> (SelectionChoice, SelectionLabel) {
     let s = inputs.selection.as_deref().expect("selection context");
     let provider = s.provider;
@@ -501,32 +531,59 @@ fn select_ranked(
     let mut entries: Vec<_> = candidates
         .iter()
         .filter(|c| c.account.provider == provider)
-        .filter(|c| {
-            model_move
+        .filter_map(|c| {
+            let allowed = model_move
                 || plan.settings.mode != crate::routing::Mode::Strict
                 || strict_anchor
                     .as_ref()
-                    .is_none_or(|anchor| anchor == &c.account.id)
-        })
-        .map(|c| {
-            let eligible = effective_for(inputs, c, model).eligible_at(model, now)
-                && (!c.account.drain || super::accepted_in(inputs, &c.account.id));
-            (c, eligible)
+                    .is_none_or(|anchor| anchor == &c.account.id);
+            if !allowed {
+                rejections.push((c.account.id.clone(), "strict_anchor"));
+                return None;
+            }
+            let eligible = effective_for(inputs, c, model).eligible_at(model, now);
+            if !eligible {
+                let gate = match c.account.user_state {
+                    UserState::Disabled => "disabled",
+                    UserState::Paused => "paused",
+                    _ if matches!(c.account.health, Health::NeedsRelogin { .. }) => "needs_relogin",
+                    _ => "runtime_eligibility_or_cooling",
+                };
+                rejections.push((c.account.id.clone(), gate));
+            }
+            let eligible = eligible && {
+                let allowed = !c.account.drain || super::accepted_in(inputs, &c.account.id);
+                if !allowed {
+                    rejections.push((c.account.id.clone(), "drain"));
+                }
+                allowed
+            };
+            Some((c, eligible))
         })
         .collect();
     if let Some(source) = source.as_deref() {
         // Outside use never displaces an existing source. It only vetoes
         // destinations, including forced moves and explicit preferences.
         for (candidate, eligible) in &mut entries {
-            *eligible &= candidate.account.id == source
+            let allowed = candidate.account.id == source
                 || (!outside_unknown && !s.outside_used.contains(&candidate.account.id));
+            if !allowed {
+                rejections.push((candidate.account.id.clone(), "outside_use_destination"));
+            }
+            *eligible &= allowed;
         }
     } else if entries.iter().any(|(candidate, eligible)| {
         *eligible && !outside_unknown && !s.outside_used.contains(&candidate.account.id)
     }) {
         // Last resort is before C7 preference/gate partitions: a healthy
         // unmarked account cannot be bypassed by a reset or plan ranking.
-        entries.retain(|(candidate, _)| !s.outside_used.contains(&candidate.account.id));
+        entries.retain(|(candidate, _)| {
+            let allowed = !s.outside_used.contains(&candidate.account.id);
+            if !allowed {
+                rejections.push((candidate.account.id.clone(), "outside_use_destination"));
+            }
+            allowed
+        });
     }
     if let Some(id) = pinned
         && entries
@@ -769,7 +826,12 @@ fn select_ranked(
     }
     let eligible: Vec<_> = entries
         .into_iter()
-        .filter(|(c, eligible)| !c.account.drain && *eligible)
+        .filter(|(c, eligible)| {
+            if c.account.drain {
+                rejections.push((c.account.id.clone(), "drain"));
+            }
+            !c.account.drain && *eligible
+        })
         .map(|(c, _)| {
             (
                 c,
@@ -786,7 +848,7 @@ fn select_ranked(
             ) {
                 return true;
             }
-            bound_account.as_ref().is_some_and(|source| {
+            let allowed = bound_account.as_ref().is_some_and(|source| {
                 source != &c.account.id
                     && m::rebalance_target_base_for(inputs, source, c, key.map(group))
                         .expect("selection context")
@@ -794,13 +856,23 @@ fn select_ranked(
                 s.policy
                     .discretionary_allowed(Some(&c.account.id), now)
                     .expect("validated target pool")
-            })
+            });
+            if !allowed {
+                rejections.push((c.account.id.clone(), "discretionary_target"));
+            }
+            allowed
         })
         .collect();
     let has_gate = eligible.iter().any(|(_, m)| m.gate);
     let pool: Vec<_> = eligible
         .iter()
-        .filter(|(_, m)| !has_gate || m.gate)
+        .filter(|(c, m)| {
+            let allowed = !has_gate || m.gate;
+            if !allowed {
+                rejections.push((c.account.id.clone(), "placement_gate"));
+            }
+            allowed
+        })
         .collect();
     let has_room = pool.iter().any(|(c, _)| {
         m::active_sessions(inputs, &c.account.id).expect("selection context")
@@ -810,15 +882,20 @@ fn select_ranked(
     let mut partition: Vec<_> = pool
         .into_iter()
         .filter(|(c, _)| {
-            !has_room
+            let allowed = !has_room
                 || m::active_sessions(inputs, &c.account.id).expect("selection context")
-                    + m::reserved(inputs, &c.account.id, key.map(group)).expect("selection context")
-                    < m::spread_threshold(inputs, &c.account.id).expect("selection context")
+                    + m::reserved(inputs, &c.account.id, key.map(group))
+                        .expect("selection context")
+                    < m::spread_threshold(inputs, &c.account.id).expect("selection context");
+            if !allowed {
+                rejections.push((c.account.id.clone(), "placement_room_partition"));
+            }
+            allowed
         })
         .collect();
     if reason == SelectionLabel::Overload {
         partition.retain(|(c, m)| {
-            m.gate
+            let allowed = m.gate
                 && key
                     .and_then(|key| s.metrics.overload_marks.get(group(key)))
                     .is_some_and(|mark| {
@@ -830,12 +907,16 @@ fn select_ranked(
                                     .discretionary_allowed(Some(&c.account.id), now)
                                     .expect("validated target pool")
                             })
-                    })
+                    });
+            if !allowed {
+                rejections.push((c.account.id.clone(), "overload_target_partition"));
+            }
+            allowed
         });
     }
     if reason == SelectionLabel::ColdRebalance {
         partition.retain(|(c, _)| {
-            bound_account.as_ref().is_some_and(|source| {
+            let allowed = bound_account.as_ref().is_some_and(|source| {
                 source != &c.account.id
                     && m::rebalance_target_base_for(inputs, source, c, key.map(group))
                         .expect("selection context")
@@ -843,7 +924,11 @@ fn select_ranked(
                 s.policy
                     .discretionary_allowed(Some(&c.account.id), now)
                     .expect("validated target pool")
-            })
+            });
+            if !allowed {
+                rejections.push((c.account.id.clone(), "discretionary_target"));
+            }
+            allowed
         });
     }
     if matches!(
@@ -860,14 +945,25 @@ fn select_ranked(
                 .unwrap_or(false)
         }) {
             partition.retain(|(c, _)| {
-                !s.metrics
+                let allowed = !s
+                    .metrics
                     .pacing
                     .get(&c.account.id)
                     .copied()
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if !allowed {
+                    rejections.push((c.account.id.clone(), "placement_pacing"));
+                }
+                allowed
             });
         }
-        partition.retain(|(c, _)| !m::placement_capped_for(inputs, c).expect("selection context"));
+        partition.retain(|(c, _)| {
+            let allowed = !m::placement_capped_for(inputs, c).expect("selection context");
+            if !allowed {
+                rejections.push((c.account.id.clone(), "placement_cap"));
+            }
+            allowed
+        });
     }
     if partition.is_empty()
         && matches!(
@@ -896,7 +992,13 @@ fn select_ranked(
         .map(|(c, _)| ratio(c))
         .min_by(f64::total_cmp);
     if !has_room && let Some(minimum) = min_ratio {
-        partition.retain(|(c, _)| ratio(c) == minimum);
+        partition.retain(|(c, _)| {
+            let allowed = ratio(c) == minimum;
+            if !allowed {
+                rejections.push((c.account.id.clone(), "placement_load_partition"));
+            }
+            allowed
+        });
     }
     // Step 4: form the gate-passing set before any pacing/cap ordering.
     // A lower-count or uncapped failing account must never displace it.
@@ -906,7 +1008,7 @@ fn select_ranked(
         .map(|entry| (entry.0, &entry.1))
         .collect();
     let chosen = if !gated.is_empty() {
-        prefer_pacing_and_evidence(&mut gated, inputs);
+        prefer_pacing_and_evidence(&mut gated, inputs, rejections);
         prefer(&mut gated, preference);
         prefer_root_hint(&mut gated, hinted_account);
         // Approximate reset cohorts require one fixed anchor.
@@ -947,7 +1049,7 @@ fn select_ranked(
         // Step 5: only when this set has no passing gate, apply its own
         // pacing/cap ordering and then choose the most headroom.
         let mut fallback: Vec<_> = partition.iter().map(|entry| (entry.0, &entry.1)).collect();
-        prefer_pacing_and_evidence(&mut fallback, inputs);
+        prefer_pacing_and_evidence(&mut fallback, inputs, rejections);
         prefer(&mut fallback, preference);
         prefer_root_hint(&mut fallback, hinted_account);
         fallback

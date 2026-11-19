@@ -56,6 +56,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new(managed: bool, source_supports_model: bool, strict: bool) -> Self {
+        Self::new_with_fresh_exec(managed, source_supports_model, strict, false).await
+    }
+
+    async fn new_with_fresh_exec(
+        managed: bool,
+        source_supports_model: bool,
+        strict: bool,
+        fresh_exec: bool,
+    ) -> Self {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.sandbox/tests/r30-ws-entitlements");
         require(std::fs::create_dir_all(&base));
@@ -139,7 +148,29 @@ impl Fixture {
             quota: None,
             inflight: 0,
         };
-        let token = if managed {
+        let token = if fresh_exec {
+            let entitled = Candidate {
+                account: accounts[1].clone(),
+                quota: None,
+                inflight: 0,
+            };
+            for key in ["codex:r32-other-one", "codex:r32-other-two"] {
+                match relay.bindings.choose(
+                    Provider::Codex,
+                    Some(key),
+                    None,
+                    Some(MODEL),
+                    std::slice::from_ref(&entitled),
+                    None,
+                    0,
+                ) {
+                    Decision::Selected { lease, .. } => lease.dispatched(),
+                    _ => panic!("could not seed entitled account's existing work"),
+                }
+            }
+            assert!(relay.bindings.current(Some(ROOT)).is_none());
+            None
+        } else if managed {
             let models = BTreeSet::from([OLD.to_owned()]);
             require(relay.bindings.place_launch(
                 LaunchRequest {
@@ -197,9 +228,11 @@ impl Fixture {
             assert_eq!(plan.settings.mode, crate::routing::Mode::Strict);
             assert_eq!(plan.anchor.as_deref(), Some(accounts[0].id.as_str()));
         }
-        let lease = relay.bindings.begin_request(Some(ROOT), &accounts[0].id);
-        lease.dispatched();
-        drop(lease);
+        if !fresh_exec {
+            let lease = relay.bindings.begin_request(Some(ROOT), &accounts[0].id);
+            lease.dispatched();
+            drop(lease);
+        }
         let servers = require(
             spawn_with_routes(
                 &config,
@@ -223,6 +256,10 @@ impl Fixture {
     }
 
     async fn connect(&self) -> Socket {
+        self.connect_with_agent(None).await
+    }
+
+    async fn connect_with_agent(&self, agent: Option<&'static str>) -> Socket {
         let path = self.token.as_ref().map_or_else(
             || "/v1/responses".to_owned(),
             |token| format!("/l/{}/v1/responses", token.expose_secret()),
@@ -236,6 +273,11 @@ impl Fixture {
         request
             .headers_mut()
             .insert("session-id", THREAD.parse().unwrap());
+        if let Some(agent) = agent {
+            request
+                .headers_mut()
+                .insert("user-agent", HeaderValue::from_static(agent));
+        }
         let (socket, response) = match bounded_stage("client upgrade", connect_async(request)).await
         {
             Ok(upgraded) => upgraded,
@@ -295,6 +337,39 @@ async fn next(socket: &mut Socket) -> Message {
             message => return message,
         }
     }
+}
+
+#[tokio::test]
+async fn r32_model_less_exec_reconnect_completes_on_entitled_account() {
+    let f = Fixture::new_with_fresh_exec(false, false, false, true).await;
+    let agent = Some("codex_exec/0.170.0");
+    let mut original = f.connect_with_agent(agent).await;
+    assert_eq!(f.current_upstream_identity(), "synthetic-r30-ws-a");
+    require(bounded(original.send(Message::text(CREATE))).await);
+    assert!(matches!(next(&mut original).await,
+        Message::Close(Some(frame)) if frame.code == 1012.into()));
+    drop(original);
+
+    let mut reconnected = f.connect_with_agent(agent).await;
+    assert_eq!(f.current_upstream_identity(), "synthetic-r30-ws-b");
+    const DONE: &str = r#"{"type":"response.completed","response":{"id":"r32","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+    f.upstream.state.push_reply([Message::text(DONE)]);
+    require(bounded(reconnected.send(Message::text(CREATE))).await);
+    assert_eq!(next(&mut reconnected).await, Message::text(DONE));
+    assert_eq!(
+        f.relay.bindings.current(Some(ROOT)).as_deref(),
+        Some(f.accounts[1].id.as_str())
+    );
+    let frames: Vec<_> = f
+        .upstream
+        .state
+        .messages()
+        .into_iter()
+        .filter(|message| matches!(message, Message::Text(_) | Message::Binary(_)))
+        .collect();
+    assert_eq!(frames, [Message::text(CREATE)]);
+    let _ = reconnected.close(None).await;
+    f.finish().await;
 }
 
 async fn unsent_model_reconnect(managed: bool, binary: bool) {
@@ -469,5 +544,63 @@ async fn actual_ws_model_denial_survives_failed_refresh_and_clears_only_on_succe
         .contains(source)
     );
     let _ = socket.close(None).await;
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn r32a_selector_reports_the_actual_catalog_and_strict_anchor_gates() {
+    let f = Fixture::new(false, false, true).await;
+    let mut headers = HeaderMap::new();
+    headers.insert("session-id", HeaderValue::from_static(THREAD));
+    let session = session::classify(Provider::Codex, "/v1/responses", &headers, &[]);
+    assert_eq!(session.key.as_deref(), Some(ROOT));
+    let mut completion = Completion::new(
+        f.relay.observability.clone(),
+        &Method::GET,
+        "/v1/responses",
+        Provider::Codex,
+        &headers,
+    );
+    completion.record.transport = "ws".into();
+    let selected = require(
+        f.relay
+            .select_launch_request_admitted(
+                Provider::Codex,
+                &session,
+                &mut completion,
+                Some(MODEL),
+                &BTreeSet::new(),
+                None,
+                None,
+            )
+            .await,
+    );
+    assert!(selected.is_none());
+    assert_eq!(
+        completion.selection_rejections.get(&f.accounts[0].id),
+        Some(&"catalog_entitlement")
+    );
+    assert_eq!(
+        completion.selection_rejections.get(&f.accounts[1].id),
+        Some(&"strict_anchor")
+    );
+    let response = f
+        .relay
+        .unavailable(&mut completion, Provider::Codex, true, Some(MODEL))
+        .await;
+    let body = require(axum::body::to_bytes(response.into_body(), 16 * 1024).await);
+    let value: serde_json::Value = require(serde_json::from_slice(&body));
+    let message = value["error"]["message"].as_str().unwrap();
+    for expected in [
+        MODEL,
+        &f.accounts[0].id,
+        &f.accounts[1].id,
+        "gate=catalog_entitlement",
+        "gate=strict_anchor",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(!message.contains("accounts login"));
+    assert!(f.upstream.state.requests().is_empty());
     f.finish().await;
 }

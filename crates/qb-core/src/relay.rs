@@ -706,7 +706,10 @@ impl RelayState {
                 StatusCode::TOO_MANY_REQUESTS,
                 provider,
                 "account_move_guard",
-                "계정 이동 안전장치가 반복 이동을 막았습니다. 기존 계정에서 대기 중입니다. 잠시 후 다시 요청하세요.",
+                &self
+                    .accounts
+                    .unavailable_message(provider, model, &completion.selection_rejections)
+                    .await,
             );
             response
                 .headers_mut()
@@ -721,7 +724,10 @@ impl RelayState {
                 StatusCode::CONFLICT,
                 provider,
                 "routing_policy_blocked",
-                "자동 계정 전환이 꺼져 있거나 이동 예산이 소진되었습니다. 계정 상태와 세션 정책을 확인해 주세요.",
+                &self
+                    .accounts
+                    .unavailable_message(provider, model, &completion.selection_rejections)
+                    .await,
             );
         }
         if !completion.usage_prepolled {
@@ -730,7 +736,12 @@ impl RelayState {
         }
         let response = self
             .accounts
-            .unavailable_known(provider, websocket, model)
+            .unavailable_known_with_rejections(
+                provider,
+                websocket,
+                model,
+                &completion.selection_rejections,
+            )
             .await;
         if self.is_draining() {
             handover_unavailable()
@@ -985,7 +996,7 @@ impl RelayState {
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         self.candidates_with_evidence(provider, key, model, tried)
             .await
-            .map(|(candidates, _, _, _, _)| candidates)
+            .map(|(candidates, _, _, _, _, _)| candidates)
     }
 
     async fn candidates_with_evidence(
@@ -1001,6 +1012,7 @@ impl RelayState {
             crate::bindings::MoveObservation,
             Vec<crate::accounts::StoreUnavailableEvidence>,
             Vec<crate::account_runtime::RuntimeUnavailableEvidence>,
+            crate::bindings::selection_diagnostics::Rejections,
         ),
         (),
     > {
@@ -1068,6 +1080,7 @@ impl RelayState {
                     },
                 );
             }
+            let mut rejections = crate::bindings::selection_diagnostics::Rejections::new();
             for (rank, mut account) in accounts
                 .into_iter()
                 .filter(|a| a.provider == provider)
@@ -1104,6 +1117,18 @@ impl RelayState {
                 } else {
                     None
                 };
+                let gate = if retry_excluded {
+                    Some("retry_exclusion")
+                } else if runtime_excluded {
+                    Some("runtime_unavailable")
+                } else if credential == Some(false) {
+                    Some("selection_credentials")
+                } else {
+                    None
+                };
+                if let Some(gate) = gate {
+                    rejections.insert(account.id.clone(), gate);
+                }
                 let fact_sequence =
                     obs.replay_account(account, u32::try_from(rank).ok(), credential);
                 if let (Some(r), Some(collection), Some(started)) =
@@ -1176,18 +1201,23 @@ impl RelayState {
                 observed,
                 store_evidence,
                 runtime_evidence,
+                rejections,
             ))
         })
         .await
         .map_err(|_| ())??;
-        let (mut candidates, evidence, observed, store_evidence, runtime_evidence) = collected;
+        let (mut candidates, evidence, observed, store_evidence, runtime_evidence, mut rejections) =
+            collected;
         let accounts: Vec<_> = evidence.iter().map(|row| row.account.clone()).collect();
         let incumbent = self.bindings.model_source(provider, key);
-        let entitled = self.accounts.model_entitled_accounts_with_incumbent(
+        let entitled = self.accounts.model_entitlements(
             &accounts,
             provider,
             model,
             incumbent.as_deref(),
+            |id, gate| {
+                rejections.entry(id.to_owned()).or_insert(gate);
+            },
         );
         candidates.retain(|row| entitled.contains(&row.account.id));
         Ok((
@@ -1196,6 +1226,7 @@ impl RelayState {
             observed,
             store_evidence,
             runtime_evidence,
+            rejections,
         ))
     }
 
@@ -1478,6 +1509,7 @@ impl RelayState {
                 target_observed,
                 mut store_evidence,
                 mut runtime_evidence,
+                mut rejections,
             ) = self
                 .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                 .await?;
@@ -1496,12 +1528,14 @@ impl RelayState {
                     observed,
                     refreshed_store_evidence,
                     refreshed_runtime_evidence,
+                    refreshed_rejections,
                 ) = self
                     .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                     .await?;
                 move_evidence = refreshed_evidence;
                 store_evidence = refreshed_store_evidence;
                 runtime_evidence = refreshed_runtime_evidence;
+                rejections.extend(refreshed_rejections);
                 source_observed = observed;
                 selected
             } else {
@@ -1551,85 +1585,90 @@ impl RelayState {
             let failure_evidence = completion.failure_evidence.clone().or_else(|| {
                 self.reconnect_failure(session.key.as_deref(), reconnect_source.as_deref(), model)
             });
-            let choice = crate::boxes::spawn_blocking(move || {
-                let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
-                    table.choose_with_hold_at_admitted_proof_entitled(
-                        provider,
-                        key.as_deref(),
-                        parent.as_deref(),
-                        owned_model.as_deref(),
-                        &choices,
-                        &evidence,
-                        Some(&entitled_targets),
-                        crate::bindings::MoveObservations {
-                            source: source_observed,
-                            target: target_observed,
-                        },
-                        pinned.as_deref(),
-                        bytes,
-                        hold_allowed,
-                        hold_timed_out,
-                        chrono::Utc::now(),
-                        coverage.as_ref(),
-                        root_hint.as_ref(),
-                        |account| {
-                            // BindingTable holds mutations through this
-                            // admission and publication, including ordinary HTTP.
-                            let mut admission = None;
-                            let allowed = crate::boxes::dispatch_allowed()
-                                && selection_guard::admit(&selection_operation, || {
-                                    if !eligible(
-                                        account,
-                                        table.existing_placement(key.as_deref(), account),
-                                    ) {
-                                        return false;
-                                    }
-                                    admission = admit.as_ref().map_or_else(
-                                        || Some(crate::bindings::DispatchAdmission::ordinary()),
-                                        |admit| admit(account),
-                                    );
-                                    admission.is_some()
-                                });
-                            denied_choice.store(!allowed, Ordering::Release);
-                            if allowed {
-                                admission.map(|admission| {
-                                    let catalog = catalog_source.as_ref().and_then(|source| {
-                                        ModelEntitlementEvidence::observe(
-                                            catalog_cache,
-                                            key.as_deref(),
-                                            source,
+            let (choice, kernel_rejections) = crate::boxes::spawn_blocking(move || {
+                crate::bindings::selection_diagnostics::capture(|| {
+                    let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
+                        table.choose_with_hold_at_admitted_proof_entitled(
+                            provider,
+                            key.as_deref(),
+                            parent.as_deref(),
+                            owned_model.as_deref(),
+                            &choices,
+                            &evidence,
+                            Some(&entitled_targets),
+                            crate::bindings::MoveObservations {
+                                source: source_observed,
+                                target: target_observed,
+                            },
+                            pinned.as_deref(),
+                            bytes,
+                            hold_allowed,
+                            hold_timed_out,
+                            chrono::Utc::now(),
+                            coverage.as_ref(),
+                            root_hint.as_ref(),
+                            |account| {
+                                // BindingTable holds mutations through this
+                                // admission and publication, including ordinary HTTP.
+                                let mut admission = None;
+                                let allowed = crate::boxes::dispatch_allowed()
+                                    && selection_guard::admit(&selection_operation, || {
+                                        if !eligible(
                                             account,
-                                            owned_model.as_deref(),
-                                            catalog_deadline,
-                                            &catalog_lifetime,
-                                        )
+                                            table.existing_placement(key.as_deref(), account),
+                                        ) {
+                                            return false;
+                                        }
+                                        admission = admit.as_ref().map_or_else(
+                                            || Some(crate::bindings::DispatchAdmission::ordinary()),
+                                            |admit| admit(account),
+                                        );
+                                        admission.is_some()
                                     });
-                                    admission
-                                        .with_catalog(catalog)
-                                        .with_failure(failure_evidence)
-                                        .with_pin(pin_evidence)
-                                        .with_store_evidence(store_evidence)
-                                        .with_runtime_evidence(runtime_evidence)
-                                })
-                            } else {
-                                None
-                            }
-                        },
-                    )
-                };
-                if let Some(runtime) = admission_runtime {
-                    runtime.with_selection_admission(
-                        &table,
-                        provider,
-                        owned_model.as_deref(),
-                        choose,
-                    )
-                } else {
-                    Ok(choose(&|_, _| true))
-                }
+                                denied_choice.store(!allowed, Ordering::Release);
+                                if allowed {
+                                    admission.map(|admission| {
+                                        let catalog = catalog_source.as_ref().and_then(|source| {
+                                            ModelEntitlementEvidence::observe(
+                                                catalog_cache,
+                                                key.as_deref(),
+                                                source,
+                                                account,
+                                                owned_model.as_deref(),
+                                                catalog_deadline,
+                                                &catalog_lifetime,
+                                            )
+                                        });
+                                        admission
+                                            .with_catalog(catalog)
+                                            .with_failure(failure_evidence)
+                                            .with_pin(pin_evidence)
+                                            .with_store_evidence(store_evidence)
+                                            .with_runtime_evidence(runtime_evidence)
+                                    })
+                                } else {
+                                    None
+                                }
+                            },
+                        )
+                    };
+                    if let Some(runtime) = admission_runtime {
+                        runtime.with_selection_admission(
+                            &table,
+                            provider,
+                            owned_model.as_deref(),
+                            choose,
+                        )
+                    } else {
+                        Ok(choose(&|_, _| true))
+                    }
+                })
             })
             .await
-            .map_err(|_| ())??;
+            .map_err(|_| ())?;
+            let choice = choice?;
+            rejections.extend(kernel_rejections);
+            completion.selection_rejections = rejections;
             match choice {
                 crate::bindings::Decision::None if denied.load(Ordering::Acquire) => {
                     return Ok(None);

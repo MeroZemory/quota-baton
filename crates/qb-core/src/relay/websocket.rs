@@ -476,7 +476,7 @@ async fn upgrade_inner(
                 Some(response) => response,
                 None => {
                     state
-                        .unavailable(completion, Provider::Codex, true, None)
+                        .unavailable(completion, Provider::Codex, true, session.model.as_deref())
                         .await
                 }
             };
@@ -511,7 +511,7 @@ async fn upgrade_inner(
             Ok(Err(())) => {
                 completion.policy_blocked = true;
                 return state
-                    .unavailable(completion, Provider::Codex, true, None)
+                    .unavailable(completion, Provider::Codex, true, session.model.as_deref())
                     .await;
             }
             Err(_) => return network_failure(),
@@ -552,7 +552,7 @@ async fn upgrade_inner(
             {
                 completion.policy_blocked = true;
                 return state
-                    .unavailable(completion, Provider::Codex, true, None)
+                    .unavailable(completion, Provider::Codex, true, session.model.as_deref())
                     .await;
             }
             // The hint may have changed while its blocking read was pending.
@@ -566,7 +566,17 @@ async fn upgrade_inner(
                 continue;
             }
             completion.end_attempt();
-            return capacity_http_fallback();
+            if let Some(source) = source.as_deref() {
+                completion
+                    .selection_rejections
+                    .insert(source.to_owned(), "socket_capacity");
+            }
+            return capacity_http_fallback(
+                &state,
+                &completion.selection_rejections,
+                session.model.as_deref(),
+            )
+            .await;
         }
         if let Some(wait) = own_wait.as_mut()
             && capped.contains(wait.source())
@@ -632,6 +642,7 @@ async fn upgrade_inner(
                     return None;
                 }
                 let Some(permit) = state.ws_capacity.reserve(account) else {
+                    crate::bindings::selection_diagnostics::record(account, "socket_capacity");
                     denied.store(true, Ordering::Release);
                     return None;
                 };
@@ -643,6 +654,10 @@ async fn upgrade_inner(
                 {
                     // A cap/binding change after collection cannot manufacture
                     // permission to move away from the newly observed source.
+                    crate::bindings::selection_diagnostics::record(
+                        account,
+                        "source_socket_capacity",
+                    );
                     denied.store(true, Ordering::Release);
                     return None;
                 }
@@ -667,6 +682,17 @@ async fn upgrade_inner(
                 Some(admit),
             )
             .await;
+        for id in excluded.difference(&tried) {
+            if let Some(gate) = completion.selection_rejections.get_mut(id)
+                && *gate == "retry_exclusion"
+            {
+                *gate = if capped.contains(id) {
+                    "socket_capacity"
+                } else {
+                    "capacity_preferred_source"
+                };
+            }
+        }
         if state.is_draining() {
             return handover_response();
         }
@@ -694,7 +720,7 @@ async fn upgrade_inner(
                 {
                     completion.policy_blocked = true;
                     return state
-                        .unavailable(completion, Provider::Codex, true, None)
+                        .unavailable(completion, Provider::Codex, true, session.model.as_deref())
                         .await;
                 }
                 if preferred_source.is_some()
@@ -728,18 +754,28 @@ async fn upgrade_inner(
                     if state.ws_capacity.wait_until(wait_deadline).await {
                         continue;
                     }
-                    return capacity_http_fallback();
+                    return capacity_http_fallback(
+                        &state,
+                        &completion.selection_rejections,
+                        session.model.as_deref(),
+                    )
+                    .await;
                 }
                 if completion.policy_blocked {
                     return state
-                        .unavailable(completion, Provider::Codex, true, None)
+                        .unavailable(completion, Provider::Codex, true, session.model.as_deref())
                         .await;
                 }
                 return match last_error {
                     Some(response) => response,
                     None => {
                         state
-                            .unavailable(completion, Provider::Codex, true, None)
+                            .unavailable(
+                                completion,
+                                Provider::Codex,
+                                true,
+                                session.model.as_deref(),
+                            )
                             .await
                     }
                 };
@@ -820,7 +856,7 @@ async fn upgrade_inner(
                     .bindings
                     .permits_dispatch(session.key.as_deref(), &account.id);
                 return state
-                    .unavailable(completion, Provider::Codex, true, None)
+                    .unavailable(completion, Provider::Codex, true, session.model.as_deref())
                     .await;
             }
             if state.is_draining() {
@@ -1365,7 +1401,11 @@ fn handover_response() -> Response {
     response
 }
 
-fn capacity_http_fallback() -> Response {
+async fn capacity_http_fallback(
+    state: &RelayState,
+    rejections: &crate::bindings::selection_diagnostics::Rejections,
+    model: Option<&str>,
+) -> Response {
     // Codex 0.163/0.164 core/src/client.rs handles an upgrade HTTP 426
     // as FallbackToHttp, immediately and for the rest of the session.
     // 0.163: lines 1961-1964, 2295-2314:
@@ -1376,7 +1416,13 @@ fn capacity_http_fallback() -> Response {
         StatusCode::UPGRADE_REQUIRED,
         Provider::Codex,
         "websocket_capacity",
-        "WebSocket capacity is unavailable; retry this request over HTTP.",
+        &format!(
+            "WebSocket capacity is unavailable; retry this request over HTTP. {}",
+            state
+                .accounts
+                .unavailable_message(Provider::Codex, model, rejections)
+                .await
+        ),
     )
 }
 

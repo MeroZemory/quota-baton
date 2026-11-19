@@ -9,6 +9,7 @@ pub(crate) use reset_recovery::ResetQuotaObservation;
 mod selection;
 pub(crate) use selection::RuntimeUnavailableEvidence;
 mod model_catalog;
+mod unavailable_message;
 mod wait_admission;
 mod wait_owner;
 mod wait_proof;
@@ -3462,12 +3463,24 @@ impl AccountRuntime {
         websocket: bool,
         model: Option<&str>,
     ) -> Response {
+        self.unavailable_known_with_rejections(provider, websocket, model, &BTreeMap::new())
+            .await
+    }
+
+    pub(crate) async fn unavailable_known_with_rejections(
+        &self,
+        provider: Provider,
+        websocket: bool,
+        model: Option<&str>,
+        rejections: &BTreeMap<String, &'static str>,
+    ) -> Response {
         let store = self.store.clone();
         let accounts = crate::boxes::spawn_blocking(move || store.list())
             .await
             .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+            .and_then(Result::ok);
+        let list_known = accounts.is_some();
+        let accounts = accounts.unwrap_or_default();
         let entitled = self.model_entitled_accounts(&accounts, provider, model);
         let candidates: Vec<_> = accounts
             .iter()
@@ -3503,6 +3516,22 @@ impl AccountRuntime {
                 cooling.push((*a, now + Duration::seconds(1), false, false));
             }
         }
+        // Display metadata comes from this branch's existing operational holds,
+        // never a second eligibility or gate evaluation by the formatter.
+        let mut until_by_account = BTreeMap::new();
+        for (account, until, _, _) in &cooling {
+            until_by_account
+                .entry(account.id.clone())
+                .and_modify(|value: &mut DateTime<Utc>| *value = (*value).max(*until))
+                .or_insert(*until);
+        }
+        let message = unavailable_message::format_accounts(
+            provider,
+            model,
+            list_known.then_some(accounts.as_slice()),
+            rejections,
+            &until_by_account,
+        );
         if !cooling.is_empty() {
             // Genuine native or reconstructed quota limits precede non-quota
             // fallback cooling. Within that group, use the earliest entitled
@@ -3520,9 +3549,9 @@ impl AccountRuntime {
                 r
             } else {
                 let error = if provider == Provider::Codex {
-                    json!({"error":{"type":"usage_limit_reached","message":"quota-baton: all accounts are cooling","resets_at":until.timestamp(),"resets_in_seconds":seconds}})
+                    json!({"error":{"type":"usage_limit_reached","message":message,"resets_at":until.timestamp(),"resets_in_seconds":seconds}})
                 } else {
-                    json!({"type":"error","error":{"type":"rate_limit_error","message":"quota-baton: all accounts are cooling"}})
+                    json!({"type":"error","error":{"type":"rate_limit_error","message":message}})
                 };
                 (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response()
             };
@@ -3532,7 +3561,7 @@ impl AccountRuntime {
             );
             result
         } else {
-            let mut error = json!({"error":{"type":"invalid_request_error","message":format!("quota-baton: no usable {0} account — run quota-baton accounts login {0} --no-browser",provider.as_str())}});
+            let mut error = json!({"error":{"type":"invalid_request_error","message":message}});
             if provider == Provider::Claude {
                 error["type"] = "error".into();
             }

@@ -41,6 +41,7 @@ pub mod permit_tape;
 pub(crate) mod quota_wait;
 mod rebind;
 mod selection;
+pub(crate) mod selection_diagnostics;
 #[cfg(any(test, feature = "testkit"))]
 pub mod selection_fixture;
 pub use launch::{
@@ -2955,6 +2956,7 @@ impl BindingTable {
                         "New binding refused at the restore-safe snapshot bound"
                     );
                     decision_tape::capacity_refused(self);
+                    selection_diagnostics::record(&account, "binding_capacity");
                     return Decision::Blocked;
                 }
             }
@@ -3029,6 +3031,7 @@ impl BindingTable {
                         reason = "guard_keep";
                         None
                     } else {
+                        selection_diagnostics::record(&account, "move_guard");
                         return Decision::MoveHeld {
                             until: denied.until,
                         };
@@ -3045,6 +3048,7 @@ impl BindingTable {
             let admission = admit(&account);
             decision_tape::check(self, decision_tape::Check::Admission, admission.is_some());
             let Some(admission) = admission else {
+                selection_diagnostics::record(&account, "dispatch_admission");
                 return Decision::None;
             };
             if !decision_tape::check(
@@ -3052,6 +3056,7 @@ impl BindingTable {
                 decision_tape::Check::Selection,
                 selection.valid_for(key, admitted_from.as_deref(), &account, model, now),
             ) {
+                selection_diagnostics::record(&account, "selection_evidence");
                 return Decision::None;
             }
             if !decision_tape::check(
@@ -3059,6 +3064,7 @@ impl BindingTable {
                 decision_tape::Check::AdmissionSource,
                 admission.valid_for(admitted_from.as_deref(), &account),
             ) {
+                selection_diagnostics::record(&account, "admission_source");
                 return Decision::None;
             }
             if !decision_tape::check(
@@ -3066,6 +3072,7 @@ impl BindingTable {
                 decision_tape::Check::Pin,
                 admission.valid_pin_for(provider, key, &account),
             ) {
+                selection_diagnostics::record(&account, "pin_evidence");
                 return Decision::None;
             }
             if !decision_tape::check(
@@ -3082,6 +3089,7 @@ impl BindingTable {
                     &account,
                 ),
             ) {
+                selection_diagnostics::record(&account, "store_evidence");
                 return Decision::None;
             }
             if !decision_tape::check(
@@ -3099,6 +3107,7 @@ impl BindingTable {
                     model,
                 ),
             ) {
+                selection_diagnostics::record(&account, "failure_evidence");
                 return Decision::None;
             }
             let context = rebind::RebindContext {
@@ -3129,8 +3138,14 @@ impl BindingTable {
             });
             let rebind::Rebound { mut data, moves } = match rebound {
                 Ok(rebound) => rebound,
-                Err(rebind::RebindError::Evidence) => return Decision::None,
-                Err(rebind::RebindError::Policy) => return Decision::Blocked,
+                Err(rebind::RebindError::Evidence) => {
+                    selection_diagnostics::record(&account, "rebind_evidence");
+                    return Decision::None;
+                }
+                Err(rebind::RebindError::Policy) => {
+                    selection_diagnostics::record(&account, "routing_policy");
+                    return Decision::Blocked;
+                }
             };
             let d = &mut *data;
             let lease = self.reserve(d, key, &account);

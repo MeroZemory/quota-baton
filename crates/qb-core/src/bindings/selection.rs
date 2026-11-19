@@ -431,6 +431,9 @@ impl BindingTable {
                 "reset hold skipped"
             );
         }
+        for (account, gate) in evaluation.rejections {
+            super::selection_diagnostics::record(&account, gate);
+        }
         let decision = evaluation.decision;
         let choice = match decision.choice {
             super::kernel::selection::SelectionChoice::Selected { account } => {
