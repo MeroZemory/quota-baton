@@ -9,6 +9,88 @@ mod r11_actual {
         sync::oneshot,
     };
 
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn r32_capped_entitled_exec_reconnect_falls_back_to_http() {
+        let t = LaunchHarness::new(2).await;
+        let [a, b] = t.h.ids.as_slice() else {
+            panic!("two synthetic accounts")
+        };
+        t.catalogs.set(&t.h, a, &["synthetic-model"]);
+        t.catalogs
+            .set(&t.h, b, &["synthetic-model", "alternate-model"]);
+        let source_launch = t.issue(Some(a)).await;
+        assert_eq!(source_launch.account, *a);
+        let destination = t.issue(Some(b)).await;
+        assert_eq!(destination.account, *b);
+        let mut occupied = t.connect(&destination, Some("r32-occupied")).await;
+        t.h.fake.state.queue_send(Message::text(
+            r#"{"type":"error","status":400,"error":{"code":"websocket_connection_limit_reached"}}"#,
+        ));
+        let mut rejected = t.connect(&destination, Some("r32-occupied")).await;
+        assert!(matches!(receive(&mut rejected).await,
+            Message::Text(raw) if raw.contains("websocket_connection_limit_reached")));
+        capacity_count(&t.h, b, 2).await;
+        rejected.close(None).await.unwrap();
+        drop(rejected);
+        capacity_count(&t.h, b, 1).await;
+
+        let base = format!("http://{}/v1", t.h.servers.data_addr);
+        let request = || {
+            let mut request = t.request(&base, Some("r32-capped-exec"));
+            request
+                .headers_mut()
+                .insert("user-agent", "codex_exec/0.170.0".parse().unwrap());
+            request
+        };
+        let (mut original, response) = connect_async(request()).await.unwrap();
+        assert_eq!(response.headers()["x-quota-baton-account"], a.as_str());
+        let create = r#"{"type":"response.create","model":"alternate-model","input":[]}"#;
+        original.send(Message::text(create)).await.unwrap();
+        assert!(matches!(receive(&mut original).await,
+            Message::Close(Some(frame)) if frame.code == 1012.into()));
+        drop(original);
+        capacity_count(&t.h, a, 0).await;
+
+        let upgrades = t.h.fake.state.requests().len();
+        let Err(Error::Http(fallback)) =
+            tokio::time::timeout(Duration::from_secs(5), connect_async(request()))
+                .await
+                .unwrap()
+        else {
+            panic!("local HTTP fallback required")
+        };
+        assert_eq!(t.h.fake.state.requests().len(), upgrades);
+        assert!(t.data().is_empty());
+        assert!(t.h.token_fake.state.requests().is_empty());
+        let body = String::from_utf8_lossy(fallback.body().as_deref().unwrap_or_default());
+        assert_eq!(fallback.status(), StatusCode::UPGRADE_REQUIRED, "{body}");
+        assert!(body.contains("websocket_capacity"), "{body}");
+        assert!(!body.contains("codex-qb login"), "{body}");
+
+        t.http_reply();
+        let reply = reqwest::Client::new()
+            .post(format!("{base}/responses"))
+            .bearer_auth("synthetic-local-key")
+            .header("session-id", "r32-capped-exec")
+            .header("user-agent", "codex_exec/0.170.0")
+            .json(&json!({"model":"alternate-model","input":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        assert_eq!(reply.json::<Value>().await.unwrap()["status"], "completed");
+        let http = t.h.token_fake.state.requests();
+        assert_eq!(http.len(), 1);
+        let ws = t.h.fake.state.requests();
+        assert_eq!(
+            http[0].headers["chatgpt-account-id"],
+            ws[0].headers["chatgpt-account-id"]
+        );
+        assert_eq!(ws.len(), upgrades);
+        occupied.close(None).await.unwrap();
+    }
+
     struct CatalogGate {
         arrived: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,

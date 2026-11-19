@@ -1376,14 +1376,15 @@ async fn capacity_candidate(
     {
         return false;
     }
+    let model = session.model.as_deref();
     let Ok(candidates) = state
-        .candidates(Provider::Codex, session.key.as_deref(), None, tried)
+        .candidates(Provider::Codex, session.key.as_deref(), model, tried)
         .await
     else {
         return false;
     };
     matches!(state.bindings.preview(
-        Provider::Codex, session.key.as_deref(), session.parent.as_deref(), None,
+        Provider::Codex, session.key.as_deref(), session.parent.as_deref(), model,
         &candidates, state.pins.get(Provider::Codex, session.key.as_deref()).as_deref(), 0,
     ), crate::bindings::PreviewDecision::Selected { account } if capped.contains(&account))
 }

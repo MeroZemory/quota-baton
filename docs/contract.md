@@ -522,7 +522,11 @@ not positive outside-use attribution or an authentication failure.
 
 A bound session at its account's learned WebSocket capacity first waits briefly
 for its own slot within the original upgrade deadline, then receives 426 for
-same-account HTTP fallback. Capacity never authorizes a binding move. New
+same-account HTTP fallback. For a model-entitlement reconnect, the capacity
+preview uses the remembered model in both candidate collection and selection.
+If the entitled destination is capacity-capped, the upgrade returns 426 after
+the existing bounded capacity wait. HTTP selects by the requested model and
+ordinary move rules. Capacity never authorizes a binding move. New
 sessions retain ordinary D20/D30 placement and weak-evidence protection. A
 freshly reset destination still has weak evidence.
 
