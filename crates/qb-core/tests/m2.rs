@@ -913,16 +913,21 @@ async fn no_account_and_debug_pin_routes() {
     let error: Value = response.json().await.unwrap();
     assert_eq!(error["type"], "error");
     assert_eq!(error["error"]["type"], "invalid_request_error");
-    assert_eq!(
-        error["error"]["message"],
-        "quota-baton: no usable claude account — run quota-baton accounts login claude --no-browser"
-    );
+    let message = error["error"]["message"].as_str().unwrap();
+    let claude = h
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.provider == Provider::Claude)
+        .unwrap();
+    assert!(message.contains("no usable claude account"), "{message}");
+    assert!(message.contains(&claude.id), "{message}");
     assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no usable claude account")
+        message.contains("disabled by user [gate=disabled]"),
+        "{message}"
     );
+    assert!(!message.contains("accounts login"), "{message}");
     let account = h
         .store
         .list()
