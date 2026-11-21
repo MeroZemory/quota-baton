@@ -16,6 +16,8 @@ mod ledger;
 #[path = "relay/lineage_http_tests.rs"]
 mod lineage_http_tests;
 mod model_entitlements;
+#[cfg(test)]
+mod r33_fable_hold_tests;
 pub(crate) use model_entitlements::ModelEntitlementEvidence;
 mod models;
 pub(crate) use launch::catalog_assignable;
@@ -3212,11 +3214,12 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 );
                 match state
                     .accounts
-                    .finish_http_429_report_observed(
+                    .finish_http_429_report_attributed(
                         &account.id,
                         pending_http_429,
                         decision.quota_reset,
                         decision.signal.take(),
+                        decision.quota_cause,
                         body,
                     )
                     .await
@@ -3392,7 +3395,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         } else if let Some(signal) = decision.signal.take()
             && state
                 .accounts
-                .transition(&account.id, signal)
+                .transition_attributed(&account.id, signal, decision.quota_cause)
                 .await
                 .is_err()
         {

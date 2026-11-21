@@ -1338,12 +1338,29 @@ impl AccountRuntime {
             .map(|_| ())
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish_http_429_report_observed(
         &self,
         id: &str,
         pending: Option<PendingHttp429>,
         known_reset: Option<DateTime<Utc>>,
         signal: Option<HealthSignal>,
+        body: QualifiedHttp429Body,
+    ) -> Result<Option<ObservedHttp429>, ()> {
+        self.finish_http_429_report_attributed(id, pending, known_reset, signal, None, body)
+            .await
+    }
+
+    /// `finish_http_429_report_observed`, plus the rejected Claude window that
+    /// set the hold (R33). The cause is recorded after the proof comparison, so
+    /// it never changes what the sealed proof sees.
+    pub(crate) async fn finish_http_429_report_attributed(
+        &self,
+        id: &str,
+        pending: Option<PendingHttp429>,
+        known_reset: Option<DateTime<Utc>>,
+        signal: Option<HealthSignal>,
+        quota_cause: Option<super::QuotaCause>,
         body: QualifiedHttp429Body,
     ) -> Result<Option<ObservedHttp429>, ()> {
         let store = self.store.clone();
@@ -1443,6 +1460,13 @@ impl AccountRuntime {
                                     )
                                 }
                             });
+                            if let Some(cause) = quota_cause {
+                                account.attribute_quota_cause(
+                                    cause.window,
+                                    cause.reset_at,
+                                    applied_at,
+                                );
+                            }
                         })
                         .map_err(|_| ())?;
                     if ran

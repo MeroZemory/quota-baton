@@ -113,6 +113,14 @@ pub enum HealthSignal {
     Ready,
 }
 
+/// The rejected Claude window whose reset set a quota hold. It is evidence for
+/// the hold's early release, never a new deadline (R33).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuotaCause {
+    pub(crate) window: &'static str,
+    pub(crate) reset_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 struct LimitResponse {
     status: StatusCode,
@@ -2046,6 +2054,17 @@ impl AccountRuntime {
     }
 
     pub async fn transition(&self, id: &str, signal: HealthSignal) -> Result<Account, ()> {
+        self.transition_attributed(id, signal, None).await
+    }
+
+    /// `transition`, plus the rejected window that set a Claude quota hold. The
+    /// cause only fills a missing one and never changes health or deadlines.
+    pub(crate) async fn transition_attributed(
+        &self,
+        id: &str,
+        signal: HealthSignal,
+        quota_cause: Option<QuotaCause>,
+    ) -> Result<Account, ()> {
         let store = self.store.clone();
         let id = id.to_owned();
         let account = crate::boxes::spawn_blocking(move || {
@@ -2081,7 +2100,11 @@ impl AccountRuntime {
                             HealthSignal::AuthFailure => Signal::AuthAfterRefresh,
                             HealthSignal::Ready => Signal::Ready,
                         };
-                        account.apply_health_signal(signal, Utc::now());
+                        let now = Utc::now();
+                        account.apply_health_signal(signal, now);
+                        if let Some(cause) = quota_cause {
+                            account.attribute_quota_cause(cause.window, cause.reset_at, now);
+                        }
                     },
                 )
                 .map_err(|_| ())?;

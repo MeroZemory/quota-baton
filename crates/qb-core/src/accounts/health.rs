@@ -367,6 +367,197 @@ mod claude_model_window_tests {
     }
 }
 
+// R33: Claude reports `allowed_warning` ("allowed, approaching the limit") on
+// account windows. It serves requests, so it must not widen a model rejection.
+#[cfg(test)]
+mod r33_allowed_warning_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    const FABLE: &str = "claude-fable-5-2";
+    const HAIKU: &str = "claude-haiku-4-5";
+
+    fn claude() -> Account {
+        let mut account = super::tests::fixture();
+        account.provider = Provider::Claude;
+        account
+    }
+
+    /// Request-header snapshot of the 2026-11-20 rejection: account windows
+    /// `five`/`seven` as given, `7d_oi` rejected at 100 %.
+    fn headers(
+        five: (&str, f64),
+        seven: (&str, f64),
+        now: DateTime<Utc>,
+    ) -> (Value, DateTime<Utc>) {
+        let short = now + Duration::minutes(96);
+        let weekly = now + Duration::days(2);
+        let snapshot = json!({"source":"headers","observed_at":now,"windows":[
+            {"name":"5h","used_pct":five.1,"reset_at":short,"observed_at":now,"status":five.0},
+            {"name":"7d","used_pct":seven.1,"reset_at":weekly,"observed_at":now,"status":seven.0},
+            {"name":"7d_oi","used_pct":100.0,"reset_at":weekly,"observed_at":now,"status":"rejected"}
+        ],"signals":{"unified_status":"rejected","unified_reset_at":weekly,
+            "representative_claim":"five_hour","retry_after_seconds":172800.0}});
+        (snapshot, weekly)
+    }
+
+    fn apply(snapshot: &Value, now: DateTime<Utc>) -> Account {
+        let mut account = claude();
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot: snapshot.clone(),
+                model: Some(FABLE.into()),
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+        account
+    }
+
+    #[test]
+    fn allowed_warning_and_allowed_account_windows_keep_the_rejection_model_scoped() {
+        let now = Utc::now();
+        for (five, seven) in [
+            (("allowed_warning", 52.0), ("allowed_warning", 44.0)),
+            (("allowed_warning", 52.0), ("allowed", 44.0)),
+            (("allowed", 52.0), ("allowed_warning", 44.0)),
+            (("allowed", 52.0), ("allowed", 44.0)),
+        ] {
+            let (snapshot, weekly) = headers(five, seven, now);
+            let account = apply(&snapshot, now);
+            assert_eq!(
+                account.health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: weekly,
+                    scope: format!("model:{FABLE}"),
+                },
+                "{five:?} {seven:?}"
+            );
+            let cause = account
+                .quota_cooling
+                .as_ref()
+                .expect("the hold has a cause");
+            assert_eq!((cause.window.as_str(), cause.reset_at), ("7d_oi", weekly));
+            assert!(account.eligible_at(Some(HAIKU), now + Duration::seconds(1)));
+            assert!(!account.eligible_at(Some(FABLE), now + Duration::seconds(1)));
+        }
+    }
+
+    #[test]
+    fn other_account_window_states_still_widen_the_rejection_to_the_account() {
+        let now = Utc::now();
+        for (name, five, seven) in [
+            (
+                "rejected_5h",
+                ("rejected", 100.0),
+                ("allowed_warning", 44.0),
+            ),
+            (
+                "rejected_7d",
+                ("allowed_warning", 52.0),
+                ("rejected", 100.0),
+            ),
+            (
+                "full_5h_warning",
+                ("allowed_warning", 100.0),
+                ("allowed_warning", 44.0),
+            ),
+            (
+                "unknown_status",
+                ("allowed_warn", 52.0),
+                ("allowed_warning", 44.0),
+            ),
+            ("null_status", ("", 52.0), ("allowed_warning", 44.0)),
+        ] {
+            let (mut snapshot, _) = headers(five, seven, now);
+            if name == "null_status" {
+                snapshot["windows"][0]["status"] = Value::Null;
+            }
+            let account = apply(&snapshot, now);
+            assert!(
+                matches!(&account.health, Health::Cooling { scope, .. } if scope == "account"),
+                "{name}: {:?}",
+                account.health
+            );
+            assert!(
+                !account.eligible_at(Some(HAIKU), now + Duration::seconds(1)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_quota_cause_only_fills_a_missing_cause_for_a_claude_quota_hold() {
+        let now = Utc::now();
+        let reset = now + Duration::days(2);
+        let hold = |account: &mut Account, until| {
+            account.apply_health_signal(
+                HealthSignal::Cooling {
+                    reason: HealthReason::Quota,
+                    until,
+                    scope: format!("model:{FABLE}"),
+                },
+                now,
+            );
+        };
+        // The hold deadline is the window reset, within 300 s either way.
+        for skew in [0, 299, -299, 300] {
+            let mut account = claude();
+            hold(&mut account, reset + Duration::seconds(skew));
+            assert_eq!(
+                account.quota_cooling, None,
+                "a bare request hold has no cause"
+            );
+            assert!(account.attribute_quota_cause("7d_oi", reset, now), "{skew}");
+            assert_eq!(
+                account.quota_cooling,
+                Some(QuotaCooling {
+                    window: "7d_oi".into(),
+                    reset_at: reset,
+                    started_at: now
+                })
+            );
+            assert_eq!(
+                account.health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: reset + Duration::seconds(skew),
+                    scope: format!("model:{FABLE}"),
+                },
+                "attribution never changes health"
+            );
+        }
+        // Not the deadline's window, not Claude, not a quota hold, or already set.
+        let mut account = claude();
+        hold(&mut account, reset + Duration::seconds(301));
+        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
+        assert_eq!(account.quota_cooling, None);
+        let mut account = super::tests::fixture();
+        hold(&mut account, reset);
+        assert!(!account.attribute_quota_cause("7d", reset, now));
+        assert_eq!(account.quota_cooling, None);
+        let mut account = claude();
+        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
+        account.health = Health::Cooling {
+            reason: HealthReason::Rate,
+            until: reset,
+            scope: "account".into(),
+        };
+        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
+        let mut account = claude();
+        hold(&mut account, reset);
+        let earlier = QuotaCooling {
+            window: "5h".into(),
+            reset_at: reset,
+            started_at: now - Duration::minutes(3),
+        };
+        account.quota_cooling = Some(earlier.clone());
+        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
+        assert_eq!(account.quota_cooling, Some(earlier));
+    }
+}
+
 /// A health-owner judgement about this account at this exact selection instant.
 /// Missing credentials, retry exclusion and WS capacity are not health facts.
 pub(crate) struct UnusableEvidence {
@@ -722,6 +913,40 @@ impl Account {
             )
     }
 
+    /// Record which rejected Claude window set the current quota hold (R33).
+    /// A request-level rejection knows its causing window from the response
+    /// headers, but the hold merge cannot, so the cause was left empty and no
+    /// release rule could ever fire. This only fills a missing cause, only when
+    /// the window's reset is the hold deadline (within the same 300 s the early
+    /// release uses), and never changes health, scope or deadline.
+    pub(crate) fn attribute_quota_cause(
+        &mut self,
+        window: &str,
+        reset_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.provider != Provider::Claude || self.quota_cooling.is_some() {
+            return false;
+        }
+        let Health::Cooling {
+            reason: HealthReason::Quota,
+            until,
+            ..
+        } = &self.health
+        else {
+            return false;
+        };
+        if (*until - reset_at).abs() > Duration::seconds(300) {
+            return false;
+        }
+        self.quota_cooling = Some(QuotaCooling {
+            window: window.into(),
+            reset_at,
+            started_at: now,
+        });
+        true
+    }
+
     /// Duration and account scope merge independently; account scope never narrows.
     /// The record holds one model scope: a later deadline replaces another model's
     /// scope (C5 permits this); equal or shorter deadlines retain the old model.
@@ -883,7 +1108,9 @@ impl Account {
                 .any(|w| matches!(w["name"].as_str(), Some("5h" | "7d")))
             && fresh.iter().all(|w| match w["name"].as_str() {
                 Some("5h" | "7d") => {
-                    w["status"] == "allowed"
+                    // `allowed_warning` is Claude's "allowed, approaching the
+                    // limit" and still serves requests (R33, 2026-11-20).
+                    matches!(w["status"].as_str(), Some("allowed" | "allowed_warning"))
                         && w["used_pct"]
                             .as_f64()
                             .is_some_and(|p| p.is_finite() && (0.0..100.0).contains(&p))

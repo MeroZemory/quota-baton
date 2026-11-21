@@ -97,6 +97,31 @@ fn window(name: &str, value: &Value, claude: bool, now: DateTime<Utc>) -> Option
         "observed_at": used.map(|_| now), "status": state}))
 }
 
+/// Newer Claude usage bodies report the Fable weekly window only as a
+/// `limits[]` row (`kind` `weekly_scoped`, `scope.model.display_name` "Fable")
+/// while `seven_day_opus` is null. It is the same account window that request
+/// headers call `7d_oi`. The row's `percent` is already 0-100 and it carries no
+/// request status. Only the display name is compared; no row string is copied.
+/// Other scoped display names are ignored; the only name seen so far, in the
+/// 2026-11-21 live body, is "Fable".
+fn claude_scoped_fable(limits: &Value, now: DateTime<Utc>) -> Option<Value> {
+    limits.as_array()?.iter().take(32).find_map(|row| {
+        if row["kind"].as_str() != Some("weekly_scoped")
+            || !row["scope"]["model"]["display_name"]
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("fable"))
+        {
+            return None;
+        }
+        window(
+            "7d_oi",
+            &json!({"utilization": row["percent"], "resets_at": row["resets_at"]}),
+            true,
+            now,
+        )
+    })
+}
+
 /// Returns a value deserializable as observability's Snapshot, or None when no
 /// recognized usage data is present. Null/unknown fields never invent usage.
 pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> Option<Value> {
@@ -158,6 +183,12 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
                 if let Some(w) = window(name, &root[*key], true, now) {
                     windows.push(w);
                 }
+            }
+            // `seven_day_opus` wins whenever the account still reports it.
+            if root["seven_day_opus"].is_null()
+                && let Some(w) = claude_scoped_fable(&root["limits"], now)
+            {
+                windows.push(w);
             }
         }
     }
@@ -411,6 +442,140 @@ mod tests {
             shape(Provider::Claude, &body)["usage"],
             json!({"five_hour.utilization": 0.0})
         );
+    }
+
+    // 2026-11-21 live body shape: the Fable weekly window is only a limits[]
+    // row and `seven_day_opus` is null.
+    fn limits_body(opus: Value, scoped: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "five_hour": {"utilization": 7.0, "resets_at": "2027-01-15T08:00:00Z"},
+            "seven_day": {"utilization": 45.0, "resets_at": "2027-01-21T08:00:00Z"},
+            "seven_day_opus": opus,
+            "seven_day_sonnet": null,
+            "limits": [
+                {"kind":"session","group":"session","percent":7,"severity":"normal",
+                 "resets_at":"2027-01-15T08:00:00Z","scope":null,"is_active":false},
+                {"kind":"weekly_all","group":"weekly","percent":45,"severity":"normal",
+                 "resets_at":"2027-01-21T08:00:00Z","scope":null,"is_active":true},
+                scoped
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn fable_row(name: &str, percent: Value) -> Value {
+        json!({"kind":"weekly_scoped","group":"weekly","percent":percent,
+            "severity":"normal","resets_at":"2027-01-21T11:59:59.580648+00:00",
+            "scope":{"model":{"id":null,"display_name":name},"surface":null},
+            "is_active":false})
+    }
+
+    #[test]
+    fn claude_fable_limits_row_becomes_the_7d_oi_window_when_seven_day_opus_is_null() {
+        for name in ["Fable", "fable", "FABLE"] {
+            let body = limits_body(Value::Null, fable_row(name, json!(1)));
+            let result = snapshot(Provider::Claude, &body, now()).unwrap();
+            let windows = result["windows"].as_array().unwrap();
+            let names: Vec<_> = windows
+                .iter()
+                .map(|w| w["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["5h", "7d", "7d_oi"], "{name}");
+            let fable = &windows[2];
+            assert_eq!(fable["used_pct"], 1.0);
+            assert_eq!(fable["observed_at"], json!(now()));
+            assert!(
+                fable["status"].is_null(),
+                "a limits[] row has no request status"
+            );
+            let reset = fable["reset_at"].as_str().unwrap();
+            assert!(reset.starts_with("2027-01-21T11:59:59.58"), "{reset}");
+            assert_eq!(result["signals"], json!({}));
+        }
+        // An absent seven_day_opus key is the same as a null one.
+        let mut value: Value =
+            serde_json::from_slice(&limits_body(Value::Null, fable_row("Fable", json!(97))))
+                .unwrap();
+        value.as_object_mut().unwrap().remove("seven_day_opus");
+        let result = snapshot(
+            Provider::Claude,
+            &serde_json::to_vec(&value).unwrap(),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(result["windows"][2]["name"], "7d_oi");
+        assert_eq!(result["windows"][2]["used_pct"], 97.0);
+    }
+
+    #[test]
+    fn claude_limits_absent_or_without_a_fable_row_adds_no_window() {
+        let mut value: Value =
+            serde_json::from_slice(&limits_body(Value::Null, fable_row("Fable", json!(1))))
+                .unwrap();
+        value.as_object_mut().unwrap().remove("limits");
+        let body = serde_json::to_vec(&value).unwrap();
+        let result = snapshot(Provider::Claude, &body, now()).unwrap();
+        assert_eq!(result["windows"].as_array().unwrap().len(), 2);
+        for limits in [
+            json!(null),
+            json!({}),
+            json!("Fable"),
+            json!([]),
+            json!([null, 3]),
+        ] {
+            value["limits"] = limits;
+            let body = serde_json::to_vec(&value).unwrap();
+            let result = snapshot(Provider::Claude, &body, now()).unwrap();
+            assert_eq!(result["windows"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn claude_seven_day_opus_wins_over_the_fable_limits_row() {
+        let opus = json!({"utilization": 63.0, "resets_at": "2027-01-20T00:00:00Z"});
+        let body = limits_body(opus, fable_row("Fable", json!(1)));
+        let result = snapshot(Provider::Claude, &body, now()).unwrap();
+        let windows = result["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[2]["name"], "7d_oi");
+        assert_eq!(windows[2]["used_pct"], 63.0);
+        assert_eq!(windows[2]["reset_at"], "2027-01-20T00:00:00Z");
+    }
+
+    #[test]
+    fn claude_other_scoped_display_names_and_kinds_are_ignored() {
+        // Display names seen on live bodies so far: only "Fable" (2026-11-21).
+        for name in ["Opus", "Sonnet", "Haiku", "Fable 5", "", "claude-fable-5-2"] {
+            let body = limits_body(Value::Null, fable_row(name, json!(80)));
+            let result = snapshot(Provider::Claude, &body, now()).unwrap();
+            assert_eq!(result["windows"].as_array().unwrap().len(), 2, "{name:?}");
+        }
+        let mut row = fable_row("Fable", json!(80));
+        row["kind"] = json!("weekly_all");
+        let body = limits_body(Value::Null, row);
+        let result = snapshot(Provider::Claude, &body, now()).unwrap();
+        assert_eq!(result["windows"].as_array().unwrap().len(), 2);
+        let mut row = fable_row("Fable", json!(80));
+        row["scope"]["model"]["display_name"] = json!(7);
+        let body = limits_body(Value::Null, row);
+        let result = snapshot(Provider::Claude, &body, now()).unwrap();
+        assert_eq!(result["windows"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn claude_fable_row_without_usable_numbers_adds_no_invented_window() {
+        let mut row = fable_row("Fable", json!(null));
+        row["resets_at"] = Value::Null;
+        let body = limits_body(Value::Null, row);
+        let result = snapshot(Provider::Claude, &body, now()).unwrap();
+        assert_eq!(result["windows"].as_array().unwrap().len(), 2);
+        for percent in [json!(-1), json!("garbage"), json!(f64::NAN)] {
+            let mut row = fable_row("Fable", percent);
+            row["resets_at"] = Value::Null;
+            let body = limits_body(Value::Null, row);
+            let result = snapshot(Provider::Claude, &body, now()).unwrap();
+            assert_eq!(result["windows"].as_array().unwrap().len(), 2);
+        }
     }
 
     #[test]
