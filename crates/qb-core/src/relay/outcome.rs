@@ -1,5 +1,5 @@
 use crate::{
-    account_runtime::{HealthSignal, QuotaCause},
+    account_runtime::HealthSignal,
     accounts::{HealthReason, Provider},
 };
 use axum::http::{HeaderMap, StatusCode};
@@ -22,8 +22,6 @@ pub(super) struct Decision {
     pub signal: Option<HealthSignal>,
     pub model: Option<String>,
     pub quota_reset: Option<DateTime<Utc>>,
-    /// The rejected Claude window whose reset is the hold deadline (R33).
-    pub quota_cause: Option<QuotaCause>,
     classified: Kind,
     classified_provider: Provider,
     classified_model: Option<String>,
@@ -644,7 +642,6 @@ fn classify_inner(
         kind: Kind::Relay,
         signal: None,
         quota_reset: None,
-        quota_cause: None,
         model: model.map(str::to_owned),
     };
     if matches!(
@@ -692,8 +689,6 @@ fn classify_inner(
         decision.kind = Kind::Quota;
         let mut scope = "account".to_owned();
         let mut resets = Vec::new();
-        // Claude windows that name a reset, for the hold's cause (R33).
-        let mut named: Vec<QuotaCause> = Vec::new();
         if provider == Provider::Claude {
             for w in ["5h", "7d", "7d_oi"] {
                 if has(
@@ -703,10 +698,6 @@ fn classify_inner(
                     header_timestamp(headers, &format!("anthropic-ratelimit-unified-{w}-reset"))
                 {
                     resets.push(t);
-                    named.push(QuotaCause {
-                        window: w,
-                        reset_at: t,
-                    });
                 }
             }
             let model_only = !has("anthropic-ratelimit-unified-5h-status", "rejected")
@@ -727,10 +718,6 @@ fn classify_inner(
                         header_timestamp(headers, "anthropic-ratelimit-unified-7d_oi-reset")
                 {
                     resets.push(reset);
-                    named.push(QuotaCause {
-                        window: "7d_oi",
-                        reset_at: reset,
-                    });
                 }
             }
             // Window rejections identify the cause. A broad unified deadline
@@ -801,14 +788,6 @@ fn classify_inner(
                     header_seconds_at(headers, "retry-after", now).unwrap_or(300),
                 ),
             );
-        // Only a rejected window whose reset is the deadline (within the same
-        // 300 s the reducer uses for a hold's cause) may be named as the cause.
-        decision.quota_cause = named
-            .into_iter()
-            .filter(|cause| {
-                cause.reset_at > now && (until - cause.reset_at).abs() <= Duration::seconds(300)
-            })
-            .min_by_key(|cause| (until - cause.reset_at).abs());
         decision.signal = cooling(HealthReason::Quota, until, scope);
     } else if !matches!(
         code,

@@ -1360,7 +1360,7 @@ impl AccountRuntime {
         pending: Option<PendingHttp429>,
         known_reset: Option<DateTime<Utc>>,
         signal: Option<HealthSignal>,
-        quota_cause: Option<super::QuotaCause>,
+        quota_snapshot: Option<serde_json::Value>,
         body: QualifiedHttp429Body,
     ) -> Result<Option<ObservedHttp429>, ()> {
         let store = self.store.clone();
@@ -1460,12 +1460,8 @@ impl AccountRuntime {
                                     )
                                 }
                             });
-                            if let Some(cause) = quota_cause {
-                                account.attribute_quota_cause(
-                                    cause.window,
-                                    cause.reset_at,
-                                    applied_at,
-                                );
+                            if let Some(snapshot) = &quota_snapshot {
+                                account.attribute_quota_cause(snapshot, applied_at);
                             }
                         })
                         .map_err(|_| ())?;

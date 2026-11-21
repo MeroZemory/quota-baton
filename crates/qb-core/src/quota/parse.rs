@@ -100,11 +100,13 @@ fn window(name: &str, value: &Value, claude: bool, now: DateTime<Utc>) -> Option
 /// Newer Claude usage bodies report the Fable weekly window only as a
 /// `limits[]` row (`kind` `weekly_scoped`, `scope.model.display_name` "Fable")
 /// while `seven_day_opus` is null. It is the same account window that request
-/// headers call `7d_oi`. The row's `percent` is already 0-100 and it carries no
-/// request status. Only the display name is compared; no row string is copied.
-/// Other scoped display names are ignored; the only name seen so far, in the
+/// headers call `7d_oi`. This returns the row's window input (`percent` is
+/// already 0-100; the row carries no request status) and `snapshot` turns it
+/// into a window through the same `window(name, ..)` call as every other named
+/// window. Only the display name is compared; no row string is copied. Other
+/// scoped display names are ignored; the only name seen so far, in the
 /// 2026-11-21 live body, is "Fable".
-fn claude_scoped_fable(limits: &Value, now: DateTime<Utc>) -> Option<Value> {
+fn claude_scoped_fable(limits: &Value) -> Option<Value> {
     limits.as_array()?.iter().take(32).find_map(|row| {
         if row["kind"].as_str() != Some("weekly_scoped")
             || !row["scope"]["model"]["display_name"]
@@ -113,12 +115,7 @@ fn claude_scoped_fable(limits: &Value, now: DateTime<Utc>) -> Option<Value> {
         {
             return None;
         }
-        window(
-            "7d_oi",
-            &json!({"utilization": row["percent"], "resets_at": row["resets_at"]}),
-            true,
-            now,
-        )
+        Some(json!({"utilization": row["percent"], "resets_at": row["resets_at"]}))
     })
 }
 
@@ -179,16 +176,22 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
             }
         }
         Provider::Claude => {
-            for (key, name) in CLAUDE_WINDOWS {
-                if let Some(w) = window(name, &root[*key], true, now) {
+            let mut inputs: Vec<(&str, &Value)> = CLAUDE_WINDOWS
+                .iter()
+                .map(|(key, name)| (*name, &root[*key]))
+                .collect();
+            // `seven_day_opus` wins whenever the account still reports it.
+            let scoped = root["seven_day_opus"]
+                .is_null()
+                .then(|| claude_scoped_fable(&root["limits"]))
+                .flatten();
+            if let Some(value) = &scoped {
+                inputs.push(("7d_oi", value));
+            }
+            for (name, value) in inputs {
+                if let Some(w) = window(name, value, true, now) {
                     windows.push(w);
                 }
-            }
-            // `seven_day_opus` wins whenever the account still reports it.
-            if root["seven_day_opus"].is_null()
-                && let Some(w) = claude_scoped_fable(&root["limits"], now)
-            {
-                windows.push(w);
             }
         }
     }

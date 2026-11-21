@@ -466,7 +466,21 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2339,
+        "line": 2246,
+        "rule": "admin-json",
+        "snippet": "json!({\"event\":\"account_changed\",\"data\":{\"id\":id,\"removed\":true}})",
+        "field": "",
+        "field_type": "",
+        "owner": "",
+        "attribute": ""
+      },
+      "count": 1,
+      "reason": "R33 account removal notice for the dashboard and tray: carries the removed account id and a removed flag only, no account data; reviewed occurrence in delete_account."
+    },
+    {
+      "key": {
+        "file": "crates/qb-core/src/account_runtime.rs",
+        "line": 2437,
         "rule": "admin-json",
         "snippet": "json!(earliest.as_ref().map(|(_, reset)| *reset))",
         "field": "",
@@ -480,7 +494,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2340,
+        "line": 2438,
         "rule": "admin-json",
         "snippet": "json!(earliest.map(|(id, _)| id))",
         "field": "",
@@ -494,7 +508,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2341,
+        "line": 2439,
         "rule": "admin-json",
         "snippet": "json!(accounts.iter().any(|other| {\n                    other.provider == a.provider\n                        && entitled.contains(&other.id)\n                        && other.user_state == UserState::Active\n                        && !other.drain\n                        && self\n                            .model_quota_status(other, model, now)\n                            .is_some_and(|status| status.model_limited)\n                }))",
         "field": "",
@@ -508,7 +522,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 2357,
+        "line": 2455,
         "rule": "admin-json",
         "snippet": "json!(now)",
         "field": "",
@@ -522,7 +536,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3324,
+        "line": 3422,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_updated\",\"data\":{\"id\":id,\"snapshot\":snapshot}})",
         "field": "",
@@ -536,7 +550,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3447,
+        "line": 3545,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota-baton: bound account is cooling\",\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -550,7 +564,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3449,
+        "line": 3547,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"quota-baton: bound account is cooling\"}})",
         "field": "",
@@ -564,7 +578,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3552,
+        "line": 3650,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"usage_limit_reached\",\"message\":message,\"resets_at\":until.timestamp(),\"resets_in_seconds\":seconds}})",
         "field": "",
@@ -578,7 +592,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3554,
+        "line": 3652,
         "rule": "admin-json",
         "snippet": "json!({\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":message}})",
         "field": "",
@@ -592,7 +606,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3564,
+        "line": 3662,
         "rule": "admin-json",
         "snippet": "json!({\"error\":{\"type\":\"invalid_request_error\",\"message\":message}})",
         "field": "",
@@ -606,7 +620,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4422,
+        "line": 4520,
         "rule": "admin-json",
         "snippet": "json!(\"quota_notice\")",
         "field": "",
@@ -620,7 +634,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4423,
+        "line": 4521,
         "rule": "admin-json",
         "snippet": "json!(account.id)",
         "field": "",
@@ -634,7 +648,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4424,
+        "line": 4522,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"core_warning\",\"data\":data})",
         "field": "",
@@ -648,7 +662,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 4461,
+        "line": 4559,
         "rule": "admin-json",
         "snippet": "json!([\r\n        account.health,\r\n        account.user_state,\r\n        account.drain,\r\n        account.allow_credits,\r\n        account.quota_cooling,\r\n        account.payment_until\r\n    ])",
         "field": "",
@@ -1292,7 +1306,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 221,
+        "line": 223,
         "rule": "admin-json",
         "snippet": "json!({\"account\":a.id,\"forecast\":self.observability.forecast_view(&a.id,\r\n                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})",
         "field": "",
@@ -1306,7 +1320,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/relay.rs",
-        "line": 2132,
+        "line": 2134,
         "rule": "admin-json",
         "snippet": "json!({\"error\": {\"type\": kind, \"message\": message}})",
         "field": "",
@@ -1768,7 +1782,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3022,
+        "line": 3120,
         "rule": "admin-json",
         "snippet": "json!({\"name\":cause.window,\"observed_at\":cause.started_at})",
         "field": "",
@@ -1782,7 +1796,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3047,
+        "line": 3145,
         "rule": "admin-json",
         "snippet": "json!(report.started_at)",
         "field": "",
@@ -1796,7 +1810,7 @@
     {
       "key": {
         "file": "crates/qb-core/src/account_runtime.rs",
-        "line": 3310,
+        "line": 3408,
         "rule": "admin-json",
         "snippet": "json!({\"event\":\"quota_hold_cleared\",\"data\":{\n                        \"id\":account_id,\"reason\":\"window_gone_after_plan_change\"\n                    }})",
         "field": "",

@@ -180,7 +180,7 @@ async fn reject(f: &Fixture, rejection: &Rejection, model: &str) -> outcome::Dec
             None,
             decision.quota_reset,
             decision.signal.take(),
-            decision.quota_cause,
+            f.obs.quota_snapshot(&f.id),
             body,
         )
         .await
@@ -319,13 +319,17 @@ fn unified(pairs: &[(&str, String)]) -> HeaderMap {
     headers
 }
 
-/// The classifier signal applied the way the relay does, but with no header
-/// snapshot first, so the only cause evidence is the classification itself.
-async fn hold_from_headers_only(
+/// The relay order for a Claude 429 that carries only the given headers: header
+/// observation, classification, then the signal applied through the owner with
+/// the observed snapshot as the cause evidence.
+async fn hold_from_headers(
     f: &Fixture,
     headers: &HeaderMap,
     model: &str,
 ) -> (outcome::Decision, Account) {
+    f.runtime
+        .observe_headers_for_model(&f.id, Provider::Claude, headers, Some(model))
+        .await;
     let mut decision = outcome::classify(
         Provider::Claude,
         StatusCode::TOO_MANY_REQUESTS,
@@ -341,7 +345,7 @@ async fn hold_from_headers_only(
             None,
             decision.quota_reset,
             decision.signal.take(),
-            decision.quota_cause,
+            f.obs.quota_snapshot(&f.id),
             body,
         )
         .await
@@ -425,13 +429,7 @@ async fn r33_a_request_level_claude_429_records_the_window_that_set_its_deadline
     ];
     for case in cases {
         let f = Fixture::new();
-        let (decision, held) = hold_from_headers_only(&f, &case.headers, FABLE).await;
-        assert_eq!(
-            decision.quota_cause.map(|c| (c.window, c.reset_at)),
-            case.cause,
-            "{}",
-            case.name
-        );
+        let (_, held) = hold_from_headers(&f, &case.headers, FABLE).await;
         assert_eq!(
             held.health,
             Health::Cooling {
@@ -454,8 +452,7 @@ async fn r33_a_request_level_claude_429_records_the_window_that_set_its_deadline
     let headers = unified(&[("status", "rejected".into())]);
     let mut headers = headers;
     headers.insert("retry-after", "600".parse().unwrap());
-    let (decision, held) = hold_from_headers_only(&f, &headers, FABLE).await;
-    assert_eq!(decision.quota_cause, None);
+    let (_, held) = hold_from_headers(&f, &headers, FABLE).await;
     assert_eq!(held.quota_cooling, None);
 }
 
@@ -468,35 +465,10 @@ async fn r33_the_recorded_request_cause_lets_the_ordinary_poll_release_a_model_h
         ("7d_oi-reset", weekly.timestamp().to_string()),
         ("representative-claim", "seven_day_opus".into()),
     ]);
-    let (_, held) = hold_from_headers_only(&f, &headers, FABLE).await;
+    let (_, held) = hold_from_headers(&f, &headers, FABLE).await;
     assert_eq!(held.quota_cooling.as_ref().unwrap().window, "7d_oi");
     let started_at = Utc::now() + Duration::seconds(2);
     let (released, _) = poll(&f, &usage_body(started_at, weekly, 1.0), started_at).await;
     assert_eq!(released.health, Health::Ready);
     assert_eq!(released.quota_cooling, None);
-}
-
-#[test]
-fn r33_codex_quota_classification_carries_no_cause() {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-codex-limit-reached", "true".parse().unwrap());
-    headers.insert(
-        "x-codex-primary-reset-at",
-        (Utc::now() + Duration::hours(3))
-            .timestamp()
-            .to_string()
-            .parse()
-            .unwrap(),
-    );
-    headers.insert("x-codex-primary-used-percent", "100".parse().unwrap());
-    let decision = outcome::classify(
-        Provider::Codex,
-        StatusCode::TOO_MANY_REQUESTS,
-        &headers,
-        br#"{"error":{"type":"usage_limit_reached"}}"#,
-        Some("gpt-5"),
-    );
-    assert_eq!(decision.kind, Kind::Quota);
-    assert!(decision.signal.is_some());
-    assert_eq!(decision.quota_cause, None);
 }

@@ -487,10 +487,26 @@ mod r33_allowed_warning_tests {
         }
     }
 
+    /// Observed windows as the response-header snapshot carries them.
+    fn observed(rows: &[(&str, &str, DateTime<Utc>)]) -> Value {
+        let windows: Vec<Value> = rows
+            .iter()
+            .map(|(name, status, reset)| {
+                json!({"name":name,"status":status,"reset_at":reset,"used_pct":100.0})
+            })
+            .collect();
+        json!({"source":"headers","windows":windows})
+    }
+
     #[test]
     fn attribute_quota_cause_only_fills_a_missing_cause_for_a_claude_quota_hold() {
         let now = Utc::now();
         let reset = now + Duration::days(2);
+        let snapshot = observed(&[
+            ("5h", "allowed_warning", now + Duration::minutes(96)),
+            ("7d", "allowed_warning", reset),
+            ("7d_oi", "rejected", reset),
+        ]);
         let hold = |account: &mut Account, until| {
             account.apply_health_signal(
                 HealthSignal::Cooling {
@@ -509,14 +525,15 @@ mod r33_allowed_warning_tests {
                 account.quota_cooling, None,
                 "a bare request hold has no cause"
             );
-            assert!(account.attribute_quota_cause("7d_oi", reset, now), "{skew}");
+            assert!(account.attribute_quota_cause(&snapshot, now), "{skew}");
             assert_eq!(
                 account.quota_cooling,
                 Some(QuotaCooling {
                     window: "7d_oi".into(),
                     reset_at: reset,
                     started_at: now
-                })
+                }),
+                "only the rejected window is the cause, never the allowed 7d at the same reset"
             );
             assert_eq!(
                 account.health,
@@ -528,23 +545,53 @@ mod r33_allowed_warning_tests {
                 "attribution never changes health"
             );
         }
-        // Not the deadline's window, not Claude, not a quota hold, or already set.
+        // The nearest rejected window wins.
         let mut account = claude();
-        hold(&mut account, reset + Duration::seconds(301));
-        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
-        assert_eq!(account.quota_cooling, None);
+        hold(&mut account, reset);
+        let two = observed(&[
+            ("5h", "rejected", reset - Duration::seconds(200)),
+            ("7d_oi", "rejected", reset - Duration::seconds(10)),
+        ]);
+        assert!(account.attribute_quota_cause(&two, now));
+        assert_eq!(
+            account.quota_cooling.as_ref().map(|c| c.window.as_str()),
+            Some("7d_oi")
+        );
+        // No rejected window at the deadline, a reset already past, or no windows.
+        for (name, snapshot) in [
+            (
+                "deadline is another window's",
+                observed(&[("7d_oi", "rejected", reset + Duration::seconds(301))]),
+            ),
+            (
+                "allowed windows are not causes",
+                observed(&[("7d", "allowed", reset), ("5h", "allowed_warning", reset)]),
+            ),
+            (
+                "past reset",
+                observed(&[("7d_oi", "rejected", now - Duration::seconds(1))]),
+            ),
+            ("no windows", json!({"source":"headers"})),
+        ] {
+            let mut account = claude();
+            hold(&mut account, reset);
+            assert!(!account.attribute_quota_cause(&snapshot, now), "{name}");
+            assert_eq!(account.quota_cooling, None, "{name}");
+        }
+        // Not Claude, not a quota hold, or a cause already recorded.
         let mut account = super::tests::fixture();
         hold(&mut account, reset);
-        assert!(!account.attribute_quota_cause("7d", reset, now));
+        assert!(!account.attribute_quota_cause(&snapshot, now));
         assert_eq!(account.quota_cooling, None);
         let mut account = claude();
-        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
+        assert!(!account.attribute_quota_cause(&snapshot, now));
         account.health = Health::Cooling {
             reason: HealthReason::Rate,
             until: reset,
             scope: "account".into(),
         };
-        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
+        assert!(!account.attribute_quota_cause(&snapshot, now));
+        assert_eq!(account.quota_cooling, None);
         let mut account = claude();
         hold(&mut account, reset);
         let earlier = QuotaCooling {
@@ -553,9 +600,24 @@ mod r33_allowed_warning_tests {
             started_at: now - Duration::minutes(3),
         };
         account.quota_cooling = Some(earlier.clone());
-        assert!(!account.attribute_quota_cause("7d_oi", reset, now));
+        assert!(!account.attribute_quota_cause(&snapshot, now));
         assert_eq!(account.quota_cooling, Some(earlier));
     }
+}
+
+/// The cause record for a snapshot window. This is the only production
+/// constructor of a hold's cause: it copies the window's own name and never
+/// invents one.
+fn quota_cooling_for(
+    w: &serde_json::Value,
+    reset_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+) -> Option<QuotaCooling> {
+    w["name"].as_str().map(|name| QuotaCooling {
+        window: name.into(),
+        reset_at,
+        started_at,
+    })
 }
 
 /// A health-owner judgement about this account at this exact selection instant.
@@ -914,15 +976,15 @@ impl Account {
     }
 
     /// Record which rejected Claude window set the current quota hold (R33).
-    /// A request-level rejection knows its causing window from the response
-    /// headers, but the hold merge cannot, so the cause was left empty and no
-    /// release rule could ever fire. This only fills a missing cause, only when
-    /// the window's reset is the hold deadline (within the same 300 s the early
-    /// release uses), and never changes health, scope or deadline.
+    /// A request-level hold is applied from the response classification, which
+    /// knows no window, so its cause was left empty and no release rule could
+    /// ever fire. The cause is the observed rejected window whose reset is the
+    /// hold deadline (within the same 300 s the early release uses; the nearest
+    /// one wins). This only fills a missing cause and never changes health,
+    /// scope or deadline.
     pub(crate) fn attribute_quota_cause(
         &mut self,
-        window: &str,
-        reset_at: DateTime<Utc>,
+        snapshot: &serde_json::Value,
         now: DateTime<Utc>,
     ) -> bool {
         if self.provider != Provider::Claude || self.quota_cooling.is_some() {
@@ -936,15 +998,21 @@ impl Account {
         else {
             return false;
         };
-        if (*until - reset_at).abs() > Duration::seconds(300) {
-            return false;
+        let until = *until;
+        let cause = snapshot["windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["status"] == "rejected")
+            .filter_map(|w| timestamp(&w["reset_at"]).map(|r| (w, r)))
+            .filter(|(_, r)| *r > now && (until - *r).abs() <= Duration::seconds(300))
+            .min_by_key(|(_, r)| (until - *r).abs())
+            .and_then(|(w, r)| quota_cooling_for(w, r, now));
+        let attributed = cause.is_some();
+        if attributed {
+            self.quota_cooling = cause;
         }
-        self.quota_cooling = Some(QuotaCooling {
-            window: window.into(),
-            reset_at,
-            started_at: now,
-        });
-        true
+        attributed
     }
 
     /// Duration and account scope merge independently; account scope never narrows.
@@ -1110,7 +1178,7 @@ impl Account {
                 Some("5h" | "7d") => {
                     // `allowed_warning` is Claude's "allowed, approaching the
                     // limit" and still serves requests (R33, 2026-11-20).
-                    matches!(w["status"].as_str(), Some("allowed" | "allowed_warning"))
+                    (w["status"] == "allowed" || w["status"] == "allowed_warning")
                         && w["used_pct"]
                             .as_f64()
                             .is_some_and(|p| p.is_finite() && (0.0..100.0).contains(&p))
@@ -1198,13 +1266,7 @@ impl Account {
             let incoming = self.cool(HealthReason::Quota, until, scope);
             self.quota_credit_releasable = releasable;
             if incoming {
-                self.quota_cooling = causing.and_then(|(w, r)| {
-                    w["name"].as_str().map(|name| QuotaCooling {
-                        window: name.into(),
-                        reset_at: r,
-                        started_at: now,
-                    })
-                });
+                self.quota_cooling = causing.and_then(|(w, r)| quota_cooling_for(w, r, now));
             }
         } else if self.quota_credit_releasable
             && matches!(&self.health, Health::Cooling { scope, .. } if scope == "account")

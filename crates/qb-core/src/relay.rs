@@ -3212,6 +3212,11 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                     decoded_body.as_deref(),
                     request_model.as_deref(),
                 );
+                // The snapshot the response headers just merged names the
+                // rejected window that set a Claude hold (R33).
+                let observed_quota = (provider == Provider::Claude)
+                    .then(|| state.observability.quota_snapshot(&account.id))
+                    .flatten();
                 match state
                     .accounts
                     .finish_http_429_report_attributed(
@@ -3219,7 +3224,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                         pending_http_429,
                         decision.quota_reset,
                         decision.signal.take(),
-                        decision.quota_cause,
+                        observed_quota,
                         body,
                     )
                     .await
@@ -3395,7 +3400,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         } else if let Some(signal) = decision.signal.take()
             && state
                 .accounts
-                .transition_attributed(&account.id, signal, decision.quota_cause)
+                .transition_attributed(
+                    &account.id,
+                    signal,
+                    (provider == Provider::Claude)
+                        .then(|| state.observability.quota_snapshot(&account.id))
+                        .flatten(),
+                )
                 .await
                 .is_err()
         {
