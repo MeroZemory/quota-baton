@@ -2218,6 +2218,88 @@ impl AccountRuntime {
         Ok(account)
     }
 
+    /// Removes the account file and every per-account cache, then tells the tray and
+    /// dashboard through the ordinary `account_changed` event (`removed: true`).
+    /// Bindings are not rewritten and the upstream account is not revoked.
+    pub async fn delete_account(&self, id: &str) -> Result<(), crate::accounts::DeleteError> {
+        let store = self.store.clone();
+        let obs = self.obs.clone();
+        let owned = id.to_owned();
+        crate::boxes::spawn_blocking(move || {
+            let _gate = store.transaction()?;
+            store.delete_account_unlocked(&owned)?;
+            // The authoritative list is taken under the same transaction as the
+            // removal, so reconciliation cannot prune an account created meanwhile.
+            match store.list_unlocked() {
+                Ok(existing) => {
+                    if obs.reconcile_accounts(&existing).is_err() {
+                        tracing::warn!(
+                            code = "observation_reconcile_failed",
+                            "Account observation cache persistence failed; next load will retry"
+                        );
+                    }
+                }
+                Err(_) => tracing::warn!("Account observation reconcile skipped after delete"),
+            }
+            Ok::<_, crate::accounts::DeleteError>(())
+        })
+        .await
+        .map_err(|_| {
+            crate::accounts::DeleteError::Store(crate::accounts::StoreError::Synchronization)
+        })??;
+        self.forget_account(id);
+        let _ = self
+            .events
+            .send(json!({"event":"account_changed","data":{"id":id,"removed":true}}));
+        Ok(())
+    }
+
+    /// Drops the in-memory state kept for `id`. Requests already running finish; the
+    /// account is simply absent from the next selection.
+    fn forget_account(&self, id: &str) {
+        self.selection_owner.invalidate();
+        let _ = self.catalogs.remove(id);
+        if let Some(poller) = self
+            .poller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            poller.forget_account(id);
+        }
+        if let Ok(mut limits) = self.limits.lock() {
+            limits.remove(id);
+        }
+        if let Ok(mut probes) = self.probes.lock() {
+            probes.remove(id);
+        }
+        if let Ok(mut released) = self.released_quota.lock() {
+            released.remove(id);
+        }
+        if let Ok(mut history) = self.usage_window_history.lock() {
+            history.remove(id);
+        }
+        if let Ok(mut health) = self.volatile.lock() {
+            health.remove(id);
+        }
+        if let Ok(mut attention) = self.refresh_attention.lock() {
+            attention.remove(id);
+        }
+        if let Ok(mut pacing) = self.pacing.lock() {
+            pacing.remove(id);
+        }
+        if let Ok(mut resets) = self.quota_resets.lock() {
+            resets.remove(id);
+        }
+        if let Ok(mut notices) = self.quota_notices.lock() {
+            notices.remove(id);
+        }
+        if let Ok(mut pending) = self.pending_quota.lock() {
+            pending.remove(id);
+        }
+    }
+
     pub async fn initialize_settings(
         &self,
         settings: std::collections::BTreeMap<String, crate::config::AccountConfig>,

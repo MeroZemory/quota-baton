@@ -60,6 +60,19 @@ impl ResetCredits {
         }
         Ok(accounts.entry(id.into()).or_default().clone())
     }
+
+    /// Drops the cached inventory and preview of a deleted account. An operation
+    /// that already holds the entry keeps its own reference and finishes.
+    pub(crate) fn forget(&self, id: &str) {
+        if let Ok(mut accounts) = self.accounts.lock() {
+            accounts.remove(id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds(&self, id: &str) -> bool {
+        self.accounts.lock().is_ok_and(|a| a.contains_key(id))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

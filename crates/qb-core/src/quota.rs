@@ -202,6 +202,25 @@ impl UsagePoller {
     pub(crate) fn set_tokens(&self, tokens: TokenGates) {
         *self.tokens.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
     }
+    /// Drops the poll clock and the reset-credit cache of a deleted account. A poll
+    /// already in flight may recreate an inert clock; `tick` prunes absent ids.
+    pub(crate) fn forget_account(&self, id: &str) {
+        self.clocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.reset_credits.forget(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds_account_state(&self, id: &str) -> bool {
+        self.clocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+            || self.reset_credits.holds(id)
+    }
+
     pub fn mark_tray_open(&self) {
         *self.tray_until.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(Instant::now() + Duration::from_secs(120));

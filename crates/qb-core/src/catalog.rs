@@ -262,6 +262,11 @@ impl CatalogCache {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn holds(&self, account: &str) -> bool {
+        self.0.lock().entries.contains_key(account)
+    }
+
     /// Explicit lifecycle cleanup only. Never remove an in-flight account.
     pub fn remove(&self, account: &str) -> Result<bool, CatalogError> {
         validate_account(account)?;

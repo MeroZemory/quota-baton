@@ -48,6 +48,19 @@ pub enum StoreError {
     Synchronization,
 }
 
+/// Why `DELETE /accounts/{id}` did not remove an account (R33).
+#[derive(Debug, thiserror::Error)]
+pub enum DeleteError {
+    /// Unknown or malformed id; nothing was changed.
+    #[error("account was not found")]
+    NotFound,
+    /// Stopped writes, or a login migration or fenced takeover owns the id.
+    #[error("account is busy")]
+    Busy,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
 #[derive(Serialize, Deserialize)]
 struct Record {
     #[serde(flatten)]
@@ -1030,6 +1043,69 @@ impl AccountStore {
             self.complete_takeover_journal_unlocked(id, &receipt)?;
         }
         fs::remove_file(self.path(id)?).map_err(|_| StoreError::Io)
+    }
+
+    /// Removes one account file. Bindings and the upstream account are not touched.
+    /// Takes the store transaction; callers that already hold it use
+    /// `delete_account_unlocked`.
+    pub fn delete_account(&self, id: &str) -> Result<(), DeleteError> {
+        let _guard = self.transaction()?;
+        self.delete_account_unlocked(id)
+    }
+
+    /// Caller holds the store transaction. Every refusal happens before any change,
+    /// so a refused delete leaves the file and the selection grants as they were.
+    pub(crate) fn delete_account_unlocked(&self, id: &str) -> Result<(), DeleteError> {
+        let path = self.path(id).map_err(|_| DeleteError::NotFound)?;
+        if self.writes_stopped() {
+            return Err(DeleteError::Busy);
+        }
+        let record = match self.read(id) {
+            Ok(record) => record,
+            Err(StoreError::NotFound) => return Err(DeleteError::NotFound),
+            Err(error) => return Err(error.into()),
+        };
+        // A fenced takeover has consumed or may consume the refresh token; its
+        // owner finishes or supersedes it first. A login migration names the ids
+        // it is moving between and must complete before either file goes away.
+        if record
+            .takeover_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.fenced())
+            || self.login_migration_names(id)?
+        {
+            return Err(DeleteError::Busy);
+        }
+        self.before_mutation(BeforeAccountMutation::Retire { id });
+        // A finished operation's journal must record its result before the
+        // account that owns it disappears, or startup recovery would reject it.
+        if let Some(receipt) = &record.takeover_receipt {
+            self.complete_takeover_journal_unlocked(id, receipt)?;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(DeleteError::NotFound)
+            }
+            Err(_) => Err(StoreError::Io.into()),
+        }
+    }
+
+    /// True when the pending login migration marker moves `id`; an unreadable
+    /// marker is treated as naming it.
+    fn login_migration_names(&self, id: &str) -> Result<bool, StoreError> {
+        let bytes = match crate::platform::read_private_bytes(
+            &self.dir.join(".login-migration"),
+            4 * 1024 * 1024,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(StoreError::Io),
+        };
+        let Ok(marker) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(true);
+        };
+        Ok(marker["old"] == id || marker["new"] == id)
     }
 
     pub(crate) fn begin_login_migration(

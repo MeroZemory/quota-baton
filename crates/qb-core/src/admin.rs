@@ -203,7 +203,7 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
             )
             .route(
                 "/admin/v1/accounts/{id}",
-                axum::routing::patch(account_patch),
+                axum::routing::patch(account_patch).delete(account_delete),
             )
             .route("/admin/v1/lifecycle/drain", post(lifecycle_drain))
             .route("/admin/v1/lifecycle/shutdown", post(lifecycle_shutdown)),
@@ -830,6 +830,27 @@ async fn account_patch(
     }
 }
 
+/// Removes the account file only (R33). 204 on success, 404 for an unknown id and
+/// 409 during drain, with stopped writes, or while a login migration or takeover
+/// owns the id. Nothing is revoked upstream and bindings are not rewritten.
+async fn account_delete(
+    State(state): State<RuntimeAdmin>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    use crate::accounts::DeleteError;
+    if state.relay.is_draining() {
+        return error(StatusCode::CONFLICT, "Core is draining");
+    }
+    match state.relay.accounts.delete_account(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(DeleteError::NotFound) => error(StatusCode::NOT_FOUND, "Account not found"),
+        Err(DeleteError::Busy) => error(StatusCode::CONFLICT, "Account is busy"),
+        Err(DeleteError::Store(_)) => {
+            error(StatusCode::INTERNAL_SERVER_ERROR, "Account deletion failed")
+        }
+    }
+}
+
 async fn change_account(
     state: RuntimeAdmin,
     id: String,
@@ -1373,3 +1394,6 @@ mod source_features;
 
 #[cfg(test)]
 mod routing_handoff_tests;
+
+#[cfg(test)]
+mod r33_delete_tests;
