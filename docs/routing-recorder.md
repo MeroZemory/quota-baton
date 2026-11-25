@@ -59,6 +59,24 @@ storage tests satisfy them.
 
 ## Decision-local selection and permit tape
 
+### WebSocket first-assignment replay
+
+The November 26 move-breaker incident exposed a gap before account selection.
+A model-less socket can acquire an account and reconnect when the first request
+reveals its model. The existing selection and permit records show which account
+the router chose. They omit facts needed to determine whether work had already
+reached the upstream account when the client reconnected.
+
+To qualify a change to this path under D29, first deploy a recorder that preserves
+the installed routing behavior. Capture the first frame's dispatch boundary,
+binding generation and socket ownership, and the reconnect model marker's lifetime
+using body-free events and epoch-local identities. Replay must carry each router's
+binding state across selections. Check the installed behavior and a deliberately
+altered decision on the first real hour. Integration requires a differential
+comparison over at least 24 valid hours under the existing coverage and loss rules.
+
+### Recorded selection and permit inputs
+
 Current builds write `state/decision-tape-v8/`. The native offline reader also
 accepts sealed schema-5/6/7 exports; older roots are neither rewritten nor removed.
 Each epoch uses the configured encoded-byte hourly stop-go budget (40,000,000 by
