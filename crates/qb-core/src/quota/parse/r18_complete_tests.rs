@@ -34,6 +34,46 @@ fn claude_complete_requires_explicit_account_inventory_and_valid_numeric_windows
 }
 
 #[test]
+fn claude_complete_accepts_unstarted_zero_utilization_window_with_null_resets_at() {
+    for body in [
+        json!({
+            "five_hour": {"utilization": 0, "resets_at": null},
+            "seven_day": {"utilization": 0.0, "resets_at": null}
+        }),
+        json!({
+            "five_hour": {"utilization": 0.0, "resets_at": "2099-11-07T00:00:00Z"},
+            "seven_day": {"utilization": 0.0, "resets_at": null}
+        }),
+        json!({
+            "five_hour": {"utilization": 0.0, "resets_at": null},
+            "seven_day": {"utilization": 45.0, "resets_at": "2099-11-07T00:00:00Z"}
+        }),
+    ] {
+        assert!(
+            is_complete_snapshot(Provider::Claude, &serde_json::to_vec(&body).unwrap()),
+            "{body}"
+        );
+    }
+    for malformed in [
+        json!({"utilization": 0}),
+        json!({"utilization": 0, "resets_at": "invalid"}),
+        json!({"utilization": 0, "resets_at": null, "reset_at": "invalid"}),
+        json!({"utilization": 0, "resets_at": null, "reset_after_seconds": -1}),
+        json!({"utilization": 0.1, "resets_at": null}),
+        json!({"utilization": 51, "resets_at": null}),
+    ] {
+        let body = json!({
+            "five_hour": {"utilization": 0.0, "resets_at": "2099-11-07T00:00:00Z"},
+            "seven_day": malformed
+        });
+        assert!(
+            !is_complete_snapshot(Provider::Claude, &serde_json::to_vec(&body).unwrap()),
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn r18_explicit_pro_categories_are_retained_without_numeric_tier_inference() {
     for tier in ["pro", "prolite", "promax"] {
         let mut body = report();

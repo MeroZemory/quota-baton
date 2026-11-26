@@ -472,3 +472,123 @@ async fn r33_the_recorded_request_cause_lets_the_ordinary_poll_release_a_model_h
     assert_eq!(released.health, Health::Ready);
     assert_eq!(released.quota_cooling, None);
 }
+
+#[tokio::test]
+async fn claude_web_reset_with_null_resets_at_releases_account_7d_quota_hold() {
+    // Replays the 2026-11-26 incident: a 7d 429 holds the account, then a web
+    // reset on claude.ai makes /api/oauth/usage return utilization=0.0 with
+    // resets_at=null for unstarted windows.
+    for (name, body, should_release) in [
+        (
+            "all_windows_unstarted_zero_null_reset",
+            json!({
+                "five_hour": {"utilization": 0.0, "resets_at": null},
+                "seven_day": {"utilization": 0.0, "resets_at": null},
+                "seven_day_opus": null,
+                "seven_day_sonnet": null,
+                "limits": [
+                    {"kind":"session","group":"session","percent":0,"severity":"normal",
+                     "resets_at":null,"scope":null,"is_active":false},
+                    {"kind":"weekly_all","group":"weekly","percent":0,"severity":"normal",
+                     "resets_at":null,"scope":null,"is_active":false},
+                    {"kind":"weekly_scoped","group":"weekly","percent":0,"severity":"normal",
+                     "resets_at":null,
+                     "scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},
+                     "is_active":false}
+                ]
+            }),
+            true,
+        ),
+        (
+            "only_7d_unstarted_zero_null_reset",
+            json!({
+                "five_hour": {"utilization": 0.0, "resets_at": "2099-11-26T18:49:59.979596+00:00"},
+                "seven_day": {"utilization": 0.0, "resets_at": null},
+                "seven_day_opus": null,
+                "seven_day_sonnet": null
+            }),
+            true,
+        ),
+        (
+            "nonzero_7d_with_null_reset_stays_held",
+            json!({
+                "five_hour": {"utilization": 0.0, "resets_at": null},
+                "seven_day": {"utilization": 1.0, "resets_at": null},
+                "seven_day_opus": null,
+                "seven_day_sonnet": null
+            }),
+            false,
+        ),
+        (
+            "omitted_7d_resets_at_stays_held",
+            json!({
+                "five_hour": {"utilization": 0.0, "resets_at": null},
+                "seven_day": {"utilization": 0.0},
+                "seven_day_opus": null,
+                "seven_day_sonnet": null
+            }),
+            false,
+        ),
+    ] {
+        let f = Fixture::new();
+        let short = whole(10_000);
+        let weekly = whole(332_866);
+        let headers = unified(&[
+            ("5h-utilization", "0.64".into()),
+            ("5h-reset", short.timestamp().to_string()),
+            ("5h-status", "allowed".into()),
+            ("7d-utilization", "1.0".into()),
+            ("7d-reset", weekly.timestamp().to_string()),
+            ("7d-status", "rejected".into()),
+            ("7d_oi-reset", weekly.timestamp().to_string()),
+            ("7d_oi-status", "allowed".into()),
+            ("status", "rejected".into()),
+            ("reset", weekly.timestamp().to_string()),
+            ("representative-claim", "seven_day".into()),
+            ("overage-status", "rejected".into()),
+        ]);
+        let (_, held) = hold_from_headers(&f, &headers, "claude-opus-5-5").await;
+        assert_eq!(
+            held.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                until: weekly,
+                scope: "account".into(),
+            },
+            "{name}"
+        );
+        assert_eq!(
+            held.quota_cooling.as_ref().map(|c| c.window.as_str()),
+            Some("7d"),
+            "{name}"
+        );
+
+        let started_at = Utc::now() + Duration::seconds(2);
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let snapshot = crate::quota::parse_snapshot_for_test(Provider::Claude, &bytes, started_at)
+            .expect("usage body is recognized");
+        let complete = crate::quota::is_complete_snapshot_for_test(Provider::Claude, &bytes);
+        assert_eq!(complete, should_release, "{name}");
+        let merged = f
+            .obs
+            .observe_claude_poll(&f.id, snapshot.clone(), complete, started_at)
+            .expect("poll is newer than the header observation");
+        let after = f
+            .runtime
+            .apply_polled_quota_snapshot(&f.id, merged.clone(), &snapshot, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(after.health == Health::Ready, should_release, "{name}");
+        assert_eq!(after.quota_cooling.is_none(), should_release, "{name}");
+        assert_eq!(
+            after.eligible_at(Some("claude-opus-5-5"), started_at + Duration::seconds(1)),
+            should_release,
+            "{name}"
+        );
+        assert_eq!(
+            merged["signals"]["unified_status"].is_null(),
+            should_release,
+            "{name}"
+        );
+    }
+}

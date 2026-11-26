@@ -232,8 +232,13 @@ pub(super) fn is_complete_snapshot(provider: Provider, body: &[u8]) -> bool {
             root.get(*slot).is_some_and(|value| {
                 value.is_null()
                     || (value.is_object()
-                        && number(&value["utilization"]).is_some()
-                        && reset(value, Utc::now()).is_some())
+                        && number(&value["utilization"]).is_some_and(|used| {
+                            reset(value, Utc::now()).is_some()
+                                || (used == 0.0
+                                    && value.get("resets_at").is_some_and(Value::is_null)
+                                    && value.get("reset_at").is_none_or(Value::is_null)
+                                    && value.get("reset_after_seconds").is_none_or(Value::is_null))
+                        }))
             })
         }),
     }

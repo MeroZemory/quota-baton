@@ -292,16 +292,16 @@ fn claude_poll_retires_rejection(next: &serde_json::Value, old: &serde_json::Val
             return false;
         }
     }
-    let healthy = |window: &serde_json::Value| {
-        window["used_pct"]
-            .as_f64()
-            .is_some_and(|n| n.is_finite() && (0.0..=MAX_RECOVERY_USED_PCT).contains(&n))
-            && window["status"] != "rejected"
-            && window["observed_at"] == next["observed_at"]
-            && window["reset_at"]
-                .as_str()
-                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-                .is_some()
+    let healthy = |w: &serde_json::Value| {
+        let dated = w["reset_at"]
+            .as_str()
+            .is_some_and(|s| s.parse::<DateTime<Utc>>().is_ok());
+        w["used_pct"].as_f64().is_some_and(|n| {
+            n.is_finite()
+                && (0.0..=MAX_RECOVERY_USED_PCT).contains(&n)
+                && (dated || (n == 0.0 && w["reset_at"].is_null()))
+        }) && w["status"] != "rejected"
+            && w["observed_at"] == next["observed_at"]
     };
     let healthy_account_window = |name: &str| {
         windows

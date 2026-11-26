@@ -211,3 +211,83 @@ fn ordinary_claude_poll_retirement_preserves_partial_rejected_and_unrelated_evid
         }
     }
 }
+
+#[test]
+fn ordinary_claude_poll_retires_rejection_when_reset_window_is_unstarted_zero_with_null_reset() {
+    for case in [
+        "account_zero_null_reset",
+        "model_zero_null_reset",
+        "nonzero_null_reset",
+        "partial_zero_null_reset",
+        "incoming_rejection",
+    ] {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let at = Utc::now() - Duration::seconds(10);
+        let start = at + Duration::seconds(1);
+        let reset = at + Duration::days(3);
+        let old = if case == "model_zero_null_reset" {
+            json!({"source":"headers","observed_at":at,"windows":[
+                {"name":"5h","used_pct":50.0,"reset_at":at+Duration::hours(2),"observed_at":at,"status":"allowed"},
+                {"name":"7d","used_pct":40.0,"reset_at":reset,"observed_at":at,"status":"allowed"},
+                {"name":"7d_oi","used_pct":100.0,"reset_at":reset,"observed_at":at,"status":"rejected"}
+            ],"signals":{"unified_status":"rejected","unified_reset_at":reset,"representative_claim":"seven_day_opus"}})
+        } else {
+            json!({"source":"headers","observed_at":at,"windows":[
+                {"name":"5h","used_pct":64.0,"reset_at":at+Duration::hours(2),"observed_at":at,"status":"allowed"},
+                {"name":"7d","used_pct":100.0,"reset_at":reset,"observed_at":at,"status":"rejected"},
+                {"name":"7d_oi","used_pct":20.0,"reset_at":reset,"observed_at":at,"status":"allowed"}
+            ],"signals":{"unified_status":"rejected","unified_reset_at":reset,
+                "representative_claim":"seven_day","overage_status":"rejected","retry_after_seconds":332866.0}})
+        };
+        obs.observe_poll("cl-null-reset", old, true).unwrap();
+        let mut fresh = match case {
+            "model_zero_null_reset" => json!({"source":"poll","observed_at":start,"windows":[
+                {"name":"5h","used_pct":0.0,"reset_at":null,"observed_at":start},
+                {"name":"7d","used_pct":0.0,"reset_at":null,"observed_at":start},
+                {"name":"7d_oi","used_pct":0.0,"reset_at":null,"observed_at":start}
+            ],"signals":{}}),
+            "nonzero_null_reset" => json!({"source":"poll","observed_at":start,"windows":[
+                {"name":"5h","used_pct":0.0,"reset_at":null,"observed_at":start},
+                {"name":"7d","used_pct":1.0,"reset_at":null,"observed_at":start}
+            ],"signals":{}}),
+            _ => json!({"source":"poll","observed_at":start,"windows":[
+                {"name":"5h","used_pct":0.0,"reset_at":null,"observed_at":start},
+                {"name":"7d","used_pct":0.0,"reset_at":null,"observed_at":start},
+                {"name":"7d_oi","used_pct":0.0,"reset_at":null,"observed_at":start}
+            ],"signals":{}}),
+        };
+        if case == "incoming_rejection" {
+            fresh["signals"]["unified_status"] = json!("rejected");
+        }
+        let merged = obs
+            .observe_claude_poll(
+                "cl-null-reset",
+                fresh,
+                case != "partial_zero_null_reset",
+                start,
+            )
+            .unwrap();
+        let retired = matches!(case, "account_zero_null_reset" | "model_zero_null_reset");
+        assert_eq!(
+            merged["signals"]["unified_status"].is_null(),
+            retired,
+            "{case}"
+        );
+        let target = if case == "model_zero_null_reset" {
+            "7d_oi"
+        } else {
+            "7d"
+        };
+        let window = merged["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == target)
+            .unwrap();
+        assert_eq!(window["status"].is_null(), retired, "{case}");
+        if retired {
+            assert_eq!(window["reset_at"], json!(reset), "{case}");
+        }
+    }
+}
