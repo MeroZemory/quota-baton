@@ -45,8 +45,14 @@ fn claude_complete_accepts_unstarted_zero_utilization_window_with_null_resets_at
             "seven_day": {"utilization": 0.0, "resets_at": null}
         }),
         json!({
-            "five_hour": {"utilization": 0.0, "resets_at": null},
+            "five_hour": {"utilization": 0.0, "reset_at": null},
             "seven_day": {"utilization": 45.0, "resets_at": "2099-11-07T00:00:00Z"}
+        }),
+        json!({
+            "limits": [
+                {"kind": "session", "percent": 0.0, "resets_at": null, "scope": null},
+                {"kind": "weekly_all", "percent": 12.0, "resets_at": "2099-11-07T00:00:00Z", "scope": null}
+            ]
         }),
     ] {
         assert!(

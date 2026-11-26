@@ -160,7 +160,7 @@ pub(super) fn height_for(b: &mut Builder<'_>, p: &Projection, w: f32) -> f32 {
     } else {
         format!("{} · 주간 / 30일 남은 양", name(p))
     };
-    218. + b.measured_height(&title, inner, 13., true)
+    234. + b.measured_height(&title, inner, 13., true)
         + line_height(b, &current_quantity(p), inner, false)
         + line_height(b, &verdict(p), inner, true)
         + line_height(b, &note(p), inner, false)
@@ -195,7 +195,7 @@ pub(super) fn panel(b: &mut Builder<'_>, v: &m::DashboardView, p: &Projection, r
     let lh = line_height(b, &legend, w, false);
     let note = note(p);
     let nh = line_height(b, &note, w, false);
-    let top = r.top + 12. + title_h + 6. + vh + 6. + qh + 6. + lh + 8.;
+    let top = r.top + 12. + title_h + 6. + vh + 6. + qh + 6. + lh + 24.;
     let max = p.cohort.max(1) as f64;
     let axis = format!("{max:.1}");
     let gutter = b.measured_width(&axis, 11., false).max(28.) + 8.;
@@ -248,7 +248,10 @@ pub(super) fn panel(b: &mut Builder<'_>, v: &m::DashboardView, p: &Projection, r
                 Color::Footer,
                 0.,
             );
-            for (area, color) in gap_columns(p, plot) {
+            for (mut area, color) in gap_columns(p, plot) {
+                // Pad subpixel column seams slightly when painting so Direct2D
+                // renders a smooth shaded region without vertical hairline stripes.
+                area.right = (area.right + 0.6).min(plot.right);
                 b.fill(area, color, 0.);
             }
             for n in [0., max / 2., max] {
@@ -334,7 +337,7 @@ pub(super) fn panel(b: &mut Builder<'_>, v: &m::DashboardView, p: &Projection, r
         b.text(
             rect(
                 (x(p.now) - now_w / 2.).clamp(plot.left, (plot.right - now_w).max(plot.left)),
-                plot.top,
+                plot.top - 16.,
                 now_w,
                 16.,
             ),

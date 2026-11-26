@@ -1330,7 +1330,12 @@ fn summarize(
                 &[(r.name).to_string(), (in_use.len() - 1).to_string()],
             ),
             None => {
-                crate::i18n::format("계정 {0}개 준비됨", &[(eligible.unwrap_or(0)).to_string()])
+                let count = eligible.unwrap_or(0);
+                if crate::i18n::language() == crate::i18n::UiLanguage::En && count == 1 {
+                    "1 account ready".into()
+                } else {
+                    crate::i18n::format("계정 {0}개 준비됨", &[count.to_string()])
+                }
             }
         },
         Verdict::Credits => earliest_quota
@@ -1913,14 +1918,7 @@ fn menu_info(
         sessions_tooltip: crowded_threshold.map(|t| crate::i18n::format("분산 기준 {0}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다.", &[t.to_string()])),
         show_refresh_usage: a.user_state != "disabled" && a.health.kind != "needs_relogin",
         show_relogin: a.source.owned_or_adopted() && a.health.kind != "plan_without_claude_code",
-        show_release_hold: quota(a)
-            && a.credits.as_ref().is_some_and(|c| {
-                qb_core::credits::available(
-                    c.has_credits,
-                    c.unlimited,
-                    c.balance.as_ref().and_then(|n| n.as_f64()),
-                )
-            }),
+        show_release_hold: quota(a),
         show_refresh_token: a.source.owned_or_adopted()
             && !a.drain
             && a.health.kind != "needs_relogin"
@@ -2243,32 +2241,31 @@ mod tests {
     }
 
     #[test]
-    fn release_hold_projection_requires_quota_cooling_and_available_credits() {
-        for (credits, expected) in [
-            (json!({"has_credits":true}), true),
-            (json!({"has_credits":true,"balance":0}), false),
-            (json!({"has_credits":false,"balance":12.5}), false),
-            (json!({"balance":0.01}), true),
-            (json!({"has_credits":false,"balance":0}), false),
-            (json!({"balance":-1}), false),
-            (json!({"unlimited":true}), true),
-            (json!(null), false),
+    fn release_hold_projection_covers_all_account_quota_cooling_states() {
+        for (provider, credits) in [
+            ("codex", json!({"has_credits":true})),
+            ("codex", json!({"has_credits":false,"balance":0})),
+            ("codex", json!(null)),
+            ("claude", json!(null)),
         ] {
             for allow_credits in [false, true] {
                 let mut a = base("a");
-                // A supported native Codex entitlement; no fabricated Free-plan block.
-                a["plan"] = json!("plus");
+                a["provider"] = json!(provider);
+                a["plan"] = json!(if provider == "claude" {
+                    "max_5x"
+                } else {
+                    "plus"
+                });
                 a["pool_eligible"] = json!(false);
                 a["health"] = json!({"kind":"cooling","reason":"quota","scope":"account"});
                 a["credits"] = credits.clone();
                 a["allow_credits"] = json!(allow_credits);
-                // Old hard holds must remain available for an explicit operator probe.
                 a["quota_credit_releasable"] = json!(false);
-                assert_eq!(
+                assert!(
                     actual_row(&view(vec![a.clone()], 0), "a")
                         .menu
                         .show_release_hold,
-                    expected
+                    "{provider}/{credits}"
                 );
                 for health in [
                     json!({"kind":"ready"}),
@@ -2279,8 +2276,7 @@ mod tests {
                     a["health"] = health;
                     let projected = view(vec![a.clone()], 0);
                     let row = actual_row(&projected, "a");
-                    assert_eq!(row.raw.provider, "codex");
-                    assert_eq!(row.raw.plan.as_deref(), Some("plus"));
+                    assert_eq!(row.raw.provider, provider);
                     assert_eq!(row.raw.health.kind, a["health"]["kind"].as_str().unwrap());
                     assert!(!row.menu.show_release_hold);
                     assert_eq!(
@@ -3262,7 +3258,7 @@ mod r16_localization_tests {
             let view = project(&input.to_string(), now.into()).unwrap();
             assert_eq!(view.sections[1].rows[0].name, "사용 중 {0}");
             assert_eq!(view.summaries[1].verdict.text(), "Available");
-            assert!(view.summaries[1].detail.contains("accounts ready"));
+            assert_eq!(view.summaries[1].detail, "1 account ready");
             assert_eq!(window_label("5h"), "5 hours");
             assert_eq!(window_label("300m"), "300 minutes");
             assert_eq!(reset_label(now, now), "Reset");

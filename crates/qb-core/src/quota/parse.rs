@@ -97,25 +97,53 @@ fn window(name: &str, value: &Value, claude: bool, now: DateTime<Utc>) -> Option
         "observed_at": used.map(|_| now), "status": state}))
 }
 
-/// Newer Claude usage bodies report the Fable weekly window only as a
-/// `limits[]` row (`kind` `weekly_scoped`, `scope.model.display_name` "Fable")
-/// while `seven_day_opus` is null. It is the same account window that request
-/// headers call `7d_oi`. This returns the row's window input (`percent` is
-/// already 0-100; the row carries no request status) and `snapshot` turns it
-/// into a window through the same `window(name, ..)` call as every other named
-/// window. Only the display name is compared; no row string is copied. Other
-/// scoped display names are ignored; the only name seen so far, in the
-/// 2026-11-21 live body, is "Fable".
-fn claude_scoped_fable(limits: &Value) -> Option<Value> {
+fn has_explicit_null_reset(value: &Value) -> bool {
+    (value.get("resets_at").is_some_and(Value::is_null)
+        || value.get("reset_at").is_some_and(Value::is_null))
+        && value.get("resets_at").is_none_or(Value::is_null)
+        && value.get("reset_at").is_none_or(Value::is_null)
+        && value.get("reset_after_seconds").is_none_or(Value::is_null)
+}
+
+fn valid_claude_window(value: &Value, now: DateTime<Utc>) -> bool {
+    value.is_object()
+        && number(&value["utilization"]).is_some_and(|used| {
+            reset(value, now).is_some() || (used == 0.0 && has_explicit_null_reset(value))
+        })
+}
+
+/// Newer Claude usage bodies report windows as `limits[]` rows (`session`,
+/// `weekly_all`, `weekly_scoped`) alongside or instead of legacy top-level keys.
+/// Legacy top-level keys still win whenever non-null; `limits[]` acts as a
+/// typed fallback so future top-level deprecations do not break parsing or
+/// quota recovery. Only recognized kinds and model display names are matched;
+/// no row strings are stored.
+fn claude_limit_row(limits: &Value, kind: &str, models: &[&str]) -> Option<Value> {
     limits.as_array()?.iter().take(32).find_map(|row| {
-        if row["kind"].as_str() != Some("weekly_scoped")
-            || !row["scope"]["model"]["display_name"]
-                .as_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case("fable"))
+        if row["kind"].as_str() != Some(kind) {
+            return None;
+        }
+        if models.is_empty() {
+            if !row["scope"].is_null() {
+                return None;
+            }
+        } else if !row["scope"]["model"]["display_name"]
+            .as_str()
+            .is_some_and(|name| models.iter().any(|m| name.eq_ignore_ascii_case(m)))
         {
             return None;
         }
-        Some(json!({"utilization": row["percent"], "resets_at": row["resets_at"]}))
+        let mut obj = Map::new();
+        obj.insert("utilization".into(), row["percent"].clone());
+        if let Some(resets_at) = row.get("resets_at") {
+            obj.insert("resets_at".into(), resets_at.clone());
+        } else if let Some(reset_at) = row.get("reset_at") {
+            obj.insert("reset_at".into(), reset_at.clone());
+        }
+        if let Some(seconds) = row.get("reset_after_seconds") {
+            obj.insert("reset_after_seconds".into(), seconds.clone());
+        }
+        Some(Value::Object(obj))
     })
 }
 
@@ -176,20 +204,20 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
             }
         }
         Provider::Claude => {
-            let mut inputs: Vec<(&str, &Value)> = CLAUDE_WINDOWS
-                .iter()
-                .map(|(key, name)| (*name, &root[*key]))
-                .collect();
-            // `seven_day_opus` wins whenever the account still reports it.
-            let scoped = root["seven_day_opus"]
-                .is_null()
-                .then(|| claude_scoped_fable(&root["limits"]))
-                .flatten();
-            if let Some(value) = &scoped {
-                inputs.push(("7d_oi", value));
-            }
-            for (name, value) in inputs {
-                if let Some(w) = window(name, value, true, now) {
+            let fallbacks: [(&str, &str, &[&str]); 4] = [
+                ("five_hour", "session", &[]),
+                ("seven_day", "weekly_all", &[]),
+                ("seven_day_opus", "weekly_scoped", &["fable", "opus"]),
+                ("seven_day_sonnet", "weekly_scoped", &["sonnet"]),
+            ];
+            for ((key, name), (_, kind, models)) in CLAUDE_WINDOWS.iter().zip(fallbacks.iter()) {
+                let top = &root[*key];
+                let fallback = top
+                    .is_null()
+                    .then(|| claude_limit_row(&root["limits"], kind, models))
+                    .flatten();
+                let source = fallback.as_ref().unwrap_or(top);
+                if let Some(w) = window(name, source, true, now) {
                     windows.push(w);
                 }
             }
@@ -211,6 +239,7 @@ pub(super) fn is_complete_snapshot(provider: Provider, body: &[u8]) -> bool {
     let Ok(root) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
+    let now = Utc::now();
     match provider {
         Provider::Codex => {
             let rate = &root["rate_limit"];
@@ -223,24 +252,22 @@ pub(super) fn is_complete_snapshot(provider: Provider, body: &[u8]) -> bool {
                                 && value["limit_window_seconds"]
                                     .as_u64()
                                     .is_some_and(|n| n > 0)
-                                && number(&value["used_percent"]).is_some()
-                                && reset(value, Utc::now()).is_some())
+                                && number(&value["used_percent"]).is_some_and(|used| {
+                                    reset(value, now).is_some()
+                                        || (used == 0.0 && has_explicit_null_reset(value))
+                                }))
                     })
                 })
         }
-        Provider::Claude => ["five_hour", "seven_day"].iter().all(|slot| {
-            root.get(*slot).is_some_and(|value| {
-                value.is_null()
-                    || (value.is_object()
-                        && number(&value["utilization"]).is_some_and(|used| {
-                            reset(value, Utc::now()).is_some()
-                                || (used == 0.0
-                                    && value.get("resets_at").is_some_and(Value::is_null)
-                                    && value.get("reset_at").is_none_or(Value::is_null)
-                                    && value.get("reset_after_seconds").is_none_or(Value::is_null))
-                        }))
-            })
-        }),
+        Provider::Claude => [("five_hour", "session"), ("seven_day", "weekly_all")]
+            .iter()
+            .all(|(slot, kind)| match root.get(*slot) {
+                Some(value) if value.is_null() => claude_limit_row(&root["limits"], kind, &[])
+                    .is_none_or(|row| valid_claude_window(&row, now)),
+                Some(value) => valid_claude_window(value, now),
+                None => claude_limit_row(&root["limits"], kind, &[])
+                    .is_some_and(|row| valid_claude_window(&row, now)),
+            }),
     }
 }
 
@@ -552,8 +579,16 @@ mod tests {
 
     #[test]
     fn claude_other_scoped_display_names_and_kinds_are_ignored() {
-        // Display names seen on live bodies so far: only "Fable" (2026-11-21).
-        for name in ["Opus", "Sonnet", "Haiku", "Fable 5", "", "claude-fable-5-2"] {
+        // Known scoped families map cleanly; unknown/opaque names stay ignored.
+        for (name, expected) in [("Opus", "7d_oi"), ("Sonnet", "7d_sonnet")] {
+            let body = limits_body(Value::Null, fable_row(name, json!(80)));
+            let result = snapshot(Provider::Claude, &body, now()).unwrap();
+            let windows = result["windows"].as_array().unwrap();
+            assert_eq!(windows.len(), 3, "{name}");
+            assert_eq!(windows[2]["name"], expected, "{name}");
+            assert_eq!(windows[2]["used_pct"], 80.0, "{name}");
+        }
+        for name in ["Haiku", "Fable 5", "", "claude-fable-5-2"] {
             let body = limits_body(Value::Null, fable_row(name, json!(80)));
             let result = snapshot(Provider::Claude, &body, now()).unwrap();
             assert_eq!(result["windows"].as_array().unwrap().len(), 2, "{name:?}");
@@ -568,6 +603,34 @@ mod tests {
         let body = limits_body(Value::Null, row);
         let result = snapshot(Provider::Claude, &body, now()).unwrap();
         assert_eq!(result["windows"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn claude_limits_fallback_covers_session_and_weekly_all_when_legacy_keys_absent() {
+        let body = serde_json::to_vec(&json!({
+            "limits": [
+                {"kind":"session","group":"session","percent":0,"severity":"normal",
+                 "resets_at":null,"scope":null,"is_active":false},
+                {"kind":"weekly_all","group":"weekly","percent":18,"severity":"normal",
+                 "resets_at":"2027-01-21T08:00:00Z","scope":null,"is_active":true},
+                {"kind":"weekly_scoped","group":"weekly","percent":4,"severity":"normal",
+                 "resets_at":"2027-01-21T08:00:00Z",
+                 "scope":{"model":{"id":null,"display_name":"Sonnet"},"surface":null},
+                 "is_active":false}
+            ]
+        }))
+        .unwrap();
+        assert!(is_complete_snapshot(Provider::Claude, &body));
+        let result = snapshot(Provider::Claude, &body, now()).unwrap();
+        let windows = result["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0]["name"], "5h");
+        assert_eq!(windows[0]["used_pct"], 0.0);
+        assert!(windows[0]["reset_at"].is_null());
+        assert_eq!(windows[1]["name"], "7d");
+        assert_eq!(windows[1]["used_pct"], 18.0);
+        assert_eq!(windows[2]["name"], "7d_sonnet");
+        assert_eq!(windows[2]["used_pct"], 4.0);
     }
 
     #[test]

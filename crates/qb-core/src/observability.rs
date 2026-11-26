@@ -1515,9 +1515,9 @@ impl Observability {
             };
             // 부분 헤더 응답은 기존 창 정보를 지우지 않는다.
             if let Some(old) = snapshots.get(id) {
+                // Log a diagnostic reason when low usage keeps a prior rejection.
                 let retire_claude = matches!(mode, Some(QuotaMerge::ClaudePoll { .. }))
-                    && !preserve_missing_windows
-                    && claude_poll_retires_rejection(&value, old);
+                    && retire_claude_poll(id, !preserve_missing_windows, &value, old);
                 // Headers publish before taking Store. Check and merge under
                 // this one lock, or a late poll could erase their rejection.
                 let fence = match mode {
@@ -2033,6 +2033,84 @@ fn status(h: &HeaderMap, name: &str) -> Option<String> {
         })
         .map(str::to_owned)
 }
+fn claude_poll_retirement_blocker(
+    complete: bool,
+    next: &serde_json::Value,
+    old: &serde_json::Value,
+) -> Option<&'static str> {
+    if !complete {
+        return Some("incomplete_poll");
+    }
+    let signals = &old["signals"];
+    if signals["active_limit"] == "credits" || signals["serving_from_credits"] == true {
+        return Some("paid_claim");
+    }
+    for key in ["active_limit", "representative_claim"] {
+        if signals[key]
+            .as_str()
+            .is_some_and(|claim| reset_window_name(claim).is_none())
+        {
+            return Some("unknown_claim");
+        }
+    }
+    if next["signals"]["unified_status"] == "rejected"
+        || next["signals"]["limit_reached"] == true
+        || next["signals"]["active_limit"] == "credits"
+        || next["signals"]["serving_from_credits"] == true
+    {
+        return Some("incoming_limit_signal");
+    }
+    let Some(windows) = next["windows"].as_array() else {
+        return Some("missing_windows");
+    };
+    let Some(previous) = old["windows"].as_array() else {
+        return Some("missing_prior_windows");
+    };
+    if previous.iter().any(|prior| {
+        matches!(prior["name"].as_str(), Some("7d_oi" | "7d_sonnet"))
+            && (prior["status"] == "rejected"
+                || prior["used_pct"].as_f64().is_some_and(|u| u >= 100.0))
+            && !windows.iter().any(|w| w["name"] == prior["name"])
+    }) {
+        return Some("rejected_model_window_omitted");
+    }
+    Some("window_not_healthy_or_prior_missing")
+}
+
+fn retire_claude_poll(
+    id: &str,
+    complete: bool,
+    next: &serde_json::Value,
+    old: &serde_json::Value,
+) -> bool {
+    if complete && claude_poll_retires_rejection(next, old) {
+        return true;
+    }
+    let old_rejected = old["signals"]["unified_status"] == "rejected"
+        || old["signals"]["limit_reached"] == true
+        || old["windows"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| w["status"] == "rejected"));
+    let poll_looks_healthy = next["windows"].as_array().is_some_and(|ws| {
+        ws.iter().any(|w| {
+            matches!(w["name"].as_str(), Some("5h" | "7d"))
+                && w["used_pct"]
+                    .as_f64()
+                    .is_some_and(|u| u.is_finite() && (0.0..=95.0).contains(&u))
+        })
+    });
+    if old_rejected && poll_looks_healthy {
+        let reason = claude_poll_retirement_blocker(complete, next, old).unwrap_or("unknown");
+        tracing::info!(
+            account = %id,
+            reason,
+            complete,
+            "Claude poll did not retire prior rejection despite low account usage"
+        );
+    }
+    false
+}
+
 fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Snapshot> {
     let mut windows = Vec::new();
     let mut plan = None;
@@ -2047,13 +2125,19 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                     .filter(|v| {
                         matches!(
                             *v,
-                            "5h" | "7d" | "7d_oi" | "five_hour" | "seven_day" | "seven_day_opus"
+                            "5h" | "7d"
+                                | "7d_oi"
+                                | "7d_sonnet"
+                                | "five_hour"
+                                | "seven_day"
+                                | "seven_day_opus"
+                                | "seven_day_sonnet"
                         )
                     })
                     .map(str::to_owned);
             signals.overage_status = status(h, "anthropic-ratelimit-unified-overage-status");
             signals.retry_after_seconds = number(h, "retry-after").filter(|v| *v >= 0.0);
-            for name in ["5h", "7d", "7d_oi"] {
+            for name in ["5h", "7d", "7d_oi", "7d_sonnet"] {
                 let prefix = format!("anthropic-ratelimit-unified-{name}");
                 let used_pct = number(h, &format!("{prefix}-utilization"))
                     .filter(|v| *v >= 0.0)

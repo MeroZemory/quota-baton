@@ -1482,7 +1482,15 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
     if let Some(s) = &row.menu.credits_line {
         parts.push(Part::Info(s.clone(), false, 16.));
     }
-    if matches!(row.raw.provider.as_str(), "codex" | "claude") {
+    let show_reset_menu = row.raw.provider == "codex"
+        || (row.raw.provider == "claude"
+            && row
+                .raw
+                .reset_credits
+                .as_ref()
+                .and_then(|i| i.claude.as_ref())
+                .is_some_and(|c| c.eligible && !c.grants.is_empty()));
+    if show_reset_menu {
         if let Some(reset) = &row.reset_credits {
             parts.push(Part::HintInfo(
                 reset.text.clone(),
@@ -3618,7 +3626,12 @@ mod r26_geometry_tests {
                                     action: kind.clone(),
                                 }
                         });
-                        assert_eq!(item.unwrap().enabled, reason.is_none());
+                        if provider == "claude" {
+                            // Claude omits the menu item when no eligible grant was offered.
+                            assert!(item.is_none());
+                        } else {
+                            assert_eq!(item.unwrap().enabled, reason.is_none());
+                        }
                     }
                     if reason.is_none() && provider == "codex" {
                         let now = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;

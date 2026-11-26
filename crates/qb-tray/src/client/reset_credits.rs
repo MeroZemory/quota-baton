@@ -420,7 +420,10 @@ fn claude_inventory_line<Tz: TimeZone>(
     if matches!(
         common.state,
         ResetCreditState::Unknown | ResetCreditState::Unsupported
-    ) {
+    ) || (!i.eligible
+        && i.ineligible_reason.as_deref() == Some("surface")
+        && i.grants.is_empty())
+    {
         return line;
     }
     line.can_use = common.state == ResetCreditState::Fresh

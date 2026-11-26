@@ -440,8 +440,22 @@ impl Clock {
         let secs = self.utc().signed_duration_since(at).num_seconds().max(0);
         match secs {
             0..=59 => crate::i18n::static_text("방금").into(),
-            60..=3599 => crate::i18n::format("{0}분 전", &[(secs / 60).to_string()]),
-            3600..=86399 => crate::i18n::format("{0}시간 전", &[(secs / 3600).to_string()]),
+            60..=3599 => {
+                let mins = secs / 60;
+                if crate::i18n::language() == crate::i18n::UiLanguage::En && mins == 1 {
+                    "1 min ago".into()
+                } else {
+                    crate::i18n::format("{0}분 전", &[mins.to_string()])
+                }
+            }
+            3600..=86399 => {
+                let hours = secs / 3600;
+                if crate::i18n::language() == crate::i18n::UiLanguage::En && hours == 1 {
+                    "1 hour ago".into()
+                } else {
+                    crate::i18n::format("{0}시간 전", &[hours.to_string()])
+                }
+            }
             _ => self.time(Some(at)),
         }
     }
@@ -1758,15 +1772,19 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
                         ],
                     ),
                     if d.moved_groups.unwrap_or(0) > 0 {
-                        crate::i18n::format(
-                            "연결된 세션 {0}개를 {1}로 옮겨 이어서 처리합니다. {2}는 {3}에 초기화됩니다.",
-                            &[
-                                (count(d.moved_groups)).to_string(),
-                                b.to_string(),
-                                a.to_string(),
-                                reset.to_string(),
-                            ],
-                        )
+                        let moved = count(d.moved_groups);
+                        if crate::i18n::language() == crate::i18n::UiLanguage::En
+                            && d.moved_groups == Some(1)
+                        {
+                            format!(
+                                "Moving 1 bound session to {b} to continue. {a} resets at {reset}."
+                            )
+                        } else {
+                            crate::i18n::format(
+                                "연결된 세션 {0}개를 {1}로 옮겨 이어서 처리합니다. {2}는 {3}에 초기화됩니다.",
+                                &[moved, b.to_string(), a.to_string(), reset.to_string()],
+                            )
+                        }
                     } else {
                         crate::i18n::format(
                             "새 세션은 다른 계정에 배정합니다. {0}에 초기화됩니다.",

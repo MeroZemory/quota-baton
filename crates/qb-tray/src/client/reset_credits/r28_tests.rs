@@ -93,7 +93,7 @@ fn view(i: Option<&ResetCreditInventory>, state: &str, health: &str, plan: &str)
 }
 
 #[test]
-fn unknown_or_not_offered_has_no_card_line_but_still_has_read_entry() {
+fn unknown_or_not_offered_has_no_card_line_and_omits_dead_claude_menu_entry() {
     for language in [UiLanguage::Ko, UiLanguage::En] {
         with_language(language, || {
             for i in [
@@ -101,6 +101,22 @@ fn unknown_or_not_offered_has_no_card_line_but_still_has_read_entry() {
                 Some(ResetCreditInventory::default()),
                 Some(ResetCreditInventory {
                     state: ResetCreditState::Unsupported,
+                    ..Default::default()
+                }),
+                Some(ResetCreditInventory {
+                    state: ResetCreditState::Fresh,
+                    available_count: Some(0),
+                    refusal: Some(ResetCreditRefusal::Ineligible),
+                    claude: Some(ClaudeResetInventory {
+                        eligible: false,
+                        ineligible_reason: Some("surface".into()),
+                        at_limit: Some(false),
+                        exhausted: vec![],
+                        next_grant_id: None,
+                        weekly_resets_at: None,
+                        cooldown_until: None,
+                        grants: vec![],
+                    }),
                     ..Default::default()
                 }),
             ] {
@@ -116,15 +132,33 @@ fn unknown_or_not_offered_has_no_card_line_but_still_has_read_entry() {
                     },
                     800.,
                 );
-                assert!(scene.popup.unwrap().items.iter().any(|i| i.enabled
-                    && matches!(
-                        i.target,
-                        g::Target::Menu {
-                            action: g::MenuAction::UseResetCredit,
-                            ..
-                        }
-                    )));
+                assert!(!scene.popup.unwrap().items.iter().any(|i| matches!(
+                    i.target,
+                    g::Target::Menu {
+                        action: g::MenuAction::UseResetCredit,
+                        ..
+                    }
+                )));
             }
+            // When Claude actually offers an eligible grant, the menu entry appears.
+            let offered = inventory(vec![grant("full-secret", "Full", true)]);
+            let v = view(Some(&offered), "active", "ready", "pro");
+            let scene = g::Scene::build(
+                &v,
+                g::Presentation {
+                    overlay: g::Overlay::RowMenu("cl-secret".into()),
+                    ..Default::default()
+                },
+                800.,
+            );
+            assert!(scene.popup.unwrap().items.iter().any(|i| i.enabled
+                && matches!(
+                    i.target,
+                    g::Target::Menu {
+                        action: g::MenuAction::UseResetCredit,
+                        ..
+                    }
+                )));
         });
     }
 }
